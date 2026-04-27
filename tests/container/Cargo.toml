@@ -1,0 +1,9 @@
+[package]
+name = "container_tests"
+version = "0.1.0"
+edition = "2021"
+
+[dev-dependencies]
+libsrs_container = { path = "../../crates/libsrs_container" }
+libsrs_mux = { path = "../../crates/libsrs_mux" }
+libsrs_demux = { path = "../../crates/libsrs_demux" }

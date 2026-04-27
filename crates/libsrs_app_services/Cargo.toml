@@ -1,0 +1,19 @@
+[package]
+name = "libsrs_app_services"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+libsrs_audio = { path = "../libsrs_audio" }
+libsrs_container = { path = "../libsrs_container" }
+libsrs_contract = { path = "../libsrs_contract" }
+libsrs_demux = { path = "../libsrs_demux" }
+libsrs_compat = { path = "../libsrs_compat" }
+libsrs_licensing_proto = { path = "../libsrs_licensing_proto" }
+libsrs_mux = { path = "../libsrs_mux" }
+libsrs_pipeline = { path = "../libsrs_pipeline" }
+libsrs_video = { path = "../libsrs_video" }

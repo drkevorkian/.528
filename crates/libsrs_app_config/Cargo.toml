@@ -1,0 +1,13 @@
+[package]
+name = "libsrs_app_config"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+directories = "6.0.0"
+libsrs_licensing_proto = { version = "0.1.0", path = "../libsrs_licensing_proto" }
+serde = { workspace = true, features = ["derive"] }
+toml = "1.0.7"

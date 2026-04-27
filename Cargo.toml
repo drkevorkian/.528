@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/libsrs_video",
+    "crates/libsrs_audio",
+    "crates/libsrs_container",
+    "crates/libsrs_mux",
+    "crates/libsrs_demux",
+    "crates/libsrs_contract",
+    "crates/libsrs_compat",
+    "crates/libsrs_pipeline",
+    "apps/srs_cli",
+    "apps/srs_player",
+    "tests/e2e",
+    "tests/container",
+    "tests/conformance",
+    "benchmarks",
+    "tools/bitstream_dump",
+    "tools/quality_metrics",
+    "tools/container_inspector",
+    "tools/fuzz_seed_gen",
+    "crates/libsrs_licensing_proto",
+    "crates/libsrs_app_config",
+    "crates/libsrs_licensing_client",
+    "crates/libsrs_app_services",
+    "apps/srs_license_server",
+    "apps/srs_admin",
+]
+exclude = ["tests/fuzz"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+rust-version = "1.78"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }

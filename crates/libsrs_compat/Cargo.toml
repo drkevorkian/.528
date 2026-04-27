@@ -1,0 +1,20 @@
+[package]
+name = "libsrs_compat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+ffmpeg = ["dep:ffmpeg-next"]
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+libsrs_contract = { path = "../libsrs_contract" }
+libsrs_video = { path = "../libsrs_video" }
+libsrs_audio = { path = "../libsrs_audio" }
+libsrs_demux = { path = "../libsrs_demux" }
+libsrs_container = { path = "../libsrs_container" }
+ffmpeg-next = { version = "7", optional = true }

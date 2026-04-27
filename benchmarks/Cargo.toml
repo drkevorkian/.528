@@ -1,0 +1,22 @@
+[package]
+name = "srs_benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+libsrs_contract = { path = "../crates/libsrs_contract" }
+libsrs_pipeline = { path = "../crates/libsrs_pipeline" }
+
+[dev-dependencies]
+criterion = "0.7"
+
+[[bench]]
+name = "encode_decode"
+harness = false
+
+[[bench]]
+name = "seek_latency"
+harness = false

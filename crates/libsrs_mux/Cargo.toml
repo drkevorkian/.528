@@ -1,0 +1,7 @@
+[package]
+name = "libsrs_mux"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libsrs_container = { path = "../libsrs_container" }

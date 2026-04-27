@@ -1,0 +1,35 @@
+/target
+**/target
+
+# IDE / OS
+.idea
+.vscode
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# Local runtime (tracked directory only; see var/.gitkeep)
+var/*
+!var/.gitkeep
+
+# Local secrets and overrides (never commit real credentials)
+.env
+.env.*
+!.env.example
+config/srs.local.toml
+
+# Fuzzing outputs
+tests/fuzz/artifacts
+tests/fuzz/corpus/*
+!tests/fuzz/corpus/container_parser_demux_reader/
+!tests/fuzz/corpus/container_parser_demux_reader/**
+
+# Coverage / profiling
+*.profraw
+*.gcda
+*.gcno
+lcov.info
+coverage/

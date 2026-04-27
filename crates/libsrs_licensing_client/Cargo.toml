@@ -1,0 +1,18 @@
+[package]
+name = "libsrs_licensing_client"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ed25519-dalek = "2.1.1"
+keyring = "3.6.3"
+libsrs_app_config = { version = "0.1.0", path = "../libsrs_app_config" }
+libsrs_licensing_proto = { version = "0.1.0", path = "../libsrs_licensing_proto" }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0.149"
+tracing.workspace = true
+uuid = { version = "1.20.0", features = ["v4", "serde"] }

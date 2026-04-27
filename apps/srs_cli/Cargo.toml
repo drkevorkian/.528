@@ -1,0 +1,16 @@
+[package]
+name = "srs_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap = { version = "4", features = ["derive"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+libsrs_app_config = { path = "../../crates/libsrs_app_config" }
+libsrs_app_services = { path = "../../crates/libsrs_app_services" }
+libsrs_licensing_client = { path = "../../crates/libsrs_licensing_client" }
+libsrs_licensing_proto = { path = "../../crates/libsrs_licensing_proto" }

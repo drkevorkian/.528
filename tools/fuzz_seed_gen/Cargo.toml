@@ -1,0 +1,9 @@
+[package]
+name = "fuzz_seed_gen"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow.workspace = true
+libsrs_container = { path = "../../crates/libsrs_container" }
+libsrs_mux = { path = "../../crates/libsrs_mux" }

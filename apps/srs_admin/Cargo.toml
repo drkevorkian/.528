@@ -1,0 +1,14 @@
+[package]
+name = "srs_admin"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+eframe = "0.33"
+egui = "0.33"
+libsrs_app_config = { version = "0.1.0", path = "../../crates/libsrs_app_config" }
+libsrs_licensing_proto = { version = "0.1.0", path = "../../crates/libsrs_licensing_proto" }
+reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "rustls"] }

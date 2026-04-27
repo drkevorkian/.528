@@ -1,0 +1,17 @@
+[package]
+name = "srs_e2e_tests"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+libsrs_contract = { path = "../../crates/libsrs_contract" }
+libsrs_pipeline = { path = "../../crates/libsrs_pipeline" }
+libsrs_video = { path = "../../crates/libsrs_video" }
+libsrs_audio = { path = "../../crates/libsrs_audio" }
+libsrs_container = { path = "../../crates/libsrs_container" }
+libsrs_mux = { path = "../../crates/libsrs_mux" }
+libsrs_demux = { path = "../../crates/libsrs_demux" }

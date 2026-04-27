@@ -1,0 +1,21 @@
+[package]
+name = "srs_license_server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum = "0.8.8"
+lettre = { version = "0.11.19", default-features = false, features = ["smtp-transport", "builder", "rustls-tls"] }
+libsrs_app_config = { version = "0.1.0", path = "../../crates/libsrs_app_config" }
+libsrs_licensing_proto = { version = "0.1.0", path = "../../crates/libsrs_licensing_proto" }
+rusqlite = { version = "0.39.0", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "net"] }
+tracing.workspace = true
+tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
+uuid = { version = "1.20.0", features = ["v4", "serde"] }

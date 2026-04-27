@@ -1,0 +1,24 @@
+[client]
+# Replace these with your reachable Gentoo licensing host/IP on other machines.
+# Keep localhost/127.0.0.1 only when the client and licensing server run on the same system.
+primary_url = "http://localhost:3000"
+backup_url = "http://127.0.0.1:3000"
+license_key = ""
+connect_timeout_ms = 1500
+request_timeout_ms = 5000
+refresh_interval_s = 3600
+contact_email = "support@localhost"
+help_url = "http://localhost:3000"
+
+[server]
+# Change to 0.0.0.0:3000 (or your preferred interface) when serving remote clients.
+bind_addr = "127.0.0.1:3000"
+# Set this to the public/reachable URL of your Gentoo licensing server for remote clients.
+base_url = "http://localhost:3000"
+database_path = "var/srs_license.sqlite3"
+confirmation_window_hours = 72
+token_ttl_hours = 24
+# mail_from = "noreply@example.com"
+# smtp_server = "127.0.0.1"
+# smtp_username = "smtp-user"
+# smtp_password = "smtp-password"
