@@ -1,6 +1,9 @@
 use std::io::Cursor;
 
-use libsrs_container::{FileHeader, PacketFlags, TrackDescriptor, TrackKind};
+use libsrs_container::{
+    decode_track_descriptor, encode_track_descriptor, FileHeader, PacketFlags, TrackDescriptor,
+    TrackKind, MAX_TRACK_CONFIG_BYTES,
+};
 use libsrs_demux::DemuxReader;
 use libsrs_mux::MuxWriter;
 
@@ -48,6 +51,7 @@ fn golden_mux_demux_roundtrip() {
     assert_eq!(demux.tracks(), tracks.as_slice());
 
     demux.rebuild_index().expect("index");
+    assert_eq!(demux.header().version, 2);
     assert_eq!(demux.index().len(), 4);
 
     demux.reset_to_data_start().expect("reset");
@@ -118,5 +122,60 @@ fn bad_crc_is_detected() {
 
     let mut demux = DemuxReader::open(Cursor::new(output)).expect("demux open");
     let err = demux.next_packet().expect_err("must fail");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn legacy_srsm_v1_container_still_decodeable() {
+    let cursor = Cursor::new(Vec::new());
+    let header = FileHeader::new_legacy(1, 0);
+    let tracks = vec![TrackDescriptor {
+        track_id: 1,
+        kind: TrackKind::Video,
+        codec_id: 101,
+        flags: 0,
+        timescale: 90_000,
+        config: vec![1, 2, 3],
+    }];
+    let mut mux = MuxWriter::new(cursor, header, tracks).expect("mux init");
+    mux.write_packet(1, 0, 0, true, b"legacy").expect("packet");
+    let mut output = mux.finalize().expect("finalize");
+    output.set_position(0);
+
+    let mut demux = DemuxReader::open(output).expect("demux open");
+    assert_eq!(demux.header().version, 1);
+    assert!(!demux.header().block_checksum_is_crc32c());
+    demux.rebuild_index().expect("index");
+    demux.reset_to_data_start().expect("reset");
+    let pkt = demux.next_packet().expect("packet").expect("one");
+    assert_eq!(pkt.packet.payload, b"legacy");
+}
+
+#[test]
+fn oversize_track_config_encode_rejected() {
+    let track = TrackDescriptor {
+        track_id: 1,
+        kind: TrackKind::Video,
+        codec_id: 1,
+        flags: 0,
+        timescale: 90_000,
+        config: vec![0u8; MAX_TRACK_CONFIG_BYTES + 1],
+    };
+    let err = encode_track_descriptor(&track).expect_err("config too large");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn oversize_track_config_decode_rejected() {
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.push(TrackKind::Video as u8);
+    bytes.push(0);
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    bytes.extend_from_slice(&90_000u32.to_le_bytes());
+    bytes.extend_from_slice(&((MAX_TRACK_CONFIG_BYTES as u32) + 1).to_le_bytes());
+    let mut cursor = Cursor::new(bytes);
+    let err = decode_track_descriptor(&mut cursor).expect_err("limit");
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }

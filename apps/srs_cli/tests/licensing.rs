@@ -2,7 +2,8 @@ use std::fs;
 use std::process::Command;
 
 fn write_test_config(name: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(format!("srs-cli-test-{name}-{}.toml", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("srs-cli-test-{name}-{}.toml", std::process::id()));
     fs::write(
         &path,
         r#"[client]
@@ -31,7 +32,11 @@ fn analyze_remains_available_without_license_key() {
         .expect("run analyze");
     let _ = fs::remove_file(&config);
 
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("format: foreign") || stdout.contains("foreign format"));
 }
@@ -48,7 +53,11 @@ fn encode_is_rejected_without_verified_editor_key() {
         .expect("run encode");
     let _ = fs::remove_file(&config);
 
-    assert!(!output.status.success(), "stdout: {}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        !output.status.success(),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("No license key configured") || stderr.contains("play-only mode"),

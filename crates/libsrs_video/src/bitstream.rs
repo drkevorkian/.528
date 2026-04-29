@@ -2,7 +2,9 @@ use std::io::{self, Read, Write};
 
 use crc32fast::Hasher;
 
-use crate::codec::{decode_frame, encode_frame, FrameType, VideoFrame, PACKET_SYNC, STREAM_MAGIC, STREAM_VERSION};
+use crate::codec::{
+    decode_frame, encode_frame, FrameType, VideoFrame, PACKET_SYNC, STREAM_MAGIC, STREAM_VERSION,
+};
 use crate::error::VideoCodecError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,7 +28,9 @@ impl VideoStreamHeader {
             return Err(VideoCodecError::InvalidData("invalid video stream magic"));
         }
         if bytes[4] != STREAM_VERSION {
-            return Err(VideoCodecError::InvalidData("unsupported video stream version"));
+            return Err(VideoCodecError::InvalidData(
+                "unsupported video stream version",
+            ));
         }
         let mut w = [0_u8; 4];
         w.copy_from_slice(&bytes[8..12]);
@@ -35,7 +39,9 @@ impl VideoStreamHeader {
         let width = u32::from_le_bytes(w);
         let height = u32::from_le_bytes(h);
         if width == 0 || height == 0 {
-            return Err(VideoCodecError::InvalidData("invalid zero dimension stream"));
+            return Err(VideoCodecError::InvalidData(
+                "invalid zero dimension stream",
+            ));
         }
         Ok(Self { width, height })
     }
@@ -61,7 +67,10 @@ impl<W: Write> VideoStreamWriter<W> {
         Ok(Self { inner, header })
     }
 
-    pub fn write_frame(&mut self, frame: &VideoFrame) -> Result<FramePacketMetadata, VideoCodecError> {
+    pub fn write_frame(
+        &mut self,
+        frame: &VideoFrame,
+    ) -> Result<FramePacketMetadata, VideoCodecError> {
         if frame.width != self.header.width || frame.height != self.header.height {
             return Err(VideoCodecError::DimensionMismatch {
                 expected_width: self.header.width,
@@ -82,7 +91,8 @@ impl<W: Write> VideoStreamWriter<W> {
         let crc32 = crc_hasher.finalize();
 
         self.inner.write_all(&PACKET_SYNC)?;
-        self.inner.write_all(&[STREAM_VERSION, frame.frame_type as u8])?;
+        self.inner
+            .write_all(&[STREAM_VERSION, frame.frame_type as u8])?;
         self.inner.write_all(&frame.frame_index.to_le_bytes())?;
         self.inner.write_all(&payload_len.to_le_bytes())?;
         self.inner.write_all(&crc32.to_le_bytes())?;
@@ -127,7 +137,9 @@ impl<R: Read> VideoStreamReader<R> {
         let mut version_and_type = [0_u8; 2];
         self.inner.read_exact(&mut version_and_type)?;
         if version_and_type[0] != STREAM_VERSION {
-            return Err(VideoCodecError::InvalidData("unsupported video packet version"));
+            return Err(VideoCodecError::InvalidData(
+                "unsupported video packet version",
+            ));
         }
         let frame_type = FrameType::from_u8(version_and_type[1])?;
 
@@ -161,7 +173,9 @@ impl<R: Read> VideoStreamReader<R> {
     }
 }
 
-pub fn parse_video_frame_packet_header(packet: &[u8]) -> Result<FramePacketMetadata, VideoCodecError> {
+pub fn parse_video_frame_packet_header(
+    packet: &[u8],
+) -> Result<FramePacketMetadata, VideoCodecError> {
     if packet.len() < 2 + 2 + 4 + 4 + 4 {
         return Err(VideoCodecError::InvalidData(
             "packet too small for video frame header",
@@ -171,7 +185,9 @@ pub fn parse_video_frame_packet_header(packet: &[u8]) -> Result<FramePacketMetad
         return Err(VideoCodecError::InvalidData("invalid video packet sync"));
     }
     if packet[2] != STREAM_VERSION {
-        return Err(VideoCodecError::InvalidData("unsupported video packet version"));
+        return Err(VideoCodecError::InvalidData(
+            "unsupported video packet version",
+        ));
     }
     let frame_type = FrameType::from_u8(packet[3])?;
     let mut idx = [0_u8; 4];

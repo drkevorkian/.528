@@ -53,7 +53,7 @@ fn pipeline_analyze_and_import_native_container_flow() {
     let metadata = pipeline
         .analyze_source(&temp_path)
         .expect("native metadata should resolve");
-    assert_eq!(metadata.format_name, "srsm");
+    assert_eq!(metadata.format_name, "528-container-v2");
     assert!(!metadata.tracks.is_empty());
 
     let mut native = NoopNativeTranscoder::default();
@@ -102,8 +102,8 @@ fn native_video_audio_mux_demux_roundtrip() {
         },
     ];
 
-    let mut mux = MuxWriter::new(Cursor::new(Vec::new()), FileHeader::new(2, 4), tracks)
-        .expect("init mux");
+    let mut mux =
+        MuxWriter::new(Cursor::new(Vec::new()), FileHeader::new(2, 4), tracks).expect("init mux");
     mux.write_packet(1, 0, 0, true, &encoded_video)
         .expect("write video packet");
     mux.write_packet(2, 0, 0, true, &encoded_audio)
@@ -116,8 +116,9 @@ fn native_video_audio_mux_demux_roundtrip() {
         .next_packet()
         .expect("next packet")
         .expect("video packet");
-    let decoded_video = libsrs_video::decode_frame(16, 16, 0, FrameType::I, &video_packet.packet.payload)
-        .expect("decode video");
+    let decoded_video =
+        libsrs_video::decode_frame(16, 16, 0, FrameType::I, &video_packet.packet.payload)
+            .expect("decode video");
     assert_eq!(decoded_video.data, video.data);
 
     let audio_packet = demux

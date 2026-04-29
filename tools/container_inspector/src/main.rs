@@ -9,7 +9,7 @@ fn main() -> io::Result<()> {
     let path = env::args().nth(1).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
-            "usage: container_inspector <file.srsm>",
+            "usage: container_inspector <file.528 or legacy .srsm>",
         )
     })?;
 

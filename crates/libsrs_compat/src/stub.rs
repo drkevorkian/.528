@@ -19,7 +19,7 @@ pub struct StubProbe;
 
 impl MediaProbe for StubProbe {
     fn probe_path(&self, input: &Path) -> Result<ProbeResult> {
-        if let Some("srsm") = extension(input) {
+        if matches!(extension(input), Some("528" | "srsm")) {
             return probe_native_container(input);
         }
         if let Some("srsv") = extension(input) {
@@ -87,8 +87,10 @@ impl MediaIngestor for StubIngestor {
             if self.cursor as u64 >= self.max_packets {
                 return Ok(None);
             }
-            let packet =
-                crate::probe::CompatLayer::synthetic_packet((self.cursor % 255) as u8, (self.cursor * 40) as i64);
+            let packet = crate::probe::CompatLayer::synthetic_packet(
+                (self.cursor % 255) as u8,
+                (self.cursor * 40) as i64,
+            );
             self.cursor += 1;
             return Ok(Some(packet));
         }
@@ -130,7 +132,7 @@ impl MediaIngestor for StubIngestor {
 impl StubIngestor {
     fn load_native_packets(&mut self, input: &Path) -> Result<bool> {
         match extension(input) {
-            Some("srsm") => {
+            Some("528" | "srsm") => {
                 self.packets = ingest_native_container(input)?;
                 Ok(true)
             }
@@ -175,7 +177,7 @@ fn probe_native_container(input: &Path) -> Result<ProbeResult> {
         .map(|pts| pts / 1000);
 
     Ok(ProbeResult {
-        format_name: "srsm".to_string(),
+        format_name: format!("528-container-v{}", demux.header().version),
         duration_ms,
         tracks,
     })
@@ -229,7 +231,10 @@ fn ingest_native_container(input: &Path) -> Result<Vec<SourcePacket>> {
     let mut packets = Vec::new();
     demux.reset_to_data_start()?;
     while let Some(pkt) = demux.next_packet()? {
-        let timescale = timescales.get(&pkt.packet.header.track_id).copied().unwrap_or(1_000);
+        let timescale = timescales
+            .get(&pkt.packet.header.track_id)
+            .copied()
+            .unwrap_or(1_000);
         let timebase = Timebase::new(1, timescale.max(1));
         let pts = Timestamp::new(pkt.packet.header.pts as i64, timebase);
         let dts = Timestamp::new(pkt.packet.header.dts as i64, timebase);
@@ -324,7 +329,8 @@ fn map_track_kind(kind: TrackKind) -> MediaKind {
     match kind {
         TrackKind::Audio => MediaKind::Audio,
         TrackKind::Video => MediaKind::Video,
-        TrackKind::Data => MediaKind::Data,
+        TrackKind::Subtitle => MediaKind::Subtitle,
+        TrackKind::Data | TrackKind::Metadata | TrackKind::Attachment => MediaKind::Data,
     }
 }
 

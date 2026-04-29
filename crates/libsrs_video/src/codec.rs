@@ -92,7 +92,9 @@ pub fn decode_frame(
     let mut pixels = vec![0_u8; expected_len];
     decode_residual_blocks(width, height, payload, &mut cursor, &mut pixels)?;
     if cursor != payload.len() {
-        return Err(VideoCodecError::InvalidData("unexpected bytes after payload"));
+        return Err(VideoCodecError::InvalidData(
+            "unexpected bytes after payload",
+        ));
     }
 
     Ok(VideoFrame {
@@ -195,12 +197,7 @@ fn decode_residual_blocks(
     Ok(())
 }
 
-fn block_positions(
-    width: usize,
-    height: usize,
-    bx: usize,
-    by: usize,
-) -> Vec<usize> {
+fn block_positions(width: usize, height: usize, bx: usize, by: usize) -> Vec<usize> {
     let mut pos = Vec::with_capacity(BLOCK_SIZE * BLOCK_SIZE);
     for y in by..(by + BLOCK_SIZE).min(height) {
         for x in bx..(bx + BLOCK_SIZE).min(width) {

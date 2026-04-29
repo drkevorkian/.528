@@ -53,12 +53,8 @@ pub struct CompatLayer {
     backend: CompatBackend,
 }
 
-impl CompatLayer {
-    pub const fn new(backend: CompatBackend) -> Self {
-        Self { backend }
-    }
-
-    pub fn default() -> Self {
+impl Default for CompatLayer {
+    fn default() -> Self {
         #[cfg(feature = "ffmpeg")]
         {
             return Self::new(CompatBackend::Ffmpeg);
@@ -67,6 +63,12 @@ impl CompatLayer {
         {
             Self::new(CompatBackend::Stub)
         }
+    }
+}
+
+impl CompatLayer {
+    pub const fn new(backend: CompatBackend) -> Self {
+        Self { backend }
     }
 
     pub fn backend(&self) -> CompatBackend {

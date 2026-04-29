@@ -5,3 +5,5 @@ edition = "2021"
 
 [dependencies]
 crc32fast = "1"
+libsrs_bitio = { path = "../libsrs_bitio" }
+thiserror.workspace = true

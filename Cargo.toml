@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/libsrs_bitio",
     "crates/libsrs_video",
     "crates/libsrs_audio",
     "crates/libsrs_container",
@@ -36,6 +37,7 @@ rust-version = "1.78"
 
 [workspace.dependencies]
 anyhow = "1"
+crc32c = "0.6"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }

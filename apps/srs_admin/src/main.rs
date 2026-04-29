@@ -5,8 +5,9 @@ use eframe::egui;
 use libsrs_app_config::SrsConfig;
 use libsrs_licensing_proto::{
     AdminActionResponse, AdminCreateNotificationRequest, AdminPendingRequestRecord,
-    AdminRecordState, AdminSnapshot, AdminUpdateKeyStatusRequest, AdminUpdateLicenseFeaturesRequest,
-    AdminUpdateRecordStateRequest, LicensedFeature, NotificationDeliveryState,
+    AdminRecordState, AdminSnapshot, AdminUpdateKeyStatusRequest,
+    AdminUpdateLicenseFeaturesRequest, AdminUpdateRecordStateRequest, LicensedFeature,
+    NotificationDeliveryState,
 };
 use reqwest::blocking::Client;
 
@@ -94,7 +95,10 @@ impl AdminApp {
             self.push_notification("HTTP client unavailable.".to_string());
             return;
         };
-        let url = format!("{}/api/v1/admin/snapshot", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/v1/admin/snapshot",
+            self.base_url.trim_end_matches('/')
+        );
         match client.get(&url).send() {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match response.json::<AdminSnapshot>() {
@@ -157,10 +161,7 @@ impl AdminApp {
             "{}/api/v1/admin/licenses/features",
             self.base_url.trim_end_matches('/')
         );
-        self.send_action(
-            client.post(url).json(&request),
-            "Updated license features.",
-        );
+        self.send_action(client.post(url).json(&request), "Updated license features.");
     }
 
     fn update_key_status(&mut self, key_id: &str, active: bool) {
@@ -172,7 +173,10 @@ impl AdminApp {
             key_id: key_id.to_string(),
             active,
         };
-        let url = format!("{}/api/v1/admin/keys/status", self.base_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/api/v1/admin/keys/status",
+            self.base_url.trim_end_matches('/')
+        );
         self.send_action(client.post(url).json(&request), "Updated key status.");
     }
 
@@ -252,11 +256,7 @@ impl AdminApp {
         self.send_action(client.post(url).json(&request), "Created notification.");
     }
 
-    fn send_action(
-        &mut self,
-        request: reqwest::blocking::RequestBuilder,
-        success_message: &str,
-    ) {
+    fn send_action(&mut self, request: reqwest::blocking::RequestBuilder, success_message: &str) {
         match request.send() {
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match response.json::<AdminActionResponse>() {
@@ -322,7 +322,11 @@ impl AdminApp {
         ui.label(format!("Server endpoint: {}", self.base_url));
         ui.label(format!(
             "Auto-refresh: {}",
-            if self.auto_refresh { "enabled" } else { "disabled" }
+            if self.auto_refresh {
+                "enabled"
+            } else {
+                "disabled"
+            }
         ));
         ui.label(format!(
             "Last refresh age: {}s",
@@ -368,43 +372,48 @@ impl AdminApp {
             .id_salt("admin_licenses_scroll")
             .max_height(220.0)
             .show(ui, |ui| {
-            egui::Grid::new("admin_licenses_grid")
-                .num_columns(7)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("License");
-                    ui.strong("Owner Email");
-                    ui.strong("Active Keys");
-                    ui.strong("State");
-                    ui.strong("License Type");
-                    ui.strong("Effective Features");
-                    ui.strong("Actions");
-                    ui.end_row();
+                egui::Grid::new("admin_licenses_grid")
+                    .num_columns(7)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("License");
+                        ui.strong("Owner Email");
+                        ui.strong("Active Keys");
+                        ui.strong("State");
+                        ui.strong("License Type");
+                        ui.strong("Effective Features");
+                        ui.strong("Actions");
+                        ui.end_row();
 
-                    for license in licenses {
-                        let mut selected_preset = self
-                            .license_presets
-                            .get(&license.license_id)
-                            .copied()
-                            .unwrap_or_else(|| LicensePreset::from_features(&license.features));
-                        let mut selected_features = self
-                            .license_features
-                            .get(&license.license_id)
-                            .cloned()
-                            .unwrap_or_else(|| normalize_feature_selection(license.features.clone()));
-                        let mut update_clicked = false;
+                        for license in licenses {
+                            let mut selected_preset = self
+                                .license_presets
+                                .get(&license.license_id)
+                                .copied()
+                                .unwrap_or_else(|| LicensePreset::from_features(&license.features));
+                            let mut selected_features = self
+                                .license_features
+                                .get(&license.license_id)
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    normalize_feature_selection(license.features.clone())
+                                });
+                            let mut update_clicked = false;
 
-                        ui.push_id(("license_row", &license.license_id), |ui| {
-                            let preset_before = selected_preset;
-                            ui.monospace(&license.license_id);
-                            ui.label(&license.owner_email);
-                            ui.label(license.active_key_count.to_string());
-                            ui.colored_label(
-                                record_state_color(license.record_state),
-                                license.record_state.as_str(),
-                            );
-                            ui.horizontal(|ui| {
-                                egui::ComboBox::from_id_salt(("license_preset", &license.license_id))
+                            ui.push_id(("license_row", &license.license_id), |ui| {
+                                let preset_before = selected_preset;
+                                ui.monospace(&license.license_id);
+                                ui.label(&license.owner_email);
+                                ui.label(license.active_key_count.to_string());
+                                ui.colored_label(
+                                    record_state_color(license.record_state),
+                                    license.record_state.as_str(),
+                                );
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt((
+                                        "license_preset",
+                                        &license.license_id,
+                                    ))
                                     .selected_text(selected_preset.label())
                                     .show_ui(ui, |ui| {
                                         for option in LicensePreset::all() {
@@ -416,53 +425,59 @@ impl AdminApp {
                                         }
                                     });
 
-                                if selected_preset != preset_before {
-                                    selected_features = match selected_preset {
-                                        LicensePreset::Basic => LicensedFeature::basic_defaults(),
-                                        LicensePreset::Editor => LicensedFeature::editor_defaults(),
-                                        LicensePreset::Custom => {
-                                            normalize_feature_selection(selected_features.clone())
-                                        }
-                                    };
-                                }
+                                    if selected_preset != preset_before {
+                                        selected_features = match selected_preset {
+                                            LicensePreset::Basic => {
+                                                LicensedFeature::basic_defaults()
+                                            }
+                                            LicensePreset::Editor => {
+                                                LicensedFeature::editor_defaults()
+                                            }
+                                            LicensePreset::Custom => normalize_feature_selection(
+                                                selected_features.clone(),
+                                            ),
+                                        };
+                                    }
 
-                                if selected_preset == LicensePreset::Custom {
-                                    ui.menu_button("Custom Features", |ui| {
-                                        ui.set_min_width(240.0);
-                                        edit_custom_features_ui(ui, &mut selected_features);
-                                    });
-                                }
+                                    if selected_preset == LicensePreset::Custom {
+                                        ui.menu_button("Custom Features", |ui| {
+                                            ui.set_min_width(240.0);
+                                            edit_custom_features_ui(ui, &mut selected_features);
+                                        });
+                                    }
 
-                                if ui.button("Update").clicked() {
-                                    update_clicked = true;
-                                }
+                                    if ui.button("Update").clicked() {
+                                        update_clicked = true;
+                                    }
+                                });
+                                ui.label(format_feature_list(&selected_features));
                             });
-                            ui.label(format_feature_list(&selected_features));
-                        });
-                        let target = DeleteTarget::License(license.license_id.clone());
-                        if let Some(action) = render_state_actions(
-                            ui,
-                            self.pending_delete.as_ref(),
-                            &target,
-                            license.record_state,
-                        ) {
-                            match action {
-                                RowAction::SetState(state) => self.set_record_state(&target, state),
-                                RowAction::SoftDelete => self.delete_record(target.clone()),
+                            let target = DeleteTarget::License(license.license_id.clone());
+                            if let Some(action) = render_state_actions(
+                                ui,
+                                self.pending_delete.as_ref(),
+                                &target,
+                                license.record_state,
+                            ) {
+                                match action {
+                                    RowAction::SetState(state) => {
+                                        self.set_record_state(&target, state)
+                                    }
+                                    RowAction::SoftDelete => self.delete_record(target.clone()),
+                                }
                             }
-                        }
 
-                        selected_features = normalize_feature_selection(selected_features);
-                        self.license_presets
-                            .insert(license.license_id.clone(), selected_preset);
-                        self.license_features
-                            .insert(license.license_id.clone(), selected_features);
-                        if update_clicked {
-                            self.update_license_features(&license.license_id);
+                            selected_features = normalize_feature_selection(selected_features);
+                            self.license_presets
+                                .insert(license.license_id.clone(), selected_preset);
+                            self.license_features
+                                .insert(license.license_id.clone(), selected_features);
+                            if update_clicked {
+                                self.update_license_features(&license.license_id);
+                            }
+                            ui.end_row();
                         }
-                        ui.end_row();
-                    }
-                });
+                    });
             });
     }
 
@@ -477,65 +492,65 @@ impl AdminApp {
             .id_salt("admin_keys_scroll")
             .max_height(220.0)
             .show(ui, |ui| {
-            egui::Grid::new("admin_keys_grid")
-                .num_columns(8)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Key Id");
-                    ui.strong("License");
-                    ui.strong("Key");
-                    ui.strong("Version");
-                    ui.strong("Status");
-                    ui.strong("Record State");
-                    ui.strong("Created");
-                    ui.strong("Actions");
-                    ui.end_row();
-
-                    for key in keys {
-                        ui.push_id(("key_row", &key.key_id), |ui| {
-                            ui.monospace(&key.key_id);
-                            ui.monospace(&key.license_id);
-                            ui.monospace(&key.key_value);
-                            ui.label(key.key_version.to_string());
-                            ui.colored_label(
-                                if key.active {
-                                    egui::Color32::LIGHT_GREEN
-                                } else {
-                                    egui::Color32::LIGHT_RED
-                                },
-                                if key.active { "active" } else { "inactive" },
-                            );
-                            ui.colored_label(
-                                record_state_color(key.record_state),
-                                key.record_state.as_str(),
-                            );
-                            ui.label(key.created_at_epoch_s.to_string());
-                        });
-                        let target = DeleteTarget::Key(key.key_id.clone());
-                        ui.horizontal(|ui| {
-                            if ui
-                                .button(if key.active { "Deactivate" } else { "Activate" })
-                                .clicked()
-                            {
-                                self.update_key_status(&key.key_id, !key.active);
-                            }
-                            if let Some(action) = render_state_actions(
-                                ui,
-                                self.pending_delete.as_ref(),
-                                &target,
-                                key.record_state,
-                            ) {
-                                match action {
-                                    RowAction::SetState(state) => {
-                                        self.set_record_state(&target, state)
-                                    }
-                                    RowAction::SoftDelete => self.delete_record(target.clone()),
-                                }
-                            }
-                        });
+                egui::Grid::new("admin_keys_grid")
+                    .num_columns(8)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Key Id");
+                        ui.strong("License");
+                        ui.strong("Key");
+                        ui.strong("Version");
+                        ui.strong("Status");
+                        ui.strong("Record State");
+                        ui.strong("Created");
+                        ui.strong("Actions");
                         ui.end_row();
-                    }
-                });
+
+                        for key in keys {
+                            ui.push_id(("key_row", &key.key_id), |ui| {
+                                ui.monospace(&key.key_id);
+                                ui.monospace(&key.license_id);
+                                ui.monospace(&key.key_value);
+                                ui.label(key.key_version.to_string());
+                                ui.colored_label(
+                                    if key.active {
+                                        egui::Color32::LIGHT_GREEN
+                                    } else {
+                                        egui::Color32::LIGHT_RED
+                                    },
+                                    if key.active { "active" } else { "inactive" },
+                                );
+                                ui.colored_label(
+                                    record_state_color(key.record_state),
+                                    key.record_state.as_str(),
+                                );
+                                ui.label(key.created_at_epoch_s.to_string());
+                            });
+                            let target = DeleteTarget::Key(key.key_id.clone());
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(if key.active { "Deactivate" } else { "Activate" })
+                                    .clicked()
+                                {
+                                    self.update_key_status(&key.key_id, !key.active);
+                                }
+                                if let Some(action) = render_state_actions(
+                                    ui,
+                                    self.pending_delete.as_ref(),
+                                    &target,
+                                    key.record_state,
+                                ) {
+                                    match action {
+                                        RowAction::SetState(state) => {
+                                            self.set_record_state(&target, state)
+                                        }
+                                        RowAction::SoftDelete => self.delete_record(target.clone()),
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        }
+                    });
             });
     }
 
@@ -550,59 +565,64 @@ impl AdminApp {
             .id_salt("admin_requests_scroll")
             .max_height(220.0)
             .show(ui, |ui| {
-            egui::Grid::new("admin_requests_grid")
-                .num_columns(9)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Request");
-                    ui.strong("License");
-                    ui.strong("Device");
-                    ui.strong("Requested IP");
-                    ui.strong("OS");
-                    ui.strong("Hostname");
-                    ui.strong("Approval");
-                    ui.strong("State");
-                    ui.strong("Actions");
-                    ui.end_row();
+                egui::Grid::new("admin_requests_grid")
+                    .num_columns(9)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Request");
+                        ui.strong("License");
+                        ui.strong("Device");
+                        ui.strong("Requested IP");
+                        ui.strong("OS");
+                        ui.strong("Hostname");
+                        ui.strong("Approval");
+                        ui.strong("State");
+                        ui.strong("Actions");
+                        ui.end_row();
 
-                    for request in requests {
-                        ui.push_id(("request_row", &request.request_id), |ui| {
-                            ui.monospace(&request.request_id);
-                            ui.monospace(&request.license_id);
-                            ui.monospace(&request.device_install_id);
-                            ui.label(request.requested_ip.as_deref().unwrap_or("unknown"));
-                            ui.label(format!("{}/{}", request.requested_os, request.requested_arch));
-                            ui.label(request.hostname.as_deref().unwrap_or("unknown"));
-                            ui.label(request_status_text(&request));
-                            ui.colored_label(
-                                record_state_color(request.record_state),
-                                request.record_state.as_str(),
-                            );
-                        });
-                        let target = DeleteTarget::Request(request.request_id.clone());
-                        ui.horizontal(|ui| {
-                            let can_approve = request.approved_at_epoch_s.is_none()
-                                && request.record_state == AdminRecordState::Active;
-                            ui.add_enabled_ui(can_approve, |ui| {
-                                if ui.button("Approve").clicked() {
-                                    self.approve_request(&request.request_id);
+                        for request in requests {
+                            ui.push_id(("request_row", &request.request_id), |ui| {
+                                ui.monospace(&request.request_id);
+                                ui.monospace(&request.license_id);
+                                ui.monospace(&request.device_install_id);
+                                ui.label(request.requested_ip.as_deref().unwrap_or("unknown"));
+                                ui.label(format!(
+                                    "{}/{}",
+                                    request.requested_os, request.requested_arch
+                                ));
+                                ui.label(request.hostname.as_deref().unwrap_or("unknown"));
+                                ui.label(request_status_text(&request));
+                                ui.colored_label(
+                                    record_state_color(request.record_state),
+                                    request.record_state.as_str(),
+                                );
+                            });
+                            let target = DeleteTarget::Request(request.request_id.clone());
+                            ui.horizontal(|ui| {
+                                let can_approve = request.approved_at_epoch_s.is_none()
+                                    && request.record_state == AdminRecordState::Active;
+                                ui.add_enabled_ui(can_approve, |ui| {
+                                    if ui.button("Approve").clicked() {
+                                        self.approve_request(&request.request_id);
+                                    }
+                                });
+                                if let Some(action) = render_state_actions(
+                                    ui,
+                                    self.pending_delete.as_ref(),
+                                    &target,
+                                    request.record_state,
+                                ) {
+                                    match action {
+                                        RowAction::SetState(state) => {
+                                            self.set_record_state(&target, state)
+                                        }
+                                        RowAction::SoftDelete => self.delete_record(target.clone()),
+                                    }
                                 }
                             });
-                            if let Some(action) = render_state_actions(
-                                ui,
-                                self.pending_delete.as_ref(),
-                                &target,
-                                request.record_state,
-                            ) {
-                                match action {
-                                    RowAction::SetState(state) => self.set_record_state(&target, state),
-                                    RowAction::SoftDelete => self.delete_record(target.clone()),
-                                }
-                            }
-                        });
-                        ui.end_row();
-                    }
-                });
+                            ui.end_row();
+                        }
+                    });
             });
     }
 
@@ -617,57 +637,66 @@ impl AdminApp {
             .id_salt("admin_installations_scroll")
             .max_height(240.0)
             .show(ui, |ui| {
-            egui::Grid::new("admin_installations_grid")
-                .num_columns(9)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Installation");
-                    ui.strong("License");
-                    ui.strong("Device");
-                    ui.strong("Last IP");
-                    ui.strong("First IP");
-                    ui.strong("OS");
-                    ui.strong("Hostname");
-                    ui.strong("Status");
-                    ui.strong("Actions");
-                    ui.end_row();
-
-                    for installation in installations {
-                        ui.push_id(("installation_row", &installation.installation_id), |ui| {
-                            ui.monospace(&installation.installation_id);
-                            ui.monospace(&installation.license_id);
-                            ui.monospace(&installation.device_install_id);
-                            ui.label(installation.last_seen_ip.as_deref().unwrap_or("unknown"));
-                            ui.label(installation.first_seen_ip.as_deref().unwrap_or("unknown"));
-                            ui.label(format!(
-                                "{}/{}",
-                                installation.os_family, installation.os_arch
-                            ));
-                            ui.label(installation.hostname.as_deref().unwrap_or("unknown"));
-                            ui.colored_label(
-                                if installation.trusted {
-                                    egui::Color32::LIGHT_GREEN
-                                } else {
-                                    egui::Color32::YELLOW
-                                },
-                                if installation.trusted { "verified" } else { "pending/untrusted" },
-                            );
-                        });
-                        let target = DeleteTarget::Installation(installation.installation_id.clone());
-                        if let Some(action) = render_state_actions(
-                            ui,
-                            self.pending_delete.as_ref(),
-                            &target,
-                            installation.record_state,
-                        ) {
-                            match action {
-                                RowAction::SetState(state) => self.set_record_state(&target, state),
-                                RowAction::SoftDelete => self.delete_record(target.clone()),
-                            }
-                        }
+                egui::Grid::new("admin_installations_grid")
+                    .num_columns(9)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Installation");
+                        ui.strong("License");
+                        ui.strong("Device");
+                        ui.strong("Last IP");
+                        ui.strong("First IP");
+                        ui.strong("OS");
+                        ui.strong("Hostname");
+                        ui.strong("Status");
+                        ui.strong("Actions");
                         ui.end_row();
-                    }
-                });
+
+                        for installation in installations {
+                            ui.push_id(("installation_row", &installation.installation_id), |ui| {
+                                ui.monospace(&installation.installation_id);
+                                ui.monospace(&installation.license_id);
+                                ui.monospace(&installation.device_install_id);
+                                ui.label(installation.last_seen_ip.as_deref().unwrap_or("unknown"));
+                                ui.label(
+                                    installation.first_seen_ip.as_deref().unwrap_or("unknown"),
+                                );
+                                ui.label(format!(
+                                    "{}/{}",
+                                    installation.os_family, installation.os_arch
+                                ));
+                                ui.label(installation.hostname.as_deref().unwrap_or("unknown"));
+                                ui.colored_label(
+                                    if installation.trusted {
+                                        egui::Color32::LIGHT_GREEN
+                                    } else {
+                                        egui::Color32::YELLOW
+                                    },
+                                    if installation.trusted {
+                                        "verified"
+                                    } else {
+                                        "pending/untrusted"
+                                    },
+                                );
+                            });
+                            let target =
+                                DeleteTarget::Installation(installation.installation_id.clone());
+                            if let Some(action) = render_state_actions(
+                                ui,
+                                self.pending_delete.as_ref(),
+                                &target,
+                                installation.record_state,
+                            ) {
+                                match action {
+                                    RowAction::SetState(state) => {
+                                        self.set_record_state(&target, state)
+                                    }
+                                    RowAction::SoftDelete => self.delete_record(target.clone()),
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
             });
     }
 
@@ -682,43 +711,45 @@ impl AdminApp {
             .id_salt("admin_audits_scroll")
             .max_height(260.0)
             .show(ui, |ui| {
-            egui::Grid::new("admin_audits_grid")
-                .num_columns(7)
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.strong("Time");
-                    ui.strong("License");
-                    ui.strong("Event");
-                    ui.strong("Key");
-                    ui.strong("Installation");
-                    ui.strong("Payload");
-                    ui.strong("Actions");
-                    ui.end_row();
-
-                    for audit in audits {
-                        ui.push_id(("audit_row", &audit.event_id), |ui| {
-                            ui.label(audit.created_at_epoch_s.to_string());
-                            ui.monospace(&audit.license_id);
-                            ui.label(&audit.event_type);
-                            ui.monospace(audit.key_id.as_deref().unwrap_or("-"));
-                            ui.monospace(audit.installation_id.as_deref().unwrap_or("-"));
-                            ui.label(&audit.event_payload_json);
-                        });
-                        let target = DeleteTarget::Audit(audit.event_id.clone());
-                        if let Some(action) = render_state_actions(
-                            ui,
-                            self.pending_delete.as_ref(),
-                            &target,
-                            audit.record_state,
-                        ) {
-                            match action {
-                                RowAction::SetState(state) => self.set_record_state(&target, state),
-                                RowAction::SoftDelete => self.delete_record(target.clone()),
-                            }
-                        }
+                egui::Grid::new("admin_audits_grid")
+                    .num_columns(7)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.strong("Time");
+                        ui.strong("License");
+                        ui.strong("Event");
+                        ui.strong("Key");
+                        ui.strong("Installation");
+                        ui.strong("Payload");
+                        ui.strong("Actions");
                         ui.end_row();
-                    }
-                });
+
+                        for audit in audits {
+                            ui.push_id(("audit_row", &audit.event_id), |ui| {
+                                ui.label(audit.created_at_epoch_s.to_string());
+                                ui.monospace(&audit.license_id);
+                                ui.label(&audit.event_type);
+                                ui.monospace(audit.key_id.as_deref().unwrap_or("-"));
+                                ui.monospace(audit.installation_id.as_deref().unwrap_or("-"));
+                                ui.label(&audit.event_payload_json);
+                            });
+                            let target = DeleteTarget::Audit(audit.event_id.clone());
+                            if let Some(action) = render_state_actions(
+                                ui,
+                                self.pending_delete.as_ref(),
+                                &target,
+                                audit.record_state,
+                            ) {
+                                match action {
+                                    RowAction::SetState(state) => {
+                                        self.set_record_state(&target, state)
+                                    }
+                                    RowAction::SoftDelete => self.delete_record(target.clone()),
+                                }
+                            }
+                            ui.end_row();
+                        }
+                    });
             });
     }
 
@@ -869,19 +900,25 @@ impl AdminApp {
                         ui.end_row();
 
                         for request in requests {
-                            ui.push_id(("playback_request_row", &request.playback_request_id), |ui| {
-                                ui.label(request.created_at_epoch_s.to_string());
-                                ui.monospace(request.license_id.as_deref().unwrap_or("-"));
-                                ui.monospace(&request.device_install_id);
-                                ui.label(&request.source);
-                                ui.label(format!("{} {}", request.app_name, request.app_version));
-                                ui.label(&request.tracks_json);
-                                ui.colored_label(
-                                    record_state_color(request.record_state),
-                                    request.record_state.as_str(),
-                                );
-                                ui.label("-");
-                            });
+                            ui.push_id(
+                                ("playback_request_row", &request.playback_request_id),
+                                |ui| {
+                                    ui.label(request.created_at_epoch_s.to_string());
+                                    ui.monospace(request.license_id.as_deref().unwrap_or("-"));
+                                    ui.monospace(&request.device_install_id);
+                                    ui.label(&request.source);
+                                    ui.label(format!(
+                                        "{} {}",
+                                        request.app_name, request.app_version
+                                    ));
+                                    ui.label(&request.tracks_json);
+                                    ui.colored_label(
+                                        record_state_color(request.record_state),
+                                        request.record_state.as_str(),
+                                    );
+                                    ui.label("-");
+                                },
+                            );
                             ui.end_row();
                         }
                     });
@@ -967,7 +1004,7 @@ fn render_state_actions(
     pending_delete: Option<&DeleteTarget>,
     target: &DeleteTarget,
     state: AdminRecordState,
-)-> Option<RowAction> {
+) -> Option<RowAction> {
     let mut action = None;
     ui.horizontal_wrapped(|ui| match state {
         AdminRecordState::Active => {
@@ -1111,7 +1148,9 @@ impl AdminTab {
             Self::Overview => "Overview".to_string(),
             Self::Licenses => format!(
                 "Licenses ({})",
-                snapshot.map(|snapshot| snapshot.licenses.len()).unwrap_or(0)
+                snapshot
+                    .map(|snapshot| snapshot.licenses.len())
+                    .unwrap_or(0)
             ),
             Self::Keys => format!(
                 "Keys ({})",

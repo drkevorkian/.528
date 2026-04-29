@@ -3,7 +3,9 @@ use std::path::Path;
 
 use anyhow::Result;
 use ffmpeg_next as ffmpeg;
-use libsrs_contract::{CodecType, MediaKind, Packet, StreamId, StreamRole, Timebase, Timestamp, TrackId};
+use libsrs_contract::{
+    CodecType, MediaKind, Packet, StreamId, StreamRole, Timebase, Timestamp, TrackId,
+};
 
 use crate::probe::{CompatTrackInfo, MediaIngestor, MediaProbe, ProbeResult, SourcePacket};
 

@@ -3,11 +3,14 @@ pub mod format;
 pub mod io;
 pub mod resync;
 
-pub use crc::crc32;
+pub use crc::{crc32, crc32c};
 pub use format::{
-    BlockHeader, BlockType, CueBlock, FileHeader, IndexBlock, IndexEntry, Packet, PacketFlags,
-    PacketHeader, ReadError, TrackDescriptor, TrackKind, BLOCK_HEADER_LEN, BLOCK_MAGIC,
-    CONTAINER_MAGIC,
+    BlockHeader, BlockType, CueBlock, FileHeader, FileProfile, IndexBlock, IndexEntry, Packet,
+    PacketFlags, PacketHeader, ReadError, TrackDescriptor, TrackKind, BLOCK_HEADER_LEN,
+    BLOCK_MAGIC, CONTAINER_MAGIC, CONTAINER_MAGIC_LEGACY, CONTAINER_VERSION,
+    CONTAINER_VERSION_LEGACY, FILE_HEADER_V1_ON_DISK_LEN, FILE_HEADER_V2_ON_DISK_LEN,
+    MAX_BLOCK_BODY_BYTES, MAX_INDEX_ENTRIES_PER_BLOCK, MAX_PACKET_PAYLOAD_BYTES, MAX_TRACKS,
+    MAX_TRACK_CONFIG_BYTES,
 };
 pub use io::{
     decode_block_header, decode_cue_block, decode_file_header, decode_index_block,

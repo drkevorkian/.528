@@ -14,12 +14,12 @@ use libsrs_app_config::{ServerConfig, SrsConfig};
 use libsrs_licensing_proto::{
     decode_signing_key, AdminActionResponse, AdminAuditRecord, AdminCreateNotificationRequest,
     AdminInstallationRecord, AdminKeyRecord, AdminLicenseRecord, AdminNotificationRecord,
-    AdminPendingRequestRecord, AdminPlaybackRequestRecord, AdminRecordState, AdminSnapshot, AdminStats,
-    AdminUpdateKeyStatusRequest, AdminUpdateLicenseFeaturesRequest, AdminUpdateRecordStateRequest,
-    ClientNotification, ClientNotificationReadRequest, ClientUnsupportedPlaybackRequest,
-    EntitlementClaims, EntitlementStatus,
-    IssueKeyRequest, IssueKeyResponse, LicensedFeature, NotificationDeliveryState,
-    SignedEntitlementEnvelope, VerifyKeyRequest, VerifyKeyResponse,
+    AdminPendingRequestRecord, AdminPlaybackRequestRecord, AdminRecordState, AdminSnapshot,
+    AdminStats, AdminUpdateKeyStatusRequest, AdminUpdateLicenseFeaturesRequest,
+    AdminUpdateRecordStateRequest, ClientNotification, ClientNotificationReadRequest,
+    ClientUnsupportedPlaybackRequest, EntitlementClaims, EntitlementStatus, IssueKeyRequest,
+    IssueKeyResponse, LicensedFeature, NotificationDeliveryState, SignedEntitlementEnvelope,
+    VerifyKeyRequest, VerifyKeyResponse,
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Deserialize;
@@ -158,7 +158,10 @@ async fn main() -> Result<()> {
         .route("/issue", post(issue_form))
         .route("/confirm/{token}", get(confirm_request))
         .route("/admin", get(admin_dashboard))
-        .route("/admin/licenses/features", post(update_license_features_handler))
+        .route(
+            "/admin/licenses/features",
+            post(update_license_features_handler),
+        )
         .route(
             "/admin/licenses/{license_id}/delete",
             post(delete_license_handler),
@@ -203,10 +206,7 @@ async fn main() -> Result<()> {
             "/api/v1/admin/keys/{key_id}/state",
             post(update_key_state_json),
         )
-        .route(
-            "/api/v1/admin/keys/{key_id}/delete",
-            post(delete_key_json),
-        )
+        .route("/api/v1/admin/keys/{key_id}/delete", post(delete_key_json))
         .route(
             "/api/v1/admin/requests/{request_id}/approve",
             post(approve_request_json),
@@ -251,9 +251,12 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("bind {}", bind_addr))?;
     info!("srs_license_server listening on {}", bind_addr);
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .await
-        .context("serve axum")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve axum")?;
     Ok(())
 }
 
@@ -282,8 +285,8 @@ impl Database {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
-        let conn = Connection::open(&path)
-            .with_context(|| format!("open database {}", path.display()))?;
+        let conn =
+            Connection::open(&path).with_context(|| format!("open database {}", path.display()))?;
         conn.execute_batch(SCHEMA_SQL)
             .context("initialize database schema")?;
         migrate_record_state_columns(&conn)?;
@@ -516,8 +519,11 @@ impl Database {
                     effective_ip.as_deref(),
                     now,
                 )?;
-                let new_session_secret =
-                    rotate_session_secret(&tx, &installation_id, request.session_secret.as_deref())?;
+                let new_session_secret = rotate_session_secret(
+                    &tx,
+                    &installation_id,
+                    request.session_secret.as_deref(),
+                )?;
                 insert_audit_event(
                     &tx,
                     &key_row.license_id,
@@ -622,7 +628,11 @@ impl Database {
                 expires_at as i64,
             ],
         )?;
-        let confirmation_link = format!("{}/confirm/{}", config.base_url.trim_end_matches('/'), token);
+        let confirmation_link = format!(
+            "{}/confirm/{}",
+            config.base_url.trim_end_matches('/'),
+            token
+        );
         let subject = "Was this you? Confirm a new SRS installation".to_string();
         let body = format!(
             "A new installation requested access.\n\nKey: {}\nIP: {}\nOS: {}/{}\nHostname: {}\n\nConfirm: {}\n\nIf you do nothing for {} hours, the requester will receive a separate basic key.",
@@ -684,7 +694,10 @@ impl Database {
         let stats = AdminStats {
             license_count: scalar_count(&conn, "SELECT COUNT(*) FROM licenses")?,
             key_count: scalar_count(&conn, "SELECT COUNT(*) FROM license_keys")?,
-            active_key_count: scalar_count(&conn, "SELECT COUNT(*) FROM license_keys WHERE active = 1")?,
+            active_key_count: scalar_count(
+                &conn,
+                "SELECT COUNT(*) FROM license_keys WHERE active = 1",
+            )?,
             installation_count: scalar_count(&conn, "SELECT COUNT(*) FROM installations")?,
             trusted_installation_count: scalar_count(
                 &conn,
@@ -889,13 +902,21 @@ impl Database {
         })
     }
 
-    fn update_license_features(&self, license_id: &str, features: &[LicensedFeature]) -> Result<()> {
+    fn update_license_features(
+        &self,
+        license_id: &str,
+        features: &[LicensedFeature],
+    ) -> Result<()> {
         let mut conn = self
             .conn
             .lock()
             .map_err(|_| anyhow!("database mutex poisoned"))?;
         let tx = conn.transaction()?;
-        let exists = scalar_count_with_param(&tx, "SELECT COUNT(*) FROM licenses WHERE license_id = ?1", license_id)?;
+        let exists = scalar_count_with_param(
+            &tx,
+            "SELECT COUNT(*) FROM licenses WHERE license_id = ?1",
+            license_id,
+        )?;
         if exists == 0 {
             return Err(anyhow!("license not found"));
         }
@@ -990,11 +1011,7 @@ impl Database {
         Ok(())
     }
 
-    fn set_license_record_state(
-        &self,
-        license_id: &str,
-        state: AdminRecordState,
-    ) -> Result<()> {
+    fn set_license_record_state(&self, license_id: &str, state: AdminRecordState) -> Result<()> {
         let now = now_epoch_s();
         let mut conn = self
             .conn
@@ -1112,11 +1129,7 @@ impl Database {
         Ok(())
     }
 
-    fn set_request_record_state(
-        &self,
-        request_id: &str,
-        state: AdminRecordState,
-    ) -> Result<()> {
+    fn set_request_record_state(&self, request_id: &str, state: AdminRecordState) -> Result<()> {
         let now = now_epoch_s();
         let mut conn = self
             .conn
@@ -1768,7 +1781,9 @@ async fn update_request_state_json(
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
     ensure_local_admin(&addr)?;
-    state.db.set_request_record_state(&request_id, request.state)?;
+    state
+        .db
+        .set_request_record_state(&request_id, request.state)?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: format!(
@@ -1885,24 +1900,50 @@ fn scalar_count(conn: &Connection, sql: &str) -> Result<u64> {
     Ok(conn.query_row(sql, [], |row| row.get::<_, i64>(0))? as u64)
 }
 
-fn scalar_count_with_param(
-    tx: &Transaction<'_>,
-    sql: &str,
-    param: &str,
-) -> Result<u64> {
+fn scalar_count_with_param(tx: &Transaction<'_>, sql: &str, param: &str) -> Result<u64> {
     Ok(tx.query_row(sql, params![param], |row| row.get::<_, i64>(0))? as u64)
 }
 
 fn migrate_record_state_columns(conn: &Connection) -> Result<()> {
-    ensure_column(conn, "licenses", "record_state", "TEXT NOT NULL DEFAULT 'active'")?;
+    ensure_column(
+        conn,
+        "licenses",
+        "record_state",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
     ensure_column(conn, "licenses", "state_changed_at_epoch_s", "INTEGER")?;
-    ensure_column(conn, "license_keys", "record_state", "TEXT NOT NULL DEFAULT 'active'")?;
+    ensure_column(
+        conn,
+        "license_keys",
+        "record_state",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
     ensure_column(conn, "license_keys", "state_changed_at_epoch_s", "INTEGER")?;
-    ensure_column(conn, "installations", "record_state", "TEXT NOT NULL DEFAULT 'active'")?;
+    ensure_column(
+        conn,
+        "installations",
+        "record_state",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
     ensure_column(conn, "installations", "state_changed_at_epoch_s", "INTEGER")?;
-    ensure_column(conn, "verification_requests", "record_state", "TEXT NOT NULL DEFAULT 'active'")?;
-    ensure_column(conn, "verification_requests", "state_changed_at_epoch_s", "INTEGER")?;
-    ensure_column(conn, "audit_events", "record_state", "TEXT NOT NULL DEFAULT 'active'")?;
+    ensure_column(
+        conn,
+        "verification_requests",
+        "record_state",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
+    ensure_column(
+        conn,
+        "verification_requests",
+        "state_changed_at_epoch_s",
+        "INTEGER",
+    )?;
+    ensure_column(
+        conn,
+        "audit_events",
+        "record_state",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
     ensure_column(conn, "audit_events", "state_changed_at_epoch_s", "INTEGER")?;
     ensure_column(conn, "email_outbox", "request_id", "TEXT")?;
     ensure_column(conn, "email_outbox", "delivered_at_epoch_s", "INTEGER")?;
@@ -1913,7 +1954,12 @@ fn migrate_record_state_columns(conn: &Connection) -> Result<()> {
         "notification_state",
         "TEXT NOT NULL DEFAULT 'queued'",
     )?;
-    ensure_column(conn, "email_outbox", "record_state", "TEXT NOT NULL DEFAULT 'active'")?;
+    ensure_column(
+        conn,
+        "email_outbox",
+        "record_state",
+        "TEXT NOT NULL DEFAULT 'active'",
+    )?;
     ensure_column(conn, "email_outbox", "state_changed_at_epoch_s", "INTEGER")?;
     conn.execute(
         "UPDATE email_outbox
@@ -1941,17 +1987,24 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str)
 }
 
 trait FeatureQuerySource {
-    fn prepare_features_query<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>>;
+    fn prepare_features_query<'a>(&'a self, sql: &str)
+        -> rusqlite::Result<rusqlite::Statement<'a>>;
 }
 
 impl FeatureQuerySource for Transaction<'_> {
-    fn prepare_features_query<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
+    fn prepare_features_query<'a>(
+        &'a self,
+        sql: &str,
+    ) -> rusqlite::Result<rusqlite::Statement<'a>> {
         self.prepare(sql)
     }
 }
 
 impl FeatureQuerySource for Connection {
-    fn prepare_features_query<'a>(&'a self, sql: &str) -> rusqlite::Result<rusqlite::Statement<'a>> {
+    fn prepare_features_query<'a>(
+        &'a self,
+        sql: &str,
+    ) -> rusqlite::Result<rusqlite::Statement<'a>> {
         self.prepare(sql)
     }
 }
@@ -2237,6 +2290,7 @@ fn insert_audit_event(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn signed_response(
     config: &ServerConfig,
     license_id: &str,
@@ -2354,29 +2408,26 @@ fn deliver_email(recipient: &str, subject: &str, body: &str, config: &ServerConf
 
         let mut builder = SmtpTransport::builder_dangerous(smtp_server);
         if let (Some(username), Some(password)) = (&config.smtp_username, &config.smtp_password) {
-            builder = builder.credentials(Credentials::new(
-                username.clone(),
-                password.clone(),
-            ));
+            builder = builder.credentials(Credentials::new(username.clone(), password.clone()));
         }
         let mailer = builder.build();
         return match mailer.send(&email) {
             Ok(_) => {
                 info!(
-                target: "srs_license_server::mailer",
-                "smtp delivered to {} with subject {}",
-                recipient,
-                subject
-            );
+                    target: "srs_license_server::mailer",
+                    "smtp delivered to {} with subject {}",
+                    recipient,
+                    subject
+                );
                 true
             }
             Err(err) => {
                 info!(
-                target: "srs_license_server::mailer",
-                "smtp delivery failed for {}: {}",
-                recipient,
-                err
-            );
+                    target: "srs_license_server::mailer",
+                    "smtp delivery failed for {}: {}",
+                    recipient,
+                    err
+                );
                 false
             }
         };
@@ -2521,9 +2572,16 @@ fn render_admin_page(snapshot: &AdminSnapshot) -> String {
                 html_escape(&installation.device_install_id),
                 html_escape(installation.last_seen_ip.as_deref().unwrap_or("unknown")),
                 html_escape(installation.first_seen_ip.as_deref().unwrap_or("unknown")),
-                html_escape(&format!("{}/{}", installation.os_family, installation.os_arch)),
+                html_escape(&format!(
+                    "{}/{}",
+                    installation.os_family, installation.os_arch
+                )),
                 html_escape(installation.hostname.as_deref().unwrap_or("unknown")),
-                if installation.trusted { "verified" } else { "untrusted" },
+                if installation.trusted {
+                    "verified"
+                } else {
+                    "untrusted"
+                },
                 html_escape(&format!(
                     "first={} last={}",
                     format_epoch(installation.first_seen_epoch_s),
@@ -2563,7 +2621,10 @@ fn render_admin_page(snapshot: &AdminSnapshot) -> String {
                 html_escape(&request.license_id),
                 html_escape(&request.device_install_id),
                 html_escape(request.requested_ip.as_deref().unwrap_or("unknown")),
-                html_escape(&format!("{}/{}", request.requested_os, request.requested_arch)),
+                html_escape(&format!(
+                    "{}/{}",
+                    request.requested_os, request.requested_arch
+                )),
                 html_escape(request.hostname.as_deref().unwrap_or("unknown")),
                 html_escape(&pending_request_status(request)),
                 action
@@ -2649,7 +2710,10 @@ fn format_epoch(value: u64) -> String {
 
 fn pending_request_status(request: &AdminPendingRequestRecord) -> String {
     if request.approved_at_epoch_s.is_some() {
-        format!("approved at {}", format_epoch(request.approved_at_epoch_s.unwrap_or_default()))
+        format!(
+            "approved at {}",
+            format_epoch(request.approved_at_epoch_s.unwrap_or_default())
+        )
     } else if now_epoch_s() > request.expires_at_epoch_s {
         format!("expired at {}", format_epoch(request.expires_at_epoch_s))
     } else {
@@ -2728,13 +2792,17 @@ mod tests {
     use std::fs;
 
     fn test_config(name: &str) -> ServerConfig {
-        let mut config = ServerConfig::default();
-        config.database_path = std::env::temp_dir()
-            .join(format!("srs-license-server-{name}-{}.sqlite3", Uuid::new_v4()))
-            .display()
-            .to_string();
-        config.base_url = "http://localhost:3000".to_string();
-        config
+        ServerConfig {
+            database_path: std::env::temp_dir()
+                .join(format!(
+                    "srs-license-server-{name}-{}.sqlite3",
+                    Uuid::new_v4()
+                ))
+                .display()
+                .to_string(),
+            base_url: "http://localhost:3000".to_string(),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -2744,7 +2812,10 @@ mod tests {
         let issued = db
             .issue_license(&IssueKeyRequest {
                 email: "user@example.com".to_string(),
-                requested_features: Some(vec![LicensedFeature::Basic, LicensedFeature::EditorWorkspace]),
+                requested_features: Some(vec![
+                    LicensedFeature::Basic,
+                    LicensedFeature::EditorWorkspace,
+                ]),
                 registrant_os: Some("Linux".to_string()),
                 registrant_ip: Some("127.0.0.1".to_string()),
             })
@@ -2774,7 +2845,8 @@ mod tests {
                 Some("127.0.0.1"),
             )
             .expect("verify");
-        let signing_key = decode_signing_key(config.signing_key_seed()).expect("decode signing key");
+        let signing_key =
+            decode_signing_key(config.signing_key_seed()).expect("decode signing key");
         let claims = response
             .envelope
             .verify(&signing_key.verifying_key())
@@ -2840,12 +2912,16 @@ mod tests {
         let pending = db
             .verify_key(&config, &second, Some("203.0.113.10"))
             .expect("pending verify");
-        let signing_key = decode_signing_key(config.signing_key_seed()).expect("decode signing key");
+        let signing_key =
+            decode_signing_key(config.signing_key_seed()).expect("decode signing key");
         let pending_claims = pending
             .envelope
             .verify(&signing_key.verifying_key())
             .expect("verify envelope");
-        assert_eq!(pending_claims.status, EntitlementStatus::PendingConfirmation);
+        assert_eq!(
+            pending_claims.status,
+            EntitlementStatus::PendingConfirmation
+        );
 
         let token = {
             let conn = db.conn.lock().expect("lock db");
@@ -2876,7 +2952,10 @@ mod tests {
         let issued = db
             .issue_license(&IssueKeyRequest {
                 email: "user@example.com".to_string(),
-                requested_features: Some(vec![LicensedFeature::Basic, LicensedFeature::EditorWorkspace]),
+                requested_features: Some(vec![
+                    LicensedFeature::Basic,
+                    LicensedFeature::EditorWorkspace,
+                ]),
                 registrant_os: Some("Linux".to_string()),
                 registrant_ip: Some("127.0.0.1".to_string()),
             })
@@ -2938,7 +3017,8 @@ mod tests {
         let replacement = db
             .verify_key(&config, &second_request, Some("203.0.113.10"))
             .expect("issue replacement");
-        let signing_key = decode_signing_key(config.signing_key_seed()).expect("decode signing key");
+        let signing_key =
+            decode_signing_key(config.signing_key_seed()).expect("decode signing key");
         let claims = replacement
             .envelope
             .verify(&signing_key.verifying_key())
@@ -3025,14 +3105,17 @@ mod tests {
         let verify_err = db
             .verify_key(&config, &request, Some("127.0.0.1"))
             .expect_err("archived license should not verify");
-        assert!(verify_err.to_string().contains("license key not found or inactive"));
+        assert!(verify_err
+            .to_string()
+            .contains("license key not found or inactive"));
 
         db.set_license_record_state(&issued.license_id, AdminRecordState::Active)
             .expect("restore license");
         let verified = db
             .verify_key(&config, &request, Some("127.0.0.1"))
             .expect("restored license should verify");
-        let signing_key = decode_signing_key(config.signing_key_seed()).expect("decode signing key");
+        let signing_key =
+            decode_signing_key(config.signing_key_seed()).expect("decode signing key");
         let claims = verified
             .envelope
             .verify(&signing_key.verifying_key())
@@ -3133,7 +3216,14 @@ mod tests {
                     },
                 )
                 .expect("fetch notification");
-            (token.0, token.1, notification.0, notification.1, notification.2, notification.3)
+            (
+                token.0,
+                token.1,
+                notification.0,
+                notification.1,
+                notification.2,
+                notification.3,
+            )
         };
 
         assert!(sent_at.is_some());

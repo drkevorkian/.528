@@ -60,7 +60,9 @@ impl LicensingClient {
 
     pub fn current_key(&self) -> Option<String> {
         let state = self.load_state();
-        state.current_key.or_else(|| self.config.license_key.clone())
+        state
+            .current_key
+            .or_else(|| self.config.license_key.clone())
     }
 
     pub fn refresh_entitlement(&self, app_name: &str, app_version: &str) -> LicenseSnapshot {
@@ -128,12 +130,7 @@ impl LicensingClient {
             match self.verify_against_endpoint(&endpoint, &request, &verifying_key) {
                 Ok((response, claims)) => {
                     let server_notifications = self
-                        .read_client_notifications(
-                            &endpoint,
-                            &key,
-                            &claims.license_id,
-                            &install_id,
-                        )
+                        .read_client_notifications(&endpoint, &key, &claims.license_id, &install_id)
                         .unwrap_or_else(|err| {
                             warn!("failed to read client notifications: {err}");
                             Vec::new()
@@ -392,13 +389,12 @@ fn snapshot_from_live_response(
         EntitlementStatus::Revoked => VerificationState::Revoked,
         EntitlementStatus::ReplacementIssued => VerificationState::ReplacementIssued,
     };
-    let effective_mode = if verification_state == VerificationState::Verified
-        && claims.is_editor_enabled()
-    {
-        EffectiveMode::Editor
-    } else {
-        EffectiveMode::PlayOnly
-    };
+    let effective_mode =
+        if verification_state == VerificationState::Verified && claims.is_editor_enabled() {
+            EffectiveMode::Editor
+        } else {
+            EffectiveMode::PlayOnly
+        };
     if message.is_empty() {
         message = claims.message.clone();
     }
@@ -469,7 +465,11 @@ fn detect_best_effort_ip(endpoint: &str) -> Option<String> {
     let url = Url::parse(endpoint).ok()?;
     let host = url.host_str()?;
     let port = url.port_or_known_default()?;
-    let bind_addr = if host.contains(':') { "[::]:0" } else { "0.0.0.0:0" };
+    let bind_addr = if host.contains(':') {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let socket = UdpSocket::bind(bind_addr).ok()?;
     socket.connect((host, port)).ok()?;
     socket.local_addr().ok().map(|addr| addr.ip().to_string())
@@ -498,20 +498,23 @@ mod tests {
     }
 
     fn test_config() -> ClientConfig {
-        let signing_key =
-            libsrs_licensing_proto::decode_signing_key(libsrs_app_config::LOCALHOST_DEV_SIGNING_KEY_SEED_B64)
-                .expect("decode dev seed");
-        let mut config = ClientConfig::default();
-        config.public_key_b64 = encode_verifying_key(&signing_key.verifying_key());
-        config.primary_url = "http://localhost:9".to_string();
-        config.backup_url = "http://127.0.0.1:9".to_string();
-        config
+        let signing_key = libsrs_licensing_proto::decode_signing_key(
+            libsrs_app_config::LOCALHOST_DEV_SIGNING_KEY_SEED_B64,
+        )
+        .expect("decode dev seed");
+        ClientConfig {
+            public_key_b64: encode_verifying_key(&signing_key.verifying_key()),
+            primary_url: "http://localhost:9".to_string(),
+            backup_url: "http://127.0.0.1:9".to_string(),
+            ..Default::default()
+        }
     }
 
     fn sample_envelope() -> SignedEntitlementEnvelope {
-        let signing_key =
-            libsrs_licensing_proto::decode_signing_key(libsrs_app_config::LOCALHOST_DEV_SIGNING_KEY_SEED_B64)
-                .expect("decode dev seed");
+        let signing_key = libsrs_licensing_proto::decode_signing_key(
+            libsrs_app_config::LOCALHOST_DEV_SIGNING_KEY_SEED_B64,
+        )
+        .expect("decode dev seed");
         SignedEntitlementEnvelope::sign(
             &EntitlementClaims {
                 license_id: "license-1".to_string(),
@@ -553,7 +556,10 @@ mod tests {
         };
         client.save_state(&state).expect("save state");
         let snapshot = client.refresh_entitlement("srs-player", "0.1.0");
-        assert_eq!(snapshot.verification_state, VerificationState::OfflineFallback);
+        assert_eq!(
+            snapshot.verification_state,
+            VerificationState::OfflineFallback
+        );
         assert_eq!(snapshot.effective_mode, EffectiveMode::PlayOnly);
         assert!(snapshot.claims.is_some());
     }

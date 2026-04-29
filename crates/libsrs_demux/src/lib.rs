@@ -115,12 +115,13 @@ impl<R: Read + Seek> DemuxReader<R> {
 
     fn next_block(&mut self) -> io::Result<Option<ParsedBlock>> {
         let block_start = self.reader.stream_position()?;
-        let header = match decode_block_header(&mut self.reader) {
+        let crc32c = self.header.block_checksum_is_crc32c();
+        let header = match decode_block_header(&mut self.reader, crc32c) {
             Ok(value) => value,
             Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
             Err(err) => return self.try_resync_or_fail(block_start, err),
         };
-        let body = read_block_body(&mut self.reader, &header)?;
+        let body = read_block_body(&mut self.reader, &header, crc32c)?;
         match header.block_type {
             BlockType::Packet => Ok(Some(ParsedBlock::Packet(
                 block_start,

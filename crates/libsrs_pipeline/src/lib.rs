@@ -45,17 +45,9 @@ impl NativeTranscoder for NoopNativeTranscoder {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TranscodePipeline {
     compat: CompatLayer,
-}
-
-impl Default for TranscodePipeline {
-    fn default() -> Self {
-        Self {
-            compat: CompatLayer::default(),
-        }
-    }
 }
 
 impl TranscodePipeline {

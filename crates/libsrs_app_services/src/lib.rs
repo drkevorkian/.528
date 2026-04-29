@@ -39,7 +39,7 @@ impl AppServices {
         match extension(input) {
             Some("srsv") => inspect_native_video(input),
             Some("srsa") => inspect_native_audio(input),
-            Some("srsm") => inspect_native_container(input),
+            Some("528") | Some("srsm") => inspect_native_container(input),
             _ => inspect_foreign_source(&self.pipeline, input),
         }
     }
@@ -279,10 +279,14 @@ fn inspect_native_container(input: &Path) -> Result<MediaInspection> {
         .iter()
         .map(|track| (track.track_id, track.timescale.max(1)))
         .collect::<HashMap<_, _>>();
-    let duration_ms = demux.index().iter().map(|entry| {
-        let timescale = timescales.get(&entry.track_id).copied().unwrap_or(1_000);
-        entry.pts.saturating_mul(1_000) / u64::from(timescale)
-    }).max();
+    let duration_ms = demux
+        .index()
+        .iter()
+        .map(|entry| {
+            let timescale = timescales.get(&entry.track_id).copied().unwrap_or(1_000);
+            entry.pts.saturating_mul(1_000) / u64::from(timescale)
+        })
+        .max();
 
     let mut packet_count = 0_u64;
     demux.reset_to_data_start()?;
@@ -307,12 +311,13 @@ fn inspect_native_container(input: &Path) -> Result<MediaInspection> {
                 track.timescale,
                 track.config.len()
             ),
-            supported_without_license: container_codec(track.codec_id).is_royalty_free_playback_allowed(),
+            supported_without_license: container_codec(track.codec_id)
+                .is_royalty_free_playback_allowed(),
         })
         .collect::<Vec<_>>();
 
     Ok(MediaInspection {
-        format_name: "srsm".to_string(),
+        format_name: format!("528-container-v{}", demux.header().version),
         duration_ms,
         summary: format!(
             "native container: tracks={}, index_entries={}, packets={packet_count}",
@@ -360,14 +365,14 @@ fn encode_input_to_native(input: &Path, output: &Path) -> Result<()> {
     match extension(output) {
         Some("srsv") => encode_raw_video(input, output),
         Some("srsa") => encode_raw_audio(input, output),
-        Some("srsm") => {
+        Some("528") | Some("srsm") => {
             let stem = output.with_extension("");
             let video_path = stem.with_extension("srsv");
             encode_raw_video(input, &video_path)?;
             mux_elementary_streams(&stem, output)
         }
         _ => Err(anyhow!(
-            "unsupported output extension; expected .srsv, .srsa, or .srsm"
+            "unsupported output extension; expected .srsv, .srsa, .528, or .srsm (legacy)"
         )),
     }
 }
@@ -376,9 +381,9 @@ fn decode_native_to_raw(input: &Path, output: &Path) -> Result<()> {
     match extension(input) {
         Some("srsv") => decode_video_to_raw(input, output),
         Some("srsa") => decode_audio_to_pcm(input, output),
-        Some("srsm") => demux_container_to_elementary(input, output),
+        Some("528") | Some("srsm") => demux_container_to_elementary(input, output),
         _ => Err(anyhow!(
-            "unsupported input extension; expected .srsv, .srsa, or .srsm"
+            "unsupported input extension; expected .srsv, .srsa, .528, or .srsm (legacy)"
         )),
     }
 }
@@ -402,7 +407,9 @@ fn encode_raw_video(input: &Path, output: &Path) -> Result<()> {
 fn encode_raw_audio(input: &Path, output: &Path) -> Result<()> {
     let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
     if bytes.len() % 2 != 0 {
-        return Err(anyhow!("raw PCM input must be 16-bit little-endian samples"));
+        return Err(anyhow!(
+            "raw PCM input must be 16-bit little-endian samples"
+        ));
     }
     let samples = bytes
         .chunks_exact(2)
@@ -576,7 +583,8 @@ fn demux_container_to_elementary(input: &Path, output_stem: &Path) -> Result<()>
                     sample_rate,
                 ));
             }
-            TrackKind::Data => {}
+            TrackKind::Data | TrackKind::Subtitle | TrackKind::Metadata | TrackKind::Attachment => {
+            }
         }
     }
 

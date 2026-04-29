@@ -11,21 +11,12 @@ pub const DEFAULT_PRIMARY_URL: &str = "http://localhost:3000";
 pub const DEFAULT_BACKUP_URL: &str = "http://127.0.0.1:3000";
 pub const LOCALHOST_DEV_SIGNING_KEY_SEED_B64: &str = "bG9jYWxob3N0LWRldi1zaWduaW5nLXNlZWQtMDAwMSE=";
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SrsConfig {
     #[serde(default)]
     pub client: ClientConfig,
     #[serde(default)]
     pub server: ServerConfig,
-}
-
-impl Default for SrsConfig {
-    fn default() -> Self {
-        Self {
-            client: ClientConfig::default(),
-            server: ServerConfig::default(),
-        }
-    }
 }
 
 impl SrsConfig {
@@ -129,8 +120,7 @@ impl Default for ClientConfig {
 
 impl ClientConfig {
     pub fn project_dirs(&self) -> Result<ProjectDirs> {
-        ProjectDirs::from("dev", "srs", "srs-media-system")
-            .context("resolve project directories")
+        ProjectDirs::from("dev", "srs", "srs-media-system").context("resolve project directories")
     }
 
     pub fn state_dir(&self) -> Result<PathBuf> {
@@ -200,10 +190,7 @@ impl ServerConfig {
 
     pub fn local_base_url(&self) -> String {
         let bind = self.bind_addr.trim();
-        let (host, port) = bind
-            .rsplit_once(':')
-            .map(|(host, port)| (host, port))
-            .unwrap_or(("127.0.0.1", "3000"));
+        let (host, port) = bind.rsplit_once(':').unwrap_or(("127.0.0.1", "3000"));
         let host = match host {
             "0.0.0.0" | "*" | "" => "127.0.0.1",
             value => value,

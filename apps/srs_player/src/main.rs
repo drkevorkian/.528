@@ -220,10 +220,8 @@ impl PlayerApp {
     }
 
     fn schedule_next_auto_refresh(&mut self) {
-        let interval_secs = next_refresh_interval_secs(
-            &mut self.refresh_prng_state,
-            runtime_refresh_entropy(),
-        );
+        let interval_secs =
+            next_refresh_interval_secs(&mut self.refresh_prng_state, runtime_refresh_entropy());
         self.next_auto_refresh_at = Instant::now() + Duration::from_secs(interval_secs);
     }
 
@@ -335,10 +333,16 @@ impl PlayerApp {
 
     fn report_unsupported_playback(&mut self, tracks: Vec<UnsupportedCodecTrack>) {
         let Some(client) = &self.licensing else {
-            self.push_notification("Unsupported playback report skipped: no licensing client.".to_string());
+            self.push_notification(
+                "Unsupported playback report skipped: no licensing client.".to_string(),
+            );
             return;
         };
-        let license_id = self.license_snapshot.claims.as_ref().map(|claims| claims.license_id.as_str());
+        let license_id = self
+            .license_snapshot
+            .claims
+            .as_ref()
+            .map(|claims| claims.license_id.as_str());
         let endpoint = self.license_snapshot.endpoint.as_deref();
         if let Err(err) = client.report_unsupported_playback(
             endpoint,
@@ -395,7 +399,9 @@ impl PlayerApp {
             return;
         };
         if self.input_path.trim().is_empty() {
-            self.push_notification("Select an input path before running editor actions.".to_string());
+            self.push_notification(
+                "Select an input path before running editor actions.".to_string(),
+            );
             return;
         }
         if self.output_path.trim().is_empty() {
@@ -406,13 +412,16 @@ impl PlayerApp {
         let input = PathBuf::from(self.input_path.trim());
         let output = PathBuf::from(self.output_path.trim());
         let result = match action {
-            EditorAction::Encode => self.services.encode_input_to_native(&input, &output, claims),
+            EditorAction::Encode => self
+                .services
+                .encode_input_to_native(&input, &output, claims),
             EditorAction::Decode => self.services.decode_native_to_raw(&input, &output, claims),
-            EditorAction::Mux => self.services.mux_elementary_streams(&input, &output, claims),
-            EditorAction::Demux => {
-                self.services
-                    .demux_container_to_elementary(&input, &output, claims)
-            }
+            EditorAction::Mux => self
+                .services
+                .mux_elementary_streams(&input, &output, claims),
+            EditorAction::Demux => self
+                .services
+                .demux_container_to_elementary(&input, &output, claims),
             EditorAction::Import => self
                 .services
                 .import_to_native(&input, &output, claims)
@@ -425,8 +434,11 @@ impl PlayerApp {
         match result {
             Ok(()) => {
                 let action_name = action.label();
-                self.editor.last_result =
-                    format!("{action_name} completed: {} -> {}", input.display(), output.display());
+                self.editor.last_result = format!(
+                    "{action_name} completed: {} -> {}",
+                    input.display(),
+                    output.display()
+                );
                 self.push_notification(self.editor.last_result.clone());
             }
             Err(err) => self.push_notification(format!("{} failed: {err}", action.label())),
@@ -467,10 +479,7 @@ impl PlayerApp {
         if self.seen_server_notifications.len() > 200 {
             self.seen_server_notifications.remove(0);
         }
-        self.push_notification(format!(
-            "{}: {}",
-            notification.subject, notification.body
-        ));
+        self.push_notification(format!("{}: {}", notification.subject, notification.body));
     }
 
     fn render_top_bar(&mut self, ctx: &egui::Context) {
@@ -483,7 +492,7 @@ impl PlayerApp {
                             egui::RichText::new("SRS Player")
                                 .size(24.0)
                                 .color(accent_blue()),
-                                );
+                        );
                         badge(
                             ui,
                             if self.license_snapshot.allows_editor() {
@@ -539,14 +548,13 @@ impl PlayerApp {
                                             .stroke(egui::Stroke::new(1.0, panel_stroke()))
                                             .inner_margin(egui::Margin::same(6))
                                             .show(ui, |ui| {
-                                                ui.label(
-                                                    egui::RichText::new(&note.message)
-                                                        .color(if note.is_active() {
-                                                            accent_blue()
-                                                        } else {
-                                                            egui::Color32::WHITE
-                                                        }),
-                                                );
+                                                ui.label(egui::RichText::new(&note.message).color(
+                                                    if note.is_active() {
+                                                        accent_blue()
+                                                    } else {
+                                                        egui::Color32::WHITE
+                                                    },
+                                                ));
                                                 ui.label(
                                                     egui::RichText::new(format!(
                                                         "age: {}s",
@@ -600,7 +608,7 @@ impl PlayerApp {
                         }
                     });
                 });
-        });
+            });
     }
 
     fn render_side_panel(&mut self, ctx: &egui::Context) {
@@ -742,7 +750,11 @@ impl PlayerApp {
                 ui.add_space(8.0);
 
                 styled_section(ui, "Key Management", |ui| {
-                    ui.label(egui::RichText::new("License Key").strong().color(muted_text()));
+                    ui.label(
+                        egui::RichText::new("License Key")
+                            .strong()
+                            .color(muted_text()),
+                    );
                     ui.add_sized(
                         [ui.available_width(), 30.0],
                         egui::TextEdit::singleline(&mut self.license_key_input),
@@ -779,11 +791,15 @@ impl PlayerApp {
     fn render_workspace(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if workspace_tab_button(ui, self.workspace == WorkspaceTab::PlayOnly, "Playback").clicked() {
+                if workspace_tab_button(ui, self.workspace == WorkspaceTab::PlayOnly, "Playback")
+                    .clicked()
+                {
                     self.workspace = WorkspaceTab::PlayOnly;
                 }
                 ui.add_enabled_ui(self.license_snapshot.allows_editor(), |ui| {
-                    if workspace_tab_button(ui, self.workspace == WorkspaceTab::Editor, "Editor").clicked() {
+                    if workspace_tab_button(ui, self.workspace == WorkspaceTab::Editor, "Editor")
+                        .clicked()
+                    {
                         self.workspace = WorkspaceTab::Editor;
                     }
                 });
@@ -811,7 +827,11 @@ impl PlayerApp {
             metric_card(
                 ui,
                 "State",
-                if self.playback.playing { "Playing" } else { "Paused" },
+                if self.playback.playing {
+                    "Playing"
+                } else {
+                    "Paused"
+                },
                 self.status.as_str(),
                 if self.playback.playing {
                     accent_green()
@@ -880,9 +900,7 @@ impl PlayerApp {
             });
 
             styled_section(&mut columns[1], "Debug / Queue", |ui| {
-                ui.label(
-                    egui::RichText::new("Player runtime diagnostics").color(muted_text()),
-                );
+                ui.label(egui::RichText::new("Player runtime diagnostics").color(muted_text()));
                 ui.label(&self.playback.debug_stats);
             });
         });
@@ -899,13 +917,31 @@ impl PlayerApp {
 
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            if workspace_tab_button(ui, self.editor.active_tab == EditorTab::Pipeline, "Pipeline").clicked() {
+            if workspace_tab_button(
+                ui,
+                self.editor.active_tab == EditorTab::Pipeline,
+                "Pipeline",
+            )
+            .clicked()
+            {
                 self.editor.active_tab = EditorTab::Pipeline;
             }
-            if workspace_tab_button(ui, self.editor.active_tab == EditorTab::Timeline, "Timeline").clicked() {
+            if workspace_tab_button(
+                ui,
+                self.editor.active_tab == EditorTab::Timeline,
+                "Timeline",
+            )
+            .clicked()
+            {
                 self.editor.active_tab = EditorTab::Timeline;
             }
-            if workspace_tab_button(ui, self.editor.active_tab == EditorTab::FrameTools, "Frame Tools").clicked() {
+            if workspace_tab_button(
+                ui,
+                self.editor.active_tab == EditorTab::FrameTools,
+                "Frame Tools",
+            )
+            .clicked()
+            {
                 self.editor.active_tab = EditorTab::FrameTools;
             }
         });
@@ -1002,7 +1038,8 @@ impl PlayerApp {
                 if accent_button(ui, "Set To Current Position", accent_violet()).clicked() {
                     self.editor.selection_start_ms = self.playback.position_ms;
                     self.editor.selection_end_ms = self.playback.position_ms;
-                    self.editor.last_result = "Selection collapsed to current position.".to_string();
+                    self.editor.last_result =
+                        "Selection collapsed to current position.".to_string();
                 }
             });
         });
@@ -1045,8 +1082,10 @@ impl PlayerApp {
             ui.horizontal_wrapped(|ui| {
                 if secondary_button(ui, "Prev Frame").clicked() {
                     self.skip_by(-40);
-                    self.editor.last_result =
-                        format!("Moved to previous frame at {} ms.", self.playback.position_ms);
+                    self.editor.last_result = format!(
+                        "Moved to previous frame at {} ms.",
+                        self.playback.position_ms
+                    );
                 }
                 if secondary_button(ui, "Next Frame").clicked() {
                     self.skip_by(40);
@@ -1150,7 +1189,7 @@ impl EditorAction {
 
 fn suggest_output_path(input: &str) -> String {
     let path = Path::new(input);
-    path.with_extension("srsm").display().to_string()
+    path.with_extension("528").display().to_string()
 }
 
 fn missing_snapshot(message: String) -> LicenseSnapshot {
@@ -1209,11 +1248,7 @@ fn apply_player_theme(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
-fn styled_section(
-    ui: &mut egui::Ui,
-    title: &str,
-    add_contents: impl FnOnce(&mut egui::Ui),
-) {
+fn styled_section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::group(ui.style())
         .fill(panel_fill_alt())
         .stroke(egui::Stroke::new(1.0, panel_stroke()))
@@ -1230,13 +1265,7 @@ fn styled_section(
         });
 }
 
-fn metric_card(
-    ui: &mut egui::Ui,
-    title: &str,
-    value: &str,
-    subtitle: &str,
-    accent: egui::Color32,
-) {
+fn metric_card(ui: &mut egui::Ui, title: &str, value: &str, subtitle: &str, accent: egui::Color32) {
     egui::Frame::group(ui.style())
         .fill(panel_fill_alt())
         .stroke(egui::Stroke::new(1.0, panel_stroke()))
@@ -1273,16 +1302,16 @@ fn badge(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
 fn workspace_tab_button(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
     ui.add_sized(
         [120.0, 32.0],
-        egui::Button::new(
-            egui::RichText::new(label)
-                .strong()
-                .color(if selected {
-                    egui::Color32::BLACK
-                } else {
-                    egui::Color32::WHITE
-                }),
-        )
-        .fill(if selected { accent_blue() } else { panel_fill_alt() }),
+        egui::Button::new(egui::RichText::new(label).strong().color(if selected {
+            egui::Color32::BLACK
+        } else {
+            egui::Color32::WHITE
+        }))
+        .fill(if selected {
+            accent_blue()
+        } else {
+            panel_fill_alt()
+        }),
     )
 }
 

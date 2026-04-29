@@ -34,7 +34,10 @@ impl Display for VideoCodecError {
             ),
             Self::UnsupportedFrameType(t) => write!(f, "unsupported frame type: {t}"),
             Self::CrcMismatch { expected, actual } => {
-                write!(f, "crc mismatch expected {expected:#010x}, got {actual:#010x}")
+                write!(
+                    f,
+                    "crc mismatch expected {expected:#010x}, got {actual:#010x}"
+                )
             }
             Self::Io(err) => write!(f, "i/o error: {err}"),
         }

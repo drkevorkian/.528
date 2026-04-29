@@ -2,8 +2,14 @@ use std::env;
 use std::fs;
 use std::process;
 
-use libsrs_audio::{parse_audio_frame_packet_header, AudioStreamHeader, PACKET_SYNC as AUDIO_SYNC, STREAM_MAGIC as AUDIO_MAGIC};
-use libsrs_video::{parse_video_frame_packet_header, FrameType, VideoStreamHeader, PACKET_SYNC as VIDEO_SYNC, STREAM_MAGIC as VIDEO_MAGIC};
+use libsrs_audio::{
+    parse_audio_frame_packet_header, AudioStreamHeader, PACKET_SYNC as AUDIO_SYNC,
+    STREAM_MAGIC as AUDIO_MAGIC,
+};
+use libsrs_video::{
+    parse_video_frame_packet_header, FrameType, VideoStreamHeader, PACKET_SYNC as VIDEO_SYNC,
+    STREAM_MAGIC as VIDEO_MAGIC,
+};
 
 fn main() {
     if let Err(err) = run() {

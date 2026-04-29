@@ -2,20 +2,25 @@ use std::io::{self, Read, Write};
 
 use crc32fast::Hasher;
 
-use crate::codec::{decode_frame, encode_frame, AudioFrame, PACKET_SYNC, STREAM_MAGIC, STREAM_VERSION};
+use crate::codec::{
+    decode_frame_with_stream_version, encode_frame, is_supported_stream_version, AudioFrame,
+    PACKET_SYNC, STREAM_MAGIC, STREAM_VERSION,
+};
 use crate::error::AudioCodecError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioStreamHeader {
     pub sample_rate: u32,
     pub channels: u8,
+    /// Revision from the 16-byte header (`1` = legacy channel coding, `2` = v2 LPC+rANS).
+    pub stream_version: u8,
 }
 
 impl AudioStreamHeader {
     pub fn encode(&self) -> [u8; 16] {
         let mut out = [0_u8; 16];
         out[0..4].copy_from_slice(&STREAM_MAGIC);
-        out[4] = STREAM_VERSION;
+        out[4] = self.stream_version;
         out[5] = self.channels;
         out[8..12].copy_from_slice(&self.sample_rate.to_le_bytes());
         out
@@ -25,8 +30,11 @@ impl AudioStreamHeader {
         if bytes[0..4] != STREAM_MAGIC {
             return Err(AudioCodecError::InvalidData("invalid audio stream magic"));
         }
-        if bytes[4] != STREAM_VERSION {
-            return Err(AudioCodecError::InvalidData("unsupported audio stream version"));
+        let stream_version = bytes[4];
+        if !is_supported_stream_version(stream_version) {
+            return Err(AudioCodecError::InvalidData(
+                "unsupported audio stream version",
+            ));
         }
         let channels = bytes[5];
         if channels != 1 && channels != 2 {
@@ -41,6 +49,7 @@ impl AudioStreamHeader {
         Ok(Self {
             sample_rate,
             channels,
+            stream_version,
         })
     }
 }
@@ -67,17 +76,25 @@ impl<W: Write> AudioStreamWriter<W> {
         let header = AudioStreamHeader {
             sample_rate,
             channels,
+            stream_version: STREAM_VERSION,
         };
         inner.write_all(&header.encode())?;
         Ok(Self { inner, header })
     }
 
-    pub fn write_frame(&mut self, frame: &AudioFrame) -> Result<AudioPacketMetadata, AudioCodecError> {
+    pub fn write_frame(
+        &mut self,
+        frame: &AudioFrame,
+    ) -> Result<AudioPacketMetadata, AudioCodecError> {
         if frame.sample_rate != self.header.sample_rate {
-            return Err(AudioCodecError::InvalidData("sample rate mismatch for stream"));
+            return Err(AudioCodecError::InvalidData(
+                "sample rate mismatch for stream",
+            ));
         }
         if frame.channels != self.header.channels {
-            return Err(AudioCodecError::InvalidData("channel count mismatch for stream"));
+            return Err(AudioCodecError::InvalidData(
+                "channel count mismatch for stream",
+            ));
         }
         let sample_count_per_channel = frame.sample_count_per_channel()?;
         let payload = encode_frame(frame)?;
@@ -85,7 +102,7 @@ impl<W: Write> AudioStreamWriter<W> {
             .map_err(|_| AudioCodecError::InvalidData("audio payload too large"))?;
 
         let mut crc_hasher = Hasher::new();
-        crc_hasher.update(&[STREAM_VERSION, frame.channels]);
+        crc_hasher.update(&[self.header.stream_version, frame.channels]);
         crc_hasher.update(&frame.frame_index.to_le_bytes());
         crc_hasher.update(&sample_count_per_channel.to_le_bytes());
         crc_hasher.update(&payload_len.to_le_bytes());
@@ -93,9 +110,11 @@ impl<W: Write> AudioStreamWriter<W> {
         let crc32 = crc_hasher.finalize();
 
         self.inner.write_all(&PACKET_SYNC)?;
-        self.inner.write_all(&[STREAM_VERSION, frame.channels])?;
+        self.inner
+            .write_all(&[self.header.stream_version, frame.channels])?;
         self.inner.write_all(&frame.frame_index.to_le_bytes())?;
-        self.inner.write_all(&sample_count_per_channel.to_le_bytes())?;
+        self.inner
+            .write_all(&sample_count_per_channel.to_le_bytes())?;
         self.inner.write_all(&payload_len.to_le_bytes())?;
         self.inner.write_all(&crc32.to_le_bytes())?;
         self.inner.write_all(&payload)?;
@@ -132,15 +151,17 @@ impl<R: Read> AudioStreamReader<R> {
         match self.inner.read_exact(&mut sync) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(err) => return Err(AudioCodecError::Io(err)),
+            Err(err) => return Err(err.into()),
         }
         if sync != PACKET_SYNC {
             return Err(AudioCodecError::InvalidData("invalid audio packet sync"));
         }
         let version = read_u8(&mut self.inner)?;
         let channels = read_u8(&mut self.inner)?;
-        if version != STREAM_VERSION {
-            return Err(AudioCodecError::InvalidData("unsupported audio packet version"));
+        if version != self.header.stream_version {
+            return Err(AudioCodecError::InvalidData(
+                "packet version does not match stream header",
+            ));
         }
         if channels != self.header.channels {
             return Err(AudioCodecError::InvalidData("packet channel mismatch"));
@@ -166,12 +187,19 @@ impl<R: Read> AudioStreamReader<R> {
             });
         }
 
-        let frame = decode_frame(self.header.sample_rate, frame_index, &payload)?;
+        let frame = decode_frame_with_stream_version(
+            self.header.sample_rate,
+            frame_index,
+            &payload,
+            self.header.stream_version,
+        )?;
         Ok(Some(frame))
     }
 }
 
-pub fn parse_audio_frame_packet_header(packet: &[u8]) -> Result<AudioPacketMetadata, AudioCodecError> {
+pub fn parse_audio_frame_packet_header(
+    packet: &[u8],
+) -> Result<AudioPacketMetadata, AudioCodecError> {
     if packet.len() < 2 + 2 + 4 + 4 + 4 + 4 {
         return Err(AudioCodecError::InvalidData(
             "packet too small for audio header",
@@ -180,8 +208,10 @@ pub fn parse_audio_frame_packet_header(packet: &[u8]) -> Result<AudioPacketMetad
     if packet[0..2] != PACKET_SYNC {
         return Err(AudioCodecError::InvalidData("invalid audio packet sync"));
     }
-    if packet[2] != STREAM_VERSION {
-        return Err(AudioCodecError::InvalidData("unsupported audio packet version"));
+    if !is_supported_stream_version(packet[2]) {
+        return Err(AudioCodecError::InvalidData(
+            "unsupported audio packet version",
+        ));
     }
     let channels = packet[3];
     if channels != 1 && channels != 2 {

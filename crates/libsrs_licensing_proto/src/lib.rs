@@ -526,8 +526,8 @@ mod tests {
     fn sign_and_verify_round_trip() {
         let signing_key = test_signing_key();
         let verifying_key = signing_key.verifying_key();
-        let envelope = SignedEntitlementEnvelope::sign(&sample_claims(), &signing_key)
-            .expect("sign claims");
+        let envelope =
+            SignedEntitlementEnvelope::sign(&sample_claims(), &signing_key).expect("sign claims");
         let claims = envelope.verify(&verifying_key).expect("verify claims");
         assert!(claims.is_editor_enabled());
         assert!(claims.allows_feature(LicensedFeature::FrameEdit));
@@ -537,10 +537,12 @@ mod tests {
     fn tampered_claims_fail_verification() {
         let signing_key = test_signing_key();
         let verifying_key = signing_key.verifying_key();
-        let mut envelope = SignedEntitlementEnvelope::sign(&sample_claims(), &signing_key)
-            .expect("sign claims");
+        let mut envelope =
+            SignedEntitlementEnvelope::sign(&sample_claims(), &signing_key).expect("sign claims");
         envelope.claims_json = envelope.claims_json.replace("license-123", "license-999");
-        let err = envelope.verify(&verifying_key).expect_err("tamper must fail");
+        let err = envelope
+            .verify(&verifying_key)
+            .expect_err("tamper must fail");
         assert!(matches!(err, LicensingProtoError::InvalidSignature));
     }
 

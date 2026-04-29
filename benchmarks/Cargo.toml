@@ -7,6 +7,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+libsrs_bitio = { path = "../crates/libsrs_bitio" }
 libsrs_contract = { path = "../crates/libsrs_contract" }
 libsrs_pipeline = { path = "../crates/libsrs_pipeline" }
 
@@ -19,4 +20,8 @@ harness = false
 
 [[bench]]
 name = "seek_latency"
+harness = false
+
+[[bench]]
+name = "bitio_entropy"
 harness = false

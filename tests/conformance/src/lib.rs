@@ -34,8 +34,8 @@ mod tests {
             assert!(meta_b.crc32 != 0);
         }
 
-        let mut reader = VideoStreamReader::new(Cursor::new(&encoded_bytes))
-            .expect("reader should initialize");
+        let mut reader =
+            VideoStreamReader::new(Cursor::new(&encoded_bytes)).expect("reader should initialize");
         let decoded_a = reader
             .read_next_frame()
             .expect("frame a should decode")
@@ -103,8 +103,9 @@ mod tests {
 
         let mut encoded_bytes_second = Vec::new();
         {
-            let mut writer = AudioStreamWriter::new(&mut encoded_bytes_second, sample_rate, channels)
-                .expect("audio writer should initialize");
+            let mut writer =
+                AudioStreamWriter::new(&mut encoded_bytes_second, sample_rate, channels)
+                    .expect("audio writer should initialize");
             writer.write_frame(&frame_a).expect("frame a should encode");
             writer.write_frame(&frame_b).expect("frame b should encode");
         }
