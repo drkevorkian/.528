@@ -19,16 +19,23 @@ impl MediaProbe for FfmpegProbe {
         let tracks = ictx
             .streams()
             .enumerate()
-            .map(|(idx, stream)| CompatTrackInfo {
-                id: TrackId(idx as u16),
-                kind: map_media_kind(stream.parameters().medium()),
-                codec: map_codec(stream.parameters().id()),
-                role: if idx == 0 {
-                    StreamRole::Primary
-                } else {
-                    StreamRole::Alternate
-                },
-                language: stream.metadata().get("language").map(ToOwned::to_owned),
+            .map(|(idx, stream)| {
+                let params = stream.parameters();
+                let (audio_sample_rate, audio_channels) =
+                    audio_params_from_ffmpeg_parameters(&params);
+                CompatTrackInfo {
+                    id: TrackId(idx as u32),
+                    kind: map_media_kind(params.medium()),
+                    codec: map_codec(params.id()),
+                    role: if idx == 0 {
+                        StreamRole::Primary
+                    } else {
+                        StreamRole::Alternate
+                    },
+                    language: stream.metadata().get("language").map(ToOwned::to_owned),
+                    audio_sample_rate,
+                    audio_channels,
+                }
             })
             .collect();
         let duration_ms = if ictx.duration() > 0 {
@@ -121,6 +128,32 @@ impl MediaIngestor for FfmpegIngestor {
         self.opened = false;
         Ok(())
     }
+}
+
+fn audio_params_from_ffmpeg_parameters(
+    par: &ffmpeg::codec::Parameters,
+) -> (Option<u32>, Option<u8>) {
+    if par.medium() != ffmpeg::media::Type::Audio {
+        return (None, None);
+    }
+    // SAFETY: `Parameters` wraps a live `AVCodecParameters` for this stream; sample_rate/channels
+    // are valid for audio types per FFmpeg's public ABI.
+    let (sample_rate, channels) = unsafe {
+        let p = par.as_ptr();
+        ((*p).sample_rate, (*p).channels)
+    };
+    let sr = if sample_rate > 0 {
+        Some(sample_rate as u32)
+    } else {
+        None
+    };
+    let ch = if channels > 0 {
+        let c = channels as u8;
+        if c == 1 || c == 2 { Some(c) } else { None }
+    } else {
+        None
+    };
+    (sr, ch)
 }
 
 fn map_media_kind(kind: ffmpeg::media::Type) -> MediaKind {

@@ -19,5 +19,10 @@ Application-level policy layers may sit above the media tiers:
 
 - External decoder/container stacks are isolated behind traits.
 - Optional FFmpeg usage is gated by cargo feature.
-- Unsafe code is avoided in bootstrap crates.
+- **`unsafe` is limited** to the optional FFmpeg backend (reading codec parameters for probe metadata). Default builds do not use it.
 - Runtime entitlements are enforced above the codec/container crates so media formats remain free of licensing business logic.
+
+## Native container and import
+
+- Multiplexed output and round-trips use the **`.528`** extension by default; **`.srsm`** remains a supported legacy name for the same format family (see [`.528` container format](../528_container_format.md)).
+- **Import** normalizes foreign or stub sources through `libsrs_compat` ingest, then muxes with **`libsrs_video`** / **`libsrs_audio`** encode APIs via **`libsrs_app_services`** orchestration.

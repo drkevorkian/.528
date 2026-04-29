@@ -55,6 +55,11 @@ impl TranscodePipeline {
         Self { compat }
     }
 
+    /// Opens a [`MediaIngestor`](libsrs_compat::MediaIngestor) for the configured backend (stub or FFmpeg).
+    pub fn create_ingestor(&self) -> Box<dyn libsrs_compat::MediaIngestor> {
+        self.compat.create_ingestor()
+    }
+
     pub fn analyze_source<P: AsRef<Path>>(&self, input: P) -> Result<ProbeResult> {
         let prober = self.compat.create_prober();
         prober.probe_path(input.as_ref())

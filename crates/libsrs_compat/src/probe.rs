@@ -22,6 +22,10 @@ pub struct CompatTrackInfo {
     pub codec: CodecType,
     pub role: StreamRole,
     pub language: Option<String>,
+    /// Sample rate in Hz when `kind` is audio and the source reported it (container config, stream header, or FFmpeg probe).
+    pub audio_sample_rate: Option<u32>,
+    /// Channel count (typically 1 or 2) when `kind` is audio and known.
+    pub audio_channels: Option<u8>,
 }
 
 #[derive(Debug, Clone)]

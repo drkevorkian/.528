@@ -22,7 +22,7 @@ fn main() -> Result<()> {
 }
 
 fn write_seed_header_only(out_dir: &Path) -> Result<()> {
-    let path = out_dir.join("seed_srsm_header_only");
+    let path = out_dir.join("seed_528_header_only");
     let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
     let tracks = vec![video_track_descriptor()];
     let header = FileHeader::new(1, 8);
@@ -32,7 +32,7 @@ fn write_seed_header_only(out_dir: &Path) -> Result<()> {
 }
 
 fn write_seed_packet_like(out_dir: &Path) -> Result<()> {
-    let path = out_dir.join("seed_srsm_packet_like");
+    let path = out_dir.join("seed_528_packet_like");
     let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
     let tracks = vec![video_track_descriptor()];
     let header = FileHeader::new(1, 8);
@@ -43,7 +43,7 @@ fn write_seed_packet_like(out_dir: &Path) -> Result<()> {
 }
 
 fn write_seed_with_cue_and_index(out_dir: &Path) -> Result<()> {
-    let path = out_dir.join("seed_srsm_with_cue_and_index");
+    let path = out_dir.join("seed_528_with_cue_and_index");
     let file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
     let tracks = vec![video_track_descriptor()];
     // cue every packet to maximize cue/index parser coverage.

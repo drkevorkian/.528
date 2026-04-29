@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use libsrs_audio::AudioStreamReader;
+use libsrs_audio::{AudioStreamHeader, AudioStreamReader};
 use libsrs_container::{PacketFlags, TrackKind};
 use libsrs_contract::{
     CodecType, MediaKind, Packet, StreamId, StreamRole, Timebase, Timestamp, TrackId,
@@ -29,22 +29,29 @@ impl MediaProbe for StubProbe {
             return probe_native_audio(input);
         }
 
-        let format_name = input
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("synthetic")
-            .to_string();
-
         Ok(ProbeResult {
-            format_name,
+            format_name: "stub-synthetic-av".to_string(),
             duration_ms: Some(5_000),
-            tracks: vec![CompatTrackInfo {
-                id: TrackId(0),
-                kind: MediaKind::Video,
-                codec: CodecType::Unknown,
-                role: StreamRole::Primary,
-                language: None,
-            }],
+            tracks: vec![
+                CompatTrackInfo {
+                    id: TrackId(0),
+                    kind: MediaKind::Video,
+                    codec: CodecType::NativeSrsVideo,
+                    role: StreamRole::Primary,
+                    language: None,
+                    audio_sample_rate: None,
+                    audio_channels: None,
+                },
+                CompatTrackInfo {
+                    id: TrackId(1),
+                    kind: MediaKind::Audio,
+                    codec: CodecType::NativeSrsAudio,
+                    role: StreamRole::Alternate,
+                    language: None,
+                    audio_sample_rate: Some(48_000),
+                    audio_channels: Some(1),
+                },
+            ],
         })
     }
 }
@@ -87,10 +94,42 @@ impl MediaIngestor for StubIngestor {
             if self.cursor as u64 >= self.max_packets {
                 return Ok(None);
             }
-            let packet = crate::probe::CompatLayer::synthetic_packet(
-                (self.cursor % 255) as u8,
-                (self.cursor * 40) as i64,
-            );
+            let packet = if self.cursor % 2 == 0 {
+                SourcePacket {
+                    packet: Packet {
+                        stream_id: StreamId(0),
+                        pts: Some(Timestamp::new(
+                            (self.cursor as i64) * 40,
+                            Timebase::milliseconds(),
+                        )),
+                        dts: None,
+                        duration: None,
+                        keyframe: true,
+                        data: vec![(self.cursor % 255) as u8; 64],
+                    },
+                    source_offset: Some(self.cursor as u64),
+                }
+            } else {
+                let mut data = vec![0_u8; 960];
+                for (i, chunk) in data.chunks_exact_mut(2).enumerate() {
+                    let v = ((self.cursor as i32 * 17 + i as i32) as i16).wrapping_mul(3);
+                    chunk.copy_from_slice(&v.to_le_bytes());
+                }
+                SourcePacket {
+                    packet: Packet {
+                        stream_id: StreamId(1),
+                        pts: Some(Timestamp::new(
+                            (self.cursor as i64) * 20,
+                            Timebase::milliseconds(),
+                        )),
+                        dts: None,
+                        duration: None,
+                        keyframe: true,
+                        data,
+                    },
+                    source_offset: Some(self.cursor as u64),
+                }
+            };
             self.cursor += 1;
             return Ok(Some(packet));
         }
@@ -156,16 +195,21 @@ fn probe_native_container(input: &Path) -> Result<ProbeResult> {
     let tracks = demux
         .tracks()
         .iter()
-        .map(|track| CompatTrackInfo {
-            id: TrackId(track.track_id as u32),
-            kind: map_track_kind(track.kind),
-            codec: map_codec(track.codec_id),
-            role: if track.track_id == 1 {
-                StreamRole::Primary
-            } else {
-                StreamRole::Alternate
-            },
-            language: None,
+        .map(|track| {
+            let (audio_sample_rate, audio_channels) = audio_params_from_native_track(track);
+            CompatTrackInfo {
+                id: TrackId(track.track_id as u32),
+                kind: map_track_kind(track.kind),
+                codec: map_codec(track.codec_id),
+                role: if track.track_id == 1 {
+                    StreamRole::Primary
+                } else {
+                    StreamRole::Alternate
+                },
+                language: None,
+                audio_sample_rate,
+                audio_channels,
+            }
         })
         .collect::<Vec<_>>();
     demux.rebuild_index()?;
@@ -196,14 +240,20 @@ fn probe_native_video(input: &Path) -> Result<ProbeResult> {
             codec: CodecType::NativeSrsVideo,
             role: StreamRole::Primary,
             language: None,
+            audio_sample_rate: None,
+            audio_channels: None,
         }],
     })
 }
 
 fn probe_native_audio(input: &Path) -> Result<ProbeResult> {
-    let file = File::open(input).with_context(|| format!("open {}", input.display()))?;
-    let _reader = AudioStreamReader::new(BufReader::new(file))
-        .with_context(|| format!("parse {}", input.display()))?;
+    let mut file = File::open(input).with_context(|| format!("open {}", input.display()))?;
+    let mut preamble = [0_u8; 16];
+    file
+        .read_exact(&mut preamble)
+        .with_context(|| format!("read audio stream header {}", input.display()))?;
+    let header = AudioStreamHeader::decode(preamble)
+        .with_context(|| format!("parse audio stream header {}", input.display()))?;
     Ok(ProbeResult {
         format_name: "srsa".to_string(),
         duration_ms: None,
@@ -213,6 +263,8 @@ fn probe_native_audio(input: &Path) -> Result<ProbeResult> {
             codec: CodecType::NativeSrsAudio,
             role: StreamRole::Primary,
             language: None,
+            audio_sample_rate: Some(header.sample_rate),
+            audio_channels: Some(header.channels),
         }],
     })
 }
@@ -342,9 +394,61 @@ fn map_codec(codec_id: u16) -> CodecType {
     }
 }
 
+/// Parses multiplexed native audio track config: `sample_rate` (le u32) + `channels` (u8), same layout as mux `TrackDescriptor.config`.
+fn audio_params_from_native_track(
+    track: &libsrs_container::TrackDescriptor,
+) -> (Option<u32>, Option<u8>) {
+    if track.kind != TrackKind::Audio {
+        return (None, None);
+    }
+    if track.config.len() < 5 {
+        return (None, None);
+    }
+    let sample_rate = u32::from_le_bytes([
+        track.config[0],
+        track.config[1],
+        track.config[2],
+        track.config[3],
+    ]);
+    let channels = track.config[4];
+    if sample_rate == 0 || (channels != 1 && channels != 2) {
+        return (None, None);
+    }
+    (Some(sample_rate), Some(channels))
+}
+
 fn timestamp_to_ms(ts: Timestamp) -> i64 {
     if ts.timebase.den == 0 {
         return ts.ticks;
     }
     ((ts.ticks as i128) * (ts.timebase.num as i128) * 1_000 / (ts.timebase.den as i128)) as i64
+}
+
+#[cfg(test)]
+mod probe_audio_tests {
+    use super::*;
+    use libsrs_audio::STREAM_VERSION_V2;
+
+    #[test]
+    fn probe_srsa_reads_rate_and_channels_from_header_only() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "srsa-probe-{}.srsa",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let header = AudioStreamHeader {
+            sample_rate: 44_100,
+            channels: 2,
+            stream_version: STREAM_VERSION_V2,
+        };
+        std::fs::write(&path, header.encode().as_slice()).unwrap();
+        let probe = StubProbe.probe_path(&path).expect("probe");
+        assert_eq!(probe.tracks.len(), 1);
+        assert_eq!(probe.tracks[0].audio_sample_rate, Some(44_100));
+        assert_eq!(probe.tracks[0].audio_channels, Some(2));
+        std::fs::remove_file(&path).ok();
+    }
 }

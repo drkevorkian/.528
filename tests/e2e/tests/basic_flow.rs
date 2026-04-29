@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use libsrs_audio::AudioFrame;
+use libsrs_audio::{AudioFrame, STREAM_VERSION_V2, decode_frame_with_stream_version};
 use libsrs_container::{FileHeader, TrackDescriptor, TrackKind};
 use libsrs_demux::DemuxReader;
 use libsrs_mux::MuxWriter;
@@ -19,7 +19,7 @@ fn synthetic_contract_packet_shape_is_valid() {
 #[test]
 fn pipeline_analyze_and_import_native_container_flow() {
     let temp_path = std::env::temp_dir().join(format!(
-        "srs-e2e-{}.srsm",
+        "srs-e2e-{}.528",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -126,6 +126,7 @@ fn native_video_audio_mux_demux_roundtrip() {
         .expect("next packet")
         .expect("audio packet");
     let decoded_audio =
-        libsrs_audio::decode_frame(48_000, 0, &audio_packet.packet.payload).expect("decode audio");
+        decode_frame_with_stream_version(48_000, 0, &audio_packet.packet.payload, STREAM_VERSION_V2)
+            .expect("decode audio");
     assert_eq!(decoded_audio.samples, audio.samples);
 }

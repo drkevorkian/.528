@@ -50,6 +50,19 @@ Parsers reject inconsistent pairs (for example v2 magic with `version != 2`, or 
 | `config_len` | u32 | Length of following blob |
 | `config` | bytes | Codec private data (capped: `MAX_TRACK_CONFIG_BYTES`) |
 
+### Native audio track `config` (SRS audio, `codec_id = 2`)
+
+For tracks muxed as **native SRS audio**, `config` is at least **5 bytes**:
+
+1. **Sample rate:** `u32` little-endian (Hz), non-zero.
+2. **Channels:** `u8`, **`1`** (mono) or **`2`** (stereo).
+
+This layout is what **`libsrs_compat`** reads when probing **`.528` / `.srsm`** files (so imports can preserve rate and layout), and what **`libsrs_app_services`** expects when building mux descriptors during **import**. Wider channel counts are not part of this native mux profile.
+
+### Native video track `config` (SRS video, `codec_id = 1`)
+
+Writers typically store **width** and **height** as consecutive **`u32` LE** values (square raster assumptions in some import paths may require width == height—see application code).
+
 ## Block envelope (`SBLK`)
 
 Each logical block is wrapped:

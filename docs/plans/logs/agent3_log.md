@@ -1,5 +1,11 @@
 # Agent 3 Log
 
+## 2026-04-27
+
+### Docs
+
+- Refreshed root `README` (`.528` / import / probe), `docs/specs/compatibility_layer.md`, `architecture_overview.md`, `container_format.md` (now an index to `528_container_format.md`), `528_container_format.md` (native audio `config`), `samples/README`, fuzz corpus README, and ADR-0002 consequences for probe/import behavior.
+
 ## 2026-04-19
 
 ### Changed
@@ -10,7 +16,7 @@
 - Added `apps/srs_player` desktop UI shell (open/play/pause/stop/seek/status panels).
 - Added `tests/e2e`, `tests/fuzz`, and `benchmarks` harness scaffolds.
 - Added ADR/spec/plan files and integration docs.
-- Replaced `libsrs_compat` synthetic-only ingest/probe paths with native `.srsm/.srsv/.srsa` support and updated e2e coverage accordingly.
+- Replaced `libsrs_compat` synthetic-only ingest/probe paths with native `.528` / legacy `.srsm`, `.srsv`, and `.srsa` support and updated e2e coverage accordingly.
 
 ### Assumptions
 
