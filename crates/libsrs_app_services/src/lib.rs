@@ -14,7 +14,11 @@ use libsrs_demux::DemuxReader;
 use libsrs_licensing_proto::{EntitlementClaims, LicensedFeature};
 use libsrs_mux::MuxWriter;
 use libsrs_pipeline::TranscodePipeline;
-use libsrs_video::{FrameType, VideoFrame, VideoStreamReader, VideoStreamWriter};
+use libsrs_video::{
+    decode_sequence_header_v2, decode_yuv420_intra_payload, encode_sequence_header_v2, FrameType,
+    VideoFrame, VideoStreamReader, VideoStreamReaderV2, VideoStreamWriter, VideoStreamWriterV2,
+    SEQUENCE_HEADER_BYTES,
+};
 use thiserror::Error;
 
 mod import_pipeline;
@@ -50,6 +54,7 @@ impl AppServices {
         let input = input.as_ref();
         match extension(input) {
             Some("srsv") => inspect_native_video(input),
+            Some("srsv2") => inspect_native_video_v2(input),
             Some("srsa") => inspect_native_audio(input),
             Some("528") | Some("srsm") => inspect_native_container(input),
             _ => inspect_foreign_source(&self.pipeline, input),
@@ -243,6 +248,33 @@ fn inspect_native_video(input: &Path) -> Result<MediaInspection> {
     })
 }
 
+fn inspect_native_video_v2(input: &Path) -> Result<MediaInspection> {
+    let file = File::open(input).with_context(|| format!("open {}", input.display()))?;
+    let mut reader = VideoStreamReaderV2::new(BufReader::new(file))?;
+    let w = reader.seq.width;
+    let h = reader.seq.height;
+    let mut frame_count = 0_u64;
+    while reader.read_next_payload()?.is_some() {
+        frame_count += 1;
+    }
+    Ok(MediaInspection {
+        format_name: "srsv2".to_string(),
+        duration_ms: Some(frame_count.saturating_mul(40)),
+        summary: format!("native SRSV2 elementary: {}x{}, frames={frame_count}", w, h),
+        tracks: vec![TrackSummary {
+            id: 0,
+            kind: "Video".to_string(),
+            codec: CodecType::NativeSrsVideoV2.display_name().to_string(),
+            role: "Primary".to_string(),
+            detail: format!("{}x{} YUV420p8 intra", w, h),
+            supported_without_license: true,
+        }],
+        packet_count: None,
+        frame_count: Some(frame_count),
+        index_entries: None,
+    })
+}
+
 fn inspect_native_audio(input: &Path) -> Result<MediaInspection> {
     let file = File::open(input).with_context(|| format!("open {}", input.display()))?;
     let mut reader = AudioStreamReader::new(BufReader::new(file))?;
@@ -309,22 +341,21 @@ fn inspect_native_container(input: &Path) -> Result<MediaInspection> {
     let tracks = demux
         .tracks()
         .iter()
-        .map(|track| TrackSummary {
-            id: u32::from(track.track_id),
-            kind: format!("{:?}", track.kind),
-            codec: container_codec_name(track.codec_id).to_string(),
-            role: if track.track_id == 1 {
-                "Primary".to_string()
-            } else {
-                "Alternate".to_string()
-            },
-            detail: format!(
-                "timescale={} config={} bytes",
-                track.timescale,
-                track.config.len()
-            ),
-            supported_without_license: container_codec(track.codec_id)
-                .is_royalty_free_playback_allowed(),
+        .map(|track| {
+            let detail = container_track_detail(track);
+            TrackSummary {
+                id: u32::from(track.track_id),
+                kind: format!("{:?}", track.kind),
+                codec: container_codec_name(track.codec_id).to_string(),
+                role: if track.track_id == 1 {
+                    "Primary".to_string()
+                } else {
+                    "Alternate".to_string()
+                },
+                detail,
+                supported_without_license: container_codec(track.codec_id)
+                    .is_royalty_free_playback_allowed(),
+            }
         })
         .collect::<Vec<_>>();
 
@@ -365,7 +396,46 @@ fn container_codec(codec_id: u16) -> CodecType {
     match codec_id {
         1 => CodecType::NativeSrsVideo,
         2 => CodecType::NativeSrsAudio,
+        3 => CodecType::NativeSrsVideoV2,
         _ => CodecType::Unknown,
+    }
+}
+
+fn container_track_detail(track: &TrackDescriptor) -> String {
+    match track.kind {
+        TrackKind::Video if track.codec_id == 3 && track.config.len() >= SEQUENCE_HEADER_BYTES => {
+            match decode_sequence_header_v2(&track.config[..SEQUENCE_HEADER_BYTES]) {
+                Ok(seq) => format!(
+                    "SRSV2 {}x{} timescale={}",
+                    seq.width, seq.height, track.timescale
+                ),
+                Err(_) => format!(
+                    "SRSV2 invalid sequence config ({} bytes), timescale={}",
+                    track.config.len(),
+                    track.timescale
+                ),
+            }
+        }
+        TrackKind::Video if track.codec_id == 1 && track.config.len() >= 8 => {
+            let width = u32::from_le_bytes([
+                track.config[0],
+                track.config[1],
+                track.config[2],
+                track.config[3],
+            ]);
+            let height = u32::from_le_bytes([
+                track.config[4],
+                track.config[5],
+                track.config[6],
+                track.config[7],
+            ]);
+            format!("SRSV1 {}x{} timescale={}", width, height, track.timescale)
+        }
+        _ => format!(
+            "timescale={} config={} bytes",
+            track.timescale,
+            track.config.len()
+        ),
     }
 }
 
@@ -379,9 +449,21 @@ fn encode_input_to_native(input: &Path, output: &Path) -> Result<()> {
         Some("srsa") => encode_raw_audio(input, output),
         Some("528") | Some("srsm") => {
             let stem = output.with_extension("");
-            let video_path = stem.with_extension("srsv");
-            encode_raw_video(input, &video_path)?;
-            mux_elementary_streams(&stem, output)
+            let video_srsv2 = stem.with_extension("srsv2");
+            let video_srsv = stem.with_extension("srsv");
+            if video_srsv2.exists() {
+                if video_srsv.exists() {
+                    return Err(anyhow!(
+                        "ambiguous elementary video: remove {} or {}",
+                        video_srsv2.display(),
+                        video_srsv.display()
+                    ));
+                }
+                mux_elementary_streams(&stem, output)
+            } else {
+                encode_raw_video(input, &video_srsv)?;
+                mux_elementary_streams(&stem, output)
+            }
         }
         _ => Err(anyhow!(
             "unsupported output extension; expected .528 (primary), legacy .srsm, .srsv, or .srsa"
@@ -392,10 +474,11 @@ fn encode_input_to_native(input: &Path, output: &Path) -> Result<()> {
 fn decode_native_to_raw(input: &Path, output: &Path) -> Result<()> {
     match extension(input) {
         Some("srsv") => decode_video_to_raw(input, output),
+        Some("srsv2") => decode_srsv2_video_to_raw(input, output),
         Some("srsa") => decode_audio_to_pcm(input, output),
         Some("528") | Some("srsm") => demux_container_to_elementary(input, output),
         _ => Err(anyhow!(
-            "unsupported input extension; expected .528 (primary), legacy .srsm, .srsv, or .srsa"
+            "unsupported input extension; expected .528 (primary), legacy .srsm, .srsv, .srsv2, or .srsa"
         )),
     }
 }
@@ -450,6 +533,32 @@ fn decode_video_to_raw(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+fn append_plane_tight(out: &mut Vec<u8>, plane: &libsrs_video::VideoPlane<u8>) {
+    for row in 0..plane.height as usize {
+        out.extend_from_slice(plane.row(row));
+    }
+}
+
+/// Concatenates Y then U then V planes per frame (YUV420p8), tight rows.
+fn decode_srsv2_video_to_raw(input: &Path, output: &Path) -> Result<()> {
+    let file = File::open(input).with_context(|| format!("open {}", input.display()))?;
+    let mut reader = VideoStreamReaderV2::new(BufReader::new(file))?;
+    let seq = reader.seq.clone();
+    let mut out = Vec::new();
+    while let Some((_idx, payload)) = reader
+        .read_next_payload()
+        .map_err(|e| anyhow!("SRSV2 elementary read: {}", e))?
+    {
+        let dec = decode_yuv420_intra_payload(&seq, &payload)
+            .map_err(|e| anyhow!("SRSV2 decode: {}", e))?;
+        append_plane_tight(&mut out, &dec.yuv.y);
+        append_plane_tight(&mut out, &dec.yuv.u);
+        append_plane_tight(&mut out, &dec.yuv.v);
+    }
+    std::fs::write(output, out).with_context(|| format!("write {}", output.display()))?;
+    Ok(())
+}
+
 fn decode_audio_to_pcm(input: &Path, output: &Path) -> Result<()> {
     let file = File::open(input).with_context(|| format!("open {}", input.display()))?;
     let mut reader = AudioStreamReader::new(BufReader::new(file))?;
@@ -464,6 +573,11 @@ fn decode_audio_to_pcm(input: &Path, output: &Path) -> Result<()> {
 }
 
 fn mux_elementary_streams(input: &Path, output: &Path) -> Result<()> {
+    let video_srsv2 = if extension(input) == Some("srsv2") {
+        input.to_path_buf()
+    } else {
+        input.with_extension("srsv2")
+    };
     let video_path = if extension(input) == Some("srsv") {
         input.to_path_buf()
     } else {
@@ -474,16 +588,37 @@ fn mux_elementary_streams(input: &Path, output: &Path) -> Result<()> {
     } else {
         input.with_extension("srsa")
     };
-    if !video_path.exists() && !audio_path.exists() {
+    if video_srsv2.exists() && video_path.exists() {
         return Err(anyhow!(
-            "no input streams found; expected {} and/or {}",
+            "ambiguous elementary video: remove {} or {}",
+            video_srsv2.display(),
+            video_path.display()
+        ));
+    }
+    if !video_srsv2.exists() && !video_path.exists() && !audio_path.exists() {
+        return Err(anyhow!(
+            "no input streams found; expected {}, {}, and/or {}",
+            video_srsv2.display(),
             video_path.display(),
             audio_path.display()
         ));
     }
 
     let mut tracks = Vec::new();
-    if video_path.exists() {
+    if video_srsv2.exists() {
+        let file = File::open(&video_srsv2)?;
+        let reader = VideoStreamReaderV2::new(BufReader::new(file))
+            .map_err(|e| anyhow!("SRSV2 elementary: {}", e))?;
+        let cfg = encode_sequence_header_v2(&reader.seq);
+        tracks.push(TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg.to_vec(),
+        });
+    } else if video_path.exists() {
         let file = File::open(&video_path)?;
         let reader = VideoStreamReader::new(BufReader::new(file))?;
         let mut config = Vec::new();
@@ -518,7 +653,20 @@ fn mux_elementary_streams(input: &Path, output: &Path) -> Result<()> {
     let header = FileHeader::new(u16::try_from(tracks.len())?, 8);
     let mut mux = MuxWriter::new(out_file, header, tracks)?;
 
-    if video_path.exists() {
+    if video_srsv2.exists() {
+        let file = File::open(&video_srsv2)?;
+        let mut reader = VideoStreamReaderV2::new(BufReader::new(file))
+            .map_err(|e| anyhow!("SRSV2 elementary: {}", e))?;
+        let mut pts = 0_u64;
+        while let Some((frame_index, payload)) = reader
+            .read_next_payload()
+            .map_err(|e| anyhow!("SRSV2 read frame: {}", e))?
+        {
+            mux.write_packet(1, pts, pts, true, &payload)?;
+            let _ = frame_index;
+            pts = pts.saturating_add(3_000);
+        }
+    } else if video_path.exists() {
         let file = File::open(&video_path)?;
         let mut reader = VideoStreamReader::new(BufReader::new(file))?;
         let mut pts = 0_u64;
@@ -545,39 +693,67 @@ fn mux_elementary_streams(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+enum DemuxVideoSink {
+    V1 {
+        writer: VideoStreamWriter<File>,
+        width: u32,
+        height: u32,
+    },
+    V2 {
+        writer: VideoStreamWriterV2<File>,
+    },
+}
+
 fn demux_container_to_elementary(input: &Path, output_stem: &Path) -> Result<()> {
     let in_file = File::open(input).with_context(|| format!("open {}", input.display()))?;
     let mut demux = DemuxReader::open(BufReader::new(in_file))?;
     let tracks = demux.tracks().to_vec();
 
-    let mut video_writer: Option<(VideoStreamWriter<File>, u32, u32)> = None;
+    let mut video_writer: Option<DemuxVideoSink> = None;
     let mut audio_writer: Option<(AudioStreamWriter<File>, u32)> = None;
 
     for track in &tracks {
         match track.kind {
-            TrackKind::Video => {
-                if track.config.len() < 8 {
-                    return Err(anyhow!("video track config is too short"));
+            TrackKind::Video => match track.codec_id {
+                1 => {
+                    if track.config.len() < 8 {
+                        return Err(anyhow!("video track config is too short"));
+                    }
+                    let width = u32::from_le_bytes([
+                        track.config[0],
+                        track.config[1],
+                        track.config[2],
+                        track.config[3],
+                    ]);
+                    let height = u32::from_le_bytes([
+                        track.config[4],
+                        track.config[5],
+                        track.config[6],
+                        track.config[7],
+                    ]);
+                    let path = output_stem.with_extension("srsv");
+                    video_writer = Some(DemuxVideoSink::V1 {
+                        writer: VideoStreamWriter::new(File::create(path)?, width, height)?,
+                        width,
+                        height,
+                    });
                 }
-                let width = u32::from_le_bytes([
-                    track.config[0],
-                    track.config[1],
-                    track.config[2],
-                    track.config[3],
-                ]);
-                let height = u32::from_le_bytes([
-                    track.config[4],
-                    track.config[5],
-                    track.config[6],
-                    track.config[7],
-                ]);
-                let path = output_stem.with_extension("srsv");
-                video_writer = Some((
-                    VideoStreamWriter::new(File::create(path)?, width, height)?,
-                    width,
-                    height,
-                ));
-            }
+                3 => {
+                    if track.config.len() < SEQUENCE_HEADER_BYTES {
+                        return Err(anyhow!("SRSV2 video track config is too short"));
+                    }
+                    let seq = decode_sequence_header_v2(&track.config[..SEQUENCE_HEADER_BYTES])
+                        .map_err(|e| anyhow!("SRSV2 sequence header: {}", e))?;
+                    let path = output_stem.with_extension("srsv2");
+                    video_writer = Some(DemuxVideoSink::V2 {
+                        writer: VideoStreamWriterV2::new(File::create(path)?, &seq)
+                            .map_err(|e| anyhow!("SRSV2 writer: {}", e))?,
+                    });
+                }
+                other => {
+                    return Err(anyhow!("unsupported video codec_id {} for demux", other));
+                }
+            },
             TrackKind::Audio => {
                 if track.config.len() < 5 {
                     return Err(anyhow!("audio track config is too short"));
@@ -603,15 +779,27 @@ fn demux_container_to_elementary(input: &Path, output_stem: &Path) -> Result<()>
     demux.reset_to_data_start()?;
     while let Some(pkt) = demux.next_packet()? {
         if pkt.packet.header.track_id == 1 {
-            if let Some((writer, width, height)) = video_writer.as_mut() {
-                let frame = libsrs_video::decode_frame(
-                    *width,
-                    *height,
-                    pkt.packet.header.sequence as u32,
-                    FrameType::I,
-                    &pkt.packet.payload,
-                )?;
-                let _ = writer.write_frame(&frame)?;
+            match video_writer.as_mut() {
+                Some(DemuxVideoSink::V1 {
+                    writer,
+                    width,
+                    height,
+                }) => {
+                    let frame = libsrs_video::decode_frame(
+                        *width,
+                        *height,
+                        pkt.packet.header.sequence as u32,
+                        FrameType::I,
+                        &pkt.packet.payload,
+                    )?;
+                    let _ = writer.write_frame(&frame)?;
+                }
+                Some(DemuxVideoSink::V2 { writer }) => {
+                    writer
+                        .write_frame_payload(pkt.packet.header.sequence as u32, &pkt.packet.payload)
+                        .map_err(|e| anyhow!("SRSV2 write frame: {}", e))?;
+                }
+                None => {}
             }
         } else if pkt.packet.header.track_id == 2 {
             if let Some((writer, sample_rate)) = audio_writer.as_mut() {

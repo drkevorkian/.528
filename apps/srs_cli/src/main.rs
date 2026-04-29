@@ -1,6 +1,7 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use libsrs_app_config::SrsConfig;
 use libsrs_app_services::{
@@ -25,6 +26,21 @@ enum Commands {
     Encode {
         input: PathBuf,
         output: PathBuf,
+        /// `srsv1` (legacy grayscale), or `srsv2` (YUV420 intra).
+        #[arg(long, default_value = "srsv1")]
+        codec: String,
+        #[arg(long)]
+        width: Option<u32>,
+        #[arg(long)]
+        height: Option<u32>,
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
+        #[arg(long, default_value = "rgba8")]
+        pix_fmt: String,
+        #[arg(long, default_value = "main")]
+        profile: String,
+        #[arg(long, default_value_t = 28)]
+        quality: u8,
     },
     Decode {
         input: PathBuf,
@@ -40,6 +56,8 @@ enum Commands {
     },
     Analyze {
         input: PathBuf,
+        #[arg(long, default_value_t = false)]
+        dump_codec: bool,
     },
     Codecs,
     Play {
@@ -78,8 +96,15 @@ fn main() -> Result<()> {
     }
 
     match cli.command {
-        Commands::Analyze { input } => {
-            print_inspection(&services.inspect_media(&input)?);
+        Commands::Analyze { input, dump_codec } => {
+            let inspection = services.inspect_media(&input)?;
+            print_inspection(&inspection);
+            if dump_codec {
+                println!("--- dump-codec ---");
+                for t in &inspection.tracks {
+                    println!("track {}: codec={} detail={}", t.id, t.codec, t.detail);
+                }
+            }
         }
         Commands::Codecs => {
             println!("Royalty-free codecs allowed for playback/conversion:");
@@ -105,10 +130,57 @@ fn main() -> Result<()> {
                 decode_only,
             )?;
         }
-        Commands::Encode { input, output } => {
+        Commands::Encode {
+            input,
+            output,
+            codec,
+            width,
+            height,
+            fps: _fps,
+            pix_fmt,
+            profile,
+            quality,
+        } => {
             let snapshot = licensing.refresh_entitlement("srs-cli", env!("CARGO_PKG_VERSION"));
             let claims = require_editor_claims(&snapshot)?;
-            services.encode_input_to_native(&input, &output, claims)?;
+            match codec.as_str() {
+                "srsv1" | "srsv" | "native" => {
+                    services.encode_input_to_native(&input, &output, claims)?;
+                }
+                "srsv2" => {
+                    let w =
+                        width.ok_or_else(|| anyhow!("--width is required for --codec srsv2"))?;
+                    let h =
+                        height.ok_or_else(|| anyhow!("--height is required for --codec srsv2"))?;
+                    let srsv2_out = match output
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.to_ascii_lowercase())
+                    {
+                        Some(ext) if ext == "528" || ext == "srsm" => {
+                            output.with_extension("srsv2")
+                        }
+                        Some(ext) if ext == "srsv2" => output.clone(),
+                        _ => {
+                            return Err(anyhow!(
+                                "SRSV2 encode: output must end in .srsv2 or .528 / .srsm, got {}",
+                                output.display()
+                            ));
+                        }
+                    };
+                    encode_srsv2_elementary_file(
+                        &input, &srsv2_out, w, h, &pix_fmt, &profile, quality,
+                    )?;
+                    if matches!(
+                        output.extension().and_then(|e| e.to_str()),
+                        Some("528" | "srsm")
+                    ) {
+                        let stem = output.with_extension("");
+                        services.mux_elementary_streams(&stem, &output, claims)?;
+                    }
+                }
+                other => return Err(anyhow!("unknown --codec {other}")),
+            }
             println!("encoded {} -> {}", input.display(), output.display());
         }
         Commands::Decode { input, output } => {
@@ -278,6 +350,127 @@ fn run_play_command(
         session.decoded_audio_chunks,
         input.display()
     );
+    Ok(())
+}
+
+fn rgba_to_rgb888(buf: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w.saturating_mul(h).saturating_mul(3));
+    for i in 0..w.saturating_mul(h) {
+        let j = i.saturating_mul(4);
+        out.extend_from_slice(&buf[j..j + 3]);
+    }
+    out
+}
+
+fn bgra_to_rgb888(buf: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(w.saturating_mul(h).saturating_mul(3));
+    for i in 0..w.saturating_mul(h) {
+        let j = i.saturating_mul(4);
+        out.push(buf[j + 2]);
+        out.push(buf[j + 1]);
+        out.push(buf[j]);
+    }
+    out
+}
+
+/// One-frame SRSV2 intra elementary stream (`.srsv2`).
+fn encode_srsv2_elementary_file(
+    input: &Path,
+    srsv2_out: &Path,
+    width: u32,
+    height: u32,
+    pix_fmt: &str,
+    profile: &str,
+    quality: u8,
+) -> Result<()> {
+    use libsrs_video::{
+        encode_yuv420_intra_payload, rgb888_full_to_yuv420_bt709, ChromaSiting, ColorPrimaries,
+        ColorRange, MatrixCoefficients, PixelFormat, SrsVideoProfile, TransferFunction,
+        VideoSequenceHeaderV2, VideoStreamWriterV2,
+    };
+
+    let raw = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    let profile_e = match profile.to_ascii_lowercase().as_str() {
+        "baseline" => SrsVideoProfile::Baseline,
+        "main" => SrsVideoProfile::Main,
+        "pro" => SrsVideoProfile::Pro,
+        "lossless" => SrsVideoProfile::Lossless,
+        "screen" => SrsVideoProfile::Screen,
+        _ => return Err(anyhow!("unknown --profile {profile}")),
+    };
+    let w = width as usize;
+    let h = height as usize;
+    let rgb: Vec<u8> = match pix_fmt.to_ascii_lowercase().as_str() {
+        "rgb8" => {
+            let need = w
+                .checked_mul(h)
+                .and_then(|x| x.checked_mul(3))
+                .ok_or_else(|| anyhow!("dimension overflow"))?;
+            if raw.len() < need {
+                return Err(anyhow!(
+                    "input size {} < expected {} bytes for rgb8",
+                    raw.len(),
+                    need
+                ));
+            }
+            raw[..need].to_vec()
+        }
+        "rgba8" => {
+            let need = w
+                .checked_mul(h)
+                .and_then(|x| x.checked_mul(4))
+                .ok_or_else(|| anyhow!("dimension overflow"))?;
+            if raw.len() < need {
+                return Err(anyhow!(
+                    "input size {} < expected {} bytes for rgba8",
+                    raw.len(),
+                    need
+                ));
+            }
+            rgba_to_rgb888(&raw[..need], w, h)
+        }
+        "bgra8" => {
+            let need = w
+                .checked_mul(h)
+                .and_then(|x| x.checked_mul(4))
+                .ok_or_else(|| anyhow!("dimension overflow"))?;
+            if raw.len() < need {
+                return Err(anyhow!(
+                    "input size {} < expected {} bytes for bgra8",
+                    raw.len(),
+                    need
+                ));
+            }
+            bgra_to_rgb888(&raw[..need], w, h)
+        }
+        _ => {
+            return Err(anyhow!(
+                "unsupported --pix-fmt {pix_fmt} for srsv2 (use rgb8, rgba8, bgra8)"
+            ));
+        }
+    };
+    let seq = VideoSequenceHeaderV2 {
+        width,
+        height,
+        profile: profile_e,
+        pixel_format: PixelFormat::Yuv420p8,
+        color_primaries: ColorPrimaries::Bt709,
+        transfer: TransferFunction::Sdr,
+        matrix: MatrixCoefficients::Bt709,
+        chroma_siting: ChromaSiting::Center,
+        range: ColorRange::Limited,
+        disable_loop_filter: true,
+        max_ref_frames: 0,
+    };
+    let yuv = rgb888_full_to_yuv420_bt709(&rgb, width, height, ColorRange::Limited)
+        .map_err(|e| anyhow!("color convert: {e}"))?;
+    let qp = quality.clamp(1, 51);
+    let payload =
+        encode_yuv420_intra_payload(&seq, &yuv, 0, qp).map_err(|e| anyhow!("encode: {e}"))?;
+    let f = File::create(srsv2_out).with_context(|| format!("create {}", srsv2_out.display()))?;
+    let mut wr = VideoStreamWriterV2::new(f, &seq).map_err(|e| anyhow!("srsv2 writer: {e}"))?;
+    wr.write_frame_payload(0, &payload)
+        .map_err(|e| anyhow!("write frame: {e}"))?;
     Ok(())
 }
 

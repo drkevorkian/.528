@@ -2652,6 +2652,8 @@ name = "libsrs_video"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "libsrs_bitio",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

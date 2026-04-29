@@ -14,8 +14,8 @@ libsrs_app_config = { path = "../../crates/libsrs_app_config" }
 libsrs_app_services = { path = "../../crates/libsrs_app_services" }
 libsrs_licensing_client = { path = "../../crates/libsrs_licensing_client" }
 libsrs_licensing_proto = { path = "../../crates/libsrs_licensing_proto" }
+libsrs_video = { path = "../../crates/libsrs_video" }
 
 [dev-dependencies]
 libsrs_container = { path = "../../crates/libsrs_container" }
 libsrs_mux = { path = "../../crates/libsrs_mux" }
-libsrs_video = { path = "../../crates/libsrs_video" }

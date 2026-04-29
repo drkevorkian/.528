@@ -22,6 +22,8 @@ pub enum StreamRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CodecType {
     NativeSrsVideo,
+    /// SRSV2 modern intra/inter codec path (distinct from legacy grayscale SRSV1).
+    NativeSrsVideoV2,
     NativeSrsAudio,
     Aac,
     Opus,
@@ -43,6 +45,7 @@ impl CodecType {
         matches!(
             self,
             Self::NativeSrsVideo
+                | Self::NativeSrsVideoV2
                 | Self::NativeSrsAudio
                 | Self::Opus
                 | Self::Vorbis
@@ -63,6 +66,7 @@ impl CodecType {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::NativeSrsVideo => "SRS Native Video",
+            Self::NativeSrsVideoV2 => "SRS Native Video V2 (SRSV2)",
             Self::NativeSrsAudio => "SRS Native Audio",
             Self::Aac => "AAC",
             Self::Opus => "Opus",
@@ -83,6 +87,7 @@ impl CodecType {
     pub fn royalty_free_codecs() -> Vec<Self> {
         vec![
             Self::NativeSrsVideo,
+            Self::NativeSrsVideoV2,
             Self::NativeSrsAudio,
             Self::Av1,
             Self::Vp9,

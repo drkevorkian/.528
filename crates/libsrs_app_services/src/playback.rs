@@ -17,7 +17,10 @@ use crc32c::crc32c;
 use libsrs_audio::{decode_frame_with_stream_version, AudioFrame, STREAM_VERSION_V2};
 use libsrs_container::{PacketFlags, TrackDescriptor, TrackKind};
 use libsrs_demux::{DemuxReader, DemuxedPacket};
-use libsrs_video::{decode_frame, FrameType, VideoFrame};
+use libsrs_video::{
+    decode_frame, decode_sequence_header_v2, decode_yuv420_intra_payload, FrameType, VideoFrame,
+    VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
+};
 use thiserror::Error;
 
 /// Hard cap on per-side video dimension (hostile `.528`).
@@ -140,29 +143,45 @@ fn validate_video_config(track: &TrackDescriptor) -> Result<(u32, u32), Playback
     if track.kind != TrackKind::Video {
         return Err(PlaybackError::InvalidTrack("not a video track".to_string()));
     }
-    if track.codec_id != 1 {
-        return Err(PlaybackError::UnsupportedCodec {
+    match track.codec_id {
+        1 => {
+            if track.config.len() < 8 {
+                return Err(PlaybackError::InvalidTrack(
+                    "SRSV1 video track config must be at least 8 bytes (width, height)".to_string(),
+                ));
+            }
+            let w = u32::from_le_bytes([
+                track.config[0],
+                track.config[1],
+                track.config[2],
+                track.config[3],
+            ]);
+            let h = u32::from_le_bytes([
+                track.config[4],
+                track.config[5],
+                track.config[6],
+                track.config[7],
+            ]);
+            validate_video_dimensions(w, h)
+        }
+        3 => {
+            if track.config.len() < SEQUENCE_HEADER_BYTES {
+                return Err(PlaybackError::InvalidTrack(
+                    "SRSV2 video track config must embed full sequence header".to_string(),
+                ));
+            }
+            let seq = decode_sequence_header_v2(&track.config[..SEQUENCE_HEADER_BYTES])
+                .map_err(|e| PlaybackError::Malformed(format!("SRSV2 sequence header: {e}")))?;
+            validate_video_dimensions(seq.width, seq.height)
+        }
+        _ => Err(PlaybackError::UnsupportedCodec {
             track_id: track.track_id,
             codec_id: track.codec_id,
-        });
+        }),
     }
-    if track.config.len() < 8 {
-        return Err(PlaybackError::InvalidTrack(
-            "video track config must be at least 8 bytes (width, height)".to_string(),
-        ));
-    }
-    let w = u32::from_le_bytes([
-        track.config[0],
-        track.config[1],
-        track.config[2],
-        track.config[3],
-    ]);
-    let h = u32::from_le_bytes([
-        track.config[4],
-        track.config[5],
-        track.config[6],
-        track.config[7],
-    ]);
+}
+
+fn validate_video_dimensions(w: u32, h: u32) -> Result<(u32, u32), PlaybackError> {
     if w == 0 || h == 0 {
         return Err(PlaybackError::Malformed(
             "video dimensions must be non-zero".to_string(),
@@ -262,6 +281,8 @@ pub struct PlaybackSession {
     pub decoded_video_frames: u64,
     pub decoded_audio_chunks: u64,
     last_error: Option<String>,
+    /// Parsed SRSV2 sequence header when primary video uses `codec_id == 3`.
+    video_v2_seq: Option<VideoSequenceHeaderV2>,
 }
 
 impl std::fmt::Debug for PlaybackSession {
@@ -301,7 +322,7 @@ impl PlaybackSession {
 
         let primary_video = tracks
             .iter()
-            .filter(|t| t.kind == TrackKind::Video && t.codec_id == 1)
+            .filter(|t| t.kind == TrackKind::Video && (t.codec_id == 1 || t.codec_id == 3))
             .min_by_key(|t| t.track_id)
             .map(|t| PlaybackTrackInfo {
                 mux_track_id: t.track_id,
@@ -335,6 +356,16 @@ impl PlaybackSession {
             .transpose()?
             .unwrap_or((0, 0));
 
+        let video_v2_seq = primary_video
+            .as_ref()
+            .filter(|p| p.codec_id == 3)
+            .and_then(|pv| tracks.iter().find(|t| t.track_id == pv.mux_track_id))
+            .map(|t| {
+                decode_sequence_header_v2(&t.config[..SEQUENCE_HEADER_BYTES])
+                    .map_err(|e| PlaybackError::Malformed(format!("SRSV2 sequence header: {e}")))
+            })
+            .transpose()?;
+
         let ts_for_duration = primary_video
             .as_ref()
             .map(|v| v.timescale_hz)
@@ -367,6 +398,7 @@ impl PlaybackSession {
             decoded_video_frames: 0,
             decoded_audio_chunks: 0,
             last_error: None,
+            video_v2_seq,
         })
     }
 
@@ -562,29 +594,63 @@ impl PlaybackSession {
                 "video packet flagged corrupt".to_string(),
             ));
         }
-        let seq = u32::try_from(p.packet.header.sequence)
-            .map_err(|_| PlaybackError::Malformed("video sequence number too large".to_string()))?;
-        let vf: VideoFrame = decode_frame(
-            self.video_w,
-            self.video_h,
-            seq,
-            FrameType::I,
-            &p.packet.payload,
-        )
-        .map_err(|e| PlaybackError::VideoDecode(e.to_string()))?;
-        self.update_position_from_pts(p.packet.header.pts, timescale);
-        self.decoded_video_frames += 1;
-        let payload_crc32c = crc32c(&p.packet.payload);
-        Ok(Some(DecodedVideoFrame {
-            width: vf.width,
-            height: vf.height,
-            frame_index: vf.frame_index,
-            pts_ticks: p.packet.header.pts,
-            dts_ticks: p.packet.header.dts,
-            timescale_hz: timescale,
-            payload_crc32c,
-            gray8: vf.data,
-        }))
+        let vid = self.primary_video.as_ref().ok_or_else(|| {
+            PlaybackError::InvalidTrack("internal: decode_video_packet without video".to_string())
+        })?;
+        match vid.codec_id {
+            1 => {
+                let seq = u32::try_from(p.packet.header.sequence).map_err(|_| {
+                    PlaybackError::Malformed("video sequence number too large".to_string())
+                })?;
+                let vf: VideoFrame = decode_frame(
+                    self.video_w,
+                    self.video_h,
+                    seq,
+                    FrameType::I,
+                    &p.packet.payload,
+                )
+                .map_err(|e| PlaybackError::VideoDecode(e.to_string()))?;
+                self.update_position_from_pts(p.packet.header.pts, timescale);
+                self.decoded_video_frames += 1;
+                let payload_crc32c = crc32c(&p.packet.payload);
+                Ok(Some(DecodedVideoFrame {
+                    width: vf.width,
+                    height: vf.height,
+                    frame_index: vf.frame_index,
+                    pts_ticks: p.packet.header.pts,
+                    dts_ticks: p.packet.header.dts,
+                    timescale_hz: timescale,
+                    payload_crc32c,
+                    gray8: vf.data,
+                }))
+            }
+            3 => {
+                let seq = self.video_v2_seq.as_ref().ok_or_else(|| {
+                    PlaybackError::Malformed(
+                        "SRSV2 sequence header missing from session".to_string(),
+                    )
+                })?;
+                let dec = decode_yuv420_intra_payload(seq, &p.packet.payload)
+                    .map_err(|e| PlaybackError::VideoDecode(format!("srsv2: {e}")))?;
+                self.update_position_from_pts(p.packet.header.pts, timescale);
+                self.decoded_video_frames += 1;
+                let payload_crc32c = crc32c(&p.packet.payload);
+                Ok(Some(DecodedVideoFrame {
+                    width: dec.width,
+                    height: dec.height,
+                    frame_index: dec.frame_index,
+                    pts_ticks: p.packet.header.pts,
+                    dts_ticks: p.packet.header.dts,
+                    timescale_hz: timescale,
+                    payload_crc32c,
+                    gray8: dec.luma_gray_bytes(),
+                }))
+            }
+            _ => Err(PlaybackError::UnsupportedCodec {
+                track_id: vid.mux_track_id,
+                codec_id: vid.codec_id,
+            }),
+        }
     }
 
     fn decode_audio_packet(
