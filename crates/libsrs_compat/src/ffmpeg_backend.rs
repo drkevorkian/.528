@@ -23,6 +23,7 @@ impl MediaProbe for FfmpegProbe {
                 let params = stream.parameters();
                 let (audio_sample_rate, audio_channels) =
                     audio_params_from_ffmpeg_parameters(&params);
+                let (video_width, video_height) = video_params_from_ffmpeg_parameters(&params);
                 CompatTrackInfo {
                     id: TrackId(idx as u32),
                     kind: map_media_kind(params.medium()),
@@ -35,6 +36,8 @@ impl MediaProbe for FfmpegProbe {
                     language: stream.metadata().get("language").map(ToOwned::to_owned),
                     audio_sample_rate,
                     audio_channels,
+                    video_width,
+                    video_height,
                 }
             })
             .collect();
@@ -130,6 +133,25 @@ impl MediaIngestor for FfmpegIngestor {
     }
 }
 
+fn video_params_from_ffmpeg_parameters(
+    par: &ffmpeg::codec::Parameters,
+) -> (Option<u32>, Option<u32>) {
+    if par.medium() != ffmpeg::media::Type::Video {
+        return (None, None);
+    }
+    let (width, height) = unsafe {
+        let p = par.as_ptr();
+        ((*p).width, (*p).height)
+    };
+    let w = if width > 0 { Some(width as u32) } else { None };
+    let h = if height > 0 {
+        Some(height as u32)
+    } else {
+        None
+    };
+    (w, h)
+}
+
 fn audio_params_from_ffmpeg_parameters(
     par: &ffmpeg::codec::Parameters,
 ) -> (Option<u32>, Option<u8>) {
@@ -149,7 +171,11 @@ fn audio_params_from_ffmpeg_parameters(
     };
     let ch = if channels > 0 {
         let c = channels as u8;
-        if c == 1 || c == 2 { Some(c) } else { None }
+        if c == 1 || c == 2 {
+            Some(c)
+        } else {
+            None
+        }
     } else {
         None
     };

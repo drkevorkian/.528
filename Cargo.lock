@@ -2639,8 +2639,10 @@ name = "libsrs_pipeline"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libsrs_audio",
  "libsrs_compat",
  "libsrs_contract",
+ "libsrs_video",
  "tracing",
 ]
 
@@ -4387,8 +4389,11 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "libsrs_bitio",
+ "libsrs_container",
  "libsrs_contract",
+ "libsrs_mux",
  "libsrs_pipeline",
+ "libsrs_video",
 ]
 
 [[package]]
@@ -4399,8 +4404,11 @@ dependencies = [
  "clap",
  "libsrs_app_config",
  "libsrs_app_services",
+ "libsrs_container",
  "libsrs_licensing_client",
  "libsrs_licensing_proto",
+ "libsrs_mux",
+ "libsrs_video",
  "tracing",
  "tracing-subscriber",
 ]

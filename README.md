@@ -18,9 +18,21 @@ The workspace is intentionally scaffolded to remain buildable while codec/contai
 
 - **Multiplexed native files** should use the **`.528`** extension (v2 `SRS528\0\0`); **`.srsm`** is still accepted for the same bitstream (including legacy v1 headers—see `docs/528_container_format.md`).
 - **Analyze / mux / demux** operate on these paths through `libsrs_demux` / `libsrs_mux`.
-- **Import** (`srs_cli` import, `libsrs_app_services`) pulls packets from **`MediaIngestor`**, uses **`MediaProbe`** metadata (including **audio sample rate and channel count** when known), and writes a native container using **real** `libsrs_video` / `libsrs_audio` frame encoders—not a fake fixed-grid transcoder.
+- **Import** (`srs_cli` import, `libsrs_app_services`) ingests packets, **decodes** native SRS video/audio to normalized frames (`MediaDecoder`), then **re-encodes** into `.528` via `NativeEncoderSink`. **Non-native** paths require **`libsrs_compat` with `ffmpeg`**; the stub backend does not fabricate video.
 
 Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_format.md` (index), and `docs/528_container_format.md`.
+
+## Implementation status
+
+| Area | Status | Notes |
+|------|--------|--------|
+| `.528` / `.srsm` mux & demux | **Working** | v2 primary extension; legacy v1 read |
+| `.srsv` / `.srsa` elementary | **Working** | Internal elementary paths; probe reports dimensions / audio layout |
+| Native import / transcode (stub backend) | **Working** | Decode → normalize → re-encode; no synthetic foreign A/V |
+| Foreign ingest (FFmpeg) | **Partial** | Requires `libsrs_compat` feature `ffmpeg`; stub fails closed without it |
+| Normalized frame traits (`DecodedVideoFrame`, `DecodedAudioFrame`, `MediaDecoder`, `NativeEncoderSink`, `GpuEncodeDispatch`) | **Working** / **Prototype** | Traits and CPU sink are live; `GpuEncodeDispatch` is a stub interface |
+| Hardware (GPU) video encode | **Planned** | No kernels or device bindings yet |
+| Player decode / render | **Prototype** | UI shell; decode loop evolving per player docs |
 
 ## Build
 
@@ -84,7 +96,7 @@ Useful modes:
 ```bash
 bash tools/run_unix.sh server
 bash tools/run_unix.sh --admin-ui
-bash tools/run_unix.sh cli analyze sample.foreign
+bash tools/run_unix.sh cli analyze path/to/file.528
 bash tools/run_unix.sh cli --no-server -- analyze path/to/file.528
 ```
 

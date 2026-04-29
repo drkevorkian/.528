@@ -1,0 +1,502 @@
+//! Normalized import: `MediaDecoder` → `NativeEncoderSink` (mux + native codec frames).
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::Path;
+
+use anyhow::{anyhow, Context, Result};
+use libsrs_audio::{
+    decode_frame_with_stream_version, encode_frame as audio_encode_frame, AudioFrame,
+    STREAM_VERSION_V2,
+};
+use libsrs_compat::{ProbeResult, SourcePacket};
+use libsrs_container::{FileHeader, TrackDescriptor, TrackKind};
+use libsrs_contract::MediaKind;
+use libsrs_mux::MuxWriter;
+use libsrs_pipeline::{
+    DecodedAudioFrame, DecodedVideoFrame, MediaDecoder, NativeEncoderSink, TranscodePipeline,
+};
+use libsrs_video::{
+    decode_frame as video_decode_frame, encode_frame as video_encode_frame, FrameType, VideoFrame,
+};
+
+pub(crate) fn run_native_import(
+    pipeline: &TranscodePipeline,
+    input: &Path,
+    output: &Path,
+) -> Result<usize> {
+    let probe = pipeline.analyze_source(input)?;
+    let input_ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase());
+
+    let mut ingestor = pipeline.create_ingestor();
+    ingestor.open_path(input)?;
+    let mut packets: Vec<SourcePacket> = Vec::new();
+    while let Some(p) = ingestor.read_packet()? {
+        packets.push(p);
+    }
+    ingestor.close()?;
+    if packets.is_empty() {
+        return Ok(0);
+    }
+    let n = packets.len();
+
+    let (tracks, stream_to_mux) = build_import_mux_tracks(&probe, &packets)?;
+    let video_raw = input_ext.as_deref() == Some("srsv");
+    let audio_raw = input_ext.as_deref() == Some("srsa");
+    let mut decoder = NativeSrsMediaDecoder::from_probe(&probe, video_raw, audio_raw)?;
+    let mut sink = MuxNativeImportSink::new(output, tracks, stream_to_mux)?;
+
+    let video_id = probe
+        .tracks
+        .iter()
+        .find(|t| t.kind == MediaKind::Video)
+        .map(|t| t.id.0);
+    let audio_id = probe
+        .tracks
+        .iter()
+        .find(|t| t.kind == MediaKind::Audio)
+        .map(|t| t.id.0);
+
+    for p in packets {
+        let pkt = p.packet;
+        let stream = pkt.stream_id.0;
+        if Some(stream) == video_id {
+            let frame = decoder.decode_video_packet(&pkt.data)?;
+            let pts = pkt
+                .pts
+                .map(|t| timestamp_to_mux_ticks(t, sink.video_timescale));
+            sink.push_video(&frame, pts)?;
+        } else if Some(stream) == audio_id {
+            let frame = decoder.decode_audio_packet(&pkt.data)?;
+            let pts = pkt
+                .pts
+                .map(|t| timestamp_to_mux_ticks(t, sink.audio_timescale));
+            sink.push_audio(&frame, pts)?;
+        }
+    }
+    sink.finalize_mux()?;
+    Ok(n)
+}
+
+fn timestamp_to_mux_ticks(ts: libsrs_contract::Timestamp, timescale: u32) -> u64 {
+    if ts.timebase.den == 0 {
+        return 0;
+    }
+    let v = (ts.ticks as i128)
+        .saturating_mul(timescale as i128)
+        .saturating_mul(ts.timebase.num as i128)
+        / (ts.timebase.den as i128);
+    v.max(0) as u64
+}
+
+fn build_import_mux_tracks(
+    probe: &ProbeResult,
+    packets: &[SourcePacket],
+) -> Result<(Vec<TrackDescriptor>, HashMap<u32, u16>)> {
+    const DEFAULT_IMPORT_AUDIO_SAMPLE_RATE: u32 = 48_000;
+    const DEFAULT_IMPORT_AUDIO_CHANNELS: u8 = 1;
+
+    let vt = probe.tracks.iter().find(|t| t.kind == MediaKind::Video);
+    let at = probe.tracks.iter().find(|t| t.kind == MediaKind::Audio);
+    if vt.is_none() && at.is_none() {
+        return Err(anyhow!("no muxable audio/video tracks in probe"));
+    }
+
+    let mut stream_to_mux = HashMap::new();
+    let mut descriptors = Vec::new();
+    let mut next_mux_id = 1u16;
+
+    if let Some(v) = vt {
+        if !packets.iter().any(|p| p.packet.stream_id.0 == v.id.0) {
+            return Err(anyhow!("no video packets for import"));
+        }
+        let width = v
+            .video_width
+            .filter(|&x| x > 0)
+            .ok_or_else(|| anyhow!("probe missing native video width"))?;
+        let height = v
+            .video_height
+            .filter(|&x| x > 0)
+            .ok_or_else(|| anyhow!("probe missing native video height"))?;
+        let mut config = Vec::new();
+        config.extend_from_slice(&width.to_le_bytes());
+        config.extend_from_slice(&height.to_le_bytes());
+        descriptors.push(TrackDescriptor {
+            track_id: next_mux_id,
+            kind: TrackKind::Video,
+            codec_id: 1,
+            flags: 0,
+            timescale: 90_000,
+            config,
+        });
+        stream_to_mux.insert(v.id.0, next_mux_id);
+        next_mux_id += 1;
+    }
+
+    if let Some(a) = at {
+        if !packets.iter().any(|p| p.packet.stream_id.0 == a.id.0) {
+            return Err(anyhow!("no audio packets for import"));
+        }
+        let sample_rate = a
+            .audio_sample_rate
+            .filter(|&r| r > 0)
+            .unwrap_or(DEFAULT_IMPORT_AUDIO_SAMPLE_RATE);
+        let channels = a.audio_channels.unwrap_or(DEFAULT_IMPORT_AUDIO_CHANNELS);
+        if channels != 1 && channels != 2 {
+            return Err(anyhow!(
+                "import supports mono or stereo native audio (probe reported {} channels)",
+                channels
+            ));
+        }
+        let mut config = Vec::new();
+        config.extend_from_slice(&sample_rate.to_le_bytes());
+        config.push(channels);
+        descriptors.push(TrackDescriptor {
+            track_id: next_mux_id,
+            kind: TrackKind::Audio,
+            codec_id: 2,
+            flags: 0,
+            timescale: sample_rate,
+            config,
+        });
+        stream_to_mux.insert(a.id.0, next_mux_id);
+    }
+
+    Ok((descriptors, stream_to_mux))
+}
+
+struct NativeSrsMediaDecoder {
+    video_width: u32,
+    video_height: u32,
+    video_payload_is_raw_srsv_elementary: bool,
+    next_video_index: u32,
+    audio_sample_rate: u32,
+    audio_channels: u8,
+    audio_payload_is_raw_pcm_srsa_elementary: bool,
+    next_audio_index: u32,
+}
+
+impl NativeSrsMediaDecoder {
+    fn from_probe(probe: &ProbeResult, video_raw: bool, audio_raw: bool) -> Result<Self> {
+        let v = probe.tracks.iter().find(|t| t.kind == MediaKind::Video);
+        let a = probe.tracks.iter().find(|t| t.kind == MediaKind::Audio);
+
+        let mut video_width = 0u32;
+        let mut video_height = 0u32;
+        if v.is_some() {
+            video_width = v
+                .and_then(|t| t.video_width)
+                .filter(|&x| x > 0)
+                .ok_or_else(|| anyhow!("video track missing width in probe"))?;
+            video_height = v
+                .and_then(|t| t.video_height)
+                .filter(|&x| x > 0)
+                .ok_or_else(|| anyhow!("video track missing height in probe"))?;
+        }
+
+        let mut audio_sample_rate = 48_000u32;
+        let mut audio_channels = 1u8;
+        if a.is_some() {
+            audio_sample_rate = a
+                .and_then(|t| t.audio_sample_rate)
+                .filter(|&r| r > 0)
+                .unwrap_or(48_000);
+            audio_channels = a.and_then(|t| t.audio_channels).unwrap_or(1);
+            if audio_channels != 1 && audio_channels != 2 {
+                return Err(anyhow!(
+                    "native import audio supports mono or stereo (got {})",
+                    audio_channels
+                ));
+            }
+        }
+
+        Ok(Self {
+            video_width,
+            video_height,
+            video_payload_is_raw_srsv_elementary: video_raw,
+            next_video_index: 0,
+            audio_sample_rate,
+            audio_channels,
+            audio_payload_is_raw_pcm_srsa_elementary: audio_raw,
+            next_audio_index: 0,
+        })
+    }
+}
+
+impl MediaDecoder for NativeSrsMediaDecoder {
+    fn decode_video_packet(&mut self, payload: &[u8]) -> Result<VideoFrame> {
+        let idx = self.next_video_index;
+        self.next_video_index = self.next_video_index.wrapping_add(1);
+        if self.video_payload_is_raw_srsv_elementary {
+            let expected = (self.video_width as usize).saturating_mul(self.video_height as usize);
+            if payload.len() != expected {
+                return Err(anyhow!(
+                    "raw video packet length {} != {}x{}",
+                    payload.len(),
+                    self.video_width,
+                    self.video_height
+                ));
+            }
+            Ok(VideoFrame {
+                width: self.video_width,
+                height: self.video_height,
+                frame_index: idx,
+                frame_type: FrameType::I,
+                data: payload.to_vec(),
+            })
+        } else {
+            Ok(video_decode_frame(
+                self.video_width,
+                self.video_height,
+                idx,
+                FrameType::I,
+                payload,
+            )?)
+        }
+    }
+
+    fn decode_audio_packet(&mut self, payload: &[u8]) -> Result<AudioFrame> {
+        let idx = self.next_audio_index;
+        self.next_audio_index = self.next_audio_index.wrapping_add(1);
+        if self.audio_payload_is_raw_pcm_srsa_elementary {
+            let ch = self.audio_channels as usize;
+            if ch == 0 || payload.len() % (2 * ch) != 0 {
+                return Err(anyhow!(
+                    "PCM payload length {} is not a multiple of {} byte frames",
+                    payload.len(),
+                    2 * ch
+                ));
+            }
+            let samples = payload
+                .chunks_exact(2)
+                .map(|c| i16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            Ok(AudioFrame {
+                sample_rate: self.audio_sample_rate,
+                channels: self.audio_channels,
+                frame_index: idx,
+                samples,
+            })
+        } else {
+            Ok(decode_frame_with_stream_version(
+                self.audio_sample_rate,
+                idx,
+                payload,
+                STREAM_VERSION_V2,
+            )?)
+        }
+    }
+}
+
+struct MuxNativeImportSink {
+    mux: Option<MuxWriter<File>>,
+    video_mux_id: Option<u16>,
+    audio_mux_id: Option<u16>,
+    video_timescale: u32,
+    audio_timescale: u32,
+    next_video_pts: u64,
+    next_audio_pts: u64,
+}
+
+impl MuxNativeImportSink {
+    fn new(
+        output: &Path,
+        tracks: Vec<TrackDescriptor>,
+        _stream_to_mux: HashMap<u32, u16>,
+    ) -> Result<Self> {
+        let mut video_mux_id = None;
+        let mut audio_mux_id = None;
+        let mut video_timescale = 90_000u32;
+        let mut audio_timescale = 48_000u32;
+
+        for t in &tracks {
+            match t.kind {
+                TrackKind::Video => {
+                    video_mux_id = Some(t.track_id);
+                    video_timescale = t.timescale;
+                }
+                TrackKind::Audio => {
+                    audio_mux_id = Some(t.track_id);
+                    audio_timescale = t.timescale;
+                }
+                TrackKind::Data
+                | TrackKind::Subtitle
+                | TrackKind::Metadata
+                | TrackKind::Attachment => {}
+            }
+        }
+
+        let mux = MuxWriter::new(
+            File::create(output).with_context(|| format!("create {}", output.display()))?,
+            FileHeader::new(u16::try_from(tracks.len())?, 8),
+            tracks,
+        )?;
+
+        Ok(Self {
+            mux: Some(mux),
+            video_mux_id,
+            audio_mux_id,
+            video_timescale,
+            audio_timescale,
+            next_video_pts: 0,
+            next_audio_pts: 0,
+        })
+    }
+}
+
+impl NativeEncoderSink for MuxNativeImportSink {
+    fn push_video(&mut self, frame: &dyn DecodedVideoFrame, pts_ticks: Option<u64>) -> Result<()> {
+        let mux_id = self
+            .video_mux_id
+            .ok_or_else(|| anyhow!("video track not configured"))?;
+        let mux = self
+            .mux
+            .as_mut()
+            .ok_or_else(|| anyhow!("mux already finalized"))?;
+
+        let vf = VideoFrame {
+            width: frame.width(),
+            height: frame.height(),
+            frame_index: frame.frame_index(),
+            frame_type: frame.frame_type(),
+            data: frame.gray8_pixels().to_vec(),
+        };
+        let payload = video_encode_frame(&vf)?;
+        let pts = pts_ticks.unwrap_or(self.next_video_pts);
+        mux.write_packet(mux_id, pts, pts, true, &payload)?;
+        self.next_video_pts = pts.saturating_add(3_000);
+        Ok(())
+    }
+
+    fn push_audio(&mut self, frame: &dyn DecodedAudioFrame, pts_ticks: Option<u64>) -> Result<()> {
+        let mux_id = self
+            .audio_mux_id
+            .ok_or_else(|| anyhow!("audio track not configured"))?;
+        let mux = self
+            .mux
+            .as_mut()
+            .ok_or_else(|| anyhow!("mux already finalized"))?;
+
+        let af = AudioFrame {
+            sample_rate: frame.sample_rate(),
+            channels: frame.channels(),
+            frame_index: frame.frame_index(),
+            samples: frame.samples_i16_interleaved().to_vec(),
+        };
+        let sample_count = u64::from(af.sample_count_per_channel()?);
+        let payload = audio_encode_frame(&af)?;
+        let pts = pts_ticks.unwrap_or(self.next_audio_pts);
+        mux.write_packet(mux_id, pts, pts, true, &payload)?;
+        self.next_audio_pts = pts.saturating_add(sample_count);
+        Ok(())
+    }
+
+    fn finalize_mux(&mut self) -> Result<()> {
+        if let Some(mux) = self.mux.take() {
+            let _ = mux.finalize()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use libsrs_licensing_proto::{EntitlementClaims, EntitlementStatus, LicensedFeature};
+    use libsrs_mux::MuxWriter;
+    use std::io::Cursor;
+
+    fn editor_claims() -> EntitlementClaims {
+        EntitlementClaims {
+            license_id: "license-1".to_string(),
+            key_id: "key-1".to_string(),
+            features: LicensedFeature::editor_defaults(),
+            status: EntitlementStatus::Active,
+            issued_at_epoch_s: 1,
+            expires_at_epoch_s: 2,
+            device_install_id: "install-1".to_string(),
+            message: "editor".to_string(),
+            replacement_key: None,
+        }
+    }
+
+    /// Import must preserve non-flat video (not an 8×8 stub repeated byte pattern).
+    #[test]
+    fn native_import_roundtrip_retains_video_variance() {
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let src = dir.join(format!("import-src-{nanos}.528"));
+        let dst = dir.join(format!("import-dst-{nanos}.528"));
+
+        let w = 16u32;
+        let h = 16u32;
+        let mut pix_a: Vec<u8> = (0..(w * h)).map(|i| (i * 7) as u8).collect();
+        let mut pix_b: Vec<u8> = (0..(w * h))
+            .map(|i| (i + 41).wrapping_mul(13) as u8)
+            .collect();
+
+        let f0 = VideoFrame {
+            width: w,
+            height: h,
+            frame_index: 0,
+            frame_type: FrameType::I,
+            data: std::mem::take(&mut pix_a),
+        };
+        let f1 = VideoFrame {
+            width: w,
+            height: h,
+            frame_index: 1,
+            frame_type: FrameType::I,
+            data: std::mem::take(&mut pix_b),
+        };
+        let e0 = video_encode_frame(&f0).unwrap();
+        let e1 = video_encode_frame(&f1).unwrap();
+
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 1,
+            flags: 0,
+            timescale: 90_000,
+            config: [w.to_le_bytes(), h.to_le_bytes()].concat(),
+        }];
+        let file = File::create(&src).unwrap();
+        let mut mux = MuxWriter::new(file, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, &e0).unwrap();
+        mux.write_packet(1, 3_000, 3_000, true, &e1).unwrap();
+        mux.finalize().unwrap();
+
+        let svc = crate::AppServices::default();
+        let claims = editor_claims();
+        svc.import_to_native(&src, &dst, &claims).unwrap();
+
+        let out_bytes = std::fs::read(&dst).unwrap();
+        let mut demux = libsrs_demux::DemuxReader::open(Cursor::new(out_bytes)).unwrap();
+        let p0 = demux.next_packet().unwrap().unwrap();
+        let p1 = demux.next_packet().unwrap().unwrap();
+        let d0 =
+            video_decode_frame(w, h, 0, FrameType::I, &p0.packet.payload).expect("decode frame 0");
+        let d1 =
+            video_decode_frame(w, h, 1, FrameType::I, &p1.packet.payload).expect("decode frame 1");
+
+        let min0 = *d0.data.iter().min().unwrap();
+        let max0 = *d0.data.iter().max().unwrap();
+        assert!(
+            max0.saturating_sub(min0) > 10,
+            "frame 0 should not be near-constant placeholder"
+        );
+        assert_ne!(
+            d0.data, d1.data,
+            "successive imported frames must differ (real normalized path)"
+        );
+
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&dst).ok();
+    }
+}

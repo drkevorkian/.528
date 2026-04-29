@@ -1,13 +1,37 @@
 use std::io::Cursor;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use libsrs_audio::{AudioFrame, STREAM_VERSION_V2, decode_frame_with_stream_version};
+use libsrs_audio::{decode_frame_with_stream_version, AudioFrame, STREAM_VERSION_V2};
 use libsrs_container::{FileHeader, TrackDescriptor, TrackKind};
 use libsrs_demux::DemuxReader;
 use libsrs_mux::MuxWriter;
 use libsrs_pipeline::{NoopNativeTranscoder, TranscodePipeline};
 use libsrs_video::{FrameType, VideoFrame};
 use srs_e2e_tests::synthetic_packet;
+
+#[test]
+fn stub_pipeline_rejects_foreign_file_probe_and_ingest() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("srs-foreign-{nanos}.mov"));
+    std::fs::write(&path, b"not real media").unwrap();
+    let pipeline = TranscodePipeline::default();
+    let msg = pipeline
+        .analyze_source(&path)
+        .expect_err("foreign analyze should fail without ffmpeg")
+        .to_string();
+    assert!(
+        msg.contains("ffmpeg") || msg.contains("native"),
+        "expected stub hint, got: {msg}"
+    );
+    let mut ing = pipeline.create_ingestor();
+    ing.open_path(&path)
+        .expect_err("foreign ingest should fail without ffmpeg");
+    std::fs::remove_file(&path).ok();
+}
 
 #[test]
 fn synthetic_contract_packet_shape_is_valid() {
@@ -125,8 +149,12 @@ fn native_video_audio_mux_demux_roundtrip() {
         .next_packet()
         .expect("next packet")
         .expect("audio packet");
-    let decoded_audio =
-        decode_frame_with_stream_version(48_000, 0, &audio_packet.packet.payload, STREAM_VERSION_V2)
-            .expect("decode audio");
+    let decoded_audio = decode_frame_with_stream_version(
+        48_000,
+        0,
+        &audio_packet.packet.payload,
+        STREAM_VERSION_V2,
+    )
+    .expect("decode audio");
     assert_eq!(decoded_audio.samples, audio.samples);
 }

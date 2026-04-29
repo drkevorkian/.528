@@ -23,14 +23,42 @@ database_path = "var/test.sqlite3"
 
 #[test]
 fn analyze_remains_available_without_license_key() {
+    use libsrs_container::{FileHeader, TrackDescriptor, TrackKind};
+    use libsrs_mux::MuxWriter;
+    use libsrs_video::{encode_frame, FrameType, VideoFrame};
+
     let config = write_test_config("analyze");
+    let sample = std::env::temp_dir().join(format!("srs-cli-analyze-{}.528", std::process::id()));
+    let w = 16u32;
+    let video = VideoFrame {
+        width: w,
+        height: w,
+        frame_index: 0,
+        frame_type: FrameType::I,
+        data: vec![0x42; (w * w) as usize],
+    };
+    let enc = encode_frame(&video).expect("encode");
+    let tracks = vec![TrackDescriptor {
+        track_id: 1,
+        kind: TrackKind::Video,
+        codec_id: 1,
+        flags: 0,
+        timescale: 90_000,
+        config: [w.to_le_bytes(), w.to_le_bytes()].concat(),
+    }];
+    let file = fs::File::create(&sample).expect("temp 528");
+    let mut mux = MuxWriter::new(file, FileHeader::new(1, 4), tracks).expect("mux");
+    mux.write_packet(1, 0, 0, true, &enc).expect("pkt");
+    mux.finalize().expect("fin");
+
     let output = Command::new(env!("CARGO_BIN_EXE_srs_cli"))
         .env("SRS_CONFIG_PATH", &config)
         .arg("analyze")
-        .arg("sample.foreign")
+        .arg(&sample)
         .output()
         .expect("run analyze");
     let _ = fs::remove_file(&config);
+    let _ = fs::remove_file(&sample);
 
     assert!(
         output.status.success(),
@@ -38,7 +66,10 @@ fn analyze_remains_available_without_license_key() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("format: foreign") || stdout.contains("foreign format"));
+    assert!(
+        stdout.contains("528-container") || stdout.contains("container"),
+        "unexpected analyze output: {stdout}"
+    );
 }
 
 #[test]

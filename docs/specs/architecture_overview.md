@@ -25,4 +25,4 @@ Application-level policy layers may sit above the media tiers:
 ## Native container and import
 
 - Multiplexed output and round-trips use the **`.528`** extension by default; **`.srsm`** remains a supported legacy name for the same format family (see [`.528` container format](../528_container_format.md)).
-- **Import** normalizes foreign or stub sources through `libsrs_compat` ingest, then muxes with **`libsrs_video`** / **`libsrs_audio`** encode APIs via **`libsrs_app_services`** orchestration.
+- **Import** decodes native SRS packets to normalized frames (`libsrs_pipeline` traits), then re-encodes via **`libsrs_app_services::import_pipeline`** (CPU). Non-native sources need FFmpeg-enabled compat; see `docs/specs/compatibility_layer.md`. **`GpuEncodeDispatch`** reserves a GPU path without implementing kernels yet.

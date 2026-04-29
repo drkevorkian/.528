@@ -8,3 +8,4 @@ pub use probe::{
     CompatBackend, CompatLayer, CompatTrackInfo, MediaIngestor, MediaProbe, ProbeResult,
     SourcePacket,
 };
+pub use stub::FOREIGN_MEDIA_REQUIRES_FFMPEG;

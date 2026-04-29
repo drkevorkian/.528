@@ -8,5 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 tracing.workspace = true
+libsrs_audio = { path = "../libsrs_audio" }
 libsrs_contract = { path = "../libsrs_contract" }
 libsrs_compat = { path = "../libsrs_compat" }
+libsrs_video = { path = "../libsrs_video" }

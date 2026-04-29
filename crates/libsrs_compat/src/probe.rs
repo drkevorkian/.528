@@ -26,6 +26,10 @@ pub struct CompatTrackInfo {
     pub audio_sample_rate: Option<u32>,
     /// Channel count (typically 1 or 2) when `kind` is audio and known.
     pub audio_channels: Option<u8>,
+    /// Video width in pixels when `kind` is video and known (container config, `.srsv` header, or FFmpeg).
+    pub video_width: Option<u32>,
+    /// Video height in pixels when `kind` is video and known.
+    pub video_height: Option<u32>,
 }
 
 #[derive(Debug, Clone)]

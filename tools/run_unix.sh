@@ -35,7 +35,7 @@ Options:
 Examples:
   bash tools/run_unix.sh
   bash tools/run_unix.sh server
-  bash tools/run_unix.sh cli analyze sample.foreign
+  bash tools/run_unix.sh cli analyze path/to/file.528
   bash tools/run_unix.sh cli --no-server -- analyze path/to/file.528
 
 Supported Unix targets:

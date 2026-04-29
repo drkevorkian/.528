@@ -9,7 +9,10 @@ publish = false
 [dependencies]
 libsrs_bitio = { path = "../crates/libsrs_bitio" }
 libsrs_contract = { path = "../crates/libsrs_contract" }
+libsrs_container = { path = "../crates/libsrs_container" }
+libsrs_mux = { path = "../crates/libsrs_mux" }
 libsrs_pipeline = { path = "../crates/libsrs_pipeline" }
+libsrs_video = { path = "../crates/libsrs_video" }
 
 [dev-dependencies]
 criterion = "0.7"

@@ -1,8 +1,14 @@
+mod normalized;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use libsrs_compat::{CompatLayer, ProbeResult};
 use libsrs_contract::Packet;
+
+pub use normalized::{
+    DecodedAudioFrame, DecodedVideoFrame, GpuEncodeDispatch, MediaDecoder, NativeEncoderSink,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipelineMode {

@@ -47,7 +47,7 @@ Options:
 Examples:
   powershell -ExecutionPolicy Bypass -File tools\run_windows.ps1
   powershell -ExecutionPolicy Bypass -File tools\run_windows.ps1 server
-  powershell -ExecutionPolicy Bypass -File tools\run_windows.ps1 cli analyze sample.foreign
+  powershell -ExecutionPolicy Bypass -File tools\run_windows.ps1 cli analyze path\to\file.528
 "@
 }
 
