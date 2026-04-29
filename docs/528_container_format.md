@@ -78,6 +78,8 @@ The **body** immediately follows and must match `body_crc32` under the selected 
 | `payload_len` | u32 (capped: `MAX_PACKET_PAYLOAD_BYTES`) |
 | `payload` | bytes |
 
+Native **SRS audio** packets (`libsrs_audio`) carry a self-contained frame: the bytes in `payload` are exactly the **frame payload** described in [Audio bitstream](specs/audio_bitstream.md) (sample count, channels, then v1 sections or **v2 `R2`** channel blobs). Video packets similarly follow the native video elementary format. Demuxers must not strip or reinterpret inner headers unless a higher layer documents it.
+
 ## Cue and index blocks
 
 Both carry a table of **index entries** (28 bytes each):
