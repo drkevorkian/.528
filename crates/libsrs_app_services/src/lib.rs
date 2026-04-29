@@ -18,6 +18,13 @@ use libsrs_video::{FrameType, VideoFrame, VideoStreamReader, VideoStreamWriter};
 use thiserror::Error;
 
 mod import_pipeline;
+pub mod playback;
+
+pub use playback::{
+    DecodedAudioChunk, DecodedVideoFrame, PlaybackClock, PlaybackCommand, PlaybackError,
+    PlaybackEvent, PlaybackPosition, PlaybackSession, PlaybackState, PlaybackTrackInfo,
+    MAX_STASH_PACKETS, MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE,
+};
 
 #[derive(Debug, Clone)]
 pub struct AppServices {

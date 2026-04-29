@@ -5,14 +5,14 @@ This repository is a greenfield Rust workspace that provides:
 - shared media contracts (`libsrs_contract`)
 - compatibility probe and ingest layer (`libsrs_compat`; optional FFmpeg behind `ffmpeg` feature)
 - integration-oriented pipeline facade (`libsrs_pipeline`)
-- shared application services (`libsrs_app_services`)
+- shared application services (`libsrs_app_services`) including `.528` **playback session** (demux + decode)
 - shared config and licensing protocol/client crates
 - command line entrypoint (`apps/srs_cli`)
 - dedicated admin desktop UI (`apps/srs_admin`)
 - dual-workspace desktop player UI (`apps/srs_player`)
 - same-repo licensing server and website (`apps/srs_license_server`)
 
-The workspace is intentionally scaffolded to remain buildable while codec/container internals are completed by parallel agents.
+The workspace stays buildable while codec and GPU features grow; see the status table below for what is real today.
 
 ## Native `.528` container and import
 
@@ -26,13 +26,17 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 
 | Area | Status | Notes |
 |------|--------|--------|
-| `.528` / `.srsm` mux & demux | **Working** | v2 primary extension; legacy v1 read |
-| `.srsv` / `.srsa` elementary | **Working** | Internal elementary paths; probe reports dimensions / audio layout |
-| Native import / transcode (stub backend) | **Working** | Decode → normalize → re-encode; no synthetic foreign A/V |
-| Foreign ingest (FFmpeg) | **Partial** | Requires `libsrs_compat` feature `ffmpeg`; stub fails closed without it |
-| Normalized frame traits (`DecodedVideoFrame`, `DecodedAudioFrame`, `MediaDecoder`, `NativeEncoderSink`, `GpuEncodeDispatch`) | **Working** / **Prototype** | Traits and CPU sink are live; `GpuEncodeDispatch` is a stub interface |
-| Hardware (GPU) video encode | **Planned** | No kernels or device bindings yet |
-| Player decode / render | **Prototype** | UI shell; decode loop evolving per player docs |
+| `.528` container | **Partial / working** | v2 primary; hostile-input limits in I/O (`libsrs_container`) |
+| mux / demux | **Partial / working** | `libsrs_mux` / `libsrs_demux`; cues + index |
+| audio codec | **Working prototype** | v2 LPC stream decode in `libsrs_audio` |
+| video codec | **Prototype** | Intra SRS video path in `libsrs_video`; no full inter codec matrix |
+| import / transcode | **Native pipeline partial** | Raw packet/decoded path in app services; FFmpeg path feature-gated |
+| playback | **Decode-preview** | `PlaybackSession` demuxes + decodes; `srs_player` shows grayscale texture only; `srs_cli play` smoke decode |
+| GPU | **Planned** | No device presentation or GPU decode here |
+| lossy video v2 | **Planned** | |
+| admin / licensing | **Partial / working** | Needs production hardening |
+
+Further playback architecture: `docs/playback_pipeline.md`.
 
 ## Build
 

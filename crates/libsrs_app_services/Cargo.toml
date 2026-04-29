@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+crc32c.workspace = true
 thiserror.workspace = true
 libsrs_audio = { path = "../libsrs_audio" }
 libsrs_container = { path = "../libsrs_container" }
