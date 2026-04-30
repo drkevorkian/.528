@@ -380,7 +380,7 @@ mod tests {
         let p_payload = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, qp, &settings).unwrap();
         assert!(
             p_payload.len() < i_payload.len(),
-            "P identical should beat I: p={} i={}",
+            "expected P payload smaller than I for identical texture: p={} i={}",
             p_payload.len(),
             i_payload.len()
         );

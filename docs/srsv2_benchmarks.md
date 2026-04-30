@@ -1,14 +1,14 @@
-# SRSV2 vs H.264 benchmarks (methodology)
+# SRSV2 measurement methodology (optional comparisons)
 
-This file defines **how** we may justify bitrate–quality claims against **H.264/AVC**. Until a harness lands in CI, treat competitive statements as **aspirational**.
+This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders (for example a common **AVC** baseline). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge.
 
-## Requirements before claiming “beats H.264”
+## Fair comparison checklist
 
-1. **Baseline encoder:** **libx264** via **FFmpeg** (or vendor AVC with documented settings) on the same machine class as SRSV2.
+1. **Baseline encoder (optional):** e.g. **libx264** via **FFmpeg** (or another AVC encoder with documented settings) on the same machine class as SRSV2.
 2. **Fair comparison:**
    - Same **resolution**, **frame count**, **chroma format** (or document conversions).
    - Same or documented **color range** / **transfer** when HDR is involved.
-   - **Bitrate** matched either by **two-pass** targeting bitrate or by **CRF** with reported achieved bitrate for both codecs.
+   - **Bitrate** matched either by **two-pass** targeting bitrate or by **CRF** with reported achieved bitrate for both sides.
 3. **SRSV2 side:** documented **preset**, **profile byte**, **QP/keyframe** settings, commit hash.
 4. **Metrics** (report all that apply):
    - **Bitrate** (bits/s) and **compression ratio** vs uncompressed PCM/YUV size.
@@ -17,7 +17,7 @@ This file defines **how** we may justify bitrate–quality claims against **H.26
    - **VMAF** (optional; requires `vmaf`/`ffmpeg` with **libvmaf** or Netflix VMAF CLI).
    - **Encode FPS** and **decode FPS** (single-thread vs multi-thread noted).
 
-## Suggested FFmpeg skeleton (H.264)
+## Suggested FFmpeg skeleton (AVC baseline)
 
 Exact flags evolve with test vectors; this is a **template**:
 
@@ -49,7 +49,7 @@ Use **`srs_cli`** / **`libsrs_video`** encode paths with pinned settings; decode
 | Hardware / OS | |
 | Resolution / fps / frames | |
 | SRSV2 preset / profile / QP | |
-| x264 preset / CRF / bitrate | |
-| Bitrate SRSV2 / H.264 | |
+| Baseline encoder preset / CRF / bitrate | |
+| Bitrate SRSV2 / baseline | |
 | PSNR / SSIM / MS-SSIM / VMAF | |
 | Encode FPS / decode FPS | |

@@ -1,6 +1,6 @@
 # SRSV2 codec overview
 
-**SRSV2** (`codec_id` **3** in `.528`, elementary `.srsv2`) is the **default** video codec for **new** `.528` files created by encode, import, transcode, and mux workflows in this workspace (unless callers explicitly select legacy SRSV1). Long-term intent is an **8K-first**, scalable codec competitive with **H.264-class** efficiency at HD–8K — see **`docs/srsv2_design_targets.md`** for profiles, presets policy, and roadmap. **`docs/srsv2_benchmarks.md`** defines how **measurable** comparisons vs **FFmpeg/x264** must be run before claiming bitrate–quality wins.
+**SRSV2** (`codec_id` **3** in `.528`, elementary `.srsv2`) is the **default** video codec for **new** `.528` files created by encode, import, transcode, and mux workflows in this workspace (unless callers explicitly select legacy SRSV1). Long-term intent is an **8K-first**, scalable native codec — see **`docs/srsv2_design_targets.md`** for profiles, presets policy, and roadmap. **`docs/srsv2_benchmarks.md`** is an **optional** guide for reproducible measurements if you compare SRSV2 to other encoders yourself; the project does not rank codecs or publish superiority claims.
 
 **SRSV1** (`codec_id` **1** in `.528`, elementary `.srsv`) is **legacy / prototype** compatibility: grayscale intra, still fully readable and writable for tests and older assets.
 

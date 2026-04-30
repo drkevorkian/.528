@@ -2,13 +2,13 @@
 
 SRSV2 is the **modern native `.528` video codec** for this project. It is **not** a small replacement for the legacy grayscale prototype alone: the engineering target is a **credible 8K-first** codec that scales down to **1080p / 1440p / 4K**, remains **decode-friendly and parallel**, and can extend to **above-8K** with explicitly higher memory use and latency.
 
-This document is **normative for intent** and **descriptive for current code**. Implementation catches up incrementally; nothing here guarantees parity with H.264/HEVC/AV1/VVC until backed by **measured** comparisons (see [Benchmarks and competitive claims](#benchmarks-and-competitive-claims)).
+This document is **normative for intent** and **descriptive for current code**. Implementation catches up incrementally; goals below describe **SRSV2’s own** direction, not a ranking against any specific external codec.
 
 ## Strategic positioning
 
-- **Aspiration:** SRSV2 should **eventually** compete with **H.264 / AVC** on **bitrate–distortion** at HD through **8K**, with room to chase stronger codecs at extreme presets.
-- **Honesty:** The repository **does not** claim “better than H.264” in README or marketing copy until **benchmark evidence** exists (`docs/srsv2_benchmarks.md`).
-- **Interoperability:** SRSV2 is **not** bitstream-compatible with MPEG codecs; comparisons are always **encode/decode to raw/YUV** plus metric tooling.
+- **Aspiration:** Strong **bitrate–distortion** and **scalable** encode/decode from HD through **8K**, with room for heavier presets where compression gains justify cost.
+- **Judgment:** The project **does not** tout SRSV2 over other codecs; quality and suitability are for **users** to decide using their own content and metrics.
+- **Interoperability:** SRSV2 is **not** bitstream-compatible with MPEG codecs; any side-by-side work uses **encode/decode to raw/YUV** plus agreed metric tooling (see optional notes in `docs/srsv2_benchmarks.md`).
 
 ## Resolution and scalability
 
@@ -41,14 +41,14 @@ Wire values are stable — extend only by adding new bytes with decoder support.
 
 Presets are **product knobs**, not yet fully wired end-to-end everywhere:
 
-| Preset | Goal vs H.264 (when measured) |
-|--------|-------------------------------|
-| **Fast** | May **lose** to H.264 at equal bitrate — acceptable for realtime-ish paths |
-| **Balanced** | **Target:** match or beat H.264 on BD-rate style curves |
-| **High** | **Target:** clearly **beat** H.264 at comparable subjective quality |
-| **Insane** | Slow; chase **AV1 / VVC-class** efficiency where feasible (years-long roadmap) |
+| Preset | Intent |
+|--------|--------|
+| **Fast** | Favor encode/decode speed over compression; acceptable when latency or throughput matters most |
+| **Balanced** | Default trade-off between speed and rate–distortion |
+| **High** | Favor compression quality; slower encode acceptable |
+| **Insane** | Slow; maximum effort where tooling and time allow (long-horizon roadmap) |
 
-## Technical roadmap (vs H.264-class competence)
+## Technical roadmap
 
 Ordered roughly by dependency; many items overlap across releases.
 
@@ -67,14 +67,9 @@ Ordered roughly by dependency; many items overlap across releases.
 13. **Screen-content mode** — palette / skip / IBCCC-class shortcuts under **Screen** profile.
 14. **Quality metrics** — **PSNR**, **SSIM / MS-SSIM**, optional **VMAF** when FFmpeg or Netflix VMAF is available in CI/dev machines.
 
-## Benchmarks and competitive claims
+## Optional benchmarking
 
-**Acceptance rule:** Do **not** publish “SRSV2 beats H.264” (or similar) without:
-
-- **Controlled comparisons** using **`ffmpeg`** (or equivalent) for **H.264** encode/decode baselines when available.
-- Reported: **bitrate**, **compression ratio**, **PSNR**, **SSIM / MS-SSIM**, optional **VMAF**, **encode FPS**, **decode FPS**, resolution, preset, and hardware notes.
-
-See **`docs/srsv2_benchmarks.md`** for the proposed harness shape and reporting template.
+If you compare SRSV2 to other encoders, prefer **controlled** setups and report: **bitrate**, **compression ratio**, **PSNR**, **SSIM / MS-SSIM**, optional **VMAF**, **encode FPS**, **decode FPS**, resolution, preset, and hardware notes. See **`docs/srsv2_benchmarks.md`** for a suggested template — still **your** interpretation of the numbers.
 
 ## Relationship to `docs/srsv2_codec.md`
 
