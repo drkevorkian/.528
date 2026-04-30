@@ -6,7 +6,7 @@
   - `decode_next_step()` — file-order interleaved A/V (recommended for players).
   - `decode_next_video_frame()` / `decode_next_audio_chunk()` — per-stream pulls with a **bounded** cross-track stash (`MAX_STASH_PACKETS`).
 - **Demux:** `DemuxReader` (`libsrs_demux`) over `BufReader<File>`; packet payloads are already capped by container I/O (`MAX_PACKET_PAYLOAD_BYTES`).
-- **Decoders:** `libsrs_video::decode_frame` (intra), `libsrs_audio::decode_frame_with_stream_version` with v2 stream payloads.
+- **Decoders:** primary video by `codec_id`: **`codec_id` 1** → SRSV1 legacy grayscale intra (`libsrs_video::decode_frame`); **`codec_id` 3** → SRSV2 (`decode_yuv420_srsv2_payload`): intra **`FR2\x01`** YUV420p8 and experimental **P-frame** **`FR2\x02`** when `max_ref_frames ≥ 1` and a reference picture is available; **`codec_id` 2** → SRSA (`libsrs_audio::decode_frame_with_stream_version`, v2 stream payloads).
 - **Errors:** `PlaybackError` (thiserror); no panics on malformed bitstreams in the playback path.
 
 ## Shared between CLI and UI
@@ -19,10 +19,16 @@
 - **Real:** Demux timestamps (PTS/DTS), frame dimensions, payload CRC32C metadata, **in-panel** egui texture from the last decoded video frame (grayscale presentation path; SRSV2 frames are decoded as YUV420p8 then displayed).
 - **Not implemented:** OS audio output, GPU presentation, full-screen video sink, multi-format codec matrix.
 
-## Video codecs
+## Primary media codecs (mux)
 
-- **SRSV2** (`codec_id` **3**) is the **default** for newly generated `.528` media. Decoders consume the 64-byte sequence header from track config and intra YUV420p8 payloads.
-- **SRSV1** (`codec_id` **1**) is **legacy**; playback still opens and decodes primary video tracks using the older grayscale intra path.
+| `codec_id` | Role | Decoder |
+|------------|------|---------|
+| **1** | Video — **SRSV1** legacy | Grayscale intra (`libsrs_video::decode_frame`) |
+| **2** | Audio — **SRSA** | LPC v2 stream decode (`libsrs_audio`, `STREAM_VERSION_V2`) |
+| **3** | Video — **SRSV2** default | Intra YUV420p8 (`FR2\x01`); optional experimental **P** (`FR2\x02`) when sequence allows references |
+
+- **SRSV2** (`codec_id` **3**) is the **default** for newly generated `.528` media: 64-byte sequence header in track config; **`PlaybackSession`** keeps an SRSV2 reference picture when `max_ref_frames > 0` so **P** payloads can decode; seek/stop clear that reference (may affect mid-file **P** decode until the next **I** frame — prefer indexed seeks near chunk boundaries in future work).
+- **SRSV1** (`codec_id` **1**) is **legacy**; playback uses the older grayscale intra path.
 
 ## Limitations
 

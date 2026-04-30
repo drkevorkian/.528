@@ -5,6 +5,8 @@ use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::intra_codec::{decode_plane_intra, encode_plane_intra};
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
+use super::p_frame_codec;
+use super::rate_control::SrsV2EncodeSettings;
 
 pub const FRAME_PAYLOAD_MAGIC: [u8; 4] = [b'F', b'R', b'2', 1];
 
@@ -142,6 +144,62 @@ pub fn decode_yuv420_intra_payload(
     })
 }
 
+/// Encode SRSV2 video payload: intra (`FR2` rev 1) or experimental P (`FR2` rev 2).
+pub fn encode_yuv420_inter_payload(
+    seq: &VideoSequenceHeaderV2,
+    cur: &YuvFrame,
+    reference: Option<&YuvFrame>,
+    frame_index: u32,
+    qp: u8,
+    settings: &SrsV2EncodeSettings,
+) -> Result<Vec<u8>, SrsV2Error> {
+    let interval = settings.keyframe_interval.max(1);
+    let force_intra = frame_index == 0 || frame_index.is_multiple_of(interval);
+    if force_intra || seq.max_ref_frames == 0 {
+        return encode_yuv420_intra_payload(seq, cur, frame_index, qp);
+    }
+    let Some(reference) = reference else {
+        return encode_yuv420_intra_payload(seq, cur, frame_index, qp);
+    };
+    if !seq.width.is_multiple_of(16) || !seq.height.is_multiple_of(16) {
+        return encode_yuv420_intra_payload(seq, cur, frame_index, qp);
+    }
+    p_frame_codec::encode_yuv420_p_payload(seq, cur, reference, frame_index, qp, settings)
+}
+
+/// Decode intra or P SRSV2 payload; updates `ref_slot` when `max_ref_frames > 0` after a successful decode.
+pub fn decode_yuv420_srsv2_payload(
+    seq: &VideoSequenceHeaderV2,
+    payload: &[u8],
+    ref_slot: &mut Option<YuvFrame>,
+) -> Result<DecodedVideoFrameV2, SrsV2Error> {
+    if payload.len() < 4 {
+        return Err(SrsV2Error::Truncated);
+    }
+    match payload[3] {
+        1 => {
+            let dec = decode_yuv420_intra_payload(seq, payload)?;
+            if seq.max_ref_frames > 0 {
+                ref_slot.replace(dec.yuv.clone());
+            }
+            Ok(dec)
+        }
+        2 => {
+            let reference = ref_slot
+                .as_ref()
+                .ok_or(SrsV2Error::PFrameWithoutReference)?;
+            let dec = p_frame_codec::decode_yuv420_p_payload(seq, payload, reference)?;
+            if seq.max_ref_frames > 0 {
+                ref_slot.replace(dec.yuv.clone());
+            }
+            Ok(dec)
+        }
+        _ => Err(SrsV2Error::Unsupported(
+            "unknown SRSV2 frame payload revision",
+        )),
+    }
+}
+
 fn read_u32(data: &[u8], cur: &mut usize) -> Result<u32, SrsV2Error> {
     if data.len().saturating_sub(*cur) < 4 {
         return Err(SrsV2Error::Truncated);
@@ -159,6 +217,49 @@ mod roundtrip_tests {
         ChromaSiting, ColorPrimaries, ColorRange, MatrixCoefficients, PixelFormat, SrsVideoProfile,
         TransferFunction, VideoSequenceHeaderV2,
     };
+    use crate::srsv2::rate_control::SrsV2EncodeSettings;
+
+    #[test]
+    fn srsv2_dispatcher_p_requires_reference_then_decodes() {
+        let w = 64u32;
+        let h = 64u32;
+        let mut seq = VideoSequenceHeaderV2 {
+            width: w,
+            height: h,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![128_u8; (w * h * 3) as usize];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, w, h, ColorRange::Limited).unwrap();
+        let pbytes = encode_yuv420_inter_payload(
+            &seq,
+            &yuv,
+            Some(&yuv),
+            1,
+            28,
+            &SrsV2EncodeSettings::default(),
+        )
+        .unwrap();
+        let mut slot = None::<crate::srsv2::frame::YuvFrame>;
+        assert!(matches!(
+            decode_yuv420_srsv2_payload(&seq, &pbytes, &mut slot),
+            Err(crate::srsv2::error::SrsV2Error::PFrameWithoutReference)
+        ));
+        slot = Some(yuv.clone());
+        decode_yuv420_srsv2_payload(&seq, &pbytes, &mut slot).unwrap();
+        seq.max_ref_frames = 0;
+        let intra_only =
+            encode_yuv420_inter_payload(&seq, &yuv, None, 5, 28, &SrsV2EncodeSettings::default())
+                .unwrap();
+        assert_eq!(intra_only[3], 1);
+    }
 
     #[test]
     fn yuv420_intra_payload_encode_decode_roundtrip() {

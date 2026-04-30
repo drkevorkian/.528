@@ -20,6 +20,12 @@ pub enum SrsV2Error {
     Truncated,
     #[error("reserved / unsupported feature: {0}")]
     Unsupported(&'static str),
+    #[error("P-frame decode requires a reference frame")]
+    PFrameWithoutReference,
+    #[error("motion vector out of allowed range")]
+    CorruptedMotionVector,
+    #[error("max_ref_frames ({0}) exceeds decoder capacity")]
+    ExcessiveReferenceFrames(u8),
     #[error("profile limits exceeded: {0}")]
     LimitExceeded(&'static str),
     #[error("decode mismatch (internal)")]

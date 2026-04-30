@@ -11,20 +11,26 @@ pub mod gpu_traits;
 pub mod intra_codec;
 pub mod limits;
 pub mod model;
+pub mod p_frame_codec;
 pub mod rate_control;
+pub mod reference;
 
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
 };
 pub use error::SrsV2Error;
 pub use frame::{DecodedVideoFrameV2, EncodedVideoPacketV2, VideoPlane, YuvFrame};
-pub use frame_codec::{decode_yuv420_intra_payload, encode_yuv420_intra_payload};
+pub use frame_codec::{
+    decode_yuv420_intra_payload, decode_yuv420_srsv2_payload, encode_yuv420_inter_payload,
+    encode_yuv420_intra_payload,
+};
 pub use model::{
     decode_sequence_header_v2, encode_sequence_header_v2, ChromaSiting, ColorPrimaries, ColorRange,
     FrameHeaderV2, FrameTypeV2, MatrixCoefficients, PixelFormat, SrsVideoCodecId, SrsVideoProfile,
     TileHeaderV2, TransferFunction, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
 };
 pub use rate_control::SrsV2EncodeSettings;
+pub use reference::ReferenceFrameBuffer;
 
 pub use gpu_traits::{
     ColorConvertBackend, CpuVideoAccelerator, GpuVideoAccelerator, MotionSearchBackend,

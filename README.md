@@ -29,7 +29,7 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 | `.528` container | **Partial / working** | v2 primary; hostile-input limits in I/O (`libsrs_container`) |
 | mux / demux | **Partial / working** | `libsrs_mux` / `libsrs_demux`; cues + index; mux prefers `.srsv2` when elementary video is present |
 | audio codec | **Working prototype** | v2 LPC stream decode in `libsrs_audio` |
-| video codec | **SRSV2 default** | New `.528` video uses **SRSV2** (`codec_id` **3**, 64-byte sequence in track config). **SRSV1** (`codec_id` **1**, `.srsv`) remains **legacy** for compatibility. SRSV2 is **intra-only YUV420p8** today; inter frames, full entropy modeling, rate control, GPU, and OS A/V output are future work. |
+| video codec | **SRSV2 default** | New `.528` video uses **SRSV2** (`codec_id` **3**). **SRSV1** remains **legacy**. CLI square-gray → `.srsv2` stays **single intra** (`FR2\x01`). **Native import** (SRSV2) sets **`max_ref_frames = 1`** and emits **P** (`FR2\x02`) after the first picture when width/height are multiples of **16** (else intra). Full rate control, sub-pel motion, B-frames, GPU, and OS A/V output remain future work. |
 | import / transcode | **Native pipeline partial** | Encode/import/transcode default to SRSV2 video; `--codec srsv1` selects legacy; FFmpeg path feature-gated |
 | playback | **Decode-preview** | `PlaybackSession` decodes SRSV2 (`codec_id` 3) and legacy SRSV1 (`codec_id` 1); `srs_player` shows last frame texture; `srs_cli play` smoke decode |
 | GPU | **Planned** | No device presentation or GPU decode here |

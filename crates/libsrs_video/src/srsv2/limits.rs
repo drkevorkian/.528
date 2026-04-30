@@ -8,8 +8,12 @@ pub const MAX_LUMA_SAMPLES: u64 = 33_177_600; // 7680×4320
 pub const MAX_FRAME_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 /// Maximum tiles per frame (reserved for future tiling).
 pub const MAX_TILES: u32 = 4096;
-/// Maximum reference frames (future inter).
+/// Maximum reference frames (inter / P-frame prediction ring).
 pub const MAX_REF_FRAMES: u8 = 16;
+/// Absolute bound on encoded motion vectors (pixels); decoder rejects beyond this.
+pub const MAX_MOTION_VECTOR_PELS: i16 = 256;
+/// Encoder search radius cap (integer pel); must be ≤ [`MAX_MOTION_VECTOR_PELS`].
+pub const MAX_MOTION_SEARCH_RADIUS: i16 = 128;
 /// Maximum sequence metadata extension bytes.
 pub const MAX_METADATA_BYTES: usize = 16 * 1024;
 /// Superblock size (baseline intra path uses recursive splits down to 8×8).

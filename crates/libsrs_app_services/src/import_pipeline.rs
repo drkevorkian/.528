@@ -17,16 +17,27 @@ use libsrs_pipeline::{
     DecodedAudioFrame, DecodedVideoFrame, MediaDecoder, NativeEncoderSink, TranscodePipeline,
 };
 use libsrs_video::{
-    decode_frame as video_decode_frame, decode_sequence_header_v2,
-    encode_frame as video_encode_frame, encode_sequence_header_v2, encode_yuv420_intra_payload,
-    gray8_packed_to_yuv420p8_neutral, FrameType, VideoFrame, VideoSequenceHeaderV2,
-    SEQUENCE_HEADER_BYTES,
+    decode_frame as video_decode_frame, decode_sequence_header_v2, decode_yuv420_srsv2_payload,
+    encode_frame as video_encode_frame, encode_sequence_header_v2, encode_yuv420_inter_payload,
+    gray8_packed_to_yuv420p8_neutral, FrameType, SrsV2EncodeSettings, VideoFrame,
+    VideoSequenceHeaderV2, YuvFrame, SEQUENCE_HEADER_BYTES,
 };
 
 use crate::Native528VideoCodec;
 
-/// Quantizer for SRSV2 intra frames produced by import (normalized grayscale → YUV420).
-const IMPORT_SRSV2_INTRA_QP: u8 = 28;
+/// Quantizer for SRSV2 frames produced by import (normalized grayscale → YUV420).
+const IMPORT_SRSV2_QP: u8 = 28;
+/// Periodic I-frame when emitting **P** frames during import (`encode_yuv420_inter_payload`).
+const IMPORT_SRSV2_KEYFRAME_INTERVAL: u32 = 30;
+
+fn import_srsv2_encode_settings() -> SrsV2EncodeSettings {
+    SrsV2EncodeSettings {
+        quantizer: IMPORT_SRSV2_QP,
+        keyframe_interval: IMPORT_SRSV2_KEYFRAME_INTERVAL,
+        motion_search_radius: 16,
+        ..Default::default()
+    }
+}
 
 pub(crate) fn run_native_import(
     pipeline: &TranscodePipeline,
@@ -133,7 +144,8 @@ fn build_import_mux_tracks(
             .ok_or_else(|| anyhow!("probe missing native video height"))?;
         let (codec_id, config) = match video_codec {
             Native528VideoCodec::Srsv2 => {
-                let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(width, height);
+                let seq =
+                    VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited_one_ref(width, height);
                 (3_u16, encode_sequence_header_v2(&seq).to_vec())
             }
             Native528VideoCodec::Srsv1Legacy => {
@@ -318,9 +330,11 @@ struct MuxNativeImportSink {
     audio_timescale: u32,
     next_video_pts: u64,
     next_audio_pts: u64,
-    /// `1` = SRSV1 legacy packet payloads; `3` = SRSV2 intra payloads (`encode_yuv420_intra_payload`).
+    /// `1` = SRSV1 legacy packet payloads; `3` = SRSV2 (`encode_yuv420_inter_payload` + ref refresh).
     video_codec_id: u16,
     video_seq_v2: Option<VideoSequenceHeaderV2>,
+    /// Previous **decoded** SRSV2 frame — matches playback `decode_yuv420_srsv2_payload` state.
+    srsv2_decoded_ref: Option<YuvFrame>,
 }
 
 impl MuxNativeImportSink {
@@ -382,6 +396,7 @@ impl MuxNativeImportSink {
             next_audio_pts: 0,
             video_codec_id,
             video_seq_v2,
+            srsv2_decoded_ref: None,
         })
     }
 }
@@ -410,8 +425,19 @@ impl NativeEncoderSink for MuxNativeImportSink {
                 .ok_or_else(|| anyhow!("SRSV2 mux sink missing sequence header state"))?;
             let yuv = gray8_packed_to_yuv420p8_neutral(&vf.data, vf.width, vf.height)
                 .map_err(|e| anyhow!("grayscale to YUV420: {}", e))?;
-            encode_yuv420_intra_payload(seq, &yuv, vf.frame_index, IMPORT_SRSV2_INTRA_QP)
-                .map_err(|e| anyhow!("SRSV2 intra encode: {}", e))?
+            let settings = import_srsv2_encode_settings();
+            let enc = encode_yuv420_inter_payload(
+                seq,
+                &yuv,
+                self.srsv2_decoded_ref.as_ref(),
+                vf.frame_index,
+                IMPORT_SRSV2_QP,
+                &settings,
+            )
+            .map_err(|e| anyhow!("SRSV2 encode: {}", e))?;
+            decode_yuv420_srsv2_payload(seq, &enc, &mut self.srsv2_decoded_ref)
+                .map_err(|e| anyhow!("SRSV2 reference refresh (must match decode): {}", e))?;
+            enc
         } else {
             video_encode_frame(&vf)?
         };
@@ -458,7 +484,7 @@ mod import_tests {
     use libsrs_container::TrackKind;
     use libsrs_licensing_proto::{EntitlementClaims, EntitlementStatus, LicensedFeature};
     use libsrs_mux::MuxWriter;
-    use libsrs_video::{decode_sequence_header_v2, decode_yuv420_intra_payload};
+    use libsrs_video::{decode_sequence_header_v2, decode_yuv420_srsv2_payload};
     use std::io::Cursor;
 
     fn editor_claims() -> EntitlementClaims {
@@ -537,10 +563,16 @@ mod import_tests {
             .expect("video track");
         assert_eq!(vt.codec_id, 3, "default import must mux SRSV2");
         let seq = decode_sequence_header_v2(&vt.config[..SEQUENCE_HEADER_BYTES]).unwrap();
+        assert_eq!(seq.max_ref_frames, 1);
         let p0 = demux.next_packet().unwrap().unwrap();
         let p1 = demux.next_packet().unwrap().unwrap();
-        let d0 = decode_yuv420_intra_payload(&seq, &p0.packet.payload).expect("srsv2 frame 0");
-        let d1 = decode_yuv420_intra_payload(&seq, &p1.packet.payload).expect("srsv2 frame 1");
+        assert_eq!(p0.packet.payload[3], 1, "first SRSV2 video packet should be intra");
+        assert_eq!(p1.packet.payload[3], 2, "second frame should be P (import uses inter encode)");
+        let mut slot = None;
+        let d0 =
+            decode_yuv420_srsv2_payload(&seq, &p0.packet.payload, &mut slot).expect("srsv2 f0");
+        let d1 =
+            decode_yuv420_srsv2_payload(&seq, &p1.packet.payload, &mut slot).expect("srsv2 f1");
 
         let min0 = d0.yuv.y.samples.iter().copied().min().unwrap();
         let max0 = d0.yuv.y.samples.iter().copied().max().unwrap();

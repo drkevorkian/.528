@@ -3,7 +3,7 @@
 //! # Reality check (Phase 0)
 //! - **Demux:** [`libsrs_demux::DemuxReader`] over `Read+Seek` — already enforces container limits
 //!   (`MAX_PACKET_PAYLOAD_BYTES`, etc.) per `libsrs_container::io`.
-//! - **Video decode:** [`libsrs_video::decode_frame`] (intra frames); needs width/height from track config.
+//! - **Video decode:** [`libsrs_video::decode_frame`] for **`codec_id` 1**; [`libsrs_video::decode_yuv420_srsv2_payload`] for **`codec_id` 3** (intra `FR2\x01` and experimental P `FR2\x02` when a reference is available).
 //! - **Audio decode:** [`libsrs_audio::decode_frame_with_stream_version`] with v2 stream payloads.
 //! - **App inspect:** [`crate::inspect_native_container`](super) lists tracks; playback uses the same file layout.
 //! - **Player (before this module):** `playing=true` and wall-clock `position_ms` were scaffold-only.
@@ -18,8 +18,8 @@ use libsrs_audio::{decode_frame_with_stream_version, AudioFrame, STREAM_VERSION_
 use libsrs_container::{PacketFlags, TrackDescriptor, TrackKind};
 use libsrs_demux::{DemuxReader, DemuxedPacket};
 use libsrs_video::{
-    decode_frame, decode_sequence_header_v2, decode_yuv420_intra_payload, FrameType, VideoFrame,
-    VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
+    decode_frame, decode_sequence_header_v2, decode_yuv420_srsv2_payload, FrameType, VideoFrame,
+    VideoSequenceHeaderV2, YuvFrame, SEQUENCE_HEADER_BYTES,
 };
 use thiserror::Error;
 
@@ -283,6 +283,8 @@ pub struct PlaybackSession {
     last_error: Option<String>,
     /// Parsed SRSV2 sequence header when primary video uses `codec_id == 3`.
     video_v2_seq: Option<VideoSequenceHeaderV2>,
+    /// Last decoded SRSV2 frame for experimental P-frame payloads (`FR2` rev 2).
+    video_v2_ref: Option<YuvFrame>,
 }
 
 impl std::fmt::Debug for PlaybackSession {
@@ -399,6 +401,7 @@ impl PlaybackSession {
             decoded_audio_chunks: 0,
             last_error: None,
             video_v2_seq,
+            video_v2_ref: None,
         })
     }
 
@@ -630,8 +633,9 @@ impl PlaybackSession {
                         "SRSV2 sequence header missing from session".to_string(),
                     )
                 })?;
-                let dec = decode_yuv420_intra_payload(seq, &p.packet.payload)
-                    .map_err(|e| PlaybackError::VideoDecode(format!("srsv2: {e}")))?;
+                let dec =
+                    decode_yuv420_srsv2_payload(seq, &p.packet.payload, &mut self.video_v2_ref)
+                        .map_err(|e| PlaybackError::VideoDecode(format!("srsv2: {e}")))?;
                 self.update_position_from_pts(p.packet.header.pts, timescale);
                 self.decoded_video_frames += 1;
                 let payload_crc32c = crc32c(&p.packet.payload);
@@ -718,6 +722,7 @@ impl PlaybackSession {
         self.decoded_video_frames = 0;
         self.decoded_audio_chunks = 0;
         self.last_error = None;
+        self.video_v2_ref = None;
         Ok(())
     }
 
@@ -738,6 +743,7 @@ impl PlaybackSession {
             pts_ticks: ent.pts,
             timescale_hz: self.position.timescale_hz.max(1),
         };
+        self.video_v2_ref = None;
         Ok(())
     }
 

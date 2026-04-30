@@ -541,8 +541,12 @@ fn encode_input_to_native(
             }
             match video_codec {
                 Native528VideoCodec::Srsv2 => {
-                    if video_srsv2.exists() || video_srsv.exists() {
+                    if video_srsv2.exists() {
                         mux_elementary_streams(&stem, output)
+                    } else if video_srsv.exists() {
+                        Err(anyhow!(
+                            "legacy .srsv elementary stream found while SRSV2 was requested; use --codec srsv1 or create .srsv2"
+                        ))
                     } else {
                         encode_square_gray_raw_to_srsv2_elementary(input, &video_srsv2)?;
                         mux_elementary_streams(&stem, output)
@@ -937,7 +941,9 @@ fn extension(path: &Path) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libsrs_container::TrackKind;
     use libsrs_licensing_proto::{EntitlementStatus, LicensedFeature};
+    use std::io::Cursor;
 
     fn basic_entitlement() -> EntitlementClaims {
         EntitlementClaims {
@@ -949,6 +955,20 @@ mod tests {
             expires_at_epoch_s: 2,
             device_install_id: "install-1".to_string(),
             message: "basic".to_string(),
+            replacement_key: None,
+        }
+    }
+
+    fn editor_claims() -> EntitlementClaims {
+        EntitlementClaims {
+            license_id: "license-editor".to_string(),
+            key_id: "key-editor".to_string(),
+            features: LicensedFeature::editor_defaults(),
+            status: EntitlementStatus::Active,
+            issued_at_epoch_s: 1,
+            expires_at_epoch_s: 2,
+            device_install_id: "install-editor".to_string(),
+            message: "editor".to_string(),
             replacement_key: None,
         }
     }
@@ -979,5 +999,92 @@ mod tests {
         );
         let _ = std::fs::remove_file(stem.with_extension("srsv"));
         let _ = std::fs::remove_file(stem.with_extension("srsv2"));
+    }
+
+    #[test]
+    fn encode_default_528_raw_creates_video_codec_id_3() {
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stem = dir.join(format!("enc-def-{nanos}"));
+        let raw = stem.with_extension("raw");
+        let out528 = stem.with_extension("528");
+        std::fs::write(&raw, vec![128u8; 256]).unwrap();
+        assert!(!stem.with_extension("srsv2").exists());
+        assert!(!stem.with_extension("srsv").exists());
+        let svc = AppServices::default();
+        svc.encode_input_to_native(&raw, &out528, &editor_claims())
+            .expect("encode default SRSV2 .528");
+        let bytes = std::fs::read(&out528).unwrap();
+        let demux = libsrs_demux::DemuxReader::open(Cursor::new(bytes)).unwrap();
+        let vt = demux
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .expect("video track");
+        assert_eq!(vt.codec_id, 3);
+        let _ = std::fs::remove_file(&raw);
+        let _ = std::fs::remove_file(&out528);
+        let _ = std::fs::remove_file(stem.with_extension("srsv2"));
+    }
+
+    #[test]
+    fn encode_srsv2_errors_when_only_legacy_srsv_beside_stem() {
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stem = dir.join(format!("enc-srsv-only-{nanos}"));
+        let raw = stem.with_extension("raw");
+        let out528 = stem.with_extension("528");
+        std::fs::write(&raw, vec![128u8; 256]).unwrap();
+        std::fs::File::create(stem.with_extension("srsv")).unwrap();
+        let svc = AppServices::default();
+        let err = svc
+            .encode_input_to_native(&raw, &out528, &editor_claims())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("legacy .srsv"),
+            "unexpected err: {err}"
+        );
+        let _ = std::fs::remove_file(&raw);
+        let _ = std::fs::remove_file(stem.with_extension("srsv"));
+        let _ = std::fs::remove_file(&out528);
+    }
+
+    #[test]
+    fn encode_srsv1_with_legacy_srsv_beside_stem_succeeds() {
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stem = dir.join(format!("enc-v1-{nanos}"));
+        let raw = stem.with_extension("raw");
+        let out528 = stem.with_extension("528");
+        std::fs::write(&raw, vec![128u8; 256]).unwrap();
+        std::fs::File::create(stem.with_extension("srsv")).unwrap();
+        let svc = AppServices::default();
+        svc.encode_input_to_native_with_video_codec(
+            &raw,
+            &out528,
+            &editor_claims(),
+            Native528VideoCodec::Srsv1Legacy,
+        )
+        .expect("encode legacy path");
+        let bytes = std::fs::read(&out528).unwrap();
+        let demux = libsrs_demux::DemuxReader::open(Cursor::new(bytes)).unwrap();
+        let vt = demux
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .expect("video track");
+        assert_eq!(vt.codec_id, 1);
+        let _ = std::fs::remove_file(&raw);
+        let _ = std::fs::remove_file(&out528);
+        let _ = std::fs::remove_file(stem.with_extension("srsv"));
     }
 }

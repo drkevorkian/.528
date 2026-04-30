@@ -229,6 +229,40 @@ pub(crate) fn encode_plane_intra(
     Ok(())
 }
 
+/// Pack DCT coefficients for a pure 8×8 residual block (added to MC prediction outside).
+pub(crate) fn encode_residual_block_8x8(
+    block: &[[i16; 8]; 8],
+    qp: i16,
+    out: &mut Vec<u8>,
+) -> Result<(), SrsV2Error> {
+    let mut blk = [0_i16; 64];
+    for r in 0..8 {
+        for c in 0..8 {
+            blk[r * 8 + c] = block[r][c];
+        }
+    }
+    let freq = fdct_8x8(&blk);
+    let qfreq = quantize(&freq, qp);
+    write_block(PredMode::Dc, &qfreq, out)
+}
+
+pub(crate) fn decode_residual_block_8x8(
+    data: &[u8],
+    cursor: &mut usize,
+    qp: i16,
+) -> Result<[[i16; 8]; 8], SrsV2Error> {
+    let (_mode, freq) = read_block(data, cursor)?;
+    let recon_freq = dequantize(&freq, qp);
+    let rpix = idct_8x8(&recon_freq);
+    let mut out = [[0_i16; 8]; 8];
+    for r in 0..8 {
+        for c in 0..8 {
+            out[r][c] = rpix[r * 8 + c];
+        }
+    }
+    Ok(out)
+}
+
 fn write_block(mode: PredMode, freq: &[i16; 64], out: &mut Vec<u8>) -> Result<(), SrsV2Error> {
     out.push(mode as u8);
     out.extend_from_slice(&freq[0].to_le_bytes());

@@ -95,6 +95,11 @@ pub enum FrameTypeV2 {
     Predicted = 1,
 }
 
+impl FrameTypeV2 {
+    pub const I: Self = Self::Intra;
+    pub const P: Self = Self::Predicted;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum BlockMode {
@@ -181,6 +186,13 @@ impl VideoSequenceHeaderV2 {
             max_ref_frames: 0,
         }
     }
+
+    /// Like [`Self::intra_main_yuv420_bt709_limited`] but advertises one reference picture so mux/import may emit **P** frames (`FR2` rev 2) when dimensions are multiples of 16.
+    pub fn intra_main_yuv420_bt709_limited_one_ref(width: u32, height: u32) -> Self {
+        let mut s = Self::intra_main_yuv420_bt709_limited(width, height);
+        s.max_ref_frames = 1;
+        s
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +250,10 @@ pub fn decode_sequence_header_v2(
     }
     let width = u32::from_le_bytes(buf[8..12].try_into().unwrap());
     let height = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+    if buf[24] > super::limits::MAX_REF_FRAMES {
+        return Err(super::error::SrsV2Error::ExcessiveReferenceFrames(buf[24]));
+    }
+
     Ok(VideoSequenceHeaderV2 {
         width,
         height,
