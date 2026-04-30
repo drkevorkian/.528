@@ -13,6 +13,7 @@ pub use codec::{
 };
 pub use error::VideoCodecError;
 
+pub use srsv2::limits::MAX_LUMA_SAMPLES;
 pub use srsv2::model::SEQUENCE_HEADER_BYTES;
 pub use srsv2::{
     decode_sequence_header_v2, decode_yuv420_intra_payload, decode_yuv420_srsv2_payload,
@@ -25,3 +26,11 @@ pub use srsv2::{
     SrsVideoProfile, TransferFunction, TransformBackend, VideoPlane, VideoSequenceHeaderV2,
     YuvFrame,
 };
+
+#[cfg(test)]
+mod export_sanity_tests {
+    #[test]
+    fn max_luma_samples_export_matches_8k_uhd_plane() {
+        assert_eq!(crate::MAX_LUMA_SAMPLES, 33_177_600);
+    }
+}

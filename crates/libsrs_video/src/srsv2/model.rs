@@ -2,21 +2,26 @@
 //!
 //! Serialization uses explicit little-endian packed structs where noted.
 
-/// Distinct from container `codec_id` — identifies elementary SRSV2 stream content.
+/// Logical SRS video codec id — **`Srsv2` matches `.528` container video `codec_id` 3** (SRSV2 tracks).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SrsVideoCodecId {
-    /// Legacy grayscale intra prototype (`libsrs_video::codec` v1).
+    /// Legacy grayscale intra prototype (`libsrs_video::codec` v1); container **`codec_id` 1**.
     Srsv1 = 1,
-    /// Modern SRSV2 intra/inter architecture (this module).
-    Srsv2 = 2,
+    /// Modern SRSV2 intra + experimental P (`FR2` rev 2); container **`codec_id` 3**.
+    ///
+    /// Byte **2** is **not** SRSV2 video — in `.528`, **`codec_id` 2** is reserved for **SRSA audio**.
+    Srsv2 = 3,
 }
 
 impl SrsVideoCodecId {
     pub fn from_u8(v: u8) -> Result<Self, super::error::SrsV2Error> {
         match v {
             1 => Ok(Self::Srsv1),
-            2 => Ok(Self::Srsv2),
+            2 => Err(super::error::SrsV2Error::Unsupported(
+                "codec id byte 2 is SRSA audio in .528; SRSV2 video uses byte 3",
+            )),
+            3 => Ok(Self::Srsv2),
             _ => Err(super::error::SrsV2Error::Unsupported(
                 "unknown SrsVideoCodecId",
             )),
@@ -351,6 +356,32 @@ fn decode_range(b: u8) -> Result<ColorRange, super::error::SrsV2Error> {
         0 => Ok(ColorRange::Limited),
         1 => Ok(ColorRange::Full),
         _ => Err(super::error::SrsV2Error::syntax("unknown color range")),
+    }
+}
+
+#[cfg(test)]
+mod srs_video_codec_id_tests {
+    use super::*;
+
+    #[test]
+    fn srsv1_maps_to_container_codec_id_1() {
+        assert_eq!(SrsVideoCodecId::Srsv1 as u8, 1);
+        assert_eq!(SrsVideoCodecId::from_u8(1).unwrap(), SrsVideoCodecId::Srsv1);
+    }
+
+    #[test]
+    fn srsv2_maps_to_container_codec_id_3() {
+        assert_eq!(SrsVideoCodecId::Srsv2 as u8, 3);
+        assert_eq!(SrsVideoCodecId::from_u8(3).unwrap(), SrsVideoCodecId::Srsv2);
+    }
+
+    #[test]
+    fn byte_2_reserved_for_audio_not_srsv2_video() {
+        let err = SrsVideoCodecId::from_u8(2).unwrap_err();
+        assert!(matches!(
+            err,
+            super::super::error::SrsV2Error::Unsupported(_)
+        ));
     }
 }
 

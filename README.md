@@ -31,7 +31,7 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 | audio codec | **Working prototype** | v2 LPC stream decode in `libsrs_audio` |
 | video codec | **SRSV2 default** | Modern native **8K-first** direction (`docs/srsv2_design_targets.md`); **do not** claim H.264 superiority without **`docs/srsv2_benchmarks.md`** methodology. Today: CLI square-gray → `.srsv2` **single intra** (`FR2\x01`). **Native import** (SRSV2) uses **`max_ref_frames = 1`** and **P** (`FR2\x02`) after first picture when dimensions are **16-aligned**. Profiles **Baseline…Research** on-wire; most helpers still emit **Main**. Rate control, sub-pel/B/GPU/OS A/V remain roadmap. |
 | import / transcode | **Native pipeline partial** | Encode/import/transcode default to SRSV2 video; `--codec srsv1` selects legacy; FFmpeg path feature-gated |
-| playback | **Decode-preview** | `PlaybackSession` decodes SRSV2 (`codec_id` 3) and legacy SRSV1 (`codec_id` 1); `srs_player` shows last frame texture; `srs_cli play` smoke decode |
+| playback | **Decode-preview** | `PlaybackSession` decodes SRSV2 **intra** + experimental **P** (`codec_id` **3**, `FR2\x02` when a reference slot is filled), and SRSV1 (`codec_id` **1**); **SRSA audio** is `codec_id` **2**. OS audio/video presentation is **not** implemented; `srs_player` shows last-frame texture; `srs_cli play` smoke-decodes |
 | GPU | **Planned** | No device presentation or GPU decode here |
 | lossy video v2 | **Planned** | |
 | admin / licensing | **Partial / working** | Needs production hardening |

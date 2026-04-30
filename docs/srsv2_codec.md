@@ -19,7 +19,7 @@
 
 ## Planned / not yet merged
 
-- Wire **P** frames into default encode/import pipelines; half-pel and B-frames; merged MV modes beyond the prototype.
+- Half-pel motion, **B**-frames, and richer merged MV modes beyond the integer-pel **P** prototype.
 - Full rANS symbol models across all syntax elements (baseline uses structured plane bytes with bounds checks).
 - Loop filters beyond optional stubs, HDR signaling beyond sequence fields, 10-bit encode/decode paths.
 - GPU backends (`gpu-wgpu`, `gpu-cuda` feature placeholders).

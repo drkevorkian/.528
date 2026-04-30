@@ -286,4 +286,45 @@ mod roundtrip_tests {
         assert_eq!(dec.height, 64);
         assert_eq!(dec.yuv.y.samples.len(), yuv.y.samples.len());
     }
+
+    #[test]
+    fn identical_frames_p_payload_smaller_than_intra() {
+        let w = 64u32;
+        let h = 64u32;
+        let seq = VideoSequenceHeaderV2 {
+            width: w,
+            height: h,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![200_u8; (w * h * 3) as usize];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, w, h, ColorRange::Limited).unwrap();
+        let qp = 28_u8;
+        let intra = encode_yuv420_intra_payload(&seq, &yuv, 0, qp).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let p = encode_yuv420_inter_payload(
+            &seq,
+            &yuv,
+            slot.as_ref(),
+            1,
+            qp,
+            &SrsV2EncodeSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(p[3], 2);
+        assert!(
+            p.len() < intra.len(),
+            "expected P payload smaller than intra for identical texture (p={} intra={})",
+            p.len(),
+            intra.len()
+        );
+    }
 }

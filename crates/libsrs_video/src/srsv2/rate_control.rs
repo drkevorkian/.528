@@ -35,3 +35,34 @@ impl SrsV2EncodeSettings {
             .min(MAX_MOTION_VECTOR_PELS)
     }
 }
+
+#[cfg(test)]
+mod motion_radius_tests {
+    use super::*;
+    use crate::srsv2::limits::MAX_MOTION_SEARCH_RADIUS;
+
+    #[test]
+    fn negative_radius_clamps_to_zero() {
+        let s = SrsV2EncodeSettings {
+            motion_search_radius: -40,
+            ..Default::default()
+        };
+        assert_eq!(s.clamped_motion_search_radius(), 0);
+    }
+
+    #[test]
+    fn oversized_radius_clamps_to_max_motion_search_radius() {
+        let s = SrsV2EncodeSettings {
+            motion_search_radius: i16::MAX,
+            ..Default::default()
+        };
+        assert_eq!(s.clamped_motion_search_radius(), MAX_MOTION_SEARCH_RADIUS);
+    }
+
+    #[test]
+    fn default_radius_is_valid_and_stable() {
+        let s = SrsV2EncodeSettings::default();
+        assert_eq!(s.motion_search_radius, 16);
+        assert_eq!(s.clamped_motion_search_radius(), 16);
+    }
+}

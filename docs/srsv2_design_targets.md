@@ -52,7 +52,7 @@ Presets are **product knobs**, not yet fully wired end-to-end everywhere:
 
 Ordered roughly by dependency; many items overlap across releases.
 
-1. **P-frames** — in progress / prototype (`FR2` rev 2 path).
+1. **P-frames** — experimental **decode-preview** and encoder prototype shipped (`FR2` rev 2); no B-frames / sub-pel / GPU / full rate loop yet.
 2. **B-frames** or **alternate references** — temporal layering later.
 3. **Tiled 8K decode** — parallelism and cache locality.
 4. **64×64 and 128×128 superblocks** — hierarchical coding units.

@@ -27,7 +27,7 @@
 | **2** | Audio — **SRSA** | LPC v2 stream decode (`libsrs_audio`, `STREAM_VERSION_V2`) |
 | **3** | Video — **SRSV2** default | Intra YUV420p8 (`FR2\x01`); optional experimental **P** (`FR2\x02`) when sequence allows references |
 
-- **SRSV2** (`codec_id` **3**) is the **default** for newly generated `.528` media: 64-byte sequence header in track config; **`PlaybackSession`** keeps an SRSV2 reference picture when `max_ref_frames > 0` so **P** payloads can decode; seek/stop clear that reference (may affect mid-file **P** decode until the next **I** frame — prefer indexed seeks near chunk boundaries in future work).
+- **SRSV2** (`codec_id` **3**) is the **default** for newly generated `.528` media: 64-byte sequence header in track config; **`PlaybackSession`** holds an internal SRSV2 reference slot when `max_ref_frames > 0` so **P** payloads (`FR2\x02`) decode after at least one successful picture; **`stop` / `seek_ms`** clear that slot — if an indexed seek lands on a **P** packet with no preceding **I** at the demux cursor, the next decode returns **`PlaybackError::VideoDecode`** until an intra picture is decoded (keyframe-aware recovery not implemented yet).
 - **SRSV1** (`codec_id` **1**) is **legacy**; playback uses the older grayscale intra path.
 
 ## Limitations

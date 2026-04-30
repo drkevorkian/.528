@@ -1,4 +1,5 @@
-//! SRSV2 modern video path — intra baseline with hostile-input-safe parsers.
+//! SRSV2 modern video path — **intra baseline** plus **experimental P-frame** prototype (`FR2` revision 2),
+//! with hostile-input-safe parsers.
 //!
 //! SRSV1 (`crate::codec`) remains the legacy grayscale prototype.
 

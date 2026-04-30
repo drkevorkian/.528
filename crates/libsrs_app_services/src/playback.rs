@@ -19,14 +19,14 @@ use libsrs_container::{PacketFlags, TrackDescriptor, TrackKind};
 use libsrs_demux::{DemuxReader, DemuxedPacket};
 use libsrs_video::{
     decode_frame, decode_sequence_header_v2, decode_yuv420_srsv2_payload, FrameType, VideoFrame,
-    VideoSequenceHeaderV2, YuvFrame, SEQUENCE_HEADER_BYTES,
+    VideoSequenceHeaderV2, YuvFrame, MAX_LUMA_SAMPLES, SEQUENCE_HEADER_BYTES,
 };
 use thiserror::Error;
 
 /// Hard cap on per-side video dimension (hostile `.528`).
 pub const MAX_VIDEO_SIDE: u32 = 8192;
-/// Max pixels (width × height) we will allocate for a decoded grayscale buffer.
-pub const MAX_VIDEO_PIXELS: u64 = 32_000_000;
+/// Max pixels (width × height) we will allocate for a decoded grayscale buffer (aligned with SRSV2 `MAX_LUMA_SAMPLES`, full 8K UHD).
+pub const MAX_VIDEO_PIXELS: u64 = MAX_LUMA_SAMPLES;
 /// Max buffered packets waiting for the "other" stream (cross-track ordering).
 pub const MAX_STASH_PACKETS: usize = 64;
 
@@ -283,8 +283,8 @@ pub struct PlaybackSession {
     last_error: Option<String>,
     /// Parsed SRSV2 sequence header when primary video uses `codec_id == 3`.
     video_v2_seq: Option<VideoSequenceHeaderV2>,
-    /// Last decoded SRSV2 frame for experimental P-frame payloads (`FR2` rev 2).
-    video_v2_ref: Option<YuvFrame>,
+    /// Last decoded SRSV2 picture for experimental P-frame payloads (`FR2` rev 2).
+    video_v2_ref_slot: Option<YuvFrame>,
 }
 
 impl std::fmt::Debug for PlaybackSession {
@@ -401,7 +401,7 @@ impl PlaybackSession {
             decoded_audio_chunks: 0,
             last_error: None,
             video_v2_seq,
-            video_v2_ref: None,
+            video_v2_ref_slot: None,
         })
     }
 
@@ -633,9 +633,12 @@ impl PlaybackSession {
                         "SRSV2 sequence header missing from session".to_string(),
                     )
                 })?;
-                let dec =
-                    decode_yuv420_srsv2_payload(seq, &p.packet.payload, &mut self.video_v2_ref)
-                        .map_err(|e| PlaybackError::VideoDecode(format!("srsv2: {e}")))?;
+                let dec = decode_yuv420_srsv2_payload(
+                    seq,
+                    &p.packet.payload,
+                    &mut self.video_v2_ref_slot,
+                )
+                .map_err(|e| PlaybackError::VideoDecode(format!("srsv2: {e}")))?;
                 self.update_position_from_pts(p.packet.header.pts, timescale);
                 self.decoded_video_frames += 1;
                 let payload_crc32c = crc32c(&p.packet.payload);
@@ -722,11 +725,15 @@ impl PlaybackSession {
         self.decoded_video_frames = 0;
         self.decoded_audio_chunks = 0;
         self.last_error = None;
-        self.video_v2_ref = None;
+        self.video_v2_ref_slot = None;
         Ok(())
     }
 
     /// Seek to approximately `target_ms` using the demux index, if available.
+    ///
+    /// Clears the SRSV2 reference slot used for P-frame decode. Indexed seeks can land on a **P** packet; the next
+    /// SRSV2 decode then has **no reference** until an **I** frame is decoded — [`PlaybackError::VideoDecode`]
+    /// is expected in that situation (keyframe-aware recovery is not implemented yet).
     pub fn seek_ms(&mut self, target_ms: u64) -> Result<(), PlaybackError> {
         if !self.seek_supported {
             return Err(PlaybackError::SeekUnsupported);
@@ -743,7 +750,7 @@ impl PlaybackSession {
             pts_ticks: ent.pts,
             timescale_hz: self.position.timescale_hz.max(1),
         };
-        self.video_v2_ref = None;
+        self.video_v2_ref_slot = None;
         Ok(())
     }
 
@@ -781,9 +788,9 @@ mod playback_tests {
     use libsrs_container::{FileHeader, TrackDescriptor};
     use libsrs_mux::MuxWriter;
     use libsrs_video::{
-        encode_frame, encode_sequence_header_v2, encode_yuv420_intra_payload,
-        gray8_packed_to_yuv420p8_neutral, FrameType, VideoFrame, VideoSequenceHeaderV2,
-        SEQUENCE_HEADER_BYTES,
+        decode_yuv420_srsv2_payload, encode_frame, encode_sequence_header_v2,
+        encode_yuv420_inter_payload, encode_yuv420_intra_payload, gray8_packed_to_yuv420p8_neutral,
+        FrameType, SrsV2EncodeSettings, VideoFrame, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
     };
 
     fn write_video_only_528(path: &Path) {
@@ -829,6 +836,78 @@ mod playback_tests {
         let f = File::create(path).unwrap();
         let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
         mux.write_packet(1, 0, 0, true, &enc).unwrap();
+        mux.finalize().unwrap();
+    }
+
+    fn write_srsv2_ip_528(path: &Path) {
+        let w = 16u32;
+        let h = 16u32;
+        let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited_one_ref(w, h);
+        let gray0 = vec![0x22u8; (w * h) as usize];
+        let gray1 = vec![0xEEu8; (w * h) as usize];
+        let yuv0 = gray8_packed_to_yuv420p8_neutral(&gray0, w, h).unwrap();
+        let yuv1 = gray8_packed_to_yuv420p8_neutral(&gray1, w, h).unwrap();
+        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
+        let enc1 = encode_yuv420_inter_payload(
+            &seq,
+            &yuv1,
+            slot.as_ref(),
+            1,
+            28,
+            &SrsV2EncodeSettings::default(),
+        )
+        .unwrap();
+        assert_eq!(enc1[3], 2);
+        let cfg = encode_sequence_header_v2(&seq).to_vec();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg,
+        }];
+        let f = File::create(path).unwrap();
+        let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, &enc0).unwrap();
+        mux.write_packet(1, 3000, 3000, true, &enc1).unwrap();
+        mux.finalize().unwrap();
+    }
+
+    fn write_srsv2_predicted_only_528(path: &Path) {
+        let w = 16u32;
+        let h = 16u32;
+        let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited_one_ref(w, h);
+        let gray0 = vec![0x22u8; (w * h) as usize];
+        let gray1 = vec![0xEEu8; (w * h) as usize];
+        let yuv0 = gray8_packed_to_yuv420p8_neutral(&gray0, w, h).unwrap();
+        let yuv1 = gray8_packed_to_yuv420p8_neutral(&gray1, w, h).unwrap();
+        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
+        let enc1 = encode_yuv420_inter_payload(
+            &seq,
+            &yuv1,
+            slot.as_ref(),
+            1,
+            28,
+            &SrsV2EncodeSettings::default(),
+        )
+        .unwrap();
+        let cfg = encode_sequence_header_v2(&seq).to_vec();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg,
+        }];
+        let f = File::create(path).unwrap();
+        let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 3000, 3000, true, &enc1).unwrap();
         mux.finalize().unwrap();
     }
 
@@ -1250,6 +1329,155 @@ mod playback_tests {
         let mut s = PlaybackSession::open(&p).unwrap();
         assert!(!s.seek_supported());
         assert!(matches!(s.seek_ms(0), Err(PlaybackError::SeekUnsupported)));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_intra_then_predicted_decodes_both() {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!(
+            "pb-srsv2-ip-{}.528",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        write_srsv2_ip_528(&p);
+        let mut s = PlaybackSession::open(&p).unwrap();
+        let a = s.decode_next_video_frame().unwrap().unwrap();
+        assert_eq!(a.width, 16);
+        let b = s.decode_next_video_frame().unwrap().unwrap();
+        assert_eq!(b.width, 16);
+        assert_ne!(a.payload_crc32c, b.payload_crc32c);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_predicted_first_fails_without_reference() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pb-srsv2-pfirst.528");
+        write_srsv2_predicted_only_528(&p);
+        let mut s = PlaybackSession::open(&p).unwrap();
+        let err = s.decode_next_video_frame().unwrap_err();
+        assert!(matches!(err, PlaybackError::VideoDecode(_)));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_stop_clears_reference_decode_path() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pb-srsv2-stop-ref.528");
+        write_srsv2_ip_528(&p);
+        let mut s = PlaybackSession::open(&p).unwrap();
+        let _ = s.decode_next_video_frame().unwrap();
+        let _ = s.decode_next_video_frame().unwrap();
+        s.stop().unwrap();
+        let _ = s.decode_next_video_frame().unwrap().unwrap();
+        let _ = s.decode_next_video_frame().unwrap().unwrap();
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_seek_zero_restarts_with_intra_then_predicted() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pb-srsv2-seek0.528");
+        write_srsv2_ip_528(&p);
+        let mut s = PlaybackSession::open(&p).unwrap();
+        assert!(s.seek_supported());
+        let _ = s.decode_next_video_frame().unwrap();
+        let _ = s.decode_next_video_frame().unwrap();
+        s.seek_ms(0).unwrap();
+        let r0 = s.decode_next_video_frame().unwrap().unwrap();
+        let r1 = s.decode_next_video_frame().unwrap().unwrap();
+        assert_eq!(r0.width, 16);
+        assert_eq!(r1.width, 16);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_seek_landing_on_predicted_without_reference_fails() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pb-srsv2-seekp.528");
+        write_srsv2_ip_528(&p);
+        let mut s = PlaybackSession::open(&p).unwrap();
+        assert!(s.seek_supported());
+        s.seek_ms(50).unwrap();
+        let err = s.decode_next_video_frame().unwrap_err();
+        assert!(matches!(err, PlaybackError::VideoDecode(_)));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_8k_uhd_dimensions_accepted_at_open() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pb-srsv2-8kcfg.528");
+        let w = 7680u32;
+        let h = 4320u32;
+        let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(w, h);
+        let cfg = encode_sequence_header_v2(&seq).to_vec();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg,
+        }];
+        let f = File::create(&p).unwrap();
+        let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, b"x").unwrap();
+        mux.finalize().unwrap();
+        let _ = PlaybackSession::open(&p).unwrap();
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_oversized_pixel_grid_rejected_at_open() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pb-srsv2-hugepx.528");
+        let w = 8192u32;
+        let h = 8192u32;
+        let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(w, h);
+        let cfg = encode_sequence_header_v2(&seq).to_vec();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg,
+        }];
+        let f = File::create(&p).unwrap();
+        let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, b"x").unwrap();
+        mux.finalize().unwrap();
+        let err = PlaybackSession::open(&p).unwrap_err();
+        assert!(matches!(err, PlaybackError::Malformed(_)));
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_oversized_side_rejected_at_open() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pb-srsv2-hugeside.528");
+        let w = 8193u32;
+        let h = 4u32;
+        let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(w, h);
+        let cfg = encode_sequence_header_v2(&seq).to_vec();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg,
+        }];
+        let f = File::create(&p).unwrap();
+        let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, b"x").unwrap();
+        mux.finalize().unwrap();
+        let err = PlaybackSession::open(&p).unwrap_err();
+        assert!(matches!(err, PlaybackError::Malformed(_)));
         std::fs::remove_file(&p).ok();
     }
 }
