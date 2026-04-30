@@ -732,12 +732,20 @@ impl PlaybackSession {
     /// Seek to approximately `target_ms` using the demux index, if available.
     ///
     /// When a primary **video** track exists, the demux cursor is placed at the latest **keyframe** on that track
-    /// with `pts` at or before the requested time. **P-frames** are not used as seek targets. Callers should **decode
-    /// forward** from that keyframe toward the UI clock (no automatic hidden decode to an arbitrary PTS in this slice).
+    /// with `pts` at or before the requested time. **P-frames** are not used as seek targets.
+    ///
+    /// Then, with a strict budget, playback **decodes forward in file order** until it reaches the requested PTS
+    /// (or end-of-stream). This primes SRSV2 reference state so the next decode does not fail on a P payload.
     ///
     /// Clears the SRSV2 reference slot; the first successful video decode after seek initializes it from the keyframe.
     pub fn seek_ms(&mut self, target_ms: u64) -> Result<(), PlaybackError> {
-        self.seek_video_keyframe_before_or_at_ms(target_ms)
+        const RECOVERY_STEP_BUDGET: usize = 8192;
+        self.seek_video_keyframe_before_or_at_ms(target_ms)?;
+
+        let target_pts = target_ms
+            .saturating_mul(self.position.timescale_hz.max(1) as u64)
+            .saturating_div(1000);
+        self.recover_decode_to_pts(target_pts, RECOVERY_STEP_BUDGET)
     }
 
     /// Video-keyframe-aware wall-clock seek (see [`Self::seek_ms`]).
@@ -781,6 +789,43 @@ impl PlaybackSession {
             pts_ticks: ent.pts,
             timescale_hz: self.position.timescale_hz.max(1),
         };
+        Ok(())
+    }
+
+    fn recover_decode_to_pts(
+        &mut self,
+        target_pts: u64,
+        max_steps: usize,
+    ) -> Result<(), PlaybackError> {
+        if max_steps == 0 {
+            return Ok(());
+        }
+        if self.position.pts_ticks >= target_pts {
+            return Ok(());
+        }
+
+        let saved_video = self.decoded_video_frames;
+        let saved_audio = self.decoded_audio_chunks;
+
+        for _ in 0..max_steps {
+            match self.decode_next_step()? {
+                PlaybackEvent::EndOfStream => break,
+                PlaybackEvent::Video(_) | PlaybackEvent::Audio(_) => {}
+            }
+            if self.position.pts_ticks >= target_pts {
+                break;
+            }
+        }
+
+        // Seeking/recovery should not permanently affect counters (UI stats).
+        self.decoded_video_frames = saved_video;
+        self.decoded_audio_chunks = saved_audio;
+
+        if self.position.pts_ticks < target_pts {
+            return Err(PlaybackError::Malformed(
+                "seek recovery exceeded step budget; decode forward from the keyframe in the caller".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -903,6 +948,57 @@ mod playback_tests {
         let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
         mux.write_packet(1, 0, 0, true, &enc0).unwrap();
         mux.write_packet(1, 3000, 3000, false, &enc1).unwrap();
+        mux.finalize().unwrap();
+    }
+
+    fn write_srsv2_ipp_528(path: &Path) {
+        let w = 16u32;
+        let h = 16u32;
+        let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited_one_ref(w, h);
+        let gray0 = vec![0x10u8; (w * h) as usize];
+        let gray1 = vec![0x80u8; (w * h) as usize];
+        let gray2 = vec![0xF0u8; (w * h) as usize];
+        let yuv0 = gray8_packed_to_yuv420p8_neutral(&gray0, w, h).unwrap();
+        let yuv1 = gray8_packed_to_yuv420p8_neutral(&gray1, w, h).unwrap();
+        let yuv2 = gray8_packed_to_yuv420p8_neutral(&gray2, w, h).unwrap();
+
+        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
+        let enc1 = encode_yuv420_inter_payload(
+            &seq,
+            &yuv1,
+            slot.as_ref(),
+            1,
+            28,
+            &SrsV2EncodeSettings::default(),
+        )
+        .unwrap();
+        decode_yuv420_srsv2_payload(&seq, &enc1, &mut slot).unwrap();
+        let enc2 = encode_yuv420_inter_payload(
+            &seq,
+            &yuv2,
+            slot.as_ref(),
+            2,
+            28,
+            &SrsV2EncodeSettings::default(),
+        )
+        .unwrap();
+
+        let cfg = encode_sequence_header_v2(&seq).to_vec();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg,
+        }];
+        let f = File::create(path).unwrap();
+        let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, &enc0).unwrap();
+        mux.write_packet(1, 3000, 3000, false, &enc1).unwrap();
+        mux.write_packet(1, 6000, 6000, false, &enc2).unwrap();
         mux.finalize().unwrap();
     }
 
@@ -1425,20 +1521,17 @@ mod playback_tests {
     }
 
     #[test]
-    fn srsv2_seek_mid_timeline_lands_on_prior_keyframe() {
+    fn srsv2_seek_mid_timeline_recovers_forward_from_keyframe() {
         let dir = std::env::temp_dir();
-        let p = dir.join("pb-srsv2-seekkf.528");
-        write_srsv2_ip_528(&p);
+        let p = dir.join("pb-srsv2-seek-recover.528");
+        write_srsv2_ipp_528(&p);
         let mut s = PlaybackSession::open(&p).unwrap();
         assert!(s.seek_supported());
         s.seek_ms(50).unwrap();
-        let f = s.decode_next_video_frame().unwrap().unwrap();
-        assert_eq!(
-            f.pts_ticks, 0,
-            "seek must snap to indexed intra before P at pts 3000"
+        assert!(
+            s.position().pts_ticks >= 4500,
+            "seek recovery should decode forward toward target pts"
         );
-        let g = s.decode_next_video_frame().unwrap().unwrap();
-        assert_eq!(g.pts_ticks, 3000);
         std::fs::remove_file(&p).ok();
     }
 
