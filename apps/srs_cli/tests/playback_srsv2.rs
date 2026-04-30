@@ -64,7 +64,7 @@ fn write_srsv2_ip_528(path: &std::path::Path) {
     let f = File::create(path).unwrap();
     let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
     mux.write_packet(1, 0, 0, true, &enc0).unwrap();
-    mux.write_packet(1, 3000, 3000, true, &enc1).unwrap();
+    mux.write_packet(1, 3000, 3000, false, &enc1).unwrap();
     mux.finalize().unwrap();
 }
 

@@ -6,3 +6,12 @@ edition = "2021"
 [lib]
 name = "quality_metrics"
 path = "src/lib.rs"
+
+[[bin]]
+name = "gen_synthetic_yuv"
+path = "src/bin/gen_synthetic_yuv.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }

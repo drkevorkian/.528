@@ -1,0 +1,21 @@
+[package]
+name = "codec_compare"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "codec_compare"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+libsrs_container = { path = "../../crates/libsrs_container" }
+libsrs_mux = { path = "../../crates/libsrs_mux" }
+libsrs_video = { path = "../../crates/libsrs_video" }
+quality_metrics = { path = "../quality_metrics" }

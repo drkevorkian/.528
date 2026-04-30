@@ -731,26 +731,56 @@ impl PlaybackSession {
 
     /// Seek to approximately `target_ms` using the demux index, if available.
     ///
-    /// Clears the SRSV2 reference slot used for P-frame decode. Indexed seeks can land on a **P** packet; the next
-    /// SRSV2 decode then has **no reference** until an **I** frame is decoded — [`PlaybackError::VideoDecode`]
-    /// is expected in that situation (keyframe-aware recovery is not implemented yet).
+    /// When a primary **video** track exists, the demux cursor is placed at the latest **keyframe** on that track
+    /// with `pts` at or before the requested time. **P-frames** are not used as seek targets. Callers should **decode
+    /// forward** from that keyframe toward the UI clock (no automatic hidden decode to an arbitrary PTS in this slice).
+    ///
+    /// Clears the SRSV2 reference slot; the first successful video decode after seek initializes it from the keyframe.
     pub fn seek_ms(&mut self, target_ms: u64) -> Result<(), PlaybackError> {
+        self.seek_video_keyframe_before_or_at_ms(target_ms)
+    }
+
+    /// Video-keyframe-aware wall-clock seek (see [`Self::seek_ms`]).
+    pub fn seek_video_keyframe_before_or_at_ms(
+        &mut self,
+        target_ms: u64,
+    ) -> Result<(), PlaybackError> {
         if !self.seek_supported {
             return Err(PlaybackError::SeekUnsupported);
         }
         let ts = self.position.timescale_hz.max(1) as u64;
-        let pts = target_ms.saturating_mul(ts).saturating_div(1000);
-        let ent = self
-            .demux
-            .seek_nearest(pts)?
-            .ok_or(PlaybackError::SeekUnsupported)?;
+        let target_pts = target_ms.saturating_mul(ts).saturating_div(1000);
         self.video_stash.clear();
         self.audio_stash.clear();
+        self.video_v2_ref_slot = None;
+
+        let ent = if let Some(v) = &self.primary_video {
+            match self
+                .demux
+                .seek_nearest_video_keyframe_before_or_at(v.mux_track_id, target_pts)
+            {
+                Ok(Some(e)) => e,
+                Ok(None) if v.codec_id == 3 => {
+                    return Err(PlaybackError::Malformed(
+                        "no indexed SRSV2 video keyframe at or before seek target".to_string(),
+                    ));
+                }
+                Ok(None) => self
+                    .demux
+                    .seek_nearest(target_pts)?
+                    .ok_or(PlaybackError::SeekUnsupported)?,
+                Err(e) => return Err(PlaybackError::Io(e)),
+            }
+        } else {
+            self.demux
+                .seek_nearest(target_pts)?
+                .ok_or(PlaybackError::SeekUnsupported)?
+        };
+
         self.position = PlaybackPosition {
             pts_ticks: ent.pts,
             timescale_hz: self.position.timescale_hz.max(1),
         };
-        self.video_v2_ref_slot = None;
         Ok(())
     }
 
@@ -785,7 +815,7 @@ impl PlaybackSession {
 #[cfg(test)]
 mod playback_tests {
     use super::*;
-    use libsrs_container::{FileHeader, TrackDescriptor};
+    use libsrs_container::{FileHeader, PacketFlags, TrackDescriptor};
     use libsrs_mux::MuxWriter;
     use libsrs_video::{
         decode_yuv420_srsv2_payload, encode_frame, encode_sequence_header_v2,
@@ -872,7 +902,7 @@ mod playback_tests {
         let f = File::create(path).unwrap();
         let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
         mux.write_packet(1, 0, 0, true, &enc0).unwrap();
-        mux.write_packet(1, 3000, 3000, true, &enc1).unwrap();
+        mux.write_packet(1, 3000, 3000, false, &enc1).unwrap();
         mux.finalize().unwrap();
     }
 
@@ -907,7 +937,7 @@ mod playback_tests {
         }];
         let f = File::create(path).unwrap();
         let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
-        mux.write_packet(1, 3000, 3000, true, &enc1).unwrap();
+        mux.write_packet(1, 3000, 3000, false, &enc1).unwrap();
         mux.finalize().unwrap();
     }
 
@@ -940,7 +970,7 @@ mod playback_tests {
         let f = File::create(path).unwrap();
         let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
         mux.write_packet(1, 0, 0, true, &enc0).unwrap();
-        mux.write_packet(1, 3_000, 3_000, true, &enc1).unwrap();
+        mux.write_packet(1, 3_000, 3_000, false, &enc1).unwrap();
         mux.finalize().unwrap();
     }
 
@@ -1395,15 +1425,42 @@ mod playback_tests {
     }
 
     #[test]
-    fn srsv2_seek_landing_on_predicted_without_reference_fails() {
+    fn srsv2_seek_mid_timeline_lands_on_prior_keyframe() {
         let dir = std::env::temp_dir();
-        let p = dir.join("pb-srsv2-seekp.528");
+        let p = dir.join("pb-srsv2-seekkf.528");
         write_srsv2_ip_528(&p);
         let mut s = PlaybackSession::open(&p).unwrap();
         assert!(s.seek_supported());
         s.seek_ms(50).unwrap();
-        let err = s.decode_next_video_frame().unwrap_err();
-        assert!(matches!(err, PlaybackError::VideoDecode(_)));
+        let f = s.decode_next_video_frame().unwrap().unwrap();
+        assert_eq!(
+            f.pts_ticks, 0,
+            "seek must snap to indexed intra before P at pts 3000"
+        );
+        let g = s.decode_next_video_frame().unwrap().unwrap();
+        assert_eq!(g.pts_ticks, 3000);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_mux_index_flags_intra_keyframe_predicted_not_keyframe() {
+        let dir = std::env::temp_dir();
+        let p = dir.join("pb-srsv2-ixflags.528");
+        write_srsv2_ip_528(&p);
+        let mut d = libsrs_demux::DemuxReader::open(std::fs::File::open(&p).unwrap()).unwrap();
+        d.rebuild_index().unwrap();
+        let e0 = d
+            .index()
+            .iter()
+            .find(|e| e.track_id == 1 && e.pts == 0)
+            .unwrap();
+        let e1 = d
+            .index()
+            .iter()
+            .find(|e| e.track_id == 1 && e.pts == 3000)
+            .unwrap();
+        assert_ne!(e0.flags & PacketFlags::KEYFRAME, 0);
+        assert_eq!(e1.flags & PacketFlags::KEYFRAME, 0);
         std::fs::remove_file(&p).ok();
     }
 

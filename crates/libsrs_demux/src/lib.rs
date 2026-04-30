@@ -3,7 +3,8 @@ use std::io::{self, ErrorKind, Read, Seek, SeekFrom};
 use libsrs_container::{
     decode_block_header, decode_cue_block, decode_file_header, decode_index_block,
     decode_packet_block, decode_track_descriptor, find_next_block_magic, read_block_body,
-    BlockType, FileHeader, IndexBlock, IndexEntry, Packet, TrackDescriptor, BLOCK_MAGIC,
+    BlockType, FileHeader, IndexBlock, IndexEntry, Packet, PacketFlags, TrackDescriptor,
+    BLOCK_MAGIC,
 };
 
 #[derive(Debug, Clone)]
@@ -65,6 +66,33 @@ impl<R: Read + Seek> DemuxReader<R> {
             .index
             .iter()
             .filter(|entry| entry.pts <= pts)
+            .max_by_key(|entry| entry.pts)
+            .cloned();
+        if let Some(entry) = &selected {
+            self.reader.seek(SeekFrom::Start(entry.file_offset))?;
+        }
+        Ok(selected)
+    }
+
+    /// Seek to the latest **keyframe** packet on `track_id` with `pts <= pts`, by index order.
+    ///
+    /// Used so video seeks do not land on inter-coded packets that require an unavailable reference.
+    pub fn seek_nearest_video_keyframe_before_or_at(
+        &mut self,
+        track_id: u16,
+        pts: u64,
+    ) -> io::Result<Option<IndexEntry>> {
+        if self.index.is_empty() {
+            self.rebuild_index()?;
+        }
+        let selected = self
+            .index
+            .iter()
+            .filter(|entry| {
+                entry.track_id == track_id
+                    && entry.pts <= pts
+                    && (entry.flags & PacketFlags::KEYFRAME) != 0
+            })
             .max_by_key(|entry| entry.pts)
             .cloned();
         if let Some(entry) = &selected {

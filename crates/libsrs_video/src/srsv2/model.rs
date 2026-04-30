@@ -2,19 +2,24 @@
 //!
 //! Serialization uses explicit little-endian packed structs where noted.
 
-/// Logical SRS video codec id — **`Srsv2` matches `.528` container video `codec_id` 3** (SRSV2 tracks).
+/// Elementary / logical SRS **video** tag (e.g. in future sidecar metadata) — **not** the same type as
+/// the raw `u16` **`.528` `TrackDescriptor::codec_id`** field. For container track IDs use
+/// `libsrs_container::codec_ids` (`CONTAINER_VIDEO_CODEC_SRSV1`, `CONTAINER_VIDEO_CODEC_SRSV2`, …).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum SrsVideoCodecId {
-    /// Legacy grayscale intra prototype (`libsrs_video::codec` v1); container **`codec_id` 1**.
+pub enum SrsElementaryVideoCodecId {
+    /// Legacy grayscale intra prototype (`libsrs_video::codec` v1); same numeric value as container video **`codec_id` 1**.
     Srsv1 = 1,
-    /// Modern SRSV2 intra + experimental P (`FR2` rev 2); container **`codec_id` 3**.
+    /// Modern SRSV2 intra + experimental P (`FR2` rev 2); same numeric value as container video **`codec_id` 3**.
     ///
-    /// Byte **2** is **not** SRSV2 video — in `.528`, **`codec_id` 2** is reserved for **SRSA audio**.
+    /// Byte **2** is **not** SRSV2 video — in `.528`, **`codec_id` 2** is **SRSA audio** at the container level.
     Srsv2 = 3,
 }
 
-impl SrsVideoCodecId {
+/// Back-compat alias for [`SrsElementaryVideoCodecId`].
+pub type SrsVideoCodecId = SrsElementaryVideoCodecId;
+
+impl SrsElementaryVideoCodecId {
     pub fn from_u8(v: u8) -> Result<Self, super::error::SrsV2Error> {
         match v {
             1 => Ok(Self::Srsv1),
@@ -23,7 +28,7 @@ impl SrsVideoCodecId {
             )),
             3 => Ok(Self::Srsv2),
             _ => Err(super::error::SrsV2Error::Unsupported(
-                "unknown SrsVideoCodecId",
+                "unknown SrsElementaryVideoCodecId",
             )),
         }
     }
@@ -365,23 +370,37 @@ mod srs_video_codec_id_tests {
 
     #[test]
     fn srsv1_maps_to_container_codec_id_1() {
-        assert_eq!(SrsVideoCodecId::Srsv1 as u8, 1);
-        assert_eq!(SrsVideoCodecId::from_u8(1).unwrap(), SrsVideoCodecId::Srsv1);
+        assert_eq!(SrsElementaryVideoCodecId::Srsv1 as u8, 1);
+        assert_eq!(
+            SrsElementaryVideoCodecId::from_u8(1).unwrap(),
+            SrsElementaryVideoCodecId::Srsv1
+        );
     }
 
     #[test]
     fn srsv2_maps_to_container_codec_id_3() {
-        assert_eq!(SrsVideoCodecId::Srsv2 as u8, 3);
-        assert_eq!(SrsVideoCodecId::from_u8(3).unwrap(), SrsVideoCodecId::Srsv2);
+        assert_eq!(SrsElementaryVideoCodecId::Srsv2 as u8, 3);
+        assert_eq!(
+            SrsElementaryVideoCodecId::from_u8(3).unwrap(),
+            SrsElementaryVideoCodecId::Srsv2
+        );
     }
 
     #[test]
     fn byte_2_reserved_for_audio_not_srsv2_video() {
-        let err = SrsVideoCodecId::from_u8(2).unwrap_err();
+        let err = SrsElementaryVideoCodecId::from_u8(2).unwrap_err();
         assert!(matches!(
             err,
             super::super::error::SrsV2Error::Unsupported(_)
         ));
+    }
+
+    #[test]
+    fn srs_video_codec_id_type_alias_matches_elementary() {
+        assert_eq!(
+            SrsVideoCodecId::Srsv2 as u8,
+            SrsElementaryVideoCodecId::Srsv2 as u8
+        );
     }
 }
 

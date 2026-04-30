@@ -15,9 +15,10 @@ use libsrs_licensing_proto::{EntitlementClaims, LicensedFeature};
 use libsrs_mux::MuxWriter;
 use libsrs_pipeline::TranscodePipeline;
 use libsrs_video::{
-    decode_sequence_header_v2, decode_yuv420_intra_payload, encode_sequence_header_v2,
-    encode_yuv420_intra_payload, FrameType, VideoFrame, VideoSequenceHeaderV2, VideoStreamReader,
-    VideoStreamReaderV2, VideoStreamWriter, VideoStreamWriterV2, SEQUENCE_HEADER_BYTES,
+    classify_srsv2_payload, decode_sequence_header_v2, decode_yuv420_intra_payload,
+    encode_sequence_header_v2, encode_yuv420_intra_payload, FrameType, Srsv2PayloadKind,
+    VideoFrame, VideoSequenceHeaderV2, VideoStreamReader, VideoStreamReaderV2, VideoStreamWriter,
+    VideoStreamWriterV2, SEQUENCE_HEADER_BYTES,
 };
 use thiserror::Error;
 
@@ -761,7 +762,18 @@ fn mux_elementary_streams(input: &Path, output: &Path) -> Result<()> {
             .read_next_payload()
             .map_err(|e| anyhow!("SRSV2 read frame: {}", e))?
         {
-            mux.write_packet(1, pts, pts, true, &payload)?;
+            let is_keyframe = match classify_srsv2_payload(&payload).map_err(|e| {
+                anyhow!("SRSV2 elementary payload classification for mux index: {e}")
+            })? {
+                Srsv2PayloadKind::Intra => true,
+                Srsv2PayloadKind::Predicted => false,
+                Srsv2PayloadKind::Unknown => {
+                    return Err(anyhow!(
+                        "SRSV2 elementary uses unsupported FR2 revision; refusing mux"
+                    ));
+                }
+            };
+            mux.write_packet(1, pts, pts, is_keyframe, &payload)?;
             let _ = frame_index;
             pts = pts.saturating_add(3_000);
         }

@@ -17,10 +17,10 @@ use libsrs_pipeline::{
     DecodedAudioFrame, DecodedVideoFrame, MediaDecoder, NativeEncoderSink, TranscodePipeline,
 };
 use libsrs_video::{
-    decode_frame as video_decode_frame, decode_sequence_header_v2, decode_yuv420_srsv2_payload,
-    encode_frame as video_encode_frame, encode_sequence_header_v2, encode_yuv420_inter_payload,
-    gray8_packed_to_yuv420p8_neutral, FrameType, SrsV2EncodeSettings, VideoFrame,
-    VideoSequenceHeaderV2, YuvFrame, SEQUENCE_HEADER_BYTES,
+    classify_srsv2_payload, decode_frame as video_decode_frame, decode_sequence_header_v2,
+    decode_yuv420_srsv2_payload, encode_frame as video_encode_frame, encode_sequence_header_v2,
+    encode_yuv420_inter_payload, gray8_packed_to_yuv420p8_neutral, FrameType, SrsV2EncodeSettings,
+    Srsv2PayloadKind, VideoFrame, VideoSequenceHeaderV2, YuvFrame, SEQUENCE_HEADER_BYTES,
 };
 
 use crate::Native528VideoCodec;
@@ -442,7 +442,22 @@ impl NativeEncoderSink for MuxNativeImportSink {
             video_encode_frame(&vf)?
         };
         let pts = pts_ticks.unwrap_or(self.next_video_pts);
-        mux.write_packet(mux_id, pts, pts, true, &payload)?;
+        let is_keyframe = if self.video_codec_id == 3 {
+            match classify_srsv2_payload(&payload)
+                .map_err(|e| anyhow!("SRSV2 payload classification: {e}"))?
+            {
+                Srsv2PayloadKind::Intra => true,
+                Srsv2PayloadKind::Predicted => false,
+                Srsv2PayloadKind::Unknown => {
+                    return Err(anyhow!(
+                        "unsupported SRSV2 FR2 revision in mux path; refusing to mux"
+                    ));
+                }
+            }
+        } else {
+            true
+        };
+        mux.write_packet(mux_id, pts, pts, is_keyframe, &payload)?;
         self.next_video_pts = pts.saturating_add(3_000);
         Ok(())
     }
@@ -556,6 +571,34 @@ mod import_tests {
 
         let out_bytes = std::fs::read(&dst).unwrap();
         let mut demux = libsrs_demux::DemuxReader::open(Cursor::new(out_bytes)).unwrap();
+        demux.rebuild_index().unwrap();
+        use libsrs_container::PacketFlags;
+        let vid = demux
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .expect("video track")
+            .track_id;
+        let ix0 = demux
+            .index()
+            .iter()
+            .find(|e| e.track_id == vid && e.pts == 0)
+            .unwrap();
+        let ix1 = demux
+            .index()
+            .iter()
+            .find(|e| e.track_id == vid && e.pts == 3_000)
+            .unwrap();
+        assert_ne!(
+            ix0.flags & PacketFlags::KEYFRAME,
+            0,
+            "intra must be keyframe"
+        );
+        assert_eq!(
+            ix1.flags & PacketFlags::KEYFRAME,
+            0,
+            "P-frame must not be indexed as keyframe"
+        );
         let vt = demux
             .tracks()
             .iter()
@@ -566,6 +609,16 @@ mod import_tests {
         assert_eq!(seq.max_ref_frames, 1);
         let p0 = demux.next_packet().unwrap().unwrap();
         let p1 = demux.next_packet().unwrap().unwrap();
+        assert_ne!(
+            p0.packet.header.flags & PacketFlags::KEYFRAME,
+            0,
+            "first SRSV2 packet header must carry KEYFRAME"
+        );
+        assert_eq!(
+            p1.packet.header.flags & PacketFlags::KEYFRAME,
+            0,
+            "predicted SRSV2 packet must not carry KEYFRAME"
+        );
         assert_eq!(
             p0.packet.payload[3], 1,
             "first SRSV2 video packet should be intra"

@@ -1,5 +1,7 @@
 # SRSV2 measurement methodology (optional comparisons)
 
+Workspace tool: `cargo run -p codec_compare -- --help` (optional **libx264** branch via `ffmpeg`).
+
 This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders (for example a common **AVC** baseline). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge.
 
 ## Fair comparison checklist

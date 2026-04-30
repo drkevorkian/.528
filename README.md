@@ -38,6 +38,13 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 
 Further playback architecture: `docs/playback_pipeline.md`.
 
+### Benchmark tooling (optional, engineering measurements)
+
+- **Synthetic YUV:** `cargo run -p quality_metrics --bin gen_synthetic_yuv -- --pattern noise --seed 1 --out-yuv clip.yuv --out-meta clip.json`
+- **SRSV2 vs optional libx264:** `cargo run -p codec_compare -- --yuv clip.yuv --meta clip.json --out-json report.json --out-md report.md`  
+  If `ffmpeg` is not on `PATH`, the harness still reports SRSV2 encode/decode metrics and skips H.264.
+- These outputs are **lab measurements** — do **not** treat them as proof SRSV2 “beats” another codec without your own methodology (`docs/srsv2_benchmarks.md`).
+
 ## Build
 
 ```bash

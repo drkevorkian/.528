@@ -1,3 +1,5 @@
+pub mod synthetic;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricError {
     LengthMismatch { reference: usize, measured: usize },

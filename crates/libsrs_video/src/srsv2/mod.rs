@@ -13,6 +13,7 @@ pub mod intra_codec;
 pub mod limits;
 pub mod model;
 pub mod p_frame_codec;
+pub mod payload_kind;
 pub mod rate_control;
 pub mod reference;
 
@@ -27,9 +28,11 @@ pub use frame_codec::{
 };
 pub use model::{
     decode_sequence_header_v2, encode_sequence_header_v2, ChromaSiting, ColorPrimaries, ColorRange,
-    FrameHeaderV2, FrameTypeV2, MatrixCoefficients, PixelFormat, SrsVideoCodecId, SrsVideoProfile,
-    TileHeaderV2, TransferFunction, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
+    FrameHeaderV2, FrameTypeV2, MatrixCoefficients, PixelFormat, SrsElementaryVideoCodecId,
+    SrsVideoCodecId, SrsVideoProfile, TileHeaderV2, TransferFunction, VideoSequenceHeaderV2,
+    SEQUENCE_HEADER_BYTES,
 };
+pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::SrsV2EncodeSettings;
 pub use reference::ReferenceFrameBuffer;
 

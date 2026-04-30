@@ -17,6 +17,7 @@ members = [
     "benchmarks",
     "tools/bitstream_dump",
     "tools/quality_metrics",
+    "tools/codec_compare",
     "tools/container_inspector",
     "tools/fuzz_seed_gen",
     "crates/libsrs_licensing_proto",
@@ -41,3 +42,4 @@ crc32c = "0.6"
 thiserror = "2"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"

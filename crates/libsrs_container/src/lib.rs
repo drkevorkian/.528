@@ -1,3 +1,8 @@
+pub mod codec_ids;
+
+pub use codec_ids::{
+    CONTAINER_AUDIO_CODEC_SRSA, CONTAINER_VIDEO_CODEC_SRSV1, CONTAINER_VIDEO_CODEC_SRSV2,
+};
 pub mod crc;
 pub mod format;
 pub mod io;
