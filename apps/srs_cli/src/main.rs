@@ -38,6 +38,7 @@ enum Commands {
         fps: u32,
         #[arg(long, default_value = "rgba8")]
         pix_fmt: String,
+        /// SRSV2 sequence profile: baseline | main | pro | lossless | screen | ultra | research (see docs/srsv2_design_targets.md).
         #[arg(long, default_value = "main")]
         profile: String,
         #[arg(long, default_value_t = 28)]
@@ -427,6 +428,8 @@ fn encode_srsv2_elementary_file(
         "pro" => SrsVideoProfile::Pro,
         "lossless" => SrsVideoProfile::Lossless,
         "screen" => SrsVideoProfile::Screen,
+        "ultra" => SrsVideoProfile::Ultra,
+        "research" => SrsVideoProfile::Research,
         _ => return Err(anyhow!("unknown --profile {profile}")),
     };
     let w = width as usize;

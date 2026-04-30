@@ -24,14 +24,26 @@ impl SrsVideoCodecId {
     }
 }
 
+/// Production **`codec_id` 3** tier signaled in the 64-byte SRSV2 sequence header (byte offset 16).
+///
+/// Roadmap roles (resolution targets, tooling) live in `docs/srsv2_design_targets.md`. Today most paths still emit **`Main`**; higher tiers unlock features over time. **Unknown** profile byte values are **rejected** at decode until added to this enum and the `decode_sequence_header_v2` match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SrsVideoProfile {
+    /// Fast decode, mobile / 1080p–1440p class workloads.
     Baseline = 0,
+    /// Normal playback / production — **4K / 8K** tier focus for balanced presets.
     Main = 1,
+    /// Creator / editing / archival — **4:2:2** and **4:4:4** readiness (tooling TBD).
     Pro = 2,
+    /// Near-lossless / archival emphasis (distinct from **Pro** tooling tier).
     Lossless = 3,
+    /// Screen content: UI, games, text, AI-generated frames (future screen tools).
     Screen = 4,
+    /// **8K** high-quality compression emphasis — slower encode acceptable (`Ultra` preset roadmap).
+    Ultra = 5,
+    /// Above-8K and experimental features — permissive limits, not general interchange default.
+    Research = 6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,6 +275,8 @@ pub fn decode_sequence_header_v2(
             2 => SrsVideoProfile::Pro,
             3 => SrsVideoProfile::Lossless,
             4 => SrsVideoProfile::Screen,
+            5 => SrsVideoProfile::Ultra,
+            6 => SrsVideoProfile::Research,
             _ => {
                 return Err(super::error::SrsV2Error::syntax(
                     "unknown SRSV2 profile byte",
@@ -337,5 +351,34 @@ fn decode_range(b: u8) -> Result<ColorRange, super::error::SrsV2Error> {
         0 => Ok(ColorRange::Limited),
         1 => Ok(ColorRange::Full),
         _ => Err(super::error::SrsV2Error::syntax("unknown color range")),
+    }
+}
+
+#[cfg(test)]
+mod profile_roundtrip_tests {
+    use super::*;
+
+    #[test]
+    fn sequence_header_profiles_ultra_research_roundtrip() {
+        for p in [SrsVideoProfile::Ultra, SrsVideoProfile::Research] {
+            let seq = VideoSequenceHeaderV2 {
+                width: 7680,
+                height: 4320,
+                profile: p,
+                pixel_format: PixelFormat::Yuv420p8,
+                color_primaries: ColorPrimaries::Bt709,
+                transfer: TransferFunction::Sdr,
+                matrix: MatrixCoefficients::Bt709,
+                chroma_siting: ChromaSiting::Center,
+                range: ColorRange::Limited,
+                disable_loop_filter: true,
+                max_ref_frames: 4,
+            };
+            let b = encode_sequence_header_v2(&seq);
+            let d = decode_sequence_header_v2(&b).expect("decode");
+            assert_eq!(d.profile, p);
+            assert_eq!(d.width, 7680);
+            assert_eq!(d.height, 4320);
+        }
     }
 }

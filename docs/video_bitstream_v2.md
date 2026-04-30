@@ -7,7 +7,8 @@
 - Magic `SRS2` (4 bytes).
 - Schema byte `1`.
 - Width / height: `u32` LE each (must satisfy decoder caps in `libsrs_video::srsv2::limits`).
-- Profile, pixel format, color primaries, transfer, matrix, chroma siting, range, loop-filter disable flag, max reference frames.
+- **Profile** byte (see `SrsVideoProfile` in `libsrs_video::srsv2::model`): **0** Baseline, **1** Main, **2** Pro, **3** Lossless, **4** Screen, **5** Ultra, **6** Research — semantics in **`docs/srsv2_design_targets.md`**.
+- Pixel format, color primaries, transfer, matrix, chroma siting, range, loop-filter disable flag, max reference frames.
 
 Embedded verbatim in `.528` **video track config** when `codec_id == 3`.
 

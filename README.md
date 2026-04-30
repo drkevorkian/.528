@@ -20,7 +20,7 @@ The workspace stays buildable while codec and GPU features grow; see the status 
 - **Analyze / mux / demux** operate on these paths through `libsrs_demux` / `libsrs_mux`.
 - **Import** (`srs_cli import --codec srsv2|srsv1`, `libsrs_app_services`) ingests packets, **decodes** native SRS video/audio to normalized frames (`MediaDecoder`), then **re-encodes** into `.528` via `NativeEncoderSink`. **Default video** for new containers is **SRSV2** (`codec_id` 3); use **`--codec srsv1`** for legacy SRSV1. **Non-native** paths require **`libsrs_compat` with `ffmpeg`**; the stub backend does not fabricate video.
 
-Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_format.md` (index), and `docs/528_container_format.md`.
+Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_format.md` (index), and `docs/528_container_format.md`. SRSV2 roadmap and H.264-class benchmark policy: `docs/srsv2_design_targets.md`, `docs/srsv2_benchmarks.md`.
 
 ## Implementation status
 
@@ -29,7 +29,7 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 | `.528` container | **Partial / working** | v2 primary; hostile-input limits in I/O (`libsrs_container`) |
 | mux / demux | **Partial / working** | `libsrs_mux` / `libsrs_demux`; cues + index; mux prefers `.srsv2` when elementary video is present |
 | audio codec | **Working prototype** | v2 LPC stream decode in `libsrs_audio` |
-| video codec | **SRSV2 default** | New `.528` video uses **SRSV2** (`codec_id` **3**). **SRSV1** remains **legacy**. CLI square-gray → `.srsv2` stays **single intra** (`FR2\x01`). **Native import** (SRSV2) sets **`max_ref_frames = 1`** and emits **P** (`FR2\x02`) after the first picture when width/height are multiples of **16** (else intra). Full rate control, sub-pel motion, B-frames, GPU, and OS A/V output remain future work. |
+| video codec | **SRSV2 default** | Modern native **8K-first** direction (`docs/srsv2_design_targets.md`); **do not** claim H.264 superiority without **`docs/srsv2_benchmarks.md`** methodology. Today: CLI square-gray → `.srsv2` **single intra** (`FR2\x01`). **Native import** (SRSV2) uses **`max_ref_frames = 1`** and **P** (`FR2\x02`) after first picture when dimensions are **16-aligned**. Profiles **Baseline…Research** on-wire; most helpers still emit **Main**. Rate control, sub-pel/B/GPU/OS A/V remain roadmap. |
 | import / transcode | **Native pipeline partial** | Encode/import/transcode default to SRSV2 video; `--codec srsv1` selects legacy; FFmpeg path feature-gated |
 | playback | **Decode-preview** | `PlaybackSession` decodes SRSV2 (`codec_id` 3) and legacy SRSV1 (`codec_id` 1); `srs_player` shows last frame texture; `srs_cli play` smoke decode |
 | GPU | **Planned** | No device presentation or GPU decode here |

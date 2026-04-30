@@ -566,8 +566,14 @@ mod import_tests {
         assert_eq!(seq.max_ref_frames, 1);
         let p0 = demux.next_packet().unwrap().unwrap();
         let p1 = demux.next_packet().unwrap().unwrap();
-        assert_eq!(p0.packet.payload[3], 1, "first SRSV2 video packet should be intra");
-        assert_eq!(p1.packet.payload[3], 2, "second frame should be P (import uses inter encode)");
+        assert_eq!(
+            p0.packet.payload[3], 1,
+            "first SRSV2 video packet should be intra"
+        );
+        assert_eq!(
+            p1.packet.payload[3], 2,
+            "second frame should be P (import uses inter encode)"
+        );
         let mut slot = None;
         let d0 =
             decode_yuv420_srsv2_payload(&seq, &p0.packet.payload, &mut slot).expect("srsv2 f0");
