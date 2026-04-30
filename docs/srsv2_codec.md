@@ -1,8 +1,10 @@
 # SRSV2 codec overview
 
-**SRSV1** (`codec_id` **1** in `.528`, elementary `.srsv`) remains the legacy grayscale intra prototype used for conformance and simple tests.
+**SRSV2** (`codec_id` **3** in `.528`, elementary `.srsv2`) is the **default** video codec for **new** `.528` files created by encode, import, transcode, and mux workflows in this workspace (unless callers explicitly select legacy SRSV1).
 
-**SRSV2** (`codec_id` **3** in `.528`, elementary `.srsv2`) is the modern CPU-first path: block intra prediction, separable transforms, scalar quantization, and framed entropy-coded residuals. It does **not** interoperate with H.264/HEVC/AV1/VVC bitstreams and does not embed third-party codec sources.
+**SRSV1** (`codec_id` **1** in `.528`, elementary `.srsv`) is **legacy / prototype** compatibility: grayscale intra, still fully readable and writable for tests and older assets.
+
+**SRSV2** is the modern CPU-first path: block intra prediction, separable transforms, scalar quantization, and framed entropy-coded residuals. It does **not** interoperate with H.264/HEVC/AV1/VVC bitstreams and does not embed third-party codec sources. **Today** it is **intra-only YUV420p8**. Inter frames, full entropy modeling across all syntax, rate control, GPU codecs, and OS audio/video output remain **future slices**.
 
 ## Implemented in this repository
 

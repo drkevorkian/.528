@@ -17,10 +17,10 @@ pub use srsv2::model::SEQUENCE_HEADER_BYTES;
 pub use srsv2::{
     decode_sequence_header_v2, decode_yuv420_intra_payload,
     elementary::{peek_is_srsv2, VideoStreamReaderV2, VideoStreamWriterV2},
-    encode_sequence_header_v2, encode_yuv420_intra_payload, rgb888_full_to_yuv420_bt709,
-    yuv420_bt709_to_rgb888_limited, ChromaSiting, ColorConvertBackend, ColorPrimaries, ColorRange,
-    CpuVideoAccelerator, DecodedVideoFrameV2, GpuVideoAccelerator, MatrixCoefficients,
-    MotionSearchBackend, PixelFormat, QuantBackend, SrsV2EncodeSettings, SrsV2Error,
-    SrsVideoCodecId, SrsVideoProfile, TransferFunction, TransformBackend, VideoPlane,
+    encode_sequence_header_v2, encode_yuv420_intra_payload, gray8_packed_to_yuv420p8_neutral,
+    rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited, ChromaSiting, ColorConvertBackend,
+    ColorPrimaries, ColorRange, CpuVideoAccelerator, DecodedVideoFrameV2, GpuVideoAccelerator,
+    MatrixCoefficients, MotionSearchBackend, PixelFormat, QuantBackend, SrsV2EncodeSettings,
+    SrsV2Error, SrsVideoCodecId, SrsVideoProfile, TransferFunction, TransformBackend, VideoPlane,
     VideoSequenceHeaderV2, YuvFrame,
 };

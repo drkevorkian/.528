@@ -16,13 +16,18 @@
 
 ## What output is real today
 
-- **Real:** Demux timestamps (PTS/DTS), frame dimensions, payload CRC32C metadata, grayscale **in-panel** egui texture from the last decoded video frame.
+- **Real:** Demux timestamps (PTS/DTS), frame dimensions, payload CRC32C metadata, **in-panel** egui texture from the last decoded video frame (grayscale presentation path; SRSV2 frames are decoded as YUV420p8 then displayed).
 - **Not implemented:** OS audio output, GPU presentation, full-screen video sink, multi-format codec matrix.
+
+## Video codecs
+
+- **SRSV2** (`codec_id` **3**) is the **default** for newly generated `.528` media. Decoders consume the 64-byte sequence header from track config and intra YUV420p8 payloads.
+- **SRSV1** (`codec_id` **1**) is **legacy**; playback still opens and decodes primary video tracks using the older grayscale intra path.
 
 ## Limitations
 
 - Seek requires a **non-empty** demux index after `rebuild_index()`. Files with no indexed packets report `PlaybackError::SeekUnsupported`.
-- Only **primary** SRS video (codec id 1) and audio (codec id 2) tracks are decoded; other kinds are skipped deterministically.
+- Only **primary** SRS video (**SRSV2** `codec_id` 3 or **SRSV1** `codec_id` 1) and audio (`codec_id` 2) tracks are decoded; other kinds are skipped deterministically.
 - CONFIG packets are skipped for decode; corrupt-flagged packets are rejected.
 
 ## Security / hostile inputs

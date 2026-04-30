@@ -5,7 +5,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use libsrs_app_config::SrsConfig;
 use libsrs_app_services::{
-    royalty_free_codec_names, AppServices, MediaInspection, PlaybackEvent, PlaybackSession,
+    royalty_free_codec_names, AppServices, MediaInspection, Native528VideoCodec, PlaybackEvent,
+    PlaybackSession,
 };
 use libsrs_licensing_client::{LicenseSnapshot, LicensingClient};
 use libsrs_licensing_proto::EntitlementClaims;
@@ -26,8 +27,8 @@ enum Commands {
     Encode {
         input: PathBuf,
         output: PathBuf,
-        /// `srsv1` (legacy grayscale), or `srsv2` (YUV420 intra).
-        #[arg(long, default_value = "srsv1")]
+        /// `srsv2` (default, YUV420 intra) or `srsv1` (legacy grayscale elementary / mux).
+        #[arg(long, default_value = "srsv2")]
         codec: String,
         #[arg(long)]
         width: Option<u32>,
@@ -78,10 +79,14 @@ enum Commands {
     Import {
         input: PathBuf,
         output: PathBuf,
+        #[arg(long, default_value = "srsv2")]
+        codec: String,
     },
     Transcode {
         input: PathBuf,
         output: PathBuf,
+        #[arg(long, default_value = "srsv2")]
+        codec: String,
     },
 }
 
@@ -145,38 +150,43 @@ fn main() -> Result<()> {
             let claims = require_editor_claims(&snapshot)?;
             match codec.as_str() {
                 "srsv1" | "srsv" | "native" => {
-                    services.encode_input_to_native(&input, &output, claims)?;
+                    services.encode_input_to_native_with_video_codec(
+                        &input,
+                        &output,
+                        claims,
+                        Native528VideoCodec::Srsv1Legacy,
+                    )?;
                 }
                 "srsv2" => {
-                    let w =
-                        width.ok_or_else(|| anyhow!("--width is required for --codec srsv2"))?;
-                    let h =
-                        height.ok_or_else(|| anyhow!("--height is required for --codec srsv2"))?;
-                    let srsv2_out = match output
+                    let out_ext = output
                         .extension()
                         .and_then(|e| e.to_str())
-                        .map(|e| e.to_ascii_lowercase())
-                    {
-                        Some(ext) if ext == "528" || ext == "srsm" => {
-                            output.with_extension("srsv2")
+                        .map(|e| e.to_ascii_lowercase());
+                    if let (Some(w), Some(h)) = (width, height) {
+                        let srsv2_out = match out_ext.as_deref() {
+                            Some("528" | "srsm") => output.with_extension("srsv2"),
+                            Some("srsv2") => output.clone(),
+                            _ => {
+                                return Err(anyhow!(
+                                    "SRSV2 RGB encode: output must end in .srsv2 or .528 / .srsm, got {}",
+                                    output.display()
+                                ));
+                            }
+                        };
+                        encode_srsv2_elementary_file(
+                            &input, &srsv2_out, w, h, &pix_fmt, &profile, quality,
+                        )?;
+                        if matches!(out_ext.as_deref(), Some("528" | "srsm")) {
+                            let stem = output.with_extension("");
+                            services.mux_elementary_streams(&stem, &output, claims)?;
                         }
-                        Some(ext) if ext == "srsv2" => output.clone(),
-                        _ => {
-                            return Err(anyhow!(
-                                "SRSV2 encode: output must end in .srsv2 or .528 / .srsm, got {}",
-                                output.display()
-                            ));
-                        }
-                    };
-                    encode_srsv2_elementary_file(
-                        &input, &srsv2_out, w, h, &pix_fmt, &profile, quality,
-                    )?;
-                    if matches!(
-                        output.extension().and_then(|e| e.to_str()),
-                        Some("528" | "srsm")
-                    ) {
-                        let stem = output.with_extension("");
-                        services.mux_elementary_streams(&stem, &output, claims)?;
+                    } else {
+                        services.encode_input_to_native_with_video_codec(
+                            &input,
+                            &output,
+                            claims,
+                            Native528VideoCodec::Srsv2,
+                        )?;
                     }
                 }
                 other => return Err(anyhow!("unknown --codec {other}")),
@@ -201,21 +211,42 @@ fn main() -> Result<()> {
             services.demux_container_to_elementary(&input, &output, claims)?;
             println!("demuxed {} -> {}", input.display(), output.display());
         }
-        Commands::Import { input, output } => {
+        Commands::Import {
+            input,
+            output,
+            codec,
+        } => {
             let snapshot = licensing.refresh_entitlement("srs-cli", env!("CARGO_PKG_VERSION"));
             let claims = require_editor_claims(&snapshot)?;
-            let count = services.import_to_native(&input, &output, claims)?;
+            let vc = parse_cli_native_video_codec(&codec)?;
+            let count = services.import_to_native_with_video_codec(&input, &output, claims, vc)?;
             println!("processed {count} packets into {}", output.display());
         }
-        Commands::Transcode { input, output } => {
+        Commands::Transcode {
+            input,
+            output,
+            codec,
+        } => {
             let snapshot = licensing.refresh_entitlement("srs-cli", env!("CARGO_PKG_VERSION"));
             let claims = require_editor_claims(&snapshot)?;
-            let count = services.transcode_to_native(&input, &output, claims)?;
+            let vc = parse_cli_native_video_codec(&codec)?;
+            let count =
+                services.transcode_to_native_with_video_codec(&input, &output, claims, vc)?;
             println!("processed {count} packets into {}", output.display());
         }
     }
 
     Ok(())
+}
+
+fn parse_cli_native_video_codec(s: &str) -> Result<Native528VideoCodec> {
+    match s.to_ascii_lowercase().as_str() {
+        "srsv2" | "v2" => Ok(Native528VideoCodec::Srsv2),
+        "srsv1" | "srsv" | "native" | "v1" => Ok(Native528VideoCodec::Srsv1Legacy),
+        other => Err(anyhow!(
+            "unknown video codec policy '{other}'; use srsv2 (default) or srsv1"
+        )),
+    }
 }
 
 fn load_config(path: Option<&Path>) -> Result<SrsConfig> {

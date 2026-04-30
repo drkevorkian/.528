@@ -13,7 +13,9 @@ pub mod limits;
 pub mod model;
 pub mod rate_control;
 
-pub use color::{rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited};
+pub use color::{
+    gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
+};
 pub use error::SrsV2Error;
 pub use frame::{DecodedVideoFrameV2, EncodedVideoPacketV2, VideoPlane, YuvFrame};
 pub use frame_codec::{decode_yuv420_intra_payload, encode_yuv420_intra_payload};

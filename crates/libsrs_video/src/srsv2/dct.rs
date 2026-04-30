@@ -1,6 +1,9 @@
 //! Separable 8×8 DCT-II (orthonormal) using fixed-order `f64` transforms with explicit rounding.
 //! Not invoking patented codec algorithms — generic linear algebra.
 
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_memcpy)]
+
 const INV_SQRT2: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
 fn alpha(k: usize) -> f64 {

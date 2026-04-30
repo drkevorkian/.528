@@ -1,5 +1,7 @@
 //! Intra-only SRSV2 baseline — 8×8 blocks, integer DCT, explicit AC tuples.
 
+#![allow(clippy::needless_range_loop)]
+
 use super::dct::{fdct_8x8, idct_8x8, ZIGZAG};
 use super::error::SrsV2Error;
 use super::frame::VideoPlane;

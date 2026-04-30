@@ -40,8 +40,8 @@ pub fn rgb888_full_to_yuv420_bt709(
         return Err(SrsV2Error::syntax("rgb buffer too small"));
     }
 
-    let cw = (width + 1) / 2;
-    let ch = (height + 1) / 2;
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
     let mut ypl = VideoPlane::<u8>::try_new(width, height, w)?;
     let mut u = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;
     let mut v = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;
@@ -83,6 +83,45 @@ pub fn rgb888_full_to_yuv420_bt709(
         }
     }
 
+    Ok(YuvFrame {
+        format: PixelFormat::Yuv420p8,
+        y: ypl,
+        u,
+        v,
+    })
+}
+
+/// Packed grayscale luma (stride = width) → YUV420p8 with **neutral chroma** (128).
+///
+/// Used when only a single luma plane exists (e.g. legacy SRSV1 grayscale decode) to feed the
+/// SRSV2 intra encoder without inventing false color.
+pub fn gray8_packed_to_yuv420p8_neutral(
+    gray: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<YuvFrame, SrsV2Error> {
+    if width == 0 || height == 0 {
+        return Err(SrsV2Error::Dimensions { width, height });
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let need = w
+        .checked_mul(h)
+        .ok_or(SrsV2Error::Overflow("gray buffer"))?;
+    if gray.len() < need {
+        return Err(SrsV2Error::syntax("gray buffer smaller than width*height"));
+    }
+    let mut ypl = VideoPlane::<u8>::try_new(width, height, w)?;
+    for row in 0..h {
+        ypl.row_mut(row)
+            .copy_from_slice(&gray[row * w..row * w + w]);
+    }
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
+    let mut u = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;
+    let mut v = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;
+    u.samples.fill(128);
+    v.samples.fill(128);
     Ok(YuvFrame {
         format: PixelFormat::Yuv420p8,
         y: ypl,
@@ -171,6 +210,17 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    #[test]
+    fn gray_neutral_chroma_flat_y() {
+        let w = 4u32;
+        let h = 4u32;
+        let g: Vec<u8> = (0..16).collect();
+        let yuv = gray8_packed_to_yuv420p8_neutral(&g, w, h).unwrap();
+        assert!(yuv.u.samples.iter().all(|&x| x == 128));
+        assert!(yuv.v.samples.iter().all(|&x| x == 128));
+        assert_eq!(yuv.y.samples.len(), 16);
     }
 
     #[test]

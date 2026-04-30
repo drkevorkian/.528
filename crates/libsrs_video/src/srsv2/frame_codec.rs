@@ -106,8 +106,8 @@ pub fn decode_yuv420_intra_payload(
 
     let w = seq.width;
     let h = seq.height;
-    let cw = (w + 1) / 2;
-    let ch = (h + 1) / 2;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
 
     let mut y_plane = VideoPlane::<u8>::try_new(w, h, w as usize)?;
     let mut u_plane = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;

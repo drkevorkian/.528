@@ -15,9 +15,9 @@ use libsrs_licensing_proto::{EntitlementClaims, LicensedFeature};
 use libsrs_mux::MuxWriter;
 use libsrs_pipeline::TranscodePipeline;
 use libsrs_video::{
-    decode_sequence_header_v2, decode_yuv420_intra_payload, encode_sequence_header_v2, FrameType,
-    VideoFrame, VideoStreamReader, VideoStreamReaderV2, VideoStreamWriter, VideoStreamWriterV2,
-    SEQUENCE_HEADER_BYTES,
+    decode_sequence_header_v2, decode_yuv420_intra_payload, encode_sequence_header_v2,
+    encode_yuv420_intra_payload, FrameType, VideoFrame, VideoSequenceHeaderV2, VideoStreamReader,
+    VideoStreamReaderV2, VideoStreamWriter, VideoStreamWriterV2, SEQUENCE_HEADER_BYTES,
 };
 use thiserror::Error;
 
@@ -29,6 +29,18 @@ pub use playback::{
     PlaybackEvent, PlaybackPosition, PlaybackSession, PlaybackState, PlaybackTrackInfo,
     MAX_STASH_PACKETS, MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE,
 };
+
+/// Selects how **new** `.528` / import mux video tracks are written.
+///
+/// SRSV2 (`codec_id == 3`) is the default modern path; SRSV1 remains for legacy compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Native528VideoCodec {
+    /// SRSV2 intra YUV420p8 (`codec_id` **3**, 64-byte sequence header in track config).
+    #[default]
+    Srsv2,
+    /// Legacy grayscale intra (`codec_id` **1**, 8-byte width/height in track config).
+    Srsv1Legacy,
+}
 
 #[derive(Debug, Clone)]
 pub struct AppServices {
@@ -67,8 +79,23 @@ impl AppServices {
         output: P,
         entitlement: &EntitlementClaims,
     ) -> Result<()> {
+        self.encode_input_to_native_with_video_codec(
+            input,
+            output,
+            entitlement,
+            Native528VideoCodec::default(),
+        )
+    }
+
+    pub fn encode_input_to_native_with_video_codec<P: AsRef<Path>>(
+        &self,
+        input: P,
+        output: P,
+        entitlement: &EntitlementClaims,
+        video_codec: Native528VideoCodec,
+    ) -> Result<()> {
         require_editor_feature(entitlement, LicensedFeature::Encode, "encode")?;
-        encode_input_to_native(input.as_ref(), output.as_ref())
+        encode_input_to_native(input.as_ref(), output.as_ref(), video_codec)
     }
 
     pub fn decode_native_to_raw<P: AsRef<Path>>(
@@ -107,9 +134,24 @@ impl AppServices {
         output: P,
         entitlement: &EntitlementClaims,
     ) -> Result<usize> {
+        self.import_to_native_with_video_codec(
+            input,
+            output,
+            entitlement,
+            Native528VideoCodec::default(),
+        )
+    }
+
+    pub fn import_to_native_with_video_codec<P: AsRef<Path>>(
+        &self,
+        input: P,
+        output: P,
+        entitlement: &EntitlementClaims,
+        video_codec: Native528VideoCodec,
+    ) -> Result<usize> {
         require_editor_feature(entitlement, LicensedFeature::Import, "import")?;
         self.ensure_supported_for_conversion(input.as_ref())?;
-        run_native_import(&self.pipeline, input.as_ref(), output.as_ref())
+        run_native_import(&self.pipeline, input.as_ref(), output.as_ref(), video_codec)
     }
 
     pub fn transcode_to_native<P: AsRef<Path>>(
@@ -118,9 +160,24 @@ impl AppServices {
         output: P,
         entitlement: &EntitlementClaims,
     ) -> Result<usize> {
+        self.transcode_to_native_with_video_codec(
+            input,
+            output,
+            entitlement,
+            Native528VideoCodec::default(),
+        )
+    }
+
+    pub fn transcode_to_native_with_video_codec<P: AsRef<Path>>(
+        &self,
+        input: P,
+        output: P,
+        entitlement: &EntitlementClaims,
+        video_codec: Native528VideoCodec,
+    ) -> Result<usize> {
         require_editor_feature(entitlement, LicensedFeature::Transcode, "transcode")?;
         self.ensure_supported_for_conversion(input.as_ref())?;
-        run_native_import(&self.pipeline, input.as_ref(), output.as_ref())
+        run_native_import(&self.pipeline, input.as_ref(), output.as_ref(), video_codec)
     }
 
     pub fn ensure_supported_for_conversion(&self, input: &Path) -> Result<()> {
@@ -443,30 +500,68 @@ fn container_codec_name(codec_id: u16) -> &'static str {
     container_codec(codec_id).display_name()
 }
 
-fn encode_input_to_native(input: &Path, output: &Path) -> Result<()> {
+fn encode_square_gray_raw_to_srsv2_elementary(input: &Path, srsv2_out: &Path) -> Result<()> {
+    let bytes = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
+    let side = infer_square(bytes.len())?;
+    let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(side, side);
+    let yuv = libsrs_video::gray8_packed_to_yuv420p8_neutral(&bytes, side, side)
+        .map_err(|e| anyhow!("{}", e))?;
+    let payload = encode_yuv420_intra_payload(&seq, &yuv, 0, 28).map_err(|e| anyhow!("{}", e))?;
+    let f = File::create(srsv2_out).with_context(|| format!("create {}", srsv2_out.display()))?;
+    let mut w = VideoStreamWriterV2::new(f, &seq).map_err(|e| anyhow!("SRSV2 writer: {}", e))?;
+    w.write_frame_payload(0, &payload)
+        .map_err(|e| anyhow!("SRSV2 frame: {}", e))?;
+    Ok(())
+}
+
+fn encode_input_to_native(
+    input: &Path,
+    output: &Path,
+    video_codec: Native528VideoCodec,
+) -> Result<()> {
     match extension(output) {
         Some("srsv") => encode_raw_video(input, output),
         Some("srsa") => encode_raw_audio(input, output),
+        Some("srsv2") => match video_codec {
+            Native528VideoCodec::Srsv2 => encode_square_gray_raw_to_srsv2_elementary(input, output),
+            Native528VideoCodec::Srsv1Legacy => Err(anyhow!(
+                ".srsv2 elementary output requires SRSV2 codec policy (omit --codec srsv1)"
+            )),
+        },
         Some("528") | Some("srsm") => {
             let stem = output.with_extension("");
             let video_srsv2 = stem.with_extension("srsv2");
             let video_srsv = stem.with_extension("srsv");
-            if video_srsv2.exists() {
-                if video_srsv.exists() {
-                    return Err(anyhow!(
-                        "ambiguous elementary video: remove {} or {}",
-                        video_srsv2.display(),
-                        video_srsv.display()
-                    ));
+            if video_srsv2.exists() && video_srsv.exists() {
+                return Err(anyhow!(
+                    "ambiguous elementary video: remove {} or {}",
+                    video_srsv2.display(),
+                    video_srsv.display()
+                ));
+            }
+            match video_codec {
+                Native528VideoCodec::Srsv2 => {
+                    if video_srsv2.exists() || video_srsv.exists() {
+                        mux_elementary_streams(&stem, output)
+                    } else {
+                        encode_square_gray_raw_to_srsv2_elementary(input, &video_srsv2)?;
+                        mux_elementary_streams(&stem, output)
+                    }
                 }
-                mux_elementary_streams(&stem, output)
-            } else {
-                encode_raw_video(input, &video_srsv)?;
-                mux_elementary_streams(&stem, output)
+                Native528VideoCodec::Srsv1Legacy => {
+                    if video_srsv2.exists() {
+                        return Err(anyhow!(
+                            "found {} but legacy SRSV1 mux was requested; remove it or use SRSV2 policy",
+                            video_srsv2.display()
+                        ));
+                    }
+                    encode_raw_video(input, &video_srsv)?;
+                    mux_elementary_streams(&stem, output)
+                }
             }
         }
         _ => Err(anyhow!(
-            "unsupported output extension; expected .528 (primary), legacy .srsm, .srsv, or .srsa"
+            "unsupported output extension; expected .528 (primary), legacy .srsm, .srsv, .srsv2, or .srsa"
         )),
     }
 }
@@ -816,8 +911,13 @@ fn demux_container_to_elementary(input: &Path, output_stem: &Path) -> Result<()>
     Ok(())
 }
 
-fn run_native_import(pipeline: &TranscodePipeline, input: &Path, output: &Path) -> Result<usize> {
-    import_pipeline::run_native_import(pipeline, input, output)
+fn run_native_import(
+    pipeline: &TranscodePipeline,
+    input: &Path,
+    output: &Path,
+    video_codec: Native528VideoCodec,
+) -> Result<usize> {
+    import_pipeline::run_native_import(pipeline, input, output, video_codec)
 }
 
 fn infer_square(len: usize) -> Result<u32> {
@@ -858,5 +958,26 @@ mod tests {
         let err = require_editor_feature(&basic_entitlement(), LicensedFeature::Encode, "encode")
             .expect_err("basic entitlement should not unlock encode");
         assert_eq!(err.to_string(), "editor entitlement required for encode");
+    }
+
+    #[test]
+    fn mux_rejects_both_srsv_and_srsv2_elementary() {
+        let dir = std::env::temp_dir();
+        let stem = dir.join(format!(
+            "mux-dup-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::File::create(stem.with_extension("srsv")).unwrap();
+        std::fs::File::create(stem.with_extension("srsv2")).unwrap();
+        let err = mux_elementary_streams(&stem, &stem.with_extension("528")).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "expected ambiguity error, got {err}"
+        );
+        let _ = std::fs::remove_file(stem.with_extension("srsv"));
+        let _ = std::fs::remove_file(stem.with_extension("srsv2"));
     }
 }

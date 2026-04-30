@@ -18,7 +18,7 @@ The workspace stays buildable while codec and GPU features grow; see the status 
 
 - **Multiplexed native files** should use the **`.528`** extension (v2 `SRS528\0\0`); **`.srsm`** is still accepted for the same bitstream (including legacy v1 headers—see `docs/528_container_format.md`).
 - **Analyze / mux / demux** operate on these paths through `libsrs_demux` / `libsrs_mux`.
-- **Import** (`srs_cli` import, `libsrs_app_services`) ingests packets, **decodes** native SRS video/audio to normalized frames (`MediaDecoder`), then **re-encodes** into `.528` via `NativeEncoderSink`. **Non-native** paths require **`libsrs_compat` with `ffmpeg`**; the stub backend does not fabricate video.
+- **Import** (`srs_cli import --codec srsv2|srsv1`, `libsrs_app_services`) ingests packets, **decodes** native SRS video/audio to normalized frames (`MediaDecoder`), then **re-encodes** into `.528` via `NativeEncoderSink`. **Default video** for new containers is **SRSV2** (`codec_id` 3); use **`--codec srsv1`** for legacy SRSV1. **Non-native** paths require **`libsrs_compat` with `ffmpeg`**; the stub backend does not fabricate video.
 
 Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_format.md` (index), and `docs/528_container_format.md`.
 
@@ -27,11 +27,11 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 | Area | Status | Notes |
 |------|--------|--------|
 | `.528` container | **Partial / working** | v2 primary; hostile-input limits in I/O (`libsrs_container`) |
-| mux / demux | **Partial / working** | `libsrs_mux` / `libsrs_demux`; cues + index |
+| mux / demux | **Partial / working** | `libsrs_mux` / `libsrs_demux`; cues + index; mux prefers `.srsv2` when elementary video is present |
 | audio codec | **Working prototype** | v2 LPC stream decode in `libsrs_audio` |
-| video codec | **Prototype** | Intra SRS video path in `libsrs_video`; no full inter codec matrix |
-| import / transcode | **Native pipeline partial** | Raw packet/decoded path in app services; FFmpeg path feature-gated |
-| playback | **Decode-preview** | `PlaybackSession` demuxes + decodes; `srs_player` shows grayscale texture only; `srs_cli play` smoke decode |
+| video codec | **SRSV2 default** | New `.528` video uses **SRSV2** (`codec_id` **3**, 64-byte sequence in track config). **SRSV1** (`codec_id` **1**, `.srsv`) remains **legacy** for compatibility. SRSV2 is **intra-only YUV420p8** today; inter frames, full entropy modeling, rate control, GPU, and OS A/V output are future work. |
+| import / transcode | **Native pipeline partial** | Encode/import/transcode default to SRSV2 video; `--codec srsv1` selects legacy; FFmpeg path feature-gated |
+| playback | **Decode-preview** | `PlaybackSession` decodes SRSV2 (`codec_id` 3) and legacy SRSV1 (`codec_id` 1); `srs_player` shows last frame texture; `srs_cli play` smoke decode |
 | GPU | **Planned** | No device presentation or GPU decode here |
 | lossy video v2 | **Planned** | |
 | admin / licensing | **Partial / working** | Needs production hardening |

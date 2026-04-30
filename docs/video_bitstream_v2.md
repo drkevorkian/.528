@@ -1,5 +1,7 @@
 # SRSV2 bitstream and container mapping
 
+**Container policy:** New `.528` **video** tracks should use **`codec_id == 3`** (SRSV2) with the 64-byte sequence header embedded in track config. **`codec_id == 1`** (SRSV1) is legacy; players and tools still open and decode it.
+
 ## Sequence header (64 bytes, fixed)
 
 - Magic `SRS2` (4 bytes).

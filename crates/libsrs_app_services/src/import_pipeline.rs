@@ -17,13 +17,22 @@ use libsrs_pipeline::{
     DecodedAudioFrame, DecodedVideoFrame, MediaDecoder, NativeEncoderSink, TranscodePipeline,
 };
 use libsrs_video::{
-    decode_frame as video_decode_frame, encode_frame as video_encode_frame, FrameType, VideoFrame,
+    decode_frame as video_decode_frame, decode_sequence_header_v2,
+    encode_frame as video_encode_frame, encode_sequence_header_v2, encode_yuv420_intra_payload,
+    gray8_packed_to_yuv420p8_neutral, FrameType, VideoFrame, VideoSequenceHeaderV2,
+    SEQUENCE_HEADER_BYTES,
 };
+
+use crate::Native528VideoCodec;
+
+/// Quantizer for SRSV2 intra frames produced by import (normalized grayscale → YUV420).
+const IMPORT_SRSV2_INTRA_QP: u8 = 28;
 
 pub(crate) fn run_native_import(
     pipeline: &TranscodePipeline,
     input: &Path,
     output: &Path,
+    video_codec: Native528VideoCodec,
 ) -> Result<usize> {
     let probe = pipeline.analyze_source(input)?;
     let input_ext = input
@@ -43,7 +52,7 @@ pub(crate) fn run_native_import(
     }
     let n = packets.len();
 
-    let (tracks, stream_to_mux) = build_import_mux_tracks(&probe, &packets)?;
+    let (tracks, stream_to_mux) = build_import_mux_tracks(&probe, &packets, video_codec)?;
     let video_raw = input_ext.as_deref() == Some("srsv");
     let audio_raw = input_ext.as_deref() == Some("srsa");
     let mut decoder = NativeSrsMediaDecoder::from_probe(&probe, video_raw, audio_raw)?;
@@ -95,6 +104,7 @@ fn timestamp_to_mux_ticks(ts: libsrs_contract::Timestamp, timescale: u32) -> u64
 fn build_import_mux_tracks(
     probe: &ProbeResult,
     packets: &[SourcePacket],
+    video_codec: Native528VideoCodec,
 ) -> Result<(Vec<TrackDescriptor>, HashMap<u32, u16>)> {
     const DEFAULT_IMPORT_AUDIO_SAMPLE_RATE: u32 = 48_000;
     const DEFAULT_IMPORT_AUDIO_CHANNELS: u8 = 1;
@@ -121,13 +131,22 @@ fn build_import_mux_tracks(
             .video_height
             .filter(|&x| x > 0)
             .ok_or_else(|| anyhow!("probe missing native video height"))?;
-        let mut config = Vec::new();
-        config.extend_from_slice(&width.to_le_bytes());
-        config.extend_from_slice(&height.to_le_bytes());
+        let (codec_id, config) = match video_codec {
+            Native528VideoCodec::Srsv2 => {
+                let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(width, height);
+                (3_u16, encode_sequence_header_v2(&seq).to_vec())
+            }
+            Native528VideoCodec::Srsv1Legacy => {
+                let mut c = Vec::new();
+                c.extend_from_slice(&width.to_le_bytes());
+                c.extend_from_slice(&height.to_le_bytes());
+                (1_u16, c)
+            }
+        };
         descriptors.push(TrackDescriptor {
             track_id: next_mux_id,
             kind: TrackKind::Video,
-            codec_id: 1,
+            codec_id,
             flags: 0,
             timescale: 90_000,
             config,
@@ -299,6 +318,9 @@ struct MuxNativeImportSink {
     audio_timescale: u32,
     next_video_pts: u64,
     next_audio_pts: u64,
+    /// `1` = SRSV1 legacy packet payloads; `3` = SRSV2 intra payloads (`encode_yuv420_intra_payload`).
+    video_codec_id: u16,
+    video_seq_v2: Option<VideoSequenceHeaderV2>,
 }
 
 impl MuxNativeImportSink {
@@ -312,11 +334,26 @@ impl MuxNativeImportSink {
         let mut video_timescale = 90_000u32;
         let mut audio_timescale = 48_000u32;
 
+        let mut video_codec_id = 0_u16;
+        let mut video_seq_v2 = None::<VideoSequenceHeaderV2>;
         for t in &tracks {
             match t.kind {
                 TrackKind::Video => {
                     video_mux_id = Some(t.track_id);
                     video_timescale = t.timescale;
+                    video_codec_id = t.codec_id;
+                    if t.codec_id == 3 {
+                        if t.config.len() < SEQUENCE_HEADER_BYTES {
+                            return Err(anyhow!(
+                                "SRSV2 video track config must embed {}-byte sequence header",
+                                SEQUENCE_HEADER_BYTES
+                            ));
+                        }
+                        video_seq_v2 = Some(
+                            decode_sequence_header_v2(&t.config[..SEQUENCE_HEADER_BYTES])
+                                .map_err(|e| anyhow!("SRSV2 sequence header in mux sink: {}", e))?,
+                        );
+                    }
                 }
                 TrackKind::Audio => {
                     audio_mux_id = Some(t.track_id);
@@ -343,6 +380,8 @@ impl MuxNativeImportSink {
             audio_timescale,
             next_video_pts: 0,
             next_audio_pts: 0,
+            video_codec_id,
+            video_seq_v2,
         })
     }
 }
@@ -364,7 +403,18 @@ impl NativeEncoderSink for MuxNativeImportSink {
             frame_type: frame.frame_type(),
             data: frame.gray8_pixels().to_vec(),
         };
-        let payload = video_encode_frame(&vf)?;
+        let payload = if self.video_codec_id == 3 {
+            let seq = self
+                .video_seq_v2
+                .as_ref()
+                .ok_or_else(|| anyhow!("SRSV2 mux sink missing sequence header state"))?;
+            let yuv = gray8_packed_to_yuv420p8_neutral(&vf.data, vf.width, vf.height)
+                .map_err(|e| anyhow!("grayscale to YUV420: {}", e))?;
+            encode_yuv420_intra_payload(seq, &yuv, vf.frame_index, IMPORT_SRSV2_INTRA_QP)
+                .map_err(|e| anyhow!("SRSV2 intra encode: {}", e))?
+        } else {
+            video_encode_frame(&vf)?
+        };
         let pts = pts_ticks.unwrap_or(self.next_video_pts);
         mux.write_packet(mux_id, pts, pts, true, &payload)?;
         self.next_video_pts = pts.saturating_add(3_000);
@@ -405,8 +455,10 @@ impl NativeEncoderSink for MuxNativeImportSink {
 #[cfg(test)]
 mod import_tests {
     use super::*;
+    use libsrs_container::TrackKind;
     use libsrs_licensing_proto::{EntitlementClaims, EntitlementStatus, LicensedFeature};
     use libsrs_mux::MuxWriter;
+    use libsrs_video::{decode_sequence_header_v2, decode_yuv420_intra_payload};
     use std::io::Cursor;
 
     fn editor_claims() -> EntitlementClaims {
@@ -423,7 +475,7 @@ mod import_tests {
         }
     }
 
-    /// Import must preserve non-flat video (not an 8×8 stub repeated byte pattern).
+    /// Import defaults to SRSV2 (`codec_id` 3); decoded YUV luma must stay non-flat across frames.
     #[test]
     fn native_import_roundtrip_retains_video_variance() {
         let dir = std::env::temp_dir();
@@ -478,23 +530,85 @@ mod import_tests {
 
         let out_bytes = std::fs::read(&dst).unwrap();
         let mut demux = libsrs_demux::DemuxReader::open(Cursor::new(out_bytes)).unwrap();
+        let vt = demux
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .expect("video track");
+        assert_eq!(vt.codec_id, 3, "default import must mux SRSV2");
+        let seq = decode_sequence_header_v2(&vt.config[..SEQUENCE_HEADER_BYTES]).unwrap();
         let p0 = demux.next_packet().unwrap().unwrap();
         let p1 = demux.next_packet().unwrap().unwrap();
-        let d0 =
-            video_decode_frame(w, h, 0, FrameType::I, &p0.packet.payload).expect("decode frame 0");
-        let d1 =
-            video_decode_frame(w, h, 1, FrameType::I, &p1.packet.payload).expect("decode frame 1");
+        let d0 = decode_yuv420_intra_payload(&seq, &p0.packet.payload).expect("srsv2 frame 0");
+        let d1 = decode_yuv420_intra_payload(&seq, &p1.packet.payload).expect("srsv2 frame 1");
 
-        let min0 = *d0.data.iter().min().unwrap();
-        let max0 = *d0.data.iter().max().unwrap();
+        let min0 = d0.yuv.y.samples.iter().copied().min().unwrap();
+        let max0 = d0.yuv.y.samples.iter().copied().max().unwrap();
         assert!(
             max0.saturating_sub(min0) > 10,
             "frame 0 should not be near-constant placeholder"
         );
         assert_ne!(
-            d0.data, d1.data,
+            d0.yuv.y.samples, d1.yuv.y.samples,
             "successive imported frames must differ (real normalized path)"
         );
+
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&dst).ok();
+    }
+
+    #[test]
+    fn native_import_legacy_srsv1_mux_track() {
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let src = dir.join(format!("import-src-leg-{nanos}.528"));
+        let dst = dir.join(format!("import-dst-leg-{nanos}.528"));
+
+        let w = 16u32;
+        let h = 16u32;
+        let mut pix_a: Vec<u8> = (0..(w * h)).map(|i| (i * 7) as u8).collect();
+        let f0 = VideoFrame {
+            width: w,
+            height: h,
+            frame_index: 0,
+            frame_type: FrameType::I,
+            data: std::mem::take(&mut pix_a),
+        };
+        let e0 = video_encode_frame(&f0).unwrap();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 1,
+            flags: 0,
+            timescale: 90_000,
+            config: [w.to_le_bytes(), h.to_le_bytes()].concat(),
+        }];
+        let file = File::create(&src).unwrap();
+        let mut mux = MuxWriter::new(file, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, &e0).unwrap();
+        mux.finalize().unwrap();
+
+        let svc = crate::AppServices::default();
+        let claims = editor_claims();
+        svc.import_to_native_with_video_codec(
+            &src,
+            &dst,
+            &claims,
+            crate::Native528VideoCodec::Srsv1Legacy,
+        )
+        .unwrap();
+
+        let out_bytes = std::fs::read(&dst).unwrap();
+        let demux = libsrs_demux::DemuxReader::open(Cursor::new(out_bytes)).unwrap();
+        let vt = demux
+            .tracks()
+            .iter()
+            .find(|t| t.kind == TrackKind::Video)
+            .unwrap();
+        assert_eq!(vt.codec_id, 1);
 
         std::fs::remove_file(&src).ok();
         std::fs::remove_file(&dst).ok();

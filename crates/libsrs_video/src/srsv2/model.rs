@@ -164,6 +164,25 @@ pub struct VideoSequenceHeaderV2 {
     pub max_ref_frames: u8,
 }
 
+impl VideoSequenceHeaderV2 {
+    /// Default SRSV2 intra sequence used by import/mux when embedding `codec_id == 3` tracks.
+    pub fn intra_main_yuv420_bt709_limited(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            max_ref_frames: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FrameHeaderV2 {
     pub frame_index: u32,
