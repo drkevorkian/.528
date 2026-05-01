@@ -8,7 +8,11 @@
 
 **Default CLI `encode` to `.528`** (square raw → `.srsv2` elementary) is still a **single intra** frame (`FR2\x01`, `max_ref_frames` 0 in the default sequence helper). **`SrsV2EncodeSettings::residual_entropy`** selects intra wire format: **`explicit`** keeps **`FR2\x01`** (tuple-only blocks); **`auto`** / **`rans`** emit **`FR2\x03`** with per-block **explicit vs static rANS** AC packing when enabled (see `docs/video_bitstream_v2.md`). **Native import** (SRSV2 policy) writes **`max_ref_frames = 1`** and emits **P** frames: legacy **`FR2\x02`** when residuals are tuple-only, or **`FR2\x04`** when adaptive residual modes are active. **P-frame status:** **16×16 integer-pel** motion, bounded MV search (`SrsV2EncodeSettings::motion_search_radius`), skip/residual **Y** blocks, chroma from reference with half MVs; import refreshes the encoder reference with **`decode_yuv420_srsv2_payload`** so the chain matches playback.
 
-**Rate control:** `SrsV2EncodeSettings` includes **`rate_control_mode`** (**fixed QP**, **constant-quality**, **target bitrate**), QP bounds, and a **`SrsV2RateController`** used by benchmark tooling (`bench_srsv2`) for deterministic per-frame QP selection. Details and CLI mapping: **`docs/rate_control.md`**. This is a first-pass controller for measurements, not a completed broadcast-grade RC loop.
+**Rate control:** `SrsV2EncodeSettings` includes **`rate_control_mode`** (**fixed QP**, **constant-quality**, **target bitrate**), QP bounds, and a **`SrsV2RateController`** used by benchmark tooling (`bench_srsv2`) for deterministic per-frame QP selection. Details and CLI mapping: **`docs/rate_control.md`**. This is a **first-pass** controller for measurements and encoder-side QP selection — **not** a completed broadcast-grade RC loop.
+
+**Adaptive quantization (experimental):** optional frame-level QP derivation from per-MB activity (`docs/adaptive_quantization.md`). The bitstream still carries **one QP byte** per frame; there is no per-block QP delta syntax yet.
+
+**Motion search (experimental):** integer-pel modes and skip thresholds (`docs/motion_search.md`); still **no sub-pel**.
 
 Sub-pel/B-frames, richer closed-loop RC, GPU codecs, and OS audio/video output remain **future slices**.
 

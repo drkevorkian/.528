@@ -42,10 +42,12 @@ fn write_srsv2_ip_528(path: &std::path::Path) {
         residual_entropy: ResidualEntropy::Explicit,
         ..Default::default()
     };
-    let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28, &st, None).unwrap();
+    let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28, &st, None, None).unwrap();
     let mut slot = None;
     decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
-    let enc1 = encode_yuv420_inter_payload(&seq, &yuv1, slot.as_ref(), 1, 28, &st, None).unwrap();
+    let enc1 =
+        encode_yuv420_inter_payload(&seq, &yuv1, slot.as_ref(), 1, 28, &st, None, None, None)
+            .unwrap();
     assert_eq!(enc1[3], 2);
     let cfg = encode_sequence_header_v2(&seq).to_vec();
     assert_eq!(cfg.len(), SEQUENCE_HEADER_BYTES);

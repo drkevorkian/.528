@@ -8,6 +8,7 @@ use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::intra_codec::{decode_residual_block_8x8, encode_residual_block_8x8, quantize};
 use super::limits::{MAX_FRAME_PAYLOAD_BYTES, MAX_MOTION_VECTOR_PELS};
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
+use super::motion_search::{pick_mv, sample_u8_plane, SrsV2MotionEncodeStats};
 use super::rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
 use super::residual_entropy::{
     decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
@@ -17,64 +18,8 @@ use super::residual_tokens::residual_token_model;
 pub const FRAME_PAYLOAD_MAGIC_P: [u8; 4] = [b'F', b'R', b'2', 2];
 pub const FRAME_PAYLOAD_MAGIC_P_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 4];
 
-/// Residuals below this absolute threshold become skip sub-blocks (Y only).
+/// Default skip threshold when [`SrsV2EncodeSettings::enable_skip_blocks`] is true (Y only).
 const SKIP_ABS_THRESH: i16 = 6;
-
-fn sample_u8_plane(plane: &VideoPlane<u8>, x: i32, y: i32) -> u8 {
-    let w = plane.width as i32;
-    let h = plane.height as i32;
-    if x < 0 || y < 0 || x >= w || y >= h {
-        return 128;
-    }
-    plane.samples[y as usize * plane.stride + x as usize]
-}
-
-fn sad_16x16(
-    cur: &VideoPlane<u8>,
-    refp: &VideoPlane<u8>,
-    mb_x: u32,
-    mb_y: u32,
-    mvx: i32,
-    mvy: i32,
-) -> u32 {
-    let mut acc = 0_u32;
-    for row in 0..16 {
-        for col in 0..16 {
-            let lx = mb_x * 16 + col;
-            let ly = mb_y * 16 + row;
-            let cx = cur.samples[ly as usize * cur.stride + lx as usize];
-            let rx = lx as i32 + mvx;
-            let ry = ly as i32 + mvy;
-            let pv = sample_u8_plane(refp, rx, ry);
-            acc += cx.abs_diff(pv) as u32;
-        }
-    }
-    acc
-}
-
-fn pick_mv(
-    cur: &VideoPlane<u8>,
-    refp: &VideoPlane<u8>,
-    mb_x: u32,
-    mb_y: u32,
-    radius: i16,
-) -> (i16, i16) {
-    let r = radius as i32;
-    let mut best_mvx = 0_i16;
-    let mut best_mvy = 0_i16;
-    let mut best_sad = u32::MAX;
-    for mvx in -r..=r {
-        for mvy in -r..=r {
-            let s = sad_16x16(cur, refp, mb_x, mb_y, mvx, mvy);
-            if s < best_sad {
-                best_sad = s;
-                best_mvx = mvx as i16;
-                best_mvy = mvy as i16;
-            }
-        }
-    }
-    (best_mvx, best_mvy)
-}
 
 fn validate_mv(mvx: i16, mvy: i16) -> Result<(), SrsV2Error> {
     if mvx.abs() > MAX_MOTION_VECTOR_PELS || mvy.abs() > MAX_MOTION_VECTOR_PELS {
@@ -137,6 +82,7 @@ fn read_u8(data: &[u8], cur: &mut usize) -> Result<u8, SrsV2Error> {
 }
 
 /// Encode one P-frame (`FR2` rev 2 or 4). Caller must supply a valid reference of matching dimensions.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_yuv420_p_payload(
     seq: &VideoSequenceHeaderV2,
     cur: &YuvFrame,
@@ -145,6 +91,7 @@ pub fn encode_yuv420_p_payload(
     qp: u8,
     settings: &SrsV2EncodeSettings,
     mut stats: Option<&mut ResidualEncodeStats>,
+    motion_stats: Option<&mut SrsV2MotionEncodeStats>,
 ) -> Result<Vec<u8>, SrsV2Error> {
     if seq.pixel_format != PixelFormat::Yuv420p8
         || cur.format != PixelFormat::Yuv420p8
@@ -172,6 +119,22 @@ pub fn encode_yuv420_p_payload(
     let radius = settings.clamped_motion_search_radius();
     let mb_cols = w / 16;
     let mb_rows = h / 16;
+    let skip_thresh: i16 = if settings.enable_skip_blocks {
+        SKIP_ABS_THRESH
+    } else {
+        i16::MAX
+    };
+
+    let mut motion_discard = SrsV2MotionEncodeStats::default();
+    let ms = match motion_stats {
+        Some(r) => r,
+        None => &mut motion_discard,
+    };
+    ms.motion_search_mode = settings.motion_search_mode;
+    ms.sad_evaluations = 0;
+    ms.skip_subblocks = 0;
+    ms.nonzero_motion_macroblocks = 0;
+    ms.sum_mv_l1 = 0;
 
     let mut out = Vec::new();
     let magic = match settings.residual_entropy {
@@ -186,7 +149,22 @@ pub fn encode_yuv420_p_payload(
 
     for mby in 0..mb_rows {
         for mbx in 0..mb_cols {
-            let (mvx, mvy) = pick_mv(&cur.y, &reference.y, mbx, mby, radius);
+            let mut mb_evals = 0_u64;
+            let (mvx, mvy) = pick_mv(
+                settings.motion_search_mode,
+                &cur.y,
+                &reference.y,
+                mbx,
+                mby,
+                radius,
+                settings.early_exit_sad_threshold,
+                Some(&mut mb_evals),
+            );
+            ms.sad_evaluations += mb_evals;
+            if mvx != 0 || mvy != 0 {
+                ms.nonzero_motion_macroblocks += 1;
+            }
+            ms.sum_mv_l1 += mvx.unsigned_abs() as u64 + mvy.unsigned_abs() as u64;
             out.extend_from_slice(&mvx.to_le_bytes());
             out.extend_from_slice(&mvy.to_le_bytes());
 
@@ -210,8 +188,9 @@ pub fn encode_yuv420_p_payload(
                         max_abs = max_abs.max(d.abs());
                     }
                 }
-                if max_abs <= SKIP_ABS_THRESH {
+                if max_abs <= skip_thresh {
                     pattern |= 1 << si;
+                    ms.skip_subblocks += 1;
                 } else {
                     let chunk = if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
                         let mut c = Vec::new();
@@ -428,8 +407,10 @@ mod tests {
             residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
             ..Default::default()
         };
-        let i_payload = encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &settings, None).unwrap();
-        let p_payload = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, qp, &settings, None).unwrap();
+        let i_payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &settings, None, None).unwrap();
+        let p_payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, qp, &settings, None, None).unwrap();
         assert!(
             p_payload.len() < i_payload.len(),
             "expected P payload smaller than I for identical texture: p={} i={}",
@@ -469,7 +450,8 @@ mod tests {
             motion_search_radius: 16,
             ..Default::default()
         };
-        let p_payload = encode_yuv420_p_payload(&seq, &y1, &y0, 1, qp, &settings, None).unwrap();
+        let p_payload =
+            encode_yuv420_p_payload(&seq, &y1, &y0, 1, qp, &settings, None, None).unwrap();
         let dec = decode_yuv420_p_payload(&seq, &p_payload, &y0).unwrap();
         let mean_dec: u32 = dec.yuv.y.samples.iter().map(|&x| x as u32).sum::<u32>()
             / dec.yuv.y.samples.len() as u32;
@@ -495,6 +477,7 @@ mod tests {
             1,
             28,
             &SrsV2EncodeSettings::default(),
+            None,
             None,
         )
         .unwrap();

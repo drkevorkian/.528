@@ -24,10 +24,11 @@ pub use srsv2::{
     yuv420_bt709_to_rgb888_limited, ChromaSiting, ColorConvertBackend, ColorPrimaries, ColorRange,
     CpuVideoAccelerator, DecodedVideoFrameV2, GpuVideoAccelerator, MatrixCoefficients,
     MotionSearchBackend, PixelFormat, PreviousFrameRcStats, QuantBackend, ReferenceFrameBuffer,
-    ResidualEncodeStats, ResidualEntropy, SrsElementaryVideoCodecId, SrsV2EncodeSettings,
-    SrsV2Error, SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsVideoCodecId,
-    SrsVideoProfile, Srsv2PayloadKind, TransferFunction, TransformBackend, VideoPlane,
-    VideoSequenceHeaderV2, YuvFrame,
+    ResidualEncodeStats, ResidualEntropy, SrsElementaryVideoCodecId, SrsV2AdaptiveQuantizationMode,
+    SrsV2AqEncodeStats, SrsV2EncodeSettings, SrsV2Error, SrsV2MotionEncodeStats,
+    SrsV2MotionSearchMode, SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController,
+    SrsVideoCodecId, SrsVideoProfile, Srsv2PayloadKind, TransferFunction, TransformBackend,
+    VideoPlane, VideoSequenceHeaderV2, YuvFrame,
 };
 
 #[cfg(test)]

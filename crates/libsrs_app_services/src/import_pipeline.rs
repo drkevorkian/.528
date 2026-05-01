@@ -434,6 +434,8 @@ impl NativeEncoderSink for MuxNativeImportSink {
                 IMPORT_SRSV2_QP,
                 &settings,
                 None,
+                None,
+                None,
             )
             .map_err(|e| anyhow!("SRSV2 encode: {}", e))?;
             decode_yuv420_srsv2_payload(seq, &enc, &mut self.srsv2_decoded_ref)

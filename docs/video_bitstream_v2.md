@@ -18,6 +18,8 @@ Embedded verbatim in `.528` **video track config** when `codec_id == 3`.
 
 Prefix `FR2\x01`, `frame_index` LE `u32`, `qp` byte, then three length-prefixed plane bitstreams (Y, U, V) for YUV420p8 intra.
 
+**QP byte:** encoders may choose this value using rate control and/or **experimental frame-level adaptive quantization**; decoders interpret it as the quantizer for the frame. **Per-macroblock QP deltas are not encoded** in current revisions — adaptive quantization affects **which** single QP is written, not the syntax layout.
+
 ### Revision 2 — experimental P (`FR2\x02`)
 
 Prefix `FR2\x02`, `frame_index`, `qp`, then per **16×16** macroblock (coverage requires width/height divisible by 16): `mv_x`, `mv_y` (`i16` LE, bounded by `MAX_MOTION_VECTOR_PELS`), `pattern` byte (four bits mark skip for four **8×8** Y sub-blocks), then optional length-prefixed residual blobs for non-skipped sub-blocks using **legacy explicit** intra-style coefficient tuples per **8×8** block. Chroma U/V are predicted by copying the reference planes with half-resolution MVs (no chroma residual in this slice). Decode requires `max_ref_frames ≥ 1` and a valid reference frame (`PFrameWithoutReference` otherwise).

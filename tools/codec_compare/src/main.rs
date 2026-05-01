@@ -100,6 +100,7 @@ fn main() -> Result<()> {
             args.qp,
             &SrsV2EncodeSettings::default(),
             None,
+            None,
         )
         .map_err(|e| anyhow!("{e}"))?;
         payloads.push(p);

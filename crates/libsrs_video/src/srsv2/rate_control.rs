@@ -68,6 +68,28 @@ impl std::fmt::Display for SrsV2RateControlError {
 
 impl std::error::Error for SrsV2RateControlError {}
 
+/// Experimental adaptive quantization mode (frame-level effective QP in this slice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2AdaptiveQuantizationMode {
+    #[default]
+    Off,
+    Activity,
+    EdgeAware,
+    ScreenAware,
+}
+
+/// Integer-pel motion search strategy for experimental P-frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2MotionSearchMode {
+    /// Full search within [`SrsV2EncodeSettings::motion_search_radius`] (legacy behavior).
+    #[default]
+    ExhaustiveSmall,
+    None,
+    Diamond,
+    Hex,
+    Hierarchical,
+}
+
 #[derive(Debug, Clone)]
 pub struct SrsV2EncodeSettings {
     pub quantizer: u8,
@@ -86,6 +108,16 @@ pub struct SrsV2EncodeSettings {
     pub motion_search_radius: i16,
     pub tune_quality_vs_speed: u8,
     pub residual_entropy: ResidualEntropy,
+
+    pub adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode,
+    pub aq_strength: u8,
+    pub min_block_qp_delta: i8,
+    pub max_block_qp_delta: i8,
+
+    pub motion_search_mode: SrsV2MotionSearchMode,
+    /// When non-zero, motion search may stop early once best SAD ≤ threshold.
+    pub early_exit_sad_threshold: u32,
+    pub enable_skip_blocks: bool,
 }
 
 impl Default for SrsV2EncodeSettings {
@@ -103,6 +135,15 @@ impl Default for SrsV2EncodeSettings {
             motion_search_radius: 16,
             tune_quality_vs_speed: 50,
             residual_entropy: ResidualEntropy::Auto,
+
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
+            aq_strength: 4,
+            min_block_qp_delta: -6,
+            max_block_qp_delta: 6,
+
+            motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
         }
     }
 }

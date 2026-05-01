@@ -1,6 +1,6 @@
 # SRSV2 rate control (encoder-side)
 
-This document describes the **first-pass, deterministic** rate-control hook used by `libsrs_video` and exercised by `bench_srsv2`. It is **not** a full multi-pass encoder product feature yet.
+This document describes the **first-pass, deterministic** rate-control hook used by `libsrs_video` and exercised by `bench_srsv2`. It is **not** a full multi-pass encoder product feature yet. **First-pass rate control exists today** for benchmark and encoder-side QP selection; it is **not** claimed as production-grade. Optional **frame-level adaptive quantization** (`docs/adaptive_quantization.md`) adjusts the effective QP before encode but does not add new RC modes here.
 
 ## Modes (`SrsV2RateControlMode`)
 

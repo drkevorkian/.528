@@ -499,9 +499,16 @@ fn encode_srsv2_elementary_file(
     let yuv = rgb888_full_to_yuv420_bt709(&rgb, width, height, ColorRange::Limited)
         .map_err(|e| anyhow!("color convert: {e}"))?;
     let qp = quality.clamp(1, 51);
-    let payload =
-        encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &SrsV2EncodeSettings::default(), None)
-            .map_err(|e| anyhow!("encode: {e}"))?;
+    let payload = encode_yuv420_intra_payload(
+        &seq,
+        &yuv,
+        0,
+        qp,
+        &SrsV2EncodeSettings::default(),
+        None,
+        None,
+    )
+    .map_err(|e| anyhow!("encode: {e}"))?;
     let f = File::create(srsv2_out).with_context(|| format!("create {}", srsv2_out.display()))?;
     let mut wr = VideoStreamWriterV2::new(f, &seq).map_err(|e| anyhow!("srsv2 writer: {e}"))?;
     wr.write_frame_payload(0, &payload)

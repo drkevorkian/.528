@@ -11,9 +11,11 @@ use std::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use libsrs_video::srsv2::frame::VideoPlane;
+use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, PixelFormat, PreviousFrameRcStats,
-    ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings, SrsV2RateControlMode,
+    ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats,
+    SrsV2EncodeSettings, SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2RateControlMode,
     SrsV2RateController, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
@@ -79,6 +81,27 @@ struct Args {
 
     #[arg(long, default_value_t = 2)]
     qp_step_limit: u8,
+
+    /// Adaptive quantization: `off`, `activity`, `edge-aware`, `screen-aware` (experimental; frame-level QP only).
+    #[arg(long, default_value = "off")]
+    aq: String,
+
+    #[arg(long, default_value_t = 4)]
+    aq_strength: u8,
+
+    /// Motion search: `none`, `diamond`, `hex`, `hierarchical`, `exhaustive-small` (integer-pel only).
+    #[arg(long, default_value = "exhaustive-small")]
+    motion_search: String,
+
+    #[arg(long, default_value_t = 0)]
+    early_exit_sad_threshold: u32,
+
+    #[arg(long, default_value_t = true)]
+    enable_skip_blocks: bool,
+
+    /// Append a small optional grid (AQ off vs activity × diamond vs exhaustive-small); not default.
+    #[arg(long, default_value_t = false)]
+    sweep_extended: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +136,36 @@ struct RcBenchReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct AqBenchReport {
+    mode: String,
+    aq_strength: u8,
+    min_block_qp_delta: i8,
+    max_block_qp_delta: i8,
+    aq_enabled: bool,
+    base_qp: u8,
+    effective_qp: u8,
+    min_block_qp_used: u8,
+    max_block_qp_used: u8,
+    avg_block_qp: f64,
+    positive_qp_delta_blocks: u32,
+    negative_qp_delta_blocks: u32,
+    unchanged_qp_blocks: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MotionBenchReport {
+    motion_search_mode: String,
+    motion_search_radius_effective: i16,
+    early_exit_sad_threshold: u32,
+    enable_skip_blocks: bool,
+    sad_evaluations_total: u64,
+    skip_subblocks_total: u64,
+    nonzero_motion_macroblocks_total: u64,
+    avg_mv_l1_per_nonzero_mb: f64,
+    p_frames: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct Srsv2Details {
     frames: u32,
     keyframes: u32,
@@ -129,6 +182,10 @@ struct Srsv2Details {
     legacy_explicit_total_payload_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rc: Option<RcBenchReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    aq: Option<AqBenchReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    motion: Option<MotionBenchReport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -156,6 +213,10 @@ struct SweepRunReport {
     qp: u8,
     residual_entropy: String,
     motion_radius: i16,
+    aq: String,
+    motion_search: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sweep_variant: Option<String>,
     row: CodecRow,
     details: Srsv2Details,
 }
@@ -198,6 +259,50 @@ fn parse_residual_entropy(s: &str) -> Result<ResidualEntropy> {
         _ => Err(anyhow!(
             "--residual-entropy must be auto, explicit, or rans (got {s})"
         )),
+    }
+}
+
+fn parse_aq_mode(s: &str) -> Result<SrsV2AdaptiveQuantizationMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "off" => Ok(SrsV2AdaptiveQuantizationMode::Off),
+        "activity" => Ok(SrsV2AdaptiveQuantizationMode::Activity),
+        "edge-aware" => Ok(SrsV2AdaptiveQuantizationMode::EdgeAware),
+        "screen-aware" => Ok(SrsV2AdaptiveQuantizationMode::ScreenAware),
+        _ => Err(anyhow!(
+            "--aq must be off, activity, edge-aware, or screen-aware (got {s})"
+        )),
+    }
+}
+
+fn parse_motion_search_mode(s: &str) -> Result<SrsV2MotionSearchMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "none" => Ok(SrsV2MotionSearchMode::None),
+        "diamond" => Ok(SrsV2MotionSearchMode::Diamond),
+        "hex" => Ok(SrsV2MotionSearchMode::Hex),
+        "hierarchical" => Ok(SrsV2MotionSearchMode::Hierarchical),
+        "exhaustive-small" | "exhaustive" => Ok(SrsV2MotionSearchMode::ExhaustiveSmall),
+        _ => Err(anyhow!(
+            "--motion-search must be none, diamond, hex, hierarchical, or exhaustive-small (got {s})"
+        )),
+    }
+}
+
+fn aq_mode_cli_label(m: SrsV2AdaptiveQuantizationMode) -> &'static str {
+    match m {
+        SrsV2AdaptiveQuantizationMode::Off => "off",
+        SrsV2AdaptiveQuantizationMode::Activity => "activity",
+        SrsV2AdaptiveQuantizationMode::EdgeAware => "edge-aware",
+        SrsV2AdaptiveQuantizationMode::ScreenAware => "screen-aware",
+    }
+}
+
+fn motion_mode_cli_label(m: SrsV2MotionSearchMode) -> &'static str {
+    match m {
+        SrsV2MotionSearchMode::None => "none",
+        SrsV2MotionSearchMode::Diamond => "diamond",
+        SrsV2MotionSearchMode::Hex => "hex",
+        SrsV2MotionSearchMode::Hierarchical => "hierarchical",
+        SrsV2MotionSearchMode::ExhaustiveSmall => "exhaustive-small",
     }
 }
 
@@ -272,11 +377,15 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.compare_residual_modes && args.sweep {
         bail!("--compare-residual-modes and --sweep are mutually exclusive");
     }
+    parse_aq_mode(&args.aq)?;
+    parse_motion_search_mode(&args.motion_search)?;
     Ok(())
 }
 
 fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeSettings> {
     let rc = parse_rc_mode(&args.rc)?;
+    let aq_mode = parse_aq_mode(&args.aq)?;
+    let motion_mode = parse_motion_search_mode(&args.motion_search)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -289,11 +398,26 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         keyframe_interval: args.keyint.max(1),
         motion_search_radius: args.motion_radius,
         residual_entropy: residual,
+        adaptive_quantization_mode: aq_mode,
+        aq_strength: args.aq_strength,
+        motion_search_mode: motion_mode,
+        early_exit_sad_threshold: args.early_exit_sad_threshold,
+        enable_skip_blocks: args.enable_skip_blocks,
         ..Default::default()
     };
     s.validate_rate_control()
         .map_err(|e| anyhow!("rate-control settings: {e}"))?;
+    validate_adaptive_quant_settings(&s).map_err(|e| anyhow!("adaptive quant settings: {e}"))?;
     Ok(s)
+}
+
+#[derive(Default)]
+struct MotionAgg {
+    sad_evaluations: u64,
+    skip_subblocks: u64,
+    nonzero_motion_macroblocks: u64,
+    sum_mv_l1: u64,
+    p_frames: u32,
 }
 
 struct PassNumbers {
@@ -306,6 +430,42 @@ struct PassNumbers {
     psnr_y: f64,
     ssim_y: f64,
     legacy_explicit_total_payload_bytes: Option<u64>,
+    aq_last: SrsV2AqEncodeStats,
+    motion_agg: MotionAgg,
+}
+
+fn aq_report_from_pass(settings: &SrsV2EncodeSettings, aq: &SrsV2AqEncodeStats) -> AqBenchReport {
+    AqBenchReport {
+        mode: aq_mode_cli_label(settings.adaptive_quantization_mode).to_string(),
+        aq_strength: settings.aq_strength,
+        min_block_qp_delta: settings.min_block_qp_delta,
+        max_block_qp_delta: settings.max_block_qp_delta,
+        aq_enabled: aq.aq_enabled,
+        base_qp: aq.base_qp,
+        effective_qp: aq.effective_qp,
+        min_block_qp_used: aq.min_block_qp_used,
+        max_block_qp_used: aq.max_block_qp_used,
+        avg_block_qp: aq.avg_block_qp,
+        positive_qp_delta_blocks: aq.positive_qp_delta_blocks,
+        negative_qp_delta_blocks: aq.negative_qp_delta_blocks,
+        unchanged_qp_blocks: aq.unchanged_qp_blocks,
+    }
+}
+
+fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> MotionBenchReport {
+    let nz = m.nonzero_motion_macroblocks.max(1);
+    let avg_mv = m.sum_mv_l1 as f64 / nz as f64;
+    MotionBenchReport {
+        motion_search_mode: motion_mode_cli_label(settings.motion_search_mode).to_string(),
+        motion_search_radius_effective: settings.clamped_motion_search_radius(),
+        early_exit_sad_threshold: settings.early_exit_sad_threshold,
+        enable_skip_blocks: settings.enable_skip_blocks,
+        sad_evaluations_total: m.sad_evaluations,
+        skip_subblocks_total: m.skip_subblocks,
+        nonzero_motion_macroblocks_total: m.nonzero_motion_macroblocks,
+        avg_mv_l1_per_nonzero_mb: avg_mv,
+        p_frames: m.p_frames,
+    }
 }
 
 fn run_srsv2_numbers(
@@ -325,11 +485,15 @@ fn run_srsv2_numbers(
     let mut qp_hist = Vec::with_capacity(args.frames as usize);
     let mut byte_hist = Vec::with_capacity(args.frames as usize);
     let mut prev: Option<PreviousFrameRcStats> = None;
+    let mut aq_last = SrsV2AqEncodeStats::default();
+    let mut motion_agg = MotionAgg::default();
 
     for fi in 0..args.frames {
         let qp = rc.qp_for_frame(fi, prev);
 
         let frame = load_yuv420_frame(raw, expected_frame, fi, args.width, args.height)?;
+        let mut aq_frame = SrsV2AqEncodeStats::default();
+        let mut motion_frame = SrsV2MotionEncodeStats::default();
         let payload = encode_yuv420_inter_payload(
             seq,
             &frame,
@@ -338,8 +502,20 @@ fn run_srsv2_numbers(
             qp,
             settings,
             Some(&mut enc_stats),
+            Some(&mut aq_frame),
+            Some(&mut motion_frame),
         )
         .map_err(|e| anyhow!("SRSV2 encode: {e}"))?;
+
+        aq_last = aq_frame;
+        let is_p = matches!(payload.get(3).copied(), Some(2 | 4));
+        if is_p {
+            motion_agg.sad_evaluations += motion_frame.sad_evaluations;
+            motion_agg.skip_subblocks += motion_frame.skip_subblocks;
+            motion_agg.nonzero_motion_macroblocks += motion_frame.nonzero_motion_macroblocks as u64;
+            motion_agg.sum_mv_l1 += motion_frame.sum_mv_l1;
+            motion_agg.p_frames += 1;
+        }
 
         let is_i = matches!(payload.get(3).copied(), Some(1 | 3));
         qp_hist.push(qp);
@@ -397,6 +573,8 @@ fn run_srsv2_numbers(
                     qpi,
                     &settings_leg,
                     None,
+                    None,
+                    None,
                 )
                 .map_err(|e| anyhow!("SRSV2 legacy explicit encode: {e}"))?;
                 let _ = decode_yuv420_srsv2_payload(seq, &pl, &mut slot)
@@ -416,6 +594,8 @@ fn run_srsv2_numbers(
         psnr_y,
         ssim_y,
         legacy_explicit_total_payload_bytes,
+        aq_last,
+        motion_agg,
     })
 }
 
@@ -486,6 +666,8 @@ fn pass_to_details(
         p_rans_chunks: p.enc_stats.p_rans_chunks,
         legacy_explicit_total_payload_bytes: p.legacy_explicit_total_payload_bytes,
         rc: Some(rc_report_from_pass(args, settings, p)),
+        aq: Some(aq_report_from_pass(settings, &p.aq_last)),
+        motion: Some(motion_report_from_pass(settings, &p.motion_agg)),
     }
 }
 
@@ -619,6 +801,8 @@ fn run_compare_residual_report(
                         p_rans_chunks: 0,
                         legacy_explicit_total_payload_bytes: None,
                         rc: None,
+                        aq: None,
+                        motion: None,
                     },
                 });
                 table.push(entries.last().unwrap().row.clone());
@@ -679,6 +863,8 @@ fn run_compare_residual_report(
                         p_rans_chunks: 0,
                         legacy_explicit_total_payload_bytes: None,
                         rc: None,
+                        aq: None,
+                        motion: None,
                     },
                 });
                 table.push(entries.last().unwrap().row.clone());
@@ -736,10 +922,46 @@ fn run_sweep_file(
                         qp,
                         residual_entropy: re_str.to_string(),
                         motion_radius: mr,
+                        aq: a.aq.clone(),
+                        motion_search: a.motion_search.clone(),
+                        sweep_variant: None,
                         row,
                         details,
                     });
                 }
+            }
+        }
+    }
+
+    if args.sweep_extended {
+        let extras = [
+            (28u8, "off", "exhaustive-small"),
+            (28u8, "activity", "diamond"),
+        ];
+        for (qp, aq_s, ms_s) in extras {
+            let mut a = args.clone();
+            a.qp = qp;
+            a.motion_radius = 8;
+            a.residual_entropy = "auto".to_string();
+            a.aq = aq_s.to_string();
+            a.motion_search = ms_s.to_string();
+            let settings = match build_settings(&a, ResidualEntropy::Auto) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
+                let row = pass_to_row(&a, "SRSV2", &numbers);
+                let details = pass_to_details(&a, &settings, "auto", &numbers);
+                sweep.push(SweepRunReport {
+                    qp,
+                    residual_entropy: "auto".to_string(),
+                    motion_radius: 8,
+                    aq: a.aq.clone(),
+                    motion_search: a.motion_search.clone(),
+                    sweep_variant: Some("extended-aq-motion".to_string()),
+                    row,
+                    details,
+                });
             }
         }
     }
@@ -768,14 +990,18 @@ fn sweep_to_markdown(rep: &SweepFileReport) -> String {
     let mut out = String::new();
     out.push_str("# SRSV2 benchmark sweep\n\n");
     out.push_str("_Engineering measurement only; not a marketing claim._\n\n");
-    out.push_str("| QP | residual | motion_r | bytes | ratio | bitrate | PSNR-Y | SSIM-Y |\n");
-    out.push_str("|---:|---|---:|---:|---:|---:|---:|---:|\n");
+    out.push_str("| QP | residual | motion_r | aq | motion | variant | bytes | ratio | bitrate | PSNR-Y | SSIM-Y |\n");
+    out.push_str("|---:|---|---:|---|---|---:|---:|---:|---:|---:|---:|\n");
     for r in &rep.sweep {
+        let var = r.sweep_variant.as_deref().unwrap_or("");
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {:.3} | {:.0} | {:.2} | {:.4} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {:.3} | {:.0} | {:.2} | {:.4} |\n",
             r.qp,
             r.residual_entropy,
             r.motion_radius,
+            r.aq,
+            r.motion_search,
+            var,
             r.row.bytes,
             r.row.ratio,
             r.row.bitrate_bps,
@@ -1157,6 +1383,40 @@ fn to_markdown(r: &BenchReport) -> String {
             rc.frame_bytes_summary
         ));
     }
+    if let Some(aq) = &r.srsv2.aq {
+        out.push_str("\n### Adaptive quantization (experimental)\n\n");
+        out.push_str(&format!(
+            "- mode: {}\n- aq_strength: {}\n- qp delta range: {} … {}\n- enabled: {}\n- base/effective QP: {}/{}\n- block QP min/max/avg: {}/{}/{:.2}\n- +/−/0 delta blocks: {}/{}/{}\n",
+            aq.mode,
+            aq.aq_strength,
+            aq.min_block_qp_delta,
+            aq.max_block_qp_delta,
+            aq.aq_enabled,
+            aq.base_qp,
+            aq.effective_qp,
+            aq.min_block_qp_used,
+            aq.max_block_qp_used,
+            aq.avg_block_qp,
+            aq.positive_qp_delta_blocks,
+            aq.negative_qp_delta_blocks,
+            aq.unchanged_qp_blocks
+        ));
+    }
+    if let Some(m) = &r.srsv2.motion {
+        out.push_str("\n### Motion search (integer-pel)\n\n");
+        out.push_str(&format!(
+            "- mode: {}\n- radius (effective): {}\n- early_exit_sad_threshold: {}\n- enable_skip_blocks: {}\n- P-frames: {}\n- SAD evals (total): {}\n- skip subblocks (total): {}\n- nonzero-MV macroblocks (total): {}\n- avg |MV| L1 (nonzero MBs): {:.3}\n",
+            m.motion_search_mode,
+            m.motion_search_radius_effective,
+            m.early_exit_sad_threshold,
+            m.enable_skip_blocks,
+            m.p_frames,
+            m.sad_evaluations_total,
+            m.skip_subblocks_total,
+            m.nonzero_motion_macroblocks_total,
+            m.avg_mv_l1_per_nonzero_mb
+        ));
+    }
     if let Some(x) = &r.x264 {
         out.push_str("\n## x264 details\n\n");
         out.push_str(&format!("- status: {}\n", x.status));
@@ -1196,6 +1456,12 @@ mod tests {
             min_qp: 4,
             max_qp: 51,
             qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -1246,6 +1512,32 @@ mod tests {
                     frame_payload_bytes: vec![100],
                     frame_bytes_summary: "sum=100 min=100 max=100 avg=100.0".to_string(),
                 }),
+                aq: Some(AqBenchReport {
+                    mode: "off".to_string(),
+                    aq_strength: 4,
+                    min_block_qp_delta: -6,
+                    max_block_qp_delta: 6,
+                    aq_enabled: false,
+                    base_qp: 28,
+                    effective_qp: 28,
+                    min_block_qp_used: 28,
+                    max_block_qp_used: 28,
+                    avg_block_qp: 28.0,
+                    positive_qp_delta_blocks: 0,
+                    negative_qp_delta_blocks: 0,
+                    unchanged_qp_blocks: 16,
+                }),
+                motion: Some(MotionBenchReport {
+                    motion_search_mode: "diamond".to_string(),
+                    motion_search_radius_effective: 8,
+                    early_exit_sad_threshold: 0,
+                    enable_skip_blocks: true,
+                    sad_evaluations_total: 100,
+                    skip_subblocks_total: 2,
+                    nonzero_motion_macroblocks_total: 4,
+                    avg_mv_l1_per_nonzero_mb: 3.5,
+                    p_frames: 3,
+                }),
             },
             x264: None,
             table: vec![CodecRow {
@@ -1264,7 +1556,9 @@ mod tests {
             git_commit: None,
             os: "os".to_string(),
         };
-        let _ = serde_json::to_string(&r).unwrap();
+        let js = serde_json::to_string(&r).unwrap();
+        assert!(js.contains("\"motion_search_mode\":\"diamond\""));
+        assert!(js.contains("\"mode\":\"off\"") && js.contains("\"aq\""));
     }
 
     #[test]
@@ -1293,6 +1587,8 @@ mod tests {
                 p_rans_chunks: 0,
                 legacy_explicit_total_payload_bytes: None,
                 rc: None,
+                aq: None,
+                motion: None,
             },
             x264: None,
             table: vec![],
@@ -1326,6 +1622,8 @@ mod tests {
                     p_rans_chunks: 0,
                     legacy_explicit_total_payload_bytes: None,
                     rc: None,
+                    aq: None,
+                    motion: None,
                 },
             }]),
             sweep: None,
@@ -1344,6 +1642,9 @@ mod tests {
                 qp: 28,
                 residual_entropy: "auto".to_string(),
                 motion_radius: 16,
+                aq: "off".to_string(),
+                motion_search: "exhaustive-small".to_string(),
+                sweep_variant: None,
                 row: CodecRow {
                     codec: "SRSV2".to_string(),
                     error: None,
@@ -1370,6 +1671,8 @@ mod tests {
                     p_rans_chunks: 0,
                     legacy_explicit_total_payload_bytes: None,
                     rc: None,
+                    aq: None,
+                    motion: None,
                 },
             }],
             git_commit: None,
@@ -1404,9 +1707,54 @@ mod tests {
             min_qp: 4,
             max_qp: 51,
             qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
         assert!(validate_args(&a).is_ok());
+    }
+
+    #[test]
+    fn invalid_aq_motion_strings_fail_validate() {
+        let mut a = Args {
+            input: PathBuf::from("nope"),
+            width: 64,
+            height: 64,
+            frames: 1,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "not-a-mode".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+        };
+        assert!(validate_args(&a).is_err());
+        a.aq = "off".to_string();
+        a.motion_search = "turbo-fast".to_string();
+        assert!(validate_args(&a).is_err());
     }
 }

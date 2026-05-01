@@ -1,10 +1,12 @@
 //! Serialized SRSV2 **frame** payload (inside mux packet or elementary stream).
 
+use super::adaptive_quant::{resolve_frame_adaptive_qp, SrsV2AqEncodeStats};
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::intra_codec::{decode_plane_intra, encode_plane_intra};
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
+use super::motion_search::SrsV2MotionEncodeStats;
 use super::p_frame_codec;
 use super::rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
 use super::residual_entropy::{decode_plane_intra_entropy, encode_plane_intra_entropy};
@@ -23,11 +25,16 @@ pub fn encode_yuv420_intra_payload(
     qp: u8,
     settings: &SrsV2EncodeSettings,
     stats: Option<&mut ResidualEncodeStats>,
+    aq_out: Option<&mut SrsV2AqEncodeStats>,
 ) -> Result<Vec<u8>, SrsV2Error> {
     if seq.pixel_format != PixelFormat::Yuv420p8 || yuv.format != PixelFormat::Yuv420p8 {
         return Err(SrsV2Error::Unsupported(
             "encode path only supports YUV420p8 in this slice",
         ));
+    }
+    let (eff_qp, aq_st) = resolve_frame_adaptive_qp(qp, yuv, settings)?;
+    if let Some(a) = aq_out {
+        *a = aq_st;
     }
     let mut out = Vec::new();
     let magic = match settings.residual_entropy {
@@ -36,9 +43,9 @@ pub fn encode_yuv420_intra_payload(
     };
     out.extend_from_slice(&magic);
     out.extend_from_slice(&frame_index.to_le_bytes());
-    out.push(qp);
+    out.push(eff_qp);
 
-    let qp_i = qp.max(1) as i16;
+    let qp_i = eff_qp.max(1) as i16;
     let mut yb = Vec::new();
     let mut ub = Vec::new();
     let mut vb = Vec::new();
@@ -193,6 +200,7 @@ pub fn decode_yuv420_intra_payload(
 }
 
 /// Encode SRSV2 video payload: intra (`FR2` rev 1 or 3) or experimental P (`FR2` rev 2 or 4).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_yuv420_inter_payload(
     seq: &VideoSequenceHeaderV2,
     cur: &YuvFrame,
@@ -201,19 +209,34 @@ pub fn encode_yuv420_inter_payload(
     qp: u8,
     settings: &SrsV2EncodeSettings,
     stats: Option<&mut ResidualEncodeStats>,
+    aq_out: Option<&mut SrsV2AqEncodeStats>,
+    motion_out: Option<&mut SrsV2MotionEncodeStats>,
 ) -> Result<Vec<u8>, SrsV2Error> {
     let interval = settings.keyframe_interval.max(1);
     let force_intra = frame_index == 0 || frame_index.is_multiple_of(interval);
     if force_intra || seq.max_ref_frames == 0 {
-        return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats);
+        return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats, aq_out);
     }
     let Some(reference) = reference else {
-        return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats);
+        return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats, aq_out);
     };
     if !seq.width.is_multiple_of(16) || !seq.height.is_multiple_of(16) {
-        return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats);
+        return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats, aq_out);
     }
-    p_frame_codec::encode_yuv420_p_payload(seq, cur, reference, frame_index, qp, settings, stats)
+    let (eff_qp, aq_st) = resolve_frame_adaptive_qp(qp, cur, settings)?;
+    if let Some(a) = aq_out {
+        *a = aq_st;
+    }
+    p_frame_codec::encode_yuv420_p_payload(
+        seq,
+        cur,
+        reference,
+        frame_index,
+        eff_qp,
+        settings,
+        stats,
+        motion_out,
+    )
 }
 
 /// Decode intra or P SRSV2 payload; updates `ref_slot` when `max_ref_frames > 0` after a successful decode.
@@ -295,7 +318,9 @@ mod roundtrip_tests {
         let rgb = vec![128_u8; (w * h * 3) as usize];
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, w, h, ColorRange::Limited).unwrap();
         let st = explicit_only_settings();
-        let pbytes = encode_yuv420_inter_payload(&seq, &yuv, Some(&yuv), 1, 28, &st, None).unwrap();
+        let pbytes =
+            encode_yuv420_inter_payload(&seq, &yuv, Some(&yuv), 1, 28, &st, None, None, None)
+                .unwrap();
         let mut slot = None::<crate::srsv2::frame::YuvFrame>;
         assert!(matches!(
             decode_yuv420_srsv2_payload(&seq, &pbytes, &mut slot),
@@ -304,7 +329,8 @@ mod roundtrip_tests {
         slot = Some(yuv.clone());
         decode_yuv420_srsv2_payload(&seq, &pbytes, &mut slot).unwrap();
         seq.max_ref_frames = 0;
-        let intra_only = encode_yuv420_inter_payload(&seq, &yuv, None, 5, 28, &st, None).unwrap();
+        let intra_only =
+            encode_yuv420_inter_payload(&seq, &yuv, None, 5, 28, &st, None, None, None).unwrap();
         assert_eq!(intra_only[3], 1);
     }
 
@@ -327,7 +353,7 @@ mod roundtrip_tests {
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).expect("yuv");
         let qp = 10_u8;
         let st = explicit_only_settings();
-        let payload = encode_yuv420_intra_payload(&seq, &yuv, 1, qp, &st, None).expect("enc");
+        let payload = encode_yuv420_intra_payload(&seq, &yuv, 1, qp, &st, None, None).expect("enc");
         let dec = decode_yuv420_intra_payload(&seq, &payload).expect("dec");
         assert_eq!(dec.frame_index, 1);
         assert_eq!(dec.width, 64);
@@ -356,10 +382,12 @@ mod roundtrip_tests {
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, w, h, ColorRange::Limited).unwrap();
         let qp = 28_u8;
         let st = explicit_only_settings();
-        let intra = encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &st, None).unwrap();
+        let intra = encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &st, None, None).unwrap();
         let mut slot = None;
         decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
-        let p = encode_yuv420_inter_payload(&seq, &yuv, slot.as_ref(), 1, qp, &st, None).unwrap();
+        let p =
+            encode_yuv420_inter_payload(&seq, &yuv, slot.as_ref(), 1, qp, &st, None, None, None)
+                .unwrap();
         assert_eq!(p[3], 2);
         assert!(
             p.len() < intra.len(),
@@ -390,10 +418,12 @@ mod roundtrip_tests {
             residual_entropy: ResidualEntropy::Explicit,
             ..Default::default()
         };
-        let payload_exp = encode_yuv420_intra_payload(&seq, &yuv, 0, 22, &st_exp, None).unwrap();
+        let payload_exp =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, 22, &st_exp, None, None).unwrap();
         assert_eq!(payload_exp[3], 1);
         let st_auto = SrsV2EncodeSettings::default();
-        let payload_auto = encode_yuv420_intra_payload(&seq, &yuv, 0, 22, &st_auto, None).unwrap();
+        let payload_auto =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, 22, &st_auto, None, None).unwrap();
         assert_eq!(payload_auto[3], 3);
         let dec_exp = decode_yuv420_intra_payload(&seq, &payload_exp).unwrap();
         let dec_auto = decode_yuv420_intra_payload(&seq, &payload_auto).unwrap();
