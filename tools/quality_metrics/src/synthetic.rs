@@ -1,22 +1,15 @@
-//! Deterministic **planar YUV420p8** buffers for codec measurements (`Y` plane, then `U`, then `V`).
+//! Deterministic YUV420p8 synthetic clips for benchmarks and regression tests.
+//!
+//! Frames are concatenated as planar `Y` then `U` then `V` per frame.
 
 use serde::{Deserialize, Serialize};
-use std::io::{self, Write};
+use std::io;
 
-/// Metadata written beside generated `.yuv` files.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SyntheticMeta {
-    pub width: u32,
-    pub height: u32,
-    pub fps: u32,
-    pub frames: u32,
-    pub pix_fmt: String,
-    pub seed: u64,
-    pub pattern: String,
-}
+/// Hard cap for default generator output unless `allow_large=true`.
+const DEFAULT_MAX_OUTPUT_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SyntheticPattern {
     Flat,
     GrayRamp,
@@ -25,91 +18,104 @@ pub enum SyntheticPattern {
     Noise,
     Checker,
     SceneCut,
-    Hd1080Short,
-    Uhd4kShort,
-    Uhd8kTiny,
 }
 
 impl SyntheticPattern {
-    /// Parse CLI `--pattern` names (`flat`, `noise`, `1080p`, …).
-    pub fn parse(s: &str) -> Option<Self> {
+    pub fn parse_cli(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "flat" => Some(Self::Flat),
-            "gray_ramp" | "gray-ramp" => Some(Self::GrayRamp),
-            "moving_square" | "moving-square" => Some(Self::MovingSquare),
-            "scrolling_bars" | "scrolling-bars" => Some(Self::ScrollingBars),
+            "gray-ramp" | "gray_ramp" => Some(Self::GrayRamp),
+            "moving-square" | "moving_square" => Some(Self::MovingSquare),
+            "scrolling-bars" | "scrolling_bars" => Some(Self::ScrollingBars),
             "noise" => Some(Self::Noise),
             "checker" => Some(Self::Checker),
-            "scene_cut" | "scene-cut" => Some(Self::SceneCut),
-            "1080p" | "hd1080" => Some(Self::Hd1080Short),
-            "4k" | "uhd4k" => Some(Self::Uhd4kShort),
-            "8k" | "uhd8k" => Some(Self::Uhd8kTiny),
+            "scene-cut" | "scene_cut" => Some(Self::SceneCut),
             _ => None,
         }
     }
 }
 
-#[derive(Debug)]
-pub enum SyntheticError {
-    Io(io::Error),
-    SerdeJson(serde_json::Error),
-    ResolutionNeedsAllowLarge {
-        width: u32,
-        height: u32,
-    },
-    /// Unknown `--pattern` name.
-    UnknownPattern(String),
-}
-
-impl std::fmt::Display for SyntheticError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "{e}"),
-            Self::SerdeJson(e) => write!(f, "{e}"),
-            Self::ResolutionNeedsAllowLarge { width, height } => write!(
-                f,
-                "resolution {width}x{height} requires --allow-large (hostile-input guard)"
-            ),
-            Self::UnknownPattern(s) => write!(f, "unknown pattern {s:?}"),
-        }
-    }
-}
-
-impl std::error::Error for SyntheticError {}
-
-impl From<io::Error> for SyntheticError {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-pub struct GenerateOptions {
+#[derive(Debug, Clone)]
+pub struct SyntheticClipSpec {
+    pub width: u32,
+    pub height: u32,
+    pub fps_num: u32,
+    pub fps_den: u32,
+    pub frames: u32,
     pub pattern: SyntheticPattern,
     pub seed: u64,
-    pub frames: Option<u32>,
-    pub fps: u32,
     pub allow_large: bool,
 }
 
-fn dims_for_pattern(pat: SyntheticPattern) -> (u32, u32, u32) {
-    match pat {
-        SyntheticPattern::Hd1080Short => (1920, 1080, 2),
-        SyntheticPattern::Uhd4kShort => (3840, 2160, 1),
-        SyntheticPattern::Uhd8kTiny => (7680, 4320, 1),
-        _ => (64, 64, 10),
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyntheticClipMetadata {
+    pub width: u32,
+    pub height: u32,
+    pub fps_num: u32,
+    pub fps_den: u32,
+    /// Back-compat convenience field (integer FPS).
+    #[serde(default)]
+    pub fps: u32,
+    pub frames: u32,
+    pub pix_fmt: String,
+    pub pattern: SyntheticPattern,
+    pub seed: u64,
+    pub yuv_bytes: u64,
+    pub raw_size_bytes: u64,
+}
+
+/// Back-compat name used by older tools.
+pub type SyntheticMeta = SyntheticClipMetadata;
+
+/// Back-compat helper: byte length of one planar YUV420p8 frame.
+///
+/// Prefer [`yuv420p8_frame_bytes_even`] when validating user input.
+pub fn yuv420p8_frame_bytes(width: u32, height: u32) -> usize {
+    let w = width as usize;
+    let h = height as usize;
+    w.checked_mul(h)
+        .and_then(|y| y.checked_add(y / 2))
+        .unwrap_or(0)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SyntheticError {
+    #[error("i/o: {0}")]
+    Io(#[from] io::Error),
+    #[error("invalid dimensions: {0}x{1}")]
+    Dimensions(u32, u32),
+    #[error("YUV420p8 requires even width/height, got {0}x{1}")]
+    OddDimensions(u32, u32),
+    #[error("clip would be too large ({bytes} bytes); pass --allow-large")]
+    TooLarge { bytes: u64 },
+    #[error("integer overflow computing clip size")]
+    Overflow,
+    #[error("serde json: {0}")]
+    SerdeJson(#[from] serde_json::Error),
+    #[error("unknown pattern: {0}")]
+    UnknownPattern(String),
+}
+
+fn checked_mul_u64(a: u64, b: u64) -> Result<u64, SyntheticError> {
+    a.checked_mul(b).ok_or(SyntheticError::Overflow)
+}
+
+/// Bytes per frame for planar YUV420p8, requiring **even** dimensions.
+pub fn yuv420p8_frame_bytes_even(width: u32, height: u32) -> Result<u64, SyntheticError> {
+    if width == 0 || height == 0 {
+        return Err(SyntheticError::Dimensions(width, height));
     }
-}
-
-/// Byte length of one YUV420p8 frame (planar) at `w`×`h`.
-pub fn yuv420p8_frame_bytes(w: u32, h: u32) -> usize {
-    pixel_count_yuv420(w, h)
-}
-
-fn pixel_count_yuv420(w: u32, h: u32) -> usize {
-    let y = (w as usize) * (h as usize);
-    let cu = w.div_ceil(2) as usize;
-    let ch = h.div_ceil(2) as usize;
-    y + 2 * cu * ch
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return Err(SyntheticError::OddDimensions(width, height));
+    }
+    let w = u64::from(width);
+    let h = u64::from(height);
+    // Y: w*h; U/V: (w/2)*(h/2) each.
+    let y = checked_mul_u64(w, h)?;
+    let c = checked_mul_u64(w / 2, h / 2)?;
+    y.checked_add(c.checked_mul(2).ok_or(SyntheticError::Overflow)?)
+        .ok_or(SyntheticError::Overflow)
 }
 
 /// XOR-shift PRNG (deterministic from `seed`).
@@ -120,245 +126,236 @@ fn xorshift64(mut x: u64) -> u64 {
     x
 }
 
-fn fill_frame(pat: SyntheticPattern, seed: u64, frame_idx: u32, w: u32, h: u32, buf: &mut [u8]) {
-    let cw = w.div_ceil(2);
-    let ch = h.div_ceil(2);
-    let y_len = (w * h) as usize;
-    let u_len = (cw * ch) as usize;
-    let (yplane, rest) = buf.split_at_mut(y_len);
-    let (uplane, vplane) = rest.split_at_mut(u_len);
+fn fill_yuv420_frame(
+    spec: &SyntheticClipSpec,
+    frame_idx: u32,
+    y: &mut [u8],
+    u: &mut [u8],
+    v: &mut [u8],
+) {
+    let w = spec.width;
+    let h = spec.height;
+    let cw = w / 2;
+    let ch = h / 2;
+    debug_assert_eq!(y.len(), (w * h) as usize);
+    debug_assert_eq!(u.len(), (cw * ch) as usize);
+    debug_assert_eq!(v.len(), (cw * ch) as usize);
 
-    match pat {
+    match spec.pattern {
         SyntheticPattern::Flat => {
-            yplane.fill(128);
-            uplane.fill(128);
-            vplane.fill(128);
+            y.fill(128);
+            u.fill(128);
+            v.fill(128);
         }
         SyntheticPattern::GrayRamp => {
-            for y in 0..h {
-                for x in 0..w {
-                    let v = ((x.wrapping_add(frame_idx.wrapping_mul(3))) % 256) as u8;
-                    yplane[(y * w + x) as usize] = v;
+            for yy in 0..h {
+                for xx in 0..w {
+                    let v0 = ((xx.wrapping_add(frame_idx.wrapping_mul(3))) & 0xFF) as u8;
+                    y[(yy * w + xx) as usize] = v0;
                 }
             }
-            uplane.fill(128);
-            vplane.fill(128);
+            u.fill(128);
+            v.fill(128);
         }
         SyntheticPattern::MovingSquare => {
-            yplane.fill(16);
-            let sq = 16u32;
-            let ox = (frame_idx.wrapping_mul(4) % w.saturating_sub(sq).max(1)) as i32;
-            let oy = (frame_idx.wrapping_mul(2) % h.saturating_sub(sq).max(1)) as i32;
+            y.fill(16);
+            let sq = 32u32;
+            let ox = (frame_idx.wrapping_mul(8) % w.saturating_sub(sq).max(1)) as i32;
+            let oy = (frame_idx.wrapping_mul(4) % h.saturating_sub(sq).max(1)) as i32;
             for yy in 0..sq {
                 for xx in 0..sq {
                     let px = ox + xx as i32;
                     let py = oy + yy as i32;
                     if px >= 0 && py >= 0 && (px as u32) < w && (py as u32) < h {
-                        yplane[(py as u32 * w + px as u32) as usize] = 220;
+                        y[(py as u32 * w + px as u32) as usize] = 220;
                     }
                 }
             }
-            uplane.fill(128);
-            vplane.fill(128);
+            u.fill(128);
+            v.fill(128);
         }
         SyntheticPattern::ScrollingBars => {
             let shift = (frame_idx.wrapping_mul(7)) % h.max(1);
-            for y in 0..h {
-                let band = ((y + shift) % 32) < 16;
+            for yy in 0..h {
+                let band = ((yy + shift) % 64) < 32;
                 let fill = if band { 200_u8 } else { 40_u8 };
-                for x in 0..w {
-                    yplane[(y * w + x) as usize] = fill.wrapping_add((x % 16) as u8);
+                for xx in 0..w {
+                    y[(yy * w + xx) as usize] = fill.wrapping_add((xx % 16) as u8);
                 }
             }
-            uplane.fill(128);
-            vplane.fill(128);
+            u.fill(128);
+            v.fill(128);
         }
         SyntheticPattern::Noise => {
-            let mut s = seed ^ u64::from(frame_idx).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            for b in yplane.iter_mut() {
+            let mut s = spec.seed ^ u64::from(frame_idx).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            for b in y.iter_mut() {
                 s = xorshift64(s);
                 *b = (s & 0xFF) as u8;
             }
-            for b in uplane.iter_mut().chain(vplane.iter_mut()) {
+            for b in u.iter_mut().chain(v.iter_mut()) {
                 s = xorshift64(s);
                 *b = (s & 0xFF) as u8;
             }
         }
         SyntheticPattern::Checker => {
-            for y in 0..h {
-                for x in 0..w {
-                    let c = if ((x / 8) ^ (y / 8) ^ frame_idx) & 1 == 0 {
+            for yy in 0..h {
+                for xx in 0..w {
+                    let c = if ((xx / 8) ^ (yy / 8) ^ frame_idx) & 1 == 0 {
                         240
                     } else {
                         20
                     };
-                    yplane[(y * w + x) as usize] = c as u8;
+                    y[(yy * w + xx) as usize] = c as u8;
                 }
             }
-            uplane.fill(128);
-            vplane.fill(128);
+            u.fill(128);
+            v.fill(128);
         }
         SyntheticPattern::SceneCut => {
-            let half = |buf: &mut [u8], hi: bool| {
-                let v = if hi { 210_u8 } else { 45_u8 };
-                buf.fill(v);
-            };
-            if frame_idx < 5 {
-                half(yplane, true);
-            } else {
-                half(yplane, false);
-            }
-            uplane.fill(128);
-            vplane.fill(128);
-        }
-        SyntheticPattern::Hd1080Short
-        | SyntheticPattern::Uhd4kShort
-        | SyntheticPattern::Uhd8kTiny => {
-            fill_frame(SyntheticPattern::Noise, seed, frame_idx, w, h, buf);
+            let hi = frame_idx < (spec.frames / 2).max(1);
+            y.fill(if hi { 210 } else { 45 });
+            u.fill(128);
+            v.fill(128);
         }
     }
 }
 
-/// Generate planar YUV420p8 bytes for all frames (concatenated).
-pub fn generate(opts: &GenerateOptions) -> Result<(Vec<u8>, SyntheticMeta), SyntheticError> {
-    let pat = opts.pattern;
-    let (mut w, mut h, default_frames) = dims_for_pattern(pat);
-    if !matches!(
-        pat,
-        SyntheticPattern::Hd1080Short | SyntheticPattern::Uhd4kShort | SyntheticPattern::Uhd8kTiny
-    ) {
-        w = 64;
-        h = 64;
+/// Generate a planar YUV420p8 clip: frames concatenated as `Y` + `U` + `V` per frame.
+pub fn generate_yuv420p8_clip(spec: &SyntheticClipSpec) -> Result<Vec<u8>, SyntheticError> {
+    let frame_bytes = yuv420p8_frame_bytes_even(spec.width, spec.height)?;
+    let total_bytes = checked_mul_u64(frame_bytes, u64::from(spec.frames))?;
+    if !spec.allow_large && total_bytes > DEFAULT_MAX_OUTPUT_BYTES {
+        return Err(SyntheticError::TooLarge { bytes: total_bytes });
     }
-    let frames = opts.frames.unwrap_or(default_frames);
-    if matches!(pat, SyntheticPattern::Uhd8kTiny) && !opts.allow_large {
-        return Err(SyntheticError::ResolutionNeedsAllowLarge {
-            width: w,
-            height: h,
-        });
+
+    let mut out = vec![0_u8; total_bytes as usize];
+    let y_len = (spec.width * spec.height) as usize;
+    let c_len = ((spec.width / 2) * (spec.height / 2)) as usize;
+    let per = frame_bytes as usize;
+
+    for fi in 0..spec.frames {
+        let frame = &mut out[fi as usize * per..][..per];
+        let (y, rest) = frame.split_at_mut(y_len);
+        let (u, v) = rest.split_at_mut(c_len);
+        fill_yuv420_frame(spec, fi, y, u, v);
     }
-    let px = (w as u64).saturating_mul(h as u64);
-    if px > 33_177_600 && !opts.allow_large {
-        return Err(SyntheticError::ResolutionNeedsAllowLarge {
-            width: w,
-            height: h,
-        });
-    }
-    let frame_bytes = pixel_count_yuv420(w, h);
-    let total = frame_bytes.saturating_mul(frames as usize);
-    let mut buf = vec![0_u8; total];
-    let pattern_name = format!("{pat:?}");
-    for fi in 0..frames {
-        let chunk = &mut buf[fi as usize * frame_bytes..][..frame_bytes];
-        fill_frame(pat, opts.seed, fi, w, h, chunk);
-    }
-    let meta = SyntheticMeta {
-        width: w,
-        height: h,
-        fps: opts.fps.max(1),
-        frames,
+    Ok(out)
+}
+
+pub fn metadata_for_clip(
+    spec: &SyntheticClipSpec,
+) -> Result<SyntheticClipMetadata, SyntheticError> {
+    let frame_bytes = yuv420p8_frame_bytes_even(spec.width, spec.height)?;
+    let yuv_bytes = checked_mul_u64(frame_bytes, u64::from(spec.frames))?;
+    Ok(SyntheticClipMetadata {
+        width: spec.width,
+        height: spec.height,
+        fps_num: spec.fps_num.max(1),
+        fps_den: spec.fps_den.max(1),
+        fps: spec.fps_num.max(1) / spec.fps_den.max(1),
+        frames: spec.frames,
         pix_fmt: "yuv420p".to_string(),
-        seed: opts.seed,
-        pattern: pattern_name,
-    };
-    Ok((buf, meta))
+        pattern: spec.pattern,
+        seed: spec.seed,
+        yuv_bytes,
+        raw_size_bytes: yuv_bytes,
+    })
 }
 
-/// Write `.yuv` and sidecar `meta.json`.
-pub fn write_yuv_with_meta(
+pub fn write_yuv420p8_clip(
+    spec: &SyntheticClipSpec,
     yuv_path: &std::path::Path,
-    meta_path: &std::path::Path,
-    opts: &GenerateOptions,
-) -> Result<SyntheticMeta, SyntheticError> {
-    let (bytes, meta) = generate(opts)?;
-    let mut f = std::fs::File::create(yuv_path)?;
-    f.write_all(&bytes)?;
-    let json = serde_json::to_string_pretty(&meta).map_err(SyntheticError::SerdeJson)?;
-    std::fs::write(meta_path, json)?;
+    metadata_path: &std::path::Path,
+) -> Result<SyntheticClipMetadata, SyntheticError> {
+    let yuv = generate_yuv420p8_clip(spec)?;
+    if let Some(p) = yuv_path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    if let Some(p) = metadata_path.parent() {
+        std::fs::create_dir_all(p)?;
+    }
+    std::fs::write(yuv_path, &yuv)?;
+    let meta = metadata_for_clip(spec)?;
+    let json = serde_json::to_string_pretty(&meta)?;
+    std::fs::write(metadata_path, json)?;
     Ok(meta)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn deterministic_same_seed_same_bytes() {
-        let o = GenerateOptions {
-            pattern: SyntheticPattern::Noise,
-            seed: 42,
-            frames: Some(2),
-            fps: 30,
+
+    fn base_spec(pattern: SyntheticPattern) -> SyntheticClipSpec {
+        SyntheticClipSpec {
+            width: 64,
+            height: 64,
+            fps_num: 30,
+            fps_den: 1,
+            frames: 3,
+            pattern,
+            seed: 528,
             allow_large: false,
-        };
-        let (a, _) = generate(&o).unwrap();
-        let (b, _) = generate(&o).unwrap();
+        }
+    }
+
+    #[test]
+    fn deterministic_for_same_seed() {
+        let spec = base_spec(SyntheticPattern::Noise);
+        let a = generate_yuv420p8_clip(&spec).unwrap();
+        let b = generate_yuv420p8_clip(&spec).unwrap();
         assert_eq!(a, b);
     }
 
     #[test]
-    fn meta_json_roundtrip_shape() {
-        let o = GenerateOptions {
-            pattern: SyntheticPattern::Flat,
-            seed: 1,
-            frames: Some(1),
-            fps: 30,
-            allow_large: false,
-        };
-        let (_, m) = generate(&o).unwrap();
-        let j = serde_json::to_string(&m).unwrap();
-        assert!(j.contains("\"width\": 64") || j.contains("\"width\":64"));
+    fn all_patterns_have_expected_byte_length() {
+        for p in [
+            SyntheticPattern::Flat,
+            SyntheticPattern::GrayRamp,
+            SyntheticPattern::MovingSquare,
+            SyntheticPattern::ScrollingBars,
+            SyntheticPattern::Noise,
+            SyntheticPattern::Checker,
+            SyntheticPattern::SceneCut,
+        ] {
+            let spec = base_spec(p);
+            let buf = generate_yuv420p8_clip(&spec).unwrap();
+            let fb = yuv420p8_frame_bytes_even(spec.width, spec.height).unwrap() as usize;
+            assert_eq!(buf.len(), fb * spec.frames as usize);
+        }
     }
 
     #[test]
-    fn uhd8k_blocked_without_flag() {
-        let o = GenerateOptions {
-            pattern: SyntheticPattern::Uhd8kTiny,
-            seed: 1,
-            frames: Some(1),
-            fps: 30,
-            allow_large: false,
-        };
+    fn odd_and_zero_dimensions_rejected() {
+        let mut s = base_spec(SyntheticPattern::Flat);
+        s.width = 0;
+        assert!(generate_yuv420p8_clip(&s).is_err());
+        s.width = 63;
+        s.height = 64;
         assert!(matches!(
-            generate(&o),
-            Err(SyntheticError::ResolutionNeedsAllowLarge { .. })
+            generate_yuv420p8_clip(&s),
+            Err(SyntheticError::OddDimensions(..))
         ));
     }
 
     #[test]
-    fn uhd8k_allowed_with_flag() {
-        let o = GenerateOptions {
-            pattern: SyntheticPattern::Uhd8kTiny,
-            seed: 1,
-            frames: Some(1),
-            fps: 30,
-            allow_large: true,
-        };
-        let (buf, m) = generate(&o).unwrap();
-        assert_eq!(m.width, 7680);
-        assert_eq!(buf.len(), yuv420p8_frame_bytes(7680, 4320));
+    fn large_output_blocked_unless_allowed() {
+        let mut s = base_spec(SyntheticPattern::Flat);
+        s.width = 4096;
+        s.height = 4096;
+        s.frames = 10;
+        assert!(matches!(
+            generate_yuv420p8_clip(&s),
+            Err(SyntheticError::TooLarge { .. }) | Err(SyntheticError::Overflow)
+        ));
+        s.allow_large = true;
+        let _ = generate_yuv420p8_clip(&s).unwrap();
     }
 
     #[test]
-    fn temp_write_matches_generate() {
-        let dir = std::env::temp_dir();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let full_yuv = dir.join(format!("syn-yuv-{nanos}.yuv"));
-        let meta_p = dir.join(format!("syn-meta-{nanos}.json"));
-        let o = GenerateOptions {
-            pattern: SyntheticPattern::Checker,
-            seed: 9,
-            frames: Some(3),
-            fps: 24,
-            allow_large: false,
-        };
-        write_yuv_with_meta(&full_yuv, &meta_p, &o).unwrap();
-        let disk = std::fs::read(&full_yuv).unwrap();
-        let (gen, _) = generate(&o).unwrap();
-        assert_eq!(disk, gen);
-        let _ = std::fs::remove_file(&full_yuv);
-        let _ = std::fs::remove_file(&meta_p);
+    fn metadata_serializes() {
+        let s = base_spec(SyntheticPattern::Checker);
+        let m = metadata_for_clip(&s).unwrap();
+        let j = serde_json::to_string(&m).unwrap();
+        assert!(j.contains("\"pix_fmt\""));
     }
 }

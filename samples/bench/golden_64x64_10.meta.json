@@ -1,0 +1,13 @@
+{
+  "width": 64,
+  "height": 64,
+  "fps_num": 24,
+  "fps_den": 1,
+  "fps": 24,
+  "frames": 10,
+  "pix_fmt": "yuv420p",
+  "pattern": "moving-square",
+  "seed": 42,
+  "yuv_bytes": 61440,
+  "raw_size_bytes": 61440
+}

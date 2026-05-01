@@ -11,7 +11,14 @@ path = "src/lib.rs"
 name = "gen_synthetic_yuv"
 path = "src/bin/gen_synthetic_yuv.rs"
 
+[[bin]]
+name = "bench_srsv2"
+path = "src/bin/bench_srsv2.rs"
+
 [dependencies]
+anyhow.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
+libsrs_video = { path = "../../crates/libsrs_video" }
+thiserror.workspace = true
