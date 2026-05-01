@@ -20,13 +20,14 @@ pub use srsv2::{
     decode_yuv420_srsv2_payload,
     elementary::{peek_is_srsv2, VideoStreamReaderV2, VideoStreamWriterV2},
     encode_sequence_header_v2, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
-    gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
-    ChromaSiting, ColorConvertBackend, ColorPrimaries, ColorRange, CpuVideoAccelerator,
-    DecodedVideoFrameV2, GpuVideoAccelerator, MatrixCoefficients, MotionSearchBackend, PixelFormat,
-    QuantBackend, ReferenceFrameBuffer, ResidualEncodeStats, ResidualEntropy,
-    SrsElementaryVideoCodecId, SrsV2EncodeSettings, SrsV2Error, SrsVideoCodecId, SrsVideoProfile,
-    Srsv2PayloadKind, TransferFunction, TransformBackend, VideoPlane, VideoSequenceHeaderV2,
-    YuvFrame,
+    gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, target_payload_bytes,
+    yuv420_bt709_to_rgb888_limited, ChromaSiting, ColorConvertBackend, ColorPrimaries, ColorRange,
+    CpuVideoAccelerator, DecodedVideoFrameV2, GpuVideoAccelerator, MatrixCoefficients,
+    MotionSearchBackend, PixelFormat, PreviousFrameRcStats, QuantBackend, ReferenceFrameBuffer,
+    ResidualEncodeStats, ResidualEntropy, SrsElementaryVideoCodecId, SrsV2EncodeSettings,
+    SrsV2Error, SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsVideoCodecId,
+    SrsVideoProfile, Srsv2PayloadKind, TransferFunction, TransformBackend, VideoPlane,
+    VideoSequenceHeaderV2, YuvFrame,
 };
 
 #[cfg(test)]

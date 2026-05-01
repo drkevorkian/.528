@@ -35,7 +35,10 @@ pub use model::{
     SEQUENCE_HEADER_BYTES,
 };
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
-pub use rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
+pub use rate_control::{
+    target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
+    SrsV2EncodeSettings, SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController,
+};
 pub use reference::ReferenceFrameBuffer;
 
 pub use gpu_traits::{

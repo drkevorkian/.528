@@ -8,6 +8,9 @@ Workspace tools (engineering measurements):
   - `cargo run -p quality_metrics --bin bench_srsv2 -- --input samples/bench/moving_square_1080p.yuv --width 1920 --height 1080 --frames 60 --fps 60 --qp 28 --keyint 30 --motion-radius 16 --residual-entropy auto --report-json var/bench/moving_square_srsv2.json --report-md var/bench/moving_square_srsv2.md`
   - Add `--compare-x264 --x264-crf 23 --x264-preset medium` if `ffmpeg` is on `PATH`.
   - Residual coding: `--residual-entropy auto|explicit|rans`. **`auto`** never chooses rANS for a block when that would be larger than explicit tuples (unless forced **`rans`**). Reports include intra/P **explicit vs rANS** counts and optional **`legacy_explicit_total_payload_bytes`** when not `explicit`.
+- **Compare residual modes** (single command, three encode passes — **no FFmpeg**): `--compare-residual-modes` produces rows **SRSV2-explicit**, **SRSV2-auto**, **SRSV2-rans**. If forced **rans** fails (e.g. coefficients outside the static rANS alphabet), that row is marked failed with an error string and the other rows still appear.
+- **Rate control** (benchmark loop only; see `docs/rate_control.md`): `--rc fixed-qp|quality|target-bitrate` with `--quality`, `--target-bitrate-kbps`, optional `--max-bitrate-kbps`, and `--min-qp` / `--max-qp` / `--qp-step-limit`. Reports include achieved vs target bitrate and QP history summaries.
+- **Sweep grid** (optional regression / weak-spot finder): `--sweep` runs a fixed grid of QP values `{18, 22, 28, 34}` × residual `{explicit, auto}` × motion radius `{0, 8, 16}` and writes a JSON array plus a Markdown table (`--compare-residual-modes` and `--sweep` are mutually exclusive).
 
 Legacy helper: `cargo run -p codec_compare -- --help` (optional **libx264** branch via `ffmpeg`).
 

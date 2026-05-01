@@ -67,6 +67,41 @@ Further playback architecture: `docs/playback_pipeline.md`.
     --report-json var/bench/flat_srsv2.json --report-md var/bench/flat_srsv2.md
   ```
 
+- **Residual entropy A/B/C** (`explicit` vs `auto` vs forced `rans`) in one report (no FFmpeg):
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 --compare-residual-modes \
+    --report-json var/bench/flat_residual_cmp.json --report-md var/bench/flat_residual_cmp.md
+  ```
+
+- **Rate control knobs** (encoder-side QP selection for the benchmark loop; see `docs/rate_control.md`):
+
+  ```bash
+  # Constant-quality style: `--quality` is used as the QP index (after min/max clamp).
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --rc quality --quality 22 --keyint 30 --motion-radius 16 --residual-entropy auto \
+    --report-json var/bench/flat_cq.json --report-md var/bench/flat_cq.md
+
+  # Target bitrate (first-pass per-frame adaptation; achieved bitrate is reported vs target).
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --rc target-bitrate --target-bitrate-kbps 800 --qp 28 --min-qp 10 --max-qp 40 --qp-step-limit 2 \
+    --keyint 30 --motion-radius 16 --residual-entropy auto \
+    --report-json var/bench/flat_tb.json --report-md var/bench/flat_tb.md
+  ```
+
+- **Benchmark sweep** (fixed QP grid over QP × residual × motion radius; JSON array + Markdown table):
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --keyint 30 --sweep \
+    --report-json var/bench/flat_sweep.json --report-md var/bench/flat_sweep.md
+  ```
+
 - **Legacy / helper:** `cargo run -p codec_compare -- --yuv clip.yuv --meta clip.json --out-json report.json --out-md report.md` (older harness; same optional **libx264** branch when FFmpeg is available).
 
 - These outputs are **lab measurements** — do **not** treat them as proof SRSV2 “beats” another codec without your own methodology (`docs/srsv2_benchmarks.md`).
