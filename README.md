@@ -176,7 +176,7 @@ or the batch wrapper:
 tools\run_windows.cmd
 ```
 
-Windows launcher modes match the Unix launcher: `player`, `server`, and `cli`.
+Windows launcher modes match the Unix launcher: `player`, `server`, and `cli`, plus **`deps`** to print prerequisite status (Rust/cargo, rustfmt/clippy, MSVC, Git, FFmpeg, winget). Use **`deps -InstallDeps`** to install missing tools via winget where possible; add **`-InstallMsvc`** for Visual Studio Build Tools (large). **`-SkipDepsCheck`** skips checks for automation. The background server waits up to **`-ServerWaitSeconds`** (default **600**) for the first `cargo` compile; if startup fails, errors are in **`var\srs_license_server.stderr.log`** (script prints a tail). Linker **LNK1201** on `.pdb` under **`target\`** means the linker could not write that file (cloud sync on **Documents**, backup tools, another **cargo**/IDE handle, indexing, disk space, or a stale **`target`** tree—not only antivirus). Try **`cargo clean`**, build outside synced folders, or **`tools\run_windows.ps1 -DevLinkNoPdb`** to emit fewer PDBs in dev.
 
 ## Optional FFmpeg Compatibility
 
