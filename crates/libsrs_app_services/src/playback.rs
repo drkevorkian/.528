@@ -865,8 +865,16 @@ mod playback_tests {
     use libsrs_video::{
         decode_yuv420_srsv2_payload, encode_frame, encode_sequence_header_v2,
         encode_yuv420_inter_payload, encode_yuv420_intra_payload, gray8_packed_to_yuv420p8_neutral,
-        FrameType, SrsV2EncodeSettings, VideoFrame, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
+        FrameType, ResidualEntropy, SrsV2EncodeSettings, VideoFrame, VideoSequenceHeaderV2,
+        SEQUENCE_HEADER_BYTES,
     };
+
+    fn mux_srsv2_settings() -> SrsV2EncodeSettings {
+        SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Explicit,
+            ..Default::default()
+        }
+    }
 
     fn write_video_only_528(path: &Path) {
         let w = 8u32;
@@ -897,7 +905,8 @@ mod playback_tests {
         let gray = vec![0xCDu8; (w * w) as usize];
         let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(w, w);
         let yuv = gray8_packed_to_yuv420p8_neutral(&gray, w, w).unwrap();
-        let enc = encode_yuv420_intra_payload(&seq, &yuv, 0, 28).unwrap();
+        let st = mux_srsv2_settings();
+        let enc = encode_yuv420_intra_payload(&seq, &yuv, 0, 28, &st, None).unwrap();
         let cfg = encode_sequence_header_v2(&seq).to_vec();
         assert_eq!(cfg.len(), SEQUENCE_HEADER_BYTES);
         let tracks = vec![TrackDescriptor {
@@ -922,18 +931,12 @@ mod playback_tests {
         let gray1 = vec![0xEEu8; (w * h) as usize];
         let yuv0 = gray8_packed_to_yuv420p8_neutral(&gray0, w, h).unwrap();
         let yuv1 = gray8_packed_to_yuv420p8_neutral(&gray1, w, h).unwrap();
-        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28).unwrap();
+        let st = mux_srsv2_settings();
+        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28, &st, None).unwrap();
         let mut slot = None;
         decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
-        let enc1 = encode_yuv420_inter_payload(
-            &seq,
-            &yuv1,
-            slot.as_ref(),
-            1,
-            28,
-            &SrsV2EncodeSettings::default(),
-        )
-        .unwrap();
+        let enc1 =
+            encode_yuv420_inter_payload(&seq, &yuv1, slot.as_ref(), 1, 28, &st, None).unwrap();
         assert_eq!(enc1[3], 2);
         let cfg = encode_sequence_header_v2(&seq).to_vec();
         let tracks = vec![TrackDescriptor {
@@ -962,28 +965,15 @@ mod playback_tests {
         let yuv1 = gray8_packed_to_yuv420p8_neutral(&gray1, w, h).unwrap();
         let yuv2 = gray8_packed_to_yuv420p8_neutral(&gray2, w, h).unwrap();
 
-        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28).unwrap();
+        let st = mux_srsv2_settings();
+        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28, &st, None).unwrap();
         let mut slot = None;
         decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
-        let enc1 = encode_yuv420_inter_payload(
-            &seq,
-            &yuv1,
-            slot.as_ref(),
-            1,
-            28,
-            &SrsV2EncodeSettings::default(),
-        )
-        .unwrap();
+        let enc1 =
+            encode_yuv420_inter_payload(&seq, &yuv1, slot.as_ref(), 1, 28, &st, None).unwrap();
         decode_yuv420_srsv2_payload(&seq, &enc1, &mut slot).unwrap();
-        let enc2 = encode_yuv420_inter_payload(
-            &seq,
-            &yuv2,
-            slot.as_ref(),
-            2,
-            28,
-            &SrsV2EncodeSettings::default(),
-        )
-        .unwrap();
+        let enc2 =
+            encode_yuv420_inter_payload(&seq, &yuv2, slot.as_ref(), 2, 28, &st, None).unwrap();
 
         let cfg = encode_sequence_header_v2(&seq).to_vec();
         let tracks = vec![TrackDescriptor {
@@ -1010,18 +1000,12 @@ mod playback_tests {
         let gray1 = vec![0xEEu8; (w * h) as usize];
         let yuv0 = gray8_packed_to_yuv420p8_neutral(&gray0, w, h).unwrap();
         let yuv1 = gray8_packed_to_yuv420p8_neutral(&gray1, w, h).unwrap();
-        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28).unwrap();
+        let st = mux_srsv2_settings();
+        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28, &st, None).unwrap();
         let mut slot = None;
         decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
-        let enc1 = encode_yuv420_inter_payload(
-            &seq,
-            &yuv1,
-            slot.as_ref(),
-            1,
-            28,
-            &SrsV2EncodeSettings::default(),
-        )
-        .unwrap();
+        let enc1 =
+            encode_yuv420_inter_payload(&seq, &yuv1, slot.as_ref(), 1, 28, &st, None).unwrap();
         let cfg = encode_sequence_header_v2(&seq).to_vec();
         let tracks = vec![TrackDescriptor {
             track_id: 1,

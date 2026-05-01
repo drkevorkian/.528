@@ -433,6 +433,7 @@ impl NativeEncoderSink for MuxNativeImportSink {
                 vf.frame_index,
                 IMPORT_SRSV2_QP,
                 &settings,
+                None,
             )
             .map_err(|e| anyhow!("SRSV2 encode: {}", e))?;
             decode_yuv420_srsv2_payload(seq, &enc, &mut self.srsv2_decoded_ref)
@@ -619,13 +620,13 @@ mod import_tests {
             0,
             "predicted SRSV2 packet must not carry KEYFRAME"
         );
-        assert_eq!(
-            p0.packet.payload[3], 1,
-            "first SRSV2 video packet should be intra"
+        assert!(
+            matches!(p0.packet.payload.get(3).copied(), Some(1 | 3),),
+            "first SRSV2 video packet should be intra (FR2 rev 1 or entropy intra rev 3)"
         );
-        assert_eq!(
-            p1.packet.payload[3], 2,
-            "second frame should be P (import uses inter encode)"
+        assert!(
+            matches!(p1.packet.payload.get(3).copied(), Some(2 | 4),),
+            "second frame should be P (FR2 rev 2 or entropy rev 4)"
         );
         let mut slot = None;
         let d0 =

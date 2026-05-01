@@ -12,7 +12,7 @@ use libsrs_container::{FileHeader, TrackDescriptor, TrackKind};
 use libsrs_mux::MuxWriter;
 use libsrs_video::{
     decode_yuv420_intra_payload, encode_sequence_header_v2, encode_yuv420_intra_payload,
-    gray8_packed_to_yuv420p8_neutral, VideoSequenceHeaderV2,
+    gray8_packed_to_yuv420p8_neutral, SrsV2EncodeSettings, VideoSequenceHeaderV2,
 };
 use quality_metrics::{compression_ratio, psnr_u8, synthetic::SyntheticMeta};
 use serde::Serialize;
@@ -93,7 +93,15 @@ fn main() -> Result<()> {
         let chunk = &raw[fi as usize * frame_sz..][..frame_sz];
         let gray = y420_to_gray8(chunk, w, h)?;
         let yuv = gray8_packed_to_yuv420p8_neutral(&gray, w, h)?;
-        let p = encode_yuv420_intra_payload(&seq, &yuv, fi, args.qp).map_err(|e| anyhow!("{e}"))?;
+        let p = encode_yuv420_intra_payload(
+            &seq,
+            &yuv,
+            fi,
+            args.qp,
+            &SrsV2EncodeSettings::default(),
+            None,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
         payloads.push(p);
     }
     let enc_secs = t0.elapsed().as_secs_f64();

@@ -2,15 +2,24 @@
 
 Workspace tools (engineering measurements):
 
-- Generate deterministic YUV420p8 clips:
+- Generate deterministic YUV420p8 clips (`--out`, `--meta`; patterns include `flat`, `gray-ramp`, `moving-square`, `checker`, `noise`, `scene-cut`):
   - `cargo run -p quality_metrics --bin gen_synthetic_yuv -- --pattern moving-square --width 1920 --height 1080 --frames 60 --fps 60 --seed 528 --out samples/bench/moving_square_1080p.yuv --meta samples/bench/moving_square_1080p.json`
-- Benchmark SRSV2 core (optional x264 via ffmpeg/libx264):
-  - `cargo run -p quality_metrics --bin bench_srsv2 -- --input samples/bench/moving_square_1080p.yuv --width 1920 --height 1080 --frames 60 --fps 60 --qp 28 --keyint 30 --motion-radius 16 --report-json var/bench/moving_square_srsv2.json --report-md var/bench/moving_square_srsv2.md`
+- Benchmark SRSV2 core (**no FFmpeg required**; optional x264 via ffmpeg/libx264):
+  - `cargo run -p quality_metrics --bin bench_srsv2 -- --input samples/bench/moving_square_1080p.yuv --width 1920 --height 1080 --frames 60 --fps 60 --qp 28 --keyint 30 --motion-radius 16 --residual-entropy auto --report-json var/bench/moving_square_srsv2.json --report-md var/bench/moving_square_srsv2.md`
   - Add `--compare-x264 --x264-crf 23 --x264-preset medium` if `ffmpeg` is on `PATH`.
+  - Residual coding: `--residual-entropy auto|explicit|rans`. **`auto`** never chooses rANS for a block when that would be larger than explicit tuples (unless forced **`rans`**). Reports include intra/P **explicit vs rANS** counts and optional **`legacy_explicit_total_payload_bytes`** when not `explicit`.
 
 Legacy helper: `cargo run -p codec_compare -- --help` (optional **libx264** branch via `ffmpeg`).
 
-This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders (for example a common **AVC** baseline). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge.
+This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders (for example a common **AVC** baseline). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge. This is a **compression engineering** step for the native codec, **not** a claim about beating H.264 or any other standard encoder.
+
+## Example: 128×128, 30 frames, `flat` pattern (auto residual)
+
+Command (after generating `var/bench/flat_128.yuv` / `.json` as in the snippets above with `--pattern flat --width 128 --height 128`):
+
+- SRSV2 payload **~11.9 KiB** for the clip, **1** keyframe / **29** P-frames, **`avg_i_bytes` ~2325**, **`avg_p_bytes` ~329** (one lab run on Windows; numbers vary by CPU and build).
+- **`intra_rans_blocks` 0** / **`intra_explicit_blocks` 384** for this flat clip: every **8×8** luma/chroma block stayed on **explicit** AC tuples under **`auto`** (rANS is not smaller here).
+- **`legacy_explicit_total_payload_bytes`** in the JSON is a **counterfactual** total if the same quantizer path were written as **FR2 rev 1**-style tuple-only streams; **FR2 rev 3** adds a one-byte **AC mode tag** per block, so the on-wire size can be slightly **larger** than that counterfactual even when no block picks rANS — that is expected and separate from the **auto** rule (rANS vs explicit **within** rev 3).
 
 ## Fair comparison checklist
 

@@ -16,9 +16,9 @@ use libsrs_mux::MuxWriter;
 use libsrs_pipeline::TranscodePipeline;
 use libsrs_video::{
     classify_srsv2_payload, decode_sequence_header_v2, decode_yuv420_intra_payload,
-    encode_sequence_header_v2, encode_yuv420_intra_payload, FrameType, Srsv2PayloadKind,
-    VideoFrame, VideoSequenceHeaderV2, VideoStreamReader, VideoStreamReaderV2, VideoStreamWriter,
-    VideoStreamWriterV2, SEQUENCE_HEADER_BYTES,
+    encode_sequence_header_v2, encode_yuv420_intra_payload, FrameType, SrsV2EncodeSettings,
+    Srsv2PayloadKind, VideoFrame, VideoSequenceHeaderV2, VideoStreamReader, VideoStreamReaderV2,
+    VideoStreamWriter, VideoStreamWriterV2, SEQUENCE_HEADER_BYTES,
 };
 use thiserror::Error;
 
@@ -507,7 +507,9 @@ fn encode_square_gray_raw_to_srsv2_elementary(input: &Path, srsv2_out: &Path) ->
     let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(side, side);
     let yuv = libsrs_video::gray8_packed_to_yuv420p8_neutral(&bytes, side, side)
         .map_err(|e| anyhow!("{}", e))?;
-    let payload = encode_yuv420_intra_payload(&seq, &yuv, 0, 28).map_err(|e| anyhow!("{}", e))?;
+    let payload =
+        encode_yuv420_intra_payload(&seq, &yuv, 0, 28, &SrsV2EncodeSettings::default(), None)
+            .map_err(|e| anyhow!("{}", e))?;
     let f = File::create(srsv2_out).with_context(|| format!("create {}", srsv2_out.display()))?;
     let mut w = VideoStreamWriterV2::new(f, &seq).map_err(|e| anyhow!("SRSV2 writer: {}", e))?;
     w.write_frame_payload(0, &payload)

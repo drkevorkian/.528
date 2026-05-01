@@ -1,15 +1,21 @@
-//! Experimental SRSV2 P-frame payload (`FR2` revision **2**): 16×16 integer-pel MC + 8×8 residuals.
+//! Experimental SRSV2 P-frame payload (`FR2` revision **2** legacy tuples, **4** adaptive entropy): 16×16 integer-pel MC + 8×8 residuals.
 //!
 //! Chroma is predicted by copying reference U/V with half-resolution MV (no chroma residual in this slice).
 
+use super::dct::fdct_8x8;
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
-use super::intra_codec::{decode_residual_block_8x8, encode_residual_block_8x8};
+use super::intra_codec::{decode_residual_block_8x8, encode_residual_block_8x8, quantize};
 use super::limits::{MAX_FRAME_PAYLOAD_BYTES, MAX_MOTION_VECTOR_PELS};
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
-use super::rate_control::SrsV2EncodeSettings;
+use super::rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
+use super::residual_entropy::{
+    decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
+};
+use super::residual_tokens::residual_token_model;
 
 pub const FRAME_PAYLOAD_MAGIC_P: [u8; 4] = [b'F', b'R', b'2', 2];
+pub const FRAME_PAYLOAD_MAGIC_P_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 4];
 
 /// Residuals below this absolute threshold become skip sub-blocks (Y only).
 const SKIP_ABS_THRESH: i16 = 6;
@@ -130,7 +136,7 @@ fn read_u8(data: &[u8], cur: &mut usize) -> Result<u8, SrsV2Error> {
     Ok(v)
 }
 
-/// Encode one P-frame (`FR2` rev 2). Caller must supply a valid reference of matching dimensions.
+/// Encode one P-frame (`FR2` rev 2 or 4). Caller must supply a valid reference of matching dimensions.
 pub fn encode_yuv420_p_payload(
     seq: &VideoSequenceHeaderV2,
     cur: &YuvFrame,
@@ -138,6 +144,7 @@ pub fn encode_yuv420_p_payload(
     frame_index: u32,
     qp: u8,
     settings: &SrsV2EncodeSettings,
+    mut stats: Option<&mut ResidualEncodeStats>,
 ) -> Result<Vec<u8>, SrsV2Error> {
     if seq.pixel_format != PixelFormat::Yuv420p8
         || cur.format != PixelFormat::Yuv420p8
@@ -167,9 +174,15 @@ pub fn encode_yuv420_p_payload(
     let mb_rows = h / 16;
 
     let mut out = Vec::new();
-    out.extend_from_slice(&FRAME_PAYLOAD_MAGIC_P);
+    let magic = match settings.residual_entropy {
+        ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC_P,
+        ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_P_ENTROPY,
+    };
+    out.extend_from_slice(&magic);
     out.extend_from_slice(&frame_index.to_le_bytes());
     out.push(qp);
+
+    let rans_model = residual_token_model();
 
     for mby in 0..mb_rows {
         for mbx in 0..mb_cols {
@@ -200,8 +213,39 @@ pub fn encode_yuv420_p_payload(
                 if max_abs <= SKIP_ABS_THRESH {
                     pattern |= 1 << si;
                 } else {
-                    let mut chunk = Vec::new();
-                    encode_residual_block_8x8(&blk, qp_i, &mut chunk)?;
+                    let chunk = if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
+                        let mut c = Vec::new();
+                        encode_residual_block_8x8(&blk, qp_i, &mut c)?;
+                        if let Some(s) = stats.as_mut() {
+                            s.p_explicit_chunks += 1;
+                        }
+                        c
+                    } else {
+                        let mut linear = [0_i16; 64];
+                        for r in 0..8 {
+                            for c in 0..8 {
+                                linear[r * 8 + c] = blk[r][c];
+                            }
+                        }
+                        let f = fdct_8x8(&linear);
+                        let qf = quantize(&f, qp_i);
+                        let (c, kind) =
+                            encode_p_residual_chunk(&qf, settings.residual_entropy, &rans_model)?;
+                        if let Some(s) = stats.as_mut() {
+                            match kind {
+                                PResidualChunkKind::LegacyTuple => s.p_explicit_chunks += 1,
+                                PResidualChunkKind::Adaptive(
+                                    BlockResidualCoding::ExplicitTuples,
+                                ) => {
+                                    s.p_explicit_chunks += 1;
+                                }
+                                PResidualChunkKind::Adaptive(BlockResidualCoding::RansV1) => {
+                                    s.p_rans_chunks += 1;
+                                }
+                            }
+                        }
+                        c
+                    };
                     residual_chunks.push(chunk);
                 }
             }
@@ -222,7 +266,7 @@ pub fn encode_yuv420_p_payload(
     Ok(out)
 }
 
-/// Decode `FR2` rev **2** P-frame into a full YUV420p8 frame (chroma from reference MC).
+/// Decode `FR2` rev **2** or **4** P-frame into a full YUV420p8 frame (chroma from reference MC).
 pub fn decode_yuv420_p_payload(
     seq: &VideoSequenceHeaderV2,
     payload: &[u8],
@@ -248,9 +292,10 @@ pub fn decode_yuv420_p_payload(
     if payload.len() < 4 + 4 + 1 {
         return Err(SrsV2Error::Truncated);
     }
-    if payload[0..4] != FRAME_PAYLOAD_MAGIC_P {
+    if payload.len() < 4 || &payload[0..3] != b"FR2" || !matches!(payload[3], 2 | 4) {
         return Err(SrsV2Error::BadMagic);
     }
+    let entropy_chunks = payload[3] == 4;
     let mut cur = 4usize;
     let frame_index = read_u32(payload, &mut cur)?;
     let qp = read_u8(payload, &mut cur)?;
@@ -295,11 +340,17 @@ pub fn decode_yuv420_p_payload(
                     if chunk_end > payload.len() {
                         return Err(SrsV2Error::Truncated);
                     }
-                    let mut c = chunk_start;
-                    let res = decode_residual_block_8x8(payload, &mut c, qp_i)?;
-                    if c != chunk_end {
-                        return Err(SrsV2Error::syntax("residual chunk length mismatch"));
-                    }
+                    let chunk = &payload[chunk_start..chunk_end];
+                    let res = if entropy_chunks {
+                        decode_p_residual_chunk(chunk, qp_i)?
+                    } else {
+                        let mut c = 0usize;
+                        let r = decode_residual_block_8x8(chunk, &mut c, qp_i)?;
+                        if c != chunk.len() {
+                            return Err(SrsV2Error::syntax("residual chunk length mismatch"));
+                        }
+                        r
+                    };
                     cur = chunk_end;
                     for row in 0..8 {
                         for col in 0..8 {
@@ -371,13 +422,14 @@ mod tests {
         let rgb = vec![200_u8; (w * h * 3) as usize];
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, w, h, ColorRange::Limited).unwrap();
         let qp = 28_u8;
-        let i_payload = encode_yuv420_intra_payload(&seq, &yuv, 0, qp).unwrap();
         let settings = SrsV2EncodeSettings {
             keyframe_interval: 30,
             motion_search_radius: 16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
             ..Default::default()
         };
-        let p_payload = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, qp, &settings).unwrap();
+        let i_payload = encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &settings, None).unwrap();
+        let p_payload = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, qp, &settings, None).unwrap();
         assert!(
             p_payload.len() < i_payload.len(),
             "expected P payload smaller than I for identical texture: p={} i={}",
@@ -417,7 +469,7 @@ mod tests {
             motion_search_radius: 16,
             ..Default::default()
         };
-        let p_payload = encode_yuv420_p_payload(&seq, &y1, &y0, 1, qp, &settings).unwrap();
+        let p_payload = encode_yuv420_p_payload(&seq, &y1, &y0, 1, qp, &settings, None).unwrap();
         let dec = decode_yuv420_p_payload(&seq, &p_payload, &y0).unwrap();
         let mean_dec: u32 = dec.yuv.y.samples.iter().map(|&x| x as u32).sum::<u32>()
             / dec.yuv.y.samples.len() as u32;
@@ -436,9 +488,16 @@ mod tests {
         let seq = seq_inter(w, h);
         let rgb = vec![128_u8; (w * h * 3) as usize];
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, w, h, ColorRange::Limited).unwrap();
-        let mut payload =
-            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &SrsV2EncodeSettings::default())
-                .unwrap();
+        let mut payload = encode_yuv420_p_payload(
+            &seq,
+            &yuv,
+            &yuv,
+            1,
+            28,
+            &SrsV2EncodeSettings::default(),
+            None,
+        )
+        .unwrap();
         // Corrupt first MV after header (offset 4+4+1 = 9): i16 LE 300 > MAX_MOTION_VECTOR_PELS
         if payload.len() > 11 {
             payload[9] = 0x2c;

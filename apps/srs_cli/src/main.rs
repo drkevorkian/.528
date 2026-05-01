@@ -417,8 +417,8 @@ fn encode_srsv2_elementary_file(
 ) -> Result<()> {
     use libsrs_video::{
         encode_yuv420_intra_payload, rgb888_full_to_yuv420_bt709, ChromaSiting, ColorPrimaries,
-        ColorRange, MatrixCoefficients, PixelFormat, SrsVideoProfile, TransferFunction,
-        VideoSequenceHeaderV2, VideoStreamWriterV2,
+        ColorRange, MatrixCoefficients, PixelFormat, SrsV2EncodeSettings, SrsVideoProfile,
+        TransferFunction, VideoSequenceHeaderV2, VideoStreamWriterV2,
     };
 
     let raw = std::fs::read(input).with_context(|| format!("read {}", input.display()))?;
@@ -500,7 +500,8 @@ fn encode_srsv2_elementary_file(
         .map_err(|e| anyhow!("color convert: {e}"))?;
     let qp = quality.clamp(1, 51);
     let payload =
-        encode_yuv420_intra_payload(&seq, &yuv, 0, qp).map_err(|e| anyhow!("encode: {e}"))?;
+        encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &SrsV2EncodeSettings::default(), None)
+            .map_err(|e| anyhow!("encode: {e}"))?;
     let f = File::create(srsv2_out).with_context(|| format!("create {}", srsv2_out.display()))?;
     let mut wr = VideoStreamWriterV2::new(f, &seq).map_err(|e| anyhow!("srsv2 writer: {e}"))?;
     wr.write_frame_payload(0, &payload)

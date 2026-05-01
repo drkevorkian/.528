@@ -2,6 +2,26 @@
 
 use super::limits::{MAX_MOTION_SEARCH_RADIUS, MAX_MOTION_VECTOR_PELS};
 
+/// How 8×8 residual blocks choose explicit tuples vs static rANS (`FR2` rev 3/4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResidualEntropy {
+    /// Pick the smaller on-wire representation per block (never larger than explicit tuples).
+    #[default]
+    Auto,
+    /// Legacy tuple stream only (`FR2` rev 1 / rev 2 layout).
+    Explicit,
+    /// Prefer rANS where coefficients fit the static alphabet (fails encode if not).
+    Rans,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResidualEncodeStats {
+    pub intra_explicit_blocks: u64,
+    pub intra_rans_blocks: u64,
+    pub p_explicit_chunks: u64,
+    pub p_rans_chunks: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SrsV2EncodeSettings {
     pub quantizer: u8,
@@ -12,6 +32,7 @@ pub struct SrsV2EncodeSettings {
     /// Half-side of integer-pel ME window for experimental P-frames (clamped in encoder).
     pub motion_search_radius: i16,
     pub tune_quality_vs_speed: u8,
+    pub residual_entropy: ResidualEntropy,
 }
 
 impl Default for SrsV2EncodeSettings {
@@ -23,6 +44,7 @@ impl Default for SrsV2EncodeSettings {
             keyframe_interval: 60,
             motion_search_radius: 16,
             tune_quality_vs_speed: 50,
+            residual_entropy: ResidualEntropy::Auto,
         }
     }
 }

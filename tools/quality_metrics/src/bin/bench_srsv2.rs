@@ -11,8 +11,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::{
-    decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, PixelFormat, SrsV2EncodeSettings,
-    VideoSequenceHeaderV2, YuvFrame,
+    decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, PixelFormat, ResidualEncodeStats,
+    ResidualEntropy, SrsV2EncodeSettings, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -46,6 +46,9 @@ struct Args {
     x264_crf: u8,
     #[arg(long, default_value = "medium")]
     x264_preset: String,
+    /// Residual coding: `auto` picks smaller per block, `explicit` legacy tuples only, `rans` prefers entropy.
+    #[arg(long, default_value = "auto")]
+    residual_entropy: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,6 +72,13 @@ struct Srsv2Details {
     avg_p_bytes: f64,
     encode_seconds: f64,
     decode_seconds: f64,
+    residual_entropy: String,
+    intra_explicit_blocks: u64,
+    intra_rans_blocks: u64,
+    p_explicit_chunks: u64,
+    p_rans_chunks: u64,
+    /// Total SRSV2 payload bytes if every frame were encoded with `ResidualEntropy::Explicit` (same QP/keyint).
+    legacy_explicit_total_payload_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +94,7 @@ struct X264Details {
 #[derive(Debug, Clone, Serialize)]
 struct BenchReport {
     note: &'static str,
+    residual_note: &'static str,
     command: String,
     raw_bytes: u64,
     width: u32,
@@ -95,6 +106,17 @@ struct BenchReport {
     table: Vec<CodecRow>,
     git_commit: Option<String>,
     os: String,
+}
+
+fn parse_residual_entropy(s: &str) -> Result<ResidualEntropy> {
+    match s.to_ascii_lowercase().as_str() {
+        "auto" => Ok(ResidualEntropy::Auto),
+        "explicit" => Ok(ResidualEntropy::Explicit),
+        "rans" => Ok(ResidualEntropy::Rans),
+        _ => Err(anyhow!(
+            "--residual-entropy must be auto, explicit, or rans (got {s})"
+        )),
+    }
 }
 
 fn main() -> Result<()> {
@@ -130,9 +152,11 @@ fn main() -> Result<()> {
         disable_loop_filter: true,
         max_ref_frames: 1,
     };
+    let re = parse_residual_entropy(&args.residual_entropy)?;
     let settings = SrsV2EncodeSettings {
         keyframe_interval: args.keyint.max(1),
         motion_search_radius: args.motion_radius,
+        residual_entropy: re,
         ..Default::default()
     };
 
@@ -141,15 +165,23 @@ fn main() -> Result<()> {
     let mut payloads = Vec::with_capacity(args.frames as usize);
     let mut i_bytes = Vec::<u64>::new();
     let mut p_bytes = Vec::<u64>::new();
+    let mut enc_stats = ResidualEncodeStats::default();
 
     for fi in 0..args.frames {
         let frame = load_yuv420_frame(&raw, expected_frame, fi, args.width, args.height)?;
-        let payload =
-            encode_yuv420_inter_payload(&seq, &frame, ref_slot.as_ref(), fi, args.qp, &settings)
-                .map_err(|e| anyhow!("SRSV2 encode: {e}"))?;
+        let payload = encode_yuv420_inter_payload(
+            &seq,
+            &frame,
+            ref_slot.as_ref(),
+            fi,
+            args.qp,
+            &settings,
+            Some(&mut enc_stats),
+        )
+        .map_err(|e| anyhow!("SRSV2 encode: {e}"))?;
         match payload.get(3).copied() {
-            Some(1) => i_bytes.push(payload.len() as u64),
-            Some(2) => p_bytes.push(payload.len() as u64),
+            Some(1 | 3) => i_bytes.push(payload.len() as u64),
+            Some(2 | 4) => p_bytes.push(payload.len() as u64),
             _ => {}
         }
         // Maintain reference exactly like playback/import: decode updates the slot.
@@ -198,6 +230,32 @@ fn main() -> Result<()> {
 
     let mut table = vec![srsv2_row.clone()];
 
+    let legacy_explicit_total_payload_bytes = if matches!(re, ResidualEntropy::Explicit) {
+        None
+    } else {
+        let mut settings_leg = settings.clone();
+        settings_leg.residual_entropy = ResidualEntropy::Explicit;
+        let mut sum = 0_u64;
+        let mut slot = None::<YuvFrame>;
+        for fi in 0..args.frames {
+            let frame = load_yuv420_frame(&raw, expected_frame, fi, args.width, args.height)?;
+            let pl = encode_yuv420_inter_payload(
+                &seq,
+                &frame,
+                slot.as_ref(),
+                fi,
+                args.qp,
+                &settings_leg,
+                None,
+            )
+            .map_err(|e| anyhow!("SRSV2 legacy explicit encode: {e}"))?;
+            let _ = decode_yuv420_srsv2_payload(&seq, &pl, &mut slot)
+                .map_err(|e| anyhow!("SRSV2 legacy reference refresh: {e}"))?;
+            sum += pl.len() as u64;
+        }
+        Some(sum)
+    };
+
     let x264 = if args.compare_x264 {
         let (row, details) = run_x264_compare(&args, &raw, expected_frame, &src_luma)?;
         if let Some(r) = row {
@@ -210,6 +268,7 @@ fn main() -> Result<()> {
 
     let report = BenchReport {
         note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "Residual entropy (FR2 rev 3 intra / rev 4 P) is experimental; auto mode never chooses a larger representation than explicit tuples per block.",
         command: cmd_str,
         raw_bytes,
         width: args.width,
@@ -224,6 +283,12 @@ fn main() -> Result<()> {
             avg_p_bytes: avg_u64(&p_bytes),
             encode_seconds: enc_secs,
             decode_seconds: dec_secs,
+            residual_entropy: args.residual_entropy.clone(),
+            intra_explicit_blocks: enc_stats.intra_explicit_blocks,
+            intra_rans_blocks: enc_stats.intra_rans_blocks,
+            p_explicit_chunks: enc_stats.p_explicit_chunks,
+            p_rans_chunks: enc_stats.p_rans_chunks,
+            legacy_explicit_total_payload_bytes,
         },
         x264,
         table,
@@ -485,6 +550,7 @@ fn to_markdown(r: &BenchReport) -> String {
     }
     out.push_str(&format!("**Command:** `{}`\n\n", r.command));
     out.push_str("_Engineering measurement only; not a marketing claim._\n\n");
+    out.push_str(&format!("_{}_\n\n", r.residual_note));
     out.push_str(
         "| Codec | Bytes | Ratio | Bitrate (bps) | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS |\n",
     );
@@ -507,6 +573,20 @@ fn to_markdown(r: &BenchReport) -> String {
         "- frames: {}\n- keyframes: {}\n- pframes: {}\n- avg I bytes: {:.1}\n- avg P bytes: {:.1}\n",
         r.srsv2.frames, r.srsv2.keyframes, r.srsv2.pframes, r.srsv2.avg_i_bytes, r.srsv2.avg_p_bytes
     ));
+    out.push_str(&format!(
+        "- residual_entropy setting: {}\n- intra explicit blocks: {}\n- intra rANS blocks: {}\n- P explicit chunks: {}\n- P rANS chunks: {}\n",
+        r.srsv2.residual_entropy,
+        r.srsv2.intra_explicit_blocks,
+        r.srsv2.intra_rans_blocks,
+        r.srsv2.p_explicit_chunks,
+        r.srsv2.p_rans_chunks
+    ));
+    if let Some(lb) = r.srsv2.legacy_explicit_total_payload_bytes {
+        out.push_str(&format!(
+            "- legacy explicit total payload bytes (same QP/keyint): {}\n",
+            lb
+        ));
+    }
     if let Some(x) = &r.x264 {
         out.push_str("\n## x264 details\n\n");
         out.push_str(&format!("- status: {}\n", x.status));
@@ -536,6 +616,7 @@ mod tests {
             compare_x264: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -552,6 +633,7 @@ mod tests {
     fn report_serializes() {
         let r = BenchReport {
             note: "x",
+            residual_note: "n",
             command: "cmd".to_string(),
             raw_bytes: 1,
             width: 2,
@@ -566,6 +648,12 @@ mod tests {
                 avg_p_bytes: 0.0,
                 encode_seconds: 0.1,
                 decode_seconds: 0.1,
+                residual_entropy: "auto".to_string(),
+                intra_explicit_blocks: 0,
+                intra_rans_blocks: 0,
+                p_explicit_chunks: 0,
+                p_rans_chunks: 0,
+                legacy_explicit_total_payload_bytes: None,
             },
             x264: None,
             table: vec![CodecRow {

@@ -17,7 +17,7 @@ pub(crate) enum PredMode {
 }
 
 impl PredMode {
-    fn from_u8(v: u8) -> Result<Self, SrsV2Error> {
+    pub(crate) fn from_u8(v: u8) -> Result<Self, SrsV2Error> {
         match v {
             0 => Ok(Self::Dc),
             1 => Ok(Self::Horizontal),
@@ -37,7 +37,7 @@ fn sample(rec: &[u8], stride: usize, pw: usize, ph: usize, x: isize, y: isize) -
     }
 }
 
-fn predict_block(
+pub(crate) fn predict_block(
     mode: PredMode,
     rec: &[u8],
     stride: usize,
@@ -116,7 +116,7 @@ fn satd_mode(orig: &[[i16; 8]; 8], pred: &[[i16; 8]; 8]) -> i32 {
     s
 }
 
-fn pick_mode(
+pub(crate) fn pick_mode(
     rec: &[u8],
     stride: usize,
     pw: usize,
@@ -145,7 +145,7 @@ fn pick_mode(
     best
 }
 
-fn quantize(block: &[i16; 64], qp: i16) -> [i16; 64] {
+pub(crate) fn quantize(block: &[i16; 64], qp: i16) -> [i16; 64] {
     let q = qp.max(1);
     let mut o = [0_i16; 64];
     for i in 0..64 {
@@ -155,7 +155,7 @@ fn quantize(block: &[i16; 64], qp: i16) -> [i16; 64] {
     o
 }
 
-fn dequantize(block: &[i16; 64], qp: i16) -> [i16; 64] {
+pub(crate) fn dequantize(block: &[i16; 64], qp: i16) -> [i16; 64] {
     let q = qp.max(1);
     let mut o = [0_i16; 64];
     for i in 0..64 {

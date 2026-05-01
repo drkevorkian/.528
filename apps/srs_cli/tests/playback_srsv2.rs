@@ -7,8 +7,8 @@ use libsrs_container::{FileHeader, TrackDescriptor, TrackKind};
 use libsrs_mux::MuxWriter;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, encode_sequence_header_v2, encode_yuv420_inter_payload,
-    encode_yuv420_intra_payload, gray8_packed_to_yuv420p8_neutral, SrsV2EncodeSettings,
-    VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
+    encode_yuv420_intra_payload, gray8_packed_to_yuv420p8_neutral, ResidualEntropy,
+    SrsV2EncodeSettings, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
 };
 
 fn write_temp_config() -> std::path::PathBuf {
@@ -38,18 +38,14 @@ fn write_srsv2_ip_528(path: &std::path::Path) {
     let gray1 = vec![0xEEu8; (w * h) as usize];
     let yuv0 = gray8_packed_to_yuv420p8_neutral(&gray0, w, h).unwrap();
     let yuv1 = gray8_packed_to_yuv420p8_neutral(&gray1, w, h).unwrap();
-    let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28).unwrap();
+    let st = SrsV2EncodeSettings {
+        residual_entropy: ResidualEntropy::Explicit,
+        ..Default::default()
+    };
+    let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28, &st, None).unwrap();
     let mut slot = None;
     decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
-    let enc1 = encode_yuv420_inter_payload(
-        &seq,
-        &yuv1,
-        slot.as_ref(),
-        1,
-        28,
-        &SrsV2EncodeSettings::default(),
-    )
-    .unwrap();
+    let enc1 = encode_yuv420_inter_payload(&seq, &yuv1, slot.as_ref(), 1, 28, &st, None).unwrap();
     assert_eq!(enc1[3], 2);
     let cfg = encode_sequence_header_v2(&seq).to_vec();
     assert_eq!(cfg.len(), SEQUENCE_HEADER_BYTES);

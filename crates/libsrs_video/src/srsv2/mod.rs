@@ -16,6 +16,8 @@ pub mod p_frame_codec;
 pub mod payload_kind;
 pub mod rate_control;
 pub mod reference;
+pub mod residual_entropy;
+pub mod residual_tokens;
 
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
@@ -33,7 +35,7 @@ pub use model::{
     SEQUENCE_HEADER_BYTES,
 };
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
-pub use rate_control::SrsV2EncodeSettings;
+pub use rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
 pub use reference::ReferenceFrameBuffer;
 
 pub use gpu_traits::{

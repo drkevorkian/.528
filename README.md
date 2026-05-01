@@ -29,7 +29,7 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 | `.528` container | **Partial / working** | v2 primary; hostile-input limits in I/O (`libsrs_container`) |
 | mux / demux | **Partial / working** | `libsrs_mux` / `libsrs_demux`; cues + index; mux prefers `.srsv2` when elementary video is present |
 | audio codec | **Working prototype** | v2 LPC stream decode in `libsrs_audio` |
-| video codec | **SRSV2 default** | Modern native **8K-first** direction (`docs/srsv2_design_targets.md`). Today: CLI square-gray → `.srsv2` **single intra** (`FR2\x01`). **Native import** (SRSV2) uses **`max_ref_frames = 1`** and **P** (`FR2\x02`) after first picture when dimensions are **16-aligned**. Profiles **Baseline…Research** on-wire; most helpers still emit **Main**. Rate control, sub-pel/B/GPU/OS A/V remain roadmap. |
+| video codec | **SRSV2 default** | Modern native **8K-first** direction (`docs/srsv2_design_targets.md`). Today: CLI square-gray → `.srsv2` **single intra** (`FR2\x01`). Encoders may emit **intra with adaptive residual entropy** (`FR2\x03`, experimental; see `docs/video_bitstream_v2.md`). **Native import** (SRSV2) uses **`max_ref_frames = 1`** and **P** (`FR2\x02` legacy tuples or **`FR2\x04`** adaptive residuals). Profiles **Baseline…Research** on-wire; most helpers still emit **Main**. Rate control, sub-pel/B/GPU/OS A/V remain roadmap. |
 | import / transcode | **Native pipeline partial** | Encode/import/transcode default to SRSV2 video; `--codec srsv1` selects legacy; FFmpeg path feature-gated |
 | playback | **Decode-preview** | `PlaybackSession` decodes SRSV2 **intra** + experimental **P** (`codec_id` **3**, `FR2\x02` when a reference slot is filled), and SRSV1 (`codec_id` **1**); **SRSA audio** is `codec_id` **2**. OS audio/video presentation is **not** implemented; `srs_player` shows last-frame texture; `srs_cli play` smoke-decodes |
 | GPU | **Planned** | No device presentation or GPU decode here |
@@ -40,9 +40,35 @@ Further playback architecture: `docs/playback_pipeline.md`.
 
 ### Benchmark tooling (optional, engineering measurements)
 
-- **Synthetic YUV:** `cargo run -p quality_metrics --bin gen_synthetic_yuv -- --pattern noise --seed 1 --out-yuv clip.yuv --out-meta clip.json`
-- **SRSV2 vs optional libx264:** `cargo run -p codec_compare -- --yuv clip.yuv --meta clip.json --out-json report.json --out-md report.md`  
-  If `ffmpeg` is not on `PATH`, the harness still reports SRSV2 encode/decode metrics and skips H.264.
+- **Synthetic YUV** (`--out` / `--meta`):
+
+  ```bash
+  cargo run -p quality_metrics --bin gen_synthetic_yuv -- \
+    --pattern flat --width 128 --height 128 --frames 30 --fps 30 --seed 1 \
+    --out var/bench/flat.yuv --meta var/bench/flat.json
+  ```
+
+- **SRSV2 core benchmark** (primary path; no FFmpeg required):
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 \
+    --residual-entropy auto \
+    --report-json var/bench/flat_srsv2.json --report-md var/bench/flat_srsv2.md
+  ```
+
+- **Optional libx264 comparison** (requires `ffmpeg` on `PATH`):
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 --compare-x264 --x264-crf 23 --x264-preset medium \
+    --report-json var/bench/flat_srsv2.json --report-md var/bench/flat_srsv2.md
+  ```
+
+- **Legacy / helper:** `cargo run -p codec_compare -- --yuv clip.yuv --meta clip.json --out-json report.json --out-md report.md` (older harness; same optional **libx264** branch when FFmpeg is available).
+
 - These outputs are **lab measurements** — do **not** treat them as proof SRSV2 “beats” another codec without your own methodology (`docs/srsv2_benchmarks.md`).
 
 ## Build
