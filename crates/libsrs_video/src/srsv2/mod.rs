@@ -32,8 +32,9 @@ pub use adaptive_quant::{
     SrsV2AqEncodeStats, SrsV2BlockAqWireStats,
 };
 pub use b_frame_codec::{
-    decode_yuv420_b_payload, encode_yuv420_b_payload, BBlendModeWire, FRAME_PAYLOAD_MAGIC_B,
-    FRAME_PAYLOAD_MAGIC_B_SUBPEL,
+    choose_b_macroblock_blend_and_mv, decode_yuv420_b_payload, encode_yuv420_b_payload,
+    encode_yuv420_b_payload_mb_blend, BBlendModeWire, BFrameEncodeStats, FRAME_PAYLOAD_MAGIC_B,
+    FRAME_PAYLOAD_MAGIC_B_MB_BLEND, FRAME_PAYLOAD_MAGIC_B_SUBPEL,
 };
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
@@ -60,8 +61,9 @@ pub use motion_search::SrsV2MotionEncodeStats;
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
-    SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2MotionSearchMode,
-    SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode,
+    SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
+    SrsV2MotionSearchMode, SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController,
+    SrsV2SubpelMode,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};

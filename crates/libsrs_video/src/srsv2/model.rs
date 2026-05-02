@@ -132,7 +132,7 @@ impl FrameTypeV2 {
         Ok(match rev {
             1 | 3 | 7 => Self::Intra,
             2 | 4 | 5 | 6 | 8 | 9 => Self::PredictedP,
-            10 | 11 => Self::BidirectionalB,
+            10 | 11 | 13 => Self::BidirectionalB,
             12 => Self::AltRef,
             _ => {
                 return Err(super::error::SrsV2Error::syntax(
@@ -512,7 +512,7 @@ mod frame_type_revision_tests {
                 FrameTypeV2::PredictedP
             );
         }
-        for rev in [10u8, 11] {
+        for rev in [10u8, 11, 13] {
             assert_eq!(
                 frame_type_from_srsv2_revision(rev).unwrap(),
                 FrameTypeV2::BidirectionalB
@@ -527,7 +527,7 @@ mod frame_type_revision_tests {
     #[test]
     fn unknown_revision_errors() {
         assert!(frame_type_from_srsv2_revision(0).is_err());
-        assert!(frame_type_from_srsv2_revision(13).is_err());
+        assert!(frame_type_from_srsv2_revision(14).is_err());
         assert!(frame_type_from_srsv2_revision(255).is_err());
     }
 

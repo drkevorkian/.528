@@ -60,11 +60,15 @@ B-frame **macroblock** syntax (16-aligned canvas; mux/policy may still classify 
 
 Same as revision **10** but MVs are **`i32` LE** quarter-pel (even grid), matching **P** rev **6** motion packing.
 
+### Revision 13 — experimental B-frame, per-MB blend + integer MV (`FR2\x0D`)
+
+Integer MV only (`i16` LE per reference, four components per macroblock: backward MV then forward MV). After `frame_index`, `qp`, `slot_a`, `slot_b` there is **no** frame-level blend byte: each macroblock begins with **`blend`** (`u8`, same semantics as rev **10**: forward **0**, backward **1**, average **2**, weighted **3** reserved / rejected), then the four MV components, then the usual **P**-style **8×8** skip pattern and adaptive residual chunks. Encoder chooses **`blend`** per MB (benchmark uses min-SAD among forward / backward / average predictions). **`Weighted`** remains unsupported on decode.
+
 ### Revision 12 — experimental alt-ref / hidden reference (`FR2\x0C`)
 
 Non-displayable intra-coded planes (same entropy style as **rev 3** in this slice): `frame_index`, `qp`, **`target_slot`**, **`reserved`** (must be **0**). Picture updates **`SrsV2ReferenceManager`** at **`target_slot`** with **`is_displayable == false`**; playback must **not** treat it as a presented frame.
 
-**Compatibility:** Revisions **1**–**9** remain the stable interchange baseline. **10**–**12** are **experimental**; the legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**12** — use **`decode_yuv420_srsv2_payload_managed`**.
+**Compatibility:** Revisions **1**–**9** remain the stable interchange baseline. **10**–**13** are **experimental**; the legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**13** — use **`decode_yuv420_srsv2_payload_managed`**.
 
 ## Elementary `.srsv2` file
 

@@ -2,7 +2,7 @@
 //!
 //! Optional external comparison: `--compare-x264` uses `ffmpeg` + `libx264` when available.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,9 +14,9 @@ use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
-    encode_yuv420_alt_ref_payload, encode_yuv420_b_payload, encode_yuv420_inter_payload,
-    BBlendModeWire, PixelFormat, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
-    SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats, SrsV2BlockAqMode, SrsV2EncodeSettings,
+    encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
+    PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
+    SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
     SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2RateControlMode,
     SrsV2RateController, SrsV2ReferenceManager, SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
 };
@@ -146,6 +146,10 @@ struct Args {
     #[arg(long, default_value = "off")]
     alt_ref: String,
 
+    /// B-frame integer motion (`FR2` rev **13**): `off` (default), `reuse-p`, or `independent-forward-backward`.
+    #[arg(long, default_value = "off")]
+    b_motion_search: String,
+
     /// Reserved GOP hint for future bench modes (currently unused).
     #[arg(long, default_value_t = 0)]
     gop: u32,
@@ -236,6 +240,16 @@ struct Fr2RevisionCounts {
     rev10: u32,
     rev11: u32,
     rev12: u32,
+    rev13: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct BBlendBenchReport {
+    b_forward_macroblocks: u64,
+    b_backward_macroblocks: u64,
+    b_average_macroblocks: u64,
+    b_weighted_macroblocks: u64,
+    b_sad_evaluations: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -285,6 +299,8 @@ struct MotionBenchReport {
     additional_subpel_evaluations_total: u64,
     /// Mean fractional magnitude in quarter-pel units per macroblock (0 = integer-aligned).
     avg_fractional_mv_qpel_per_mb: f64,
+    /// Experimental B-frame integer ME mode (`FR2` rev **13** bench).
+    b_motion_search_mode: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -326,7 +342,9 @@ struct Srsv2Details {
     decode_order_frame_indices: Vec<u32>,
     display_order_frame_indices: Vec<u32>,
     p_anchor_count: u32,
-    avg_anchor_p_bytes: f64,
+    avg_p_anchor_bytes: f64,
+    #[serde(default)]
+    b_blend: BBlendBenchReport,
     #[serde(skip_serializing_if = "Option::is_none")]
     unsupported_bframe_reason: Option<String>,
     bframe_mode_note: String,
@@ -372,7 +390,8 @@ impl Default for Srsv2Details {
             decode_order_frame_indices: Vec::new(),
             display_order_frame_indices: Vec::new(),
             p_anchor_count: 0,
-            avg_anchor_p_bytes: 0.0,
+            avg_p_anchor_bytes: 0.0,
+            b_blend: BBlendBenchReport::default(),
             unsupported_bframe_reason: None,
             bframe_mode_note: String::new(),
             bframe_psnr_y: 0.0,
@@ -621,7 +640,10 @@ fn validate_args(args: &Args) -> Result<()> {
     parse_loop_filter(&args.loop_filter)?;
     parse_subpel_mode(&args.subpel)?;
     parse_block_aq_mode(&args.block_aq)?;
-    let _ = parse_alt_ref_flag(&args.alt_ref)?;
+    if parse_alt_ref_flag(&args.alt_ref)? {
+        bail!("alt-ref benchmark encode is not wired yet.");
+    }
+    parse_b_motion_search_mode(&args.b_motion_search)?;
     if args.bframes > 1 {
         bail!(
             "only --bframes 0 or 1 is supported in this experimental slice (got {})",
@@ -650,6 +672,27 @@ fn parse_subpel_mode(s: &str) -> Result<SrsV2SubpelMode> {
         "off" => Ok(SrsV2SubpelMode::Off),
         "half" => Ok(SrsV2SubpelMode::HalfPel),
         _ => Err(anyhow!("--subpel must be off or half (got {s})")),
+    }
+}
+
+fn parse_b_motion_search_mode(s: &str) -> Result<SrsV2BMotionSearchMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "off" => Ok(SrsV2BMotionSearchMode::Off),
+        "reuse-p" | "reusep" => Ok(SrsV2BMotionSearchMode::ReuseP),
+        "independent-forward-backward" | "independent" => {
+            Ok(SrsV2BMotionSearchMode::IndependentForwardBackward)
+        }
+        _ => Err(anyhow!(
+            "--b-motion-search must be off, reuse-p, or independent-forward-backward (got {s})"
+        )),
+    }
+}
+
+fn b_motion_mode_cli_label(m: SrsV2BMotionSearchMode) -> &'static str {
+    match m {
+        SrsV2BMotionSearchMode::Off => "off",
+        SrsV2BMotionSearchMode::ReuseP => "reuse-p",
+        SrsV2BMotionSearchMode::IndependentForwardBackward => "independent-forward-backward",
     }
 }
 
@@ -686,6 +729,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let loop_filter_mode = parse_loop_filter(&args.loop_filter)?;
     let subpel_mode = parse_subpel_mode(&args.subpel)?;
     let block_aq_mode = parse_block_aq_mode(&args.block_aq)?;
+    let b_motion_search_mode = parse_b_motion_search_mode(&args.b_motion_search)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -710,6 +754,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         block_aq_mode,
         loop_filter_mode,
         deblock_strength: args.deblock_strength,
+        b_motion_search_mode,
         ..Default::default()
     };
     s.validate_rate_control()
@@ -755,7 +800,12 @@ struct PassNumbers {
     bframes_used: u32,
     decode_order_count: u32,
     p_anchor_count: u32,
-    avg_anchor_p_bytes: f64,
+    avg_p_anchor_bytes: f64,
+    b_blend_forward_macroblocks: u64,
+    b_blend_backward_macroblocks: u64,
+    b_blend_average_macroblocks: u64,
+    b_blend_weighted_macroblocks: u64,
+    b_blend_sad_evaluations: u64,
     bframe_psnr_y: f64,
     bframe_ssim_y: f64,
     unsupported_bframe_reason: Option<String>,
@@ -810,6 +860,7 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             10 => c.rev10 += 1,
             11 => c.rev11 += 1,
             12 => c.rev12 += 1,
+            13 => c.rev13 += 1,
             _ => {}
         }
     }
@@ -840,6 +891,7 @@ fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> Mot
         subpel_blocks_selected_total: m.subpel_blocks_selected,
         additional_subpel_evaluations_total: m.additional_subpel_evaluations,
         avg_fractional_mv_qpel_per_mb: avg_frac,
+        b_motion_search_mode: b_motion_mode_cli_label(settings.b_motion_search_mode).to_string(),
     }
 }
 
@@ -850,32 +902,89 @@ enum BenchEmitKind {
     B,
 }
 
-/// Decode-order GOP: *I₀ → P₂ → B₁ → P₄ → B₃ → …*; trailing indices encode as **P** only.
-fn b_gop_emit_schedule(n: u32) -> Vec<(u32, BenchEmitKind)> {
-    let nu = n as usize;
-    debug_assert!(nu >= 3);
-    let mut schedule = vec![
-        (0_u32, BenchEmitKind::I),
-        (2, BenchEmitKind::P),
-        (1, BenchEmitKind::B),
-    ];
-    let mut covered: HashSet<u32> = [0, 1, 2].into_iter().collect();
-    let mut m = 1_usize;
-    while 2 * m + 2 < nu {
-        let pfi = (2 * m + 2) as u32;
-        let bfi = (2 * m + 1) as u32;
-        schedule.push((pfi, BenchEmitKind::P));
-        schedule.push((bfi, BenchEmitKind::B));
-        covered.insert(pfi);
-        covered.insert(bfi);
-        m += 1;
+/// Display-order classification: **I** at `0` and every **`keyint`**; **P** on even non‑I frames;
+/// **B** on odd frames when a future **I/P** anchor exists; tail odds without a future anchor become **P**.
+fn classify_bench_emit_kind(fi: u32, n: u32, keyint: u32) -> BenchEmitKind {
+    let ki = keyint.max(1);
+    if fi == 0 || fi.is_multiple_of(ki) {
+        return BenchEmitKind::I;
     }
-    let mut tail: Vec<u32> = (0..n).filter(|fi| !covered.contains(fi)).collect();
-    tail.sort_unstable();
-    for fi in tail {
-        schedule.push((fi, BenchEmitKind::P));
+    if fi.is_multiple_of(2) {
+        return BenchEmitKind::P;
     }
-    schedule
+    let mut has_future_anchor = false;
+    for j in (fi + 1)..n {
+        if j.is_multiple_of(ki) || j.is_multiple_of(2) {
+            has_future_anchor = true;
+            break;
+        }
+    }
+    if has_future_anchor {
+        BenchEmitKind::B
+    } else {
+        BenchEmitKind::P
+    }
+}
+
+fn bench_kind_slice(n: u32, keyint: u32) -> Vec<BenchEmitKind> {
+    (0..n)
+        .map(|fi| classify_bench_emit_kind(fi, n, keyint))
+        .collect()
+}
+
+fn prev_ip_anchor(kinds: &[BenchEmitKind], fi: u32) -> Option<u32> {
+    (0..fi)
+        .rev()
+        .find(|&j| matches!(kinds[j as usize], BenchEmitKind::I | BenchEmitKind::P))
+}
+
+fn next_ip_anchor(kinds: &[BenchEmitKind], fi: u32, n: u32) -> Option<u32> {
+    ((fi + 1)..n).find(|&j| matches!(kinds[j as usize], BenchEmitKind::I | BenchEmitKind::P))
+}
+
+/// Topological encode order (decode order): smallest ready **`frame_index`** first when multiple frames are ready.
+fn b_gop_encode_order(n: u32, keyint: u32) -> Result<Vec<(u32, BenchEmitKind)>> {
+    let kinds = bench_kind_slice(n, keyint);
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n as usize];
+    let mut indeg = vec![0_u32; n as usize];
+    for fi in 0..n {
+        match kinds[fi as usize] {
+            BenchEmitKind::I => {}
+            BenchEmitKind::P => {
+                let Some(pa) = prev_ip_anchor(&kinds, fi) else {
+                    bail!("internal: P frame {fi} has no previous I/P anchor");
+                };
+                adj[pa as usize].push(fi);
+                indeg[fi as usize] += 1;
+            }
+            BenchEmitKind::B => {
+                let Some(ab) = prev_ip_anchor(&kinds, fi) else {
+                    bail!("internal: B frame {fi} has no backward anchor");
+                };
+                let Some(af) = next_ip_anchor(&kinds, fi, n) else {
+                    bail!("internal: B frame {fi} has no forward anchor");
+                };
+                adj[ab as usize].push(fi);
+                adj[af as usize].push(fi);
+                indeg[fi as usize] += 2;
+            }
+        }
+    }
+    let mut ready: BTreeSet<u32> = (0..n).filter(|&fi| indeg[fi as usize] == 0).collect();
+    let mut out = Vec::with_capacity(n as usize);
+    while let Some(u) = ready.pop_first() {
+        out.push((u, kinds[u as usize]));
+        for &v in &adj[u as usize] {
+            indeg[v as usize] = indeg[v as usize].saturating_sub(1);
+            if indeg[v as usize] == 0 {
+                ready.insert(v);
+            }
+        }
+    }
+    if out.len() != n as usize {
+        bail!("internal: cyclic GOP dependency (broken anchor schedule)");
+    }
+    Ok(out)
 }
 
 fn run_srsv2_pass(
@@ -901,17 +1010,21 @@ fn run_srsv2_numbers_b_gop(
 ) -> Result<PassNumbers> {
     let n = args.frames;
     let nu = n as usize;
-    let alt_on = parse_alt_ref_flag(&args.alt_ref)?;
-    if alt_on && seq.max_ref_frames < 2 {
-        bail!("--alt-ref on requires --reference-frames >= 2");
-    }
-
-    let schedule = b_gop_emit_schedule(n);
-    let b_fis: Vec<u32> = schedule
+    let keyint = args.keyint.max(1);
+    let kinds = bench_kind_slice(n, keyint);
+    let schedule = b_gop_encode_order(n, keyint)?;
+    let b_fis: Vec<u32> = kinds
         .iter()
+        .enumerate()
         .filter(|(_, k)| matches!(k, BenchEmitKind::B))
-        .map(|(fi, _)| *fi)
+        .map(|(i, _)| i as u32)
         .collect();
+
+    let mut b_fwd_mb = 0_u64;
+    let mut b_bwd_mb = 0_u64;
+    let mut b_avg_mb = 0_u64;
+    let mut b_wgt_mb = 0_u64;
+    let mut b_sad_ev = 0_u64;
 
     let mut rc =
         SrsV2RateController::new(settings, args.fps.max(1), 1).map_err(|e| anyhow!("{e}"))?;
@@ -926,7 +1039,6 @@ fn run_srsv2_numbers_b_gop(
     let mut aq_last = SrsV2AqEncodeStats::default();
     let mut motion_agg = MotionAgg::default();
     let mut anchor_p_payload_bytes: Vec<u64> = Vec::new();
-    let half_b = matches!(settings.subpel_mode, SrsV2SubpelMode::HalfPel);
 
     for &(fi, kind) in &schedule {
         let qp = rc.qp_for_frame(fi, prev);
@@ -985,19 +1097,17 @@ fn run_srsv2_numbers_b_gop(
                 let ref_b = mgr
                     .frame_at_slot_index(0)
                     .map_err(|e| anyhow!("B forward ref: {e}"))?;
-                encode_yuv420_b_payload(
-                    seq,
-                    &frame,
-                    ref_a,
-                    ref_b,
-                    fi,
-                    qp,
-                    1,
-                    0,
-                    BBlendModeWire::Average,
-                    half_b,
+                let mut st = BFrameEncodeStats::default();
+                let pl = encode_yuv420_b_payload_mb_blend(
+                    seq, &frame, ref_a, ref_b, fi, qp, 1, 0, settings, &mut st,
                 )
-                .map_err(|e| anyhow!("SRSV2 encode B {fi}: {e}"))?
+                .map_err(|e| anyhow!("SRSV2 encode B {fi}: {e}"))?;
+                b_fwd_mb += st.b_forward_macroblocks as u64;
+                b_bwd_mb += st.b_backward_macroblocks as u64;
+                b_avg_mb += st.b_average_macroblocks as u64;
+                b_wgt_mb += st.b_weighted_macroblocks as u64;
+                b_sad_ev += st.b_sad_evaluations;
+                pl
             }
         };
 
@@ -1014,17 +1124,6 @@ fn run_srsv2_numbers_b_gop(
             encoded_bytes: byte_hist.last().copied().unwrap_or(0) as u32,
             is_keyframe: is_i,
         });
-
-        if alt_on && matches!(kind, BenchEmitKind::I) {
-            let alt = encode_yuv420_alt_ref_payload(seq, &frame, fi, qp, 1)
-                .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
-            decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
-                .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
-            byte_hist.push(alt.len() as u64);
-            payloads.push(alt);
-            psnr_src_frame.push(None);
-            qp_hist.push(qp);
-        }
     }
 
     let enc_secs = t0.elapsed().as_secs_f64();
@@ -1112,7 +1211,7 @@ fn run_srsv2_numbers_b_gop(
 
     let display_order_frame_indices: Vec<u32> = (0..n).collect();
     let p_anchor_count = anchor_p_payload_bytes.len() as u32;
-    let avg_anchor_p_bytes = avg_u64(&anchor_p_payload_bytes);
+    let avg_p_anchor_bytes = avg_u64(&anchor_p_payload_bytes);
     let decode_order_count = decode_order_frame_indices.len() as u32;
 
     Ok(PassNumbers {
@@ -1134,11 +1233,16 @@ fn run_srsv2_numbers_b_gop(
         bframes_used: 1,
         decode_order_count,
         p_anchor_count,
-        avg_anchor_p_bytes,
+        avg_p_anchor_bytes,
+        b_blend_forward_macroblocks: b_fwd_mb,
+        b_blend_backward_macroblocks: b_bwd_mb,
+        b_blend_average_macroblocks: b_avg_mb,
+        b_blend_weighted_macroblocks: b_wgt_mb,
+        b_blend_sad_evaluations: b_sad_ev,
         bframe_psnr_y,
         bframe_ssim_y,
         unsupported_bframe_reason: None,
-        bframe_mode_note: "experimental bench GOP: decode-order I₀,P₂,B₁,…; zero-MV B average blend; metrics are display-order".to_string(),
+        bframe_mode_note: "experimental --bframes 1: keyint-aware I/B/P placement; encode order is decode order (anchors before sandwiched B); FR2 rev13 per-MB blend/SAD (+ optional integer B ME); metrics computed in display order".to_string(),
     })
 }
 
@@ -1149,11 +1253,6 @@ fn run_srsv2_numbers(
     settings: &SrsV2EncodeSettings,
     expected_frame: usize,
 ) -> Result<PassNumbers> {
-    let alt_on = parse_alt_ref_flag(&args.alt_ref)?;
-    if alt_on && seq.max_ref_frames < 2 {
-        bail!("--alt-ref on requires --reference-frames >= 2");
-    }
-
     let mut rc = SrsV2RateController::new(settings, args.fps.max(1), 1)
         .map_err(|e| anyhow!("rate controller: {e}"))?;
 
@@ -1218,16 +1317,6 @@ fn run_srsv2_numbers(
         });
         payloads.push(payload);
         psnr_src_frame.push(Some(fi));
-
-        if alt_on && is_i {
-            let alt = encode_yuv420_alt_ref_payload(seq, &frame, fi, qp, 1)
-                .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
-            decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
-                .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
-            byte_hist.push(alt.len() as u64);
-            payloads.push(alt);
-            psnr_src_frame.push(None);
-        }
     }
     let enc_secs = t0.elapsed().as_secs_f64();
 
@@ -1343,7 +1432,12 @@ fn run_srsv2_numbers(
         bframes_used: 0,
         decode_order_count,
         p_anchor_count: p_wire_bytes.len() as u32,
-        avg_anchor_p_bytes: avg_u64(&p_wire_bytes),
+        avg_p_anchor_bytes: avg_u64(&p_wire_bytes),
+        b_blend_forward_macroblocks: 0,
+        b_blend_backward_macroblocks: 0,
+        b_blend_average_macroblocks: 0,
+        b_blend_weighted_macroblocks: 0,
+        b_blend_sad_evaluations: 0,
         bframe_psnr_y: 0.0,
         bframe_ssim_y: 0.0,
         unsupported_bframe_reason: None,
@@ -1440,13 +1534,13 @@ fn pass_to_details(
         match pl.get(3).copied() {
             Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
             Some(2 | 4 | 5 | 6 | 8 | 9) => p_bytes.push(pl.len() as u64),
-            Some(10 | 11) => b_bytes.push(pl.len() as u64),
+            Some(10 | 11 | 13) => b_bytes.push(pl.len() as u64),
             Some(12) => alt_bytes.push(pl.len() as u64),
             _ => {}
         }
     }
     let fr2 = fr2_revision_counts(&p.payloads);
-    let bframe_count = fr2.rev10 + fr2.rev11;
+    let bframe_count = fr2.rev10 + fr2.rev11 + fr2.rev13;
     let alt_ref_count = fr2.rev12;
     let enc_bytes: u64 = p.byte_hist.iter().sum();
     let raw_bytes = raw_len_for_bitrate(args);
@@ -1485,7 +1579,14 @@ fn pass_to_details(
         display_order_frame_indices: p.display_order_frame_indices.clone(),
         decode_order_count: p.decode_order_count,
         p_anchor_count: p.p_anchor_count,
-        avg_anchor_p_bytes: p.avg_anchor_p_bytes,
+        avg_p_anchor_bytes: p.avg_p_anchor_bytes,
+        b_blend: BBlendBenchReport {
+            b_forward_macroblocks: p.b_blend_forward_macroblocks,
+            b_backward_macroblocks: p.b_blend_backward_macroblocks,
+            b_average_macroblocks: p.b_blend_average_macroblocks,
+            b_weighted_macroblocks: p.b_blend_weighted_macroblocks,
+            b_sad_evaluations: p.b_blend_sad_evaluations,
+        },
         unsupported_bframe_reason: p.unsupported_bframe_reason.clone(),
         bframe_mode_note: p.bframe_mode_note.clone(),
         bframe_psnr_y: p.bframe_psnr_y,
@@ -2235,20 +2336,27 @@ fn to_markdown(r: &BenchReport) -> String {
     ));
     let sv = &r.srsv2;
     out.push_str(&format!(
-        "- bframes_requested: {}\n- bframes_used: {}\n- decode_order_count: {}\n- decode_order_frame_indices: {:?}\n- display_order_frame_indices: {:?}\n- p_anchor_count: {}\n- avg_anchor_P_bytes: {:.1}\n- bframe_count (wire): {}\n- avg_B_bytes: {:.1}\n- alt_ref_count: {}\n- avg_altref_bytes: {:.1}\n- bframe_psnr_y (B-only aggregate): {:.2}\n- bframe_ssim_y (B-only aggregate): {:.4}\n",
+        "- bframes_requested: {}\n- bframes_used: {}\n- decode_order_count: {}\n- decode_order_frame_indices: {:?}\n- display_order_frame_indices: {:?}\n- display_frame_count: {}\n- reference_frames_used: {}\n- p_anchor_count: {}\n- avg_p_anchor_bytes: {:.1}\n- bframe_count (wire): {}\n- avg_B_bytes: {:.1}\n- alt_ref_count: {}\n- avg_altref_bytes: {:.1}\n- bframe_psnr_y (B-only aggregate): {:.2}\n- bframe_ssim_y (B-only aggregate): {:.4}\n- b_blend: forward_mb={} backward_mb={} average_mb={} weighted_mb={} sad_eval={}\n",
         sv.bframes_requested,
         sv.bframes_used,
         sv.decode_order_count,
         sv.decode_order_frame_indices,
         sv.display_order_frame_indices,
+        sv.display_frame_count,
+        sv.reference_frames_used,
         sv.p_anchor_count,
-        sv.avg_anchor_p_bytes,
+        sv.avg_p_anchor_bytes,
         sv.bframe_count,
         sv.avg_bframe_bytes,
         sv.alt_ref_count,
         sv.avg_altref_bytes,
         sv.bframe_psnr_y,
         sv.bframe_ssim_y,
+        sv.b_blend.b_forward_macroblocks,
+        sv.b_blend.b_backward_macroblocks,
+        sv.b_blend.b_average_macroblocks,
+        sv.b_blend.b_weighted_macroblocks,
+        sv.b_blend.b_sad_evaluations,
     ));
     if let Some(reason) = &sv.unsupported_bframe_reason {
         out.push_str(&format!("- unsupported_bframe_reason: {reason}\n"));
@@ -2256,8 +2364,8 @@ fn to_markdown(r: &BenchReport) -> String {
     if !sv.bframe_mode_note.is_empty() {
         out.push_str(&format!("- bframe_mode_note: {}\n", sv.bframe_mode_note));
     }
-    out.push_str("\n### Frame kind sizes (wire)\n\n");
-    out.push_str("| Frame kind | Count | Avg bytes |\n");
+    out.push_str("\n## Frame-kind payloads\n\n");
+    out.push_str("| Kind | Count | Avg bytes |\n");
     out.push_str("|---|---:|---:|\n");
     out.push_str(&format!(
         "| I | {} | {:.1} |\n",
@@ -2265,7 +2373,7 @@ fn to_markdown(r: &BenchReport) -> String {
     ));
     out.push_str(&format!(
         "| P anchor | {} | {:.1} |\n",
-        sv.p_anchor_count, sv.avg_anchor_p_bytes
+        sv.p_anchor_count, sv.avg_p_anchor_bytes
     ));
     out.push_str(&format!(
         "| B | {} | {:.1} |\n",
@@ -2360,6 +2468,10 @@ fn to_markdown(r: &BenchReport) -> String {
             m.additional_subpel_evaluations_total,
             m.avg_fractional_mv_qpel_per_mb
         ));
+        out.push_str(&format!(
+            "- B-frame motion search (experimental, FR2 rev13 path): {}\n",
+            m.b_motion_search_mode
+        ));
     }
     {
         let d = &r.srsv2.deblock;
@@ -2439,6 +2551,7 @@ mod tests {
             block_aq_delta_max: 6,
             bframes: 0,
             alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
         };
@@ -2489,6 +2602,7 @@ mod tests {
             block_aq_delta_max: 6,
             bframes: 2,
             alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
         };
@@ -2538,6 +2652,7 @@ mod tests {
             block_aq_delta_max: 6,
             bframes: 1,
             alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
         };
@@ -2547,11 +2662,72 @@ mod tests {
     }
 
     #[test]
-    fn b_gop_emit_schedule_three_frames_is_decode_order_i0_p2_b1() {
-        let s = b_gop_emit_schedule(3);
+    fn b_gop_encode_order_three_frames_is_decode_order_i0_p2_b1() {
+        let s = b_gop_encode_order(3, 30).unwrap();
         assert_eq!(
             s.iter().map(|(fi, _)| *fi).collect::<Vec<_>>(),
             vec![0, 2, 1]
+        );
+    }
+
+    #[test]
+    fn b_gop_encode_order_five_frames_is_i0_p2_b1_p4_b3() {
+        let s = b_gop_encode_order(5, 30).unwrap();
+        assert_eq!(
+            s.iter().map(|(fi, _)| *fi).collect::<Vec<_>>(),
+            vec![0, 2, 1, 4, 3]
+        );
+    }
+
+    #[test]
+    fn alt_ref_on_is_unsupported_in_benchmark_validate() {
+        let a = Args {
+            input: PathBuf::from("nope"),
+            width: 16,
+            height: 16,
+            frames: 3,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "on".to_string(),
+            b_motion_search: "off".to_string(),
+            gop: 0,
+            reference_frames: 2,
+        };
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(
+            err.contains("alt-ref benchmark encode is not wired yet"),
+            "{err}"
         );
     }
 
@@ -2603,6 +2779,7 @@ mod tests {
             block_aq_delta_max: 6,
             bframes: 1,
             alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 2,
         };
@@ -2630,6 +2807,65 @@ mod tests {
             exp.extend_from_slice(frame_luma_slice(&raw, fb, fi, w, h));
         }
         assert_eq!(flat, exp);
+    }
+
+    #[test]
+    fn run_srsv2_pass_b_gop_three_frames_32x32_decodes() {
+        let w = 32u32;
+        let h = 32u32;
+        let frames = 3u32;
+        let fb = yuv420_frame_bytes(w, h).unwrap();
+        let raw: Vec<u8> = (0..fb * frames as usize).map(|i| (i % 251) as u8).collect();
+        let args = Args {
+            input: PathBuf::from("nope"),
+            width: w,
+            height: h,
+            frames,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 8,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 1,
+            alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
+            gop: 0,
+            reference_frames: 2,
+        };
+        validate_args(&args).unwrap();
+        let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
+        let seq = build_seq_header(&args, &settings);
+        let numbers = run_srsv2_pass(&args, &seq, &raw, &settings, fb).unwrap();
+        assert_eq!(numbers.display_order_frame_indices.len(), frames as usize);
+        assert_eq!(numbers.decode_order_frame_indices, vec![0, 2, 1]);
+        assert!(numbers.payloads.iter().any(|p| p.get(3) == Some(&13)));
     }
 
     #[test]
@@ -2678,6 +2914,7 @@ mod tests {
             block_aq_delta_max: 6,
             bframes: 0,
             alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
         };
@@ -2779,6 +3016,7 @@ mod tests {
                     subpel_blocks_selected_total: 0,
                     additional_subpel_evaluations_total: 0,
                     avg_fractional_mv_qpel_per_mb: 0.0,
+                    b_motion_search_mode: "off".to_string(),
                 }),
                 deblock: DeblockBenchReport {
                     loop_filter_mode: "off".to_string(),
@@ -2795,7 +3033,8 @@ mod tests {
                 decode_order_frame_indices: vec![0],
                 display_order_frame_indices: vec![0],
                 p_anchor_count: 0,
-                avg_anchor_p_bytes: 0.0,
+                avg_p_anchor_bytes: 0.0,
+                b_blend: BBlendBenchReport::default(),
                 unsupported_bframe_reason: None,
                 bframe_mode_note: String::new(),
                 bframe_psnr_y: 0.0,
@@ -2827,6 +3066,9 @@ mod tests {
         assert!(js.contains("\"loop_filter_mode\":\"off\""));
         assert!(js.contains("\"subpel_mode\":\"off\""));
         assert!(js.contains("\"bframes_enabled\":false"));
+        assert!(js.contains("\"b_motion_search_mode\":\"off\""));
+        assert!(js.contains("\"avg_p_anchor_bytes\":0"));
+        assert!(js.contains("\"b_blend\""));
     }
 
     #[test]
@@ -2874,7 +3116,8 @@ mod tests {
                 decode_order_frame_indices: Vec::new(),
                 display_order_frame_indices: Vec::new(),
                 p_anchor_count: 0,
-                avg_anchor_p_bytes: 0.0,
+                avg_p_anchor_bytes: 0.0,
+                b_blend: BBlendBenchReport::default(),
                 unsupported_bframe_reason: None,
                 bframe_mode_note: String::new(),
                 bframe_psnr_y: 0.0,
@@ -2932,7 +3175,8 @@ mod tests {
                     decode_order_frame_indices: Vec::new(),
                     display_order_frame_indices: Vec::new(),
                     p_anchor_count: 0,
-                    avg_anchor_p_bytes: 0.0,
+                    avg_p_anchor_bytes: 0.0,
+                    b_blend: BBlendBenchReport::default(),
                     unsupported_bframe_reason: None,
                     bframe_mode_note: String::new(),
                     bframe_psnr_y: 0.0,
@@ -3004,7 +3248,8 @@ mod tests {
                     decode_order_frame_indices: Vec::new(),
                     display_order_frame_indices: Vec::new(),
                     p_anchor_count: 0,
-                    avg_anchor_p_bytes: 0.0,
+                    avg_p_anchor_bytes: 0.0,
+                    b_blend: BBlendBenchReport::default(),
                     unsupported_bframe_reason: None,
                     bframe_mode_note: String::new(),
                     bframe_psnr_y: 0.0,
@@ -3059,6 +3304,7 @@ mod tests {
             block_aq_delta_max: 6,
             bframes: 0,
             alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
         };
@@ -3108,6 +3354,7 @@ mod tests {
             block_aq_delta_max: 6,
             bframes: 0,
             alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
         };

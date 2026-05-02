@@ -35,7 +35,7 @@ Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future sli
 
 ## Planned / not yet merged
 
-- General **quarter-pel** motion beyond the current half-pel grid, richer **B** motion search / weighted prediction, and production-grade **GOP** / **B** placement (beyond parser-safe baselines and **`bench_srsv2 --bframes 1`** measurement GOPs).
+- General **quarter-pel** motion beyond the current half-pel grid, **B** half-pel ME, **weighted B** prediction, **B** RDO, and production-grade **GOP** / **B** placement (beyond **`FR2` rev 13** bench measurements and **`bench_srsv2 --bframes 1`** keyint-aware lab GOPs).
 - Broader entropy coding (per-file trained models, MV syntax, etc.). Today: **experimental** static rANS **AC residual** tokens only; motion and headers remain structured bytes with bounds checks.
 - **Loop filter (experimental):** when `disable_loop_filter` is **false**, encoder and decoder apply the same **simple luma deblock** on reconstructed **Y** before refreshing the SRSV2 reference (see **`docs/deblock_filter.md`**). **CDEF**, **restoration**, **film grain**, and chroma loop filtering are **not** implemented.
 - GPU backends (`gpu-wgpu`, `gpu-cuda` feature placeholders).
