@@ -51,10 +51,10 @@ pub use frame_codec::{
     FRAME_PAYLOAD_MAGIC_ALT_REF,
 };
 pub use model::{
-    decode_sequence_header_v2, encode_sequence_header_v2, ChromaSiting, ColorPrimaries, ColorRange,
-    FrameHeaderV2, FrameTypeV2, MatrixCoefficients, PixelFormat, SrsElementaryVideoCodecId,
-    SrsVideoCodecId, SrsVideoProfile, TileHeaderV2, TransferFunction, VideoSequenceHeaderV2,
-    SEQUENCE_HEADER_BYTES,
+    decode_sequence_header_v2, encode_sequence_header_v2, frame_type_from_srsv2_revision,
+    ChromaSiting, ColorPrimaries, ColorRange, FrameHeaderV2, FrameTypeV2, MatrixCoefficients,
+    PixelFormat, SrsElementaryVideoCodecId, SrsVideoCodecId, SrsVideoProfile, TileHeaderV2,
+    TransferFunction, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
 };
 pub use motion_search::SrsV2MotionEncodeStats;
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};

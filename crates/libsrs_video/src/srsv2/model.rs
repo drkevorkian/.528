@@ -114,17 +114,38 @@ pub enum ColorRange {
 #[repr(u8)]
 pub enum FrameTypeV2 {
     Intra = 0,
-    Predicted = 1,
+    /// Forward/inter predicted (`FR2` rev **2**/**4**/**5**/**6**/**8**/**9**).
+    PredictedP = 1,
     /// Experimental bidirectional (`FR2` rev **10**/**11**).
-    Bidirectional = 2,
+    BidirectionalB = 2,
     /// Experimental non-displayable reference (`FR2` rev **12**).
     AltRef = 3,
 }
 
 impl FrameTypeV2 {
     pub const I: Self = Self::Intra;
-    pub const P: Self = Self::Predicted;
-    pub const B: Self = Self::Bidirectional;
+    pub const P: Self = Self::PredictedP;
+    pub const B: Self = Self::BidirectionalB;
+
+    /// Map **`FR2` revision byte** (payload `[3]`) to a logical frame type (wire taxonomy).
+    pub fn from_srsv2_revision(rev: u8) -> Result<Self, super::error::SrsV2Error> {
+        Ok(match rev {
+            1 | 3 | 7 => Self::Intra,
+            2 | 4 | 5 | 6 | 8 | 9 => Self::PredictedP,
+            10 | 11 => Self::BidirectionalB,
+            12 => Self::AltRef,
+            _ => {
+                return Err(super::error::SrsV2Error::syntax(
+                    "unknown SRSV2 FR2 revision for frame type",
+                ));
+            }
+        })
+    }
+}
+
+/// Back-compat alias for [`FrameTypeV2::from_srsv2_revision`].
+pub fn frame_type_from_srsv2_revision(rev: u8) -> Result<FrameTypeV2, super::error::SrsV2Error> {
+    FrameTypeV2::from_srsv2_revision(rev)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,6 +491,50 @@ mod profile_roundtrip_tests {
         let got = decode_sequence_header_v2(&bytes).expect("decode hdr");
         assert!(!got.disable_loop_filter);
         assert_eq!(got.deblock_strength, 88);
+    }
+}
+
+#[cfg(test)]
+mod frame_type_revision_tests {
+    use super::{frame_type_from_srsv2_revision, FrameTypeV2};
+
+    #[test]
+    fn frame_type_maps_rev1_through_12() {
+        for rev in [1u8, 3, 7] {
+            assert_eq!(
+                frame_type_from_srsv2_revision(rev).unwrap(),
+                FrameTypeV2::Intra
+            );
+        }
+        for rev in [2u8, 4, 5, 6, 8, 9] {
+            assert_eq!(
+                frame_type_from_srsv2_revision(rev).unwrap(),
+                FrameTypeV2::PredictedP
+            );
+        }
+        for rev in [10u8, 11] {
+            assert_eq!(
+                frame_type_from_srsv2_revision(rev).unwrap(),
+                FrameTypeV2::BidirectionalB
+            );
+        }
+        assert_eq!(
+            frame_type_from_srsv2_revision(12).unwrap(),
+            FrameTypeV2::AltRef
+        );
+    }
+
+    #[test]
+    fn unknown_revision_errors() {
+        assert!(frame_type_from_srsv2_revision(0).is_err());
+        assert!(frame_type_from_srsv2_revision(13).is_err());
+        assert!(frame_type_from_srsv2_revision(255).is_err());
+    }
+
+    #[test]
+    fn legacy_p_alias_matches_predicted_p() {
+        assert_eq!(FrameTypeV2::P, FrameTypeV2::PredictedP);
+        assert_eq!(FrameTypeV2::B, FrameTypeV2::BidirectionalB);
     }
 }
 

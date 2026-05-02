@@ -14,6 +14,13 @@
 
 **Motion search (experimental):** integer-pel modes, optional **half-pel** refinement (`docs/motion_search.md`). **Experimental B** (`FR2\x0A`/`\x0B`) and **alt-ref** (`FR2\x0C`) decode through **`decode_yuv420_srsv2_payload_managed`** / **`SrsV2ReferenceManager`** (parser-safe baseline). **Playback** accepts **B** when **`max_ref_frames ≥ 2`** and packet order matches decode needs (often *I₀ → P₂ → B₁*); **`max_ref_frames < 2`** → **`PlaybackError::Unsupported`**. **`classify_srsv2_payload`** treats rev **10**/**11** like other **non-keyframe** **predicted** kinds for mux/index policy. Quality and tooling are **not** production-grade. Finer **GPU** motion remains roadmap.
 
+### Experimental B frames and alt-ref (baseline semantics)
+
+- **Rev 10 (`FR2\x0A`):** B-frame syntax with **integer** MV grid (parser-safe / minimal baseline).
+- **Rev 11 (`FR2\x0B`):** B-frame syntax with **half-pel** MV grid (same experimental tier).
+- **Rev 12 (`FR2\x0C`):** **Non-displayable** alt-ref / hidden reference refresh (`is_displayable == false`); updates **`SrsV2ReferenceManager`** only.
+- **Current B encoder (when enabled)** is intentionally minimal: **average** blend (`BBlendModeWire::Average`), **zero MV** baseline unless improved later; residual entropy follows the same experimental paths as **P**. **B-frame compression optimization** (bidirectional motion search, weighted prediction, joint RDO B/P/I decisions, tuned benchmark encode presets) remains **future work** — not “B syntax unavailable,” but **not** mature compression yet.
+
 Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future slices**.
 
 ## Implemented in this repository
@@ -28,7 +35,7 @@ Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future sli
 
 ## Planned / not yet merged
 
-- General **quarter-pel** motion beyond the current half-pel grid, richer **B** search / weighted prediction, and production-grade **GOP** / **B** placement.
+- General **quarter-pel** motion beyond the current half-pel grid, richer **B** motion search / weighted prediction, and production-grade **GOP** / **B** placement (beyond parser-safe baselines and **`bench_srsv2 --bframes 1`** measurement GOPs).
 - Broader entropy coding (per-file trained models, MV syntax, etc.). Today: **experimental** static rANS **AC residual** tokens only; motion and headers remain structured bytes with bounds checks.
 - **Loop filter (experimental):** when `disable_loop_filter` is **false**, encoder and decoder apply the same **simple luma deblock** on reconstructed **Y** before refreshing the SRSV2 reference (see **`docs/deblock_filter.md`**). **CDEF**, **restoration**, **film grain**, and chroma loop filtering are **not** implemented.
 - GPU backends (`gpu-wgpu`, `gpu-cuda` feature placeholders).

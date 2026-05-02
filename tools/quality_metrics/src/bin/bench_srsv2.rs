@@ -2,7 +2,7 @@
 //!
 //! Optional external comparison: `--compare-x264` uses `ffmpeg` + `libx264` when available.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,11 +14,11 @@ use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
-    encode_yuv420_alt_ref_payload, encode_yuv420_inter_payload, PixelFormat, PreviousFrameRcStats,
-    ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats,
-    SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2LoopFilterMode, SrsV2MotionEncodeStats,
-    SrsV2MotionSearchMode, SrsV2RateControlMode, SrsV2RateController, SrsV2ReferenceManager,
-    SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
+    encode_yuv420_alt_ref_payload, encode_yuv420_b_payload, encode_yuv420_inter_payload,
+    BBlendModeWire, PixelFormat, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
+    SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats, SrsV2BlockAqMode, SrsV2EncodeSettings,
+    SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2RateControlMode,
+    SrsV2RateController, SrsV2ReferenceManager, SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -138,7 +138,7 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     block_aq_delta_max: i8,
 
-    /// Reserved for future bench B-GOP wiring; **`> 0` is rejected** (use `libsrs_video` B-frame tests).
+    /// Experimental B frames per GOP interior: **`0`** (default) = legacy I/P-only bench; **`1`** = *I₀,P₂,B₁,…* decode-order GOP (requires **`--reference-frames ≥ 2`**, **`--frames ≥ 3`**, 16-aligned size). **`> 1`** is rejected in this slice.
     #[arg(long, default_value_t = 0)]
     bframes: u32,
 
@@ -146,7 +146,7 @@ struct Args {
     #[arg(long, default_value = "off")]
     alt_ref: String,
 
-    /// Reserved GOP hint for a future B-bench mode (ignored while `--bframes` stays unsupported).
+    /// Reserved GOP hint for future bench modes (currently unused).
     #[arg(long, default_value_t = 0)]
     gop: u32,
 
@@ -321,6 +321,19 @@ struct Srsv2Details {
     #[serde(skip_serializing_if = "Option::is_none")]
     motion: Option<MotionBenchReport>,
     deblock: DeblockBenchReport,
+    bframes_requested: u32,
+    bframes_used: u32,
+    decode_order_frame_indices: Vec<u32>,
+    display_order_frame_indices: Vec<u32>,
+    p_anchor_count: u32,
+    avg_anchor_p_bytes: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unsupported_bframe_reason: Option<String>,
+    bframe_mode_note: String,
+    bframe_psnr_y: f64,
+    bframe_ssim_y: f64,
+    /// Displayable packets decoded, in bitstream/decode order (`decode_order_frame_indices.len()`).
+    decode_order_count: u32,
 }
 
 impl Default for Srsv2Details {
@@ -354,6 +367,17 @@ impl Default for Srsv2Details {
             aq: None,
             motion: None,
             deblock: DeblockBenchReport::default(),
+            bframes_requested: 0,
+            bframes_used: 0,
+            decode_order_frame_indices: Vec::new(),
+            display_order_frame_indices: Vec::new(),
+            p_anchor_count: 0,
+            avg_anchor_p_bytes: 0.0,
+            unsupported_bframe_reason: None,
+            bframe_mode_note: String::new(),
+            bframe_psnr_y: 0.0,
+            bframe_ssim_y: 0.0,
+            decode_order_count: 0,
         }
     }
 }
@@ -598,10 +622,25 @@ fn validate_args(args: &Args) -> Result<()> {
     parse_subpel_mode(&args.subpel)?;
     parse_block_aq_mode(&args.block_aq)?;
     let _ = parse_alt_ref_flag(&args.alt_ref)?;
-    if args.bframes > 0 {
+    if args.bframes > 1 {
         bail!(
-            "--bframes > 0 is not supported in bench_srsv2; keep --bframes 0 (B syntax is covered by libsrs_video unit tests)"
+            "only --bframes 0 or 1 is supported in this experimental slice (got {})",
+            args.bframes
         );
+    }
+    if args.bframes == 1 {
+        if args.reference_frames < 2 {
+            bail!("--bframes 1 requires --reference-frames >= 2");
+        }
+        if args.frames < 3 {
+            bail!("--bframes 1 requires --frames >= 3");
+        }
+        if !args.width.is_multiple_of(16) || !args.height.is_multiple_of(16) {
+            bail!("--bframes 1 requires width and height divisible by 16");
+        }
+        if args.sweep || args.compare_residual_modes {
+            bail!("--bframes 1 cannot be combined with --sweep or --compare-residual-modes");
+        }
     }
     Ok(())
 }
@@ -708,6 +747,19 @@ struct PassNumbers {
     legacy_explicit_total_payload_bytes: Option<u64>,
     aq_last: SrsV2AqEncodeStats,
     motion_agg: MotionAgg,
+    /// `frame_index` per encoded payload (decode order).
+    decode_order_frame_indices: Vec<u32>,
+    /// Display order `0 .. frames-1`.
+    display_order_frame_indices: Vec<u32>,
+    bframes_requested: u32,
+    bframes_used: u32,
+    decode_order_count: u32,
+    p_anchor_count: u32,
+    avg_anchor_p_bytes: f64,
+    bframe_psnr_y: f64,
+    bframe_ssim_y: f64,
+    unsupported_bframe_reason: Option<String>,
+    bframe_mode_note: String,
 }
 
 fn aq_report_from_pass(settings: &SrsV2EncodeSettings, aq: &SrsV2AqEncodeStats) -> AqBenchReport {
@@ -789,6 +841,305 @@ fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> Mot
         additional_subpel_evaluations_total: m.additional_subpel_evaluations,
         avg_fractional_mv_qpel_per_mb: avg_frac,
     }
+}
+
+#[derive(Clone, Copy)]
+enum BenchEmitKind {
+    I,
+    P,
+    B,
+}
+
+/// Decode-order GOP: *I₀ → P₂ → B₁ → P₄ → B₃ → …*; trailing indices encode as **P** only.
+fn b_gop_emit_schedule(n: u32) -> Vec<(u32, BenchEmitKind)> {
+    let nu = n as usize;
+    debug_assert!(nu >= 3);
+    let mut schedule = vec![
+        (0_u32, BenchEmitKind::I),
+        (2, BenchEmitKind::P),
+        (1, BenchEmitKind::B),
+    ];
+    let mut covered: HashSet<u32> = [0, 1, 2].into_iter().collect();
+    let mut m = 1_usize;
+    while 2 * m + 2 < nu {
+        let pfi = (2 * m + 2) as u32;
+        let bfi = (2 * m + 1) as u32;
+        schedule.push((pfi, BenchEmitKind::P));
+        schedule.push((bfi, BenchEmitKind::B));
+        covered.insert(pfi);
+        covered.insert(bfi);
+        m += 1;
+    }
+    let mut tail: Vec<u32> = (0..n).filter(|fi| !covered.contains(fi)).collect();
+    tail.sort_unstable();
+    for fi in tail {
+        schedule.push((fi, BenchEmitKind::P));
+    }
+    schedule
+}
+
+fn run_srsv2_pass(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    settings: &SrsV2EncodeSettings,
+    expected_frame: usize,
+) -> Result<PassNumbers> {
+    if args.bframes == 1 {
+        run_srsv2_numbers_b_gop(args, seq, raw, settings, expected_frame)
+    } else {
+        run_srsv2_numbers(args, seq, raw, settings, expected_frame)
+    }
+}
+
+fn run_srsv2_numbers_b_gop(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    settings: &SrsV2EncodeSettings,
+    expected_frame: usize,
+) -> Result<PassNumbers> {
+    let n = args.frames;
+    let nu = n as usize;
+    let alt_on = parse_alt_ref_flag(&args.alt_ref)?;
+    if alt_on && seq.max_ref_frames < 2 {
+        bail!("--alt-ref on requires --reference-frames >= 2");
+    }
+
+    let schedule = b_gop_emit_schedule(n);
+    let b_fis: Vec<u32> = schedule
+        .iter()
+        .filter(|(_, k)| matches!(k, BenchEmitKind::B))
+        .map(|(fi, _)| *fi)
+        .collect();
+
+    let mut rc =
+        SrsV2RateController::new(settings, args.fps.max(1), 1).map_err(|e| anyhow!("{e}"))?;
+    let t0 = Instant::now();
+    let mut mgr = SrsV2ReferenceManager::new(seq.max_ref_frames).map_err(|e| anyhow!("{e}"))?;
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    let mut byte_hist: Vec<u64> = Vec::new();
+    let mut qp_hist: Vec<u8> = Vec::new();
+    let mut psnr_src_frame: Vec<Option<u32>> = Vec::new();
+    let mut enc_stats = ResidualEncodeStats::default();
+    let mut prev: Option<PreviousFrameRcStats> = None;
+    let mut aq_last = SrsV2AqEncodeStats::default();
+    let mut motion_agg = MotionAgg::default();
+    let mut anchor_p_payload_bytes: Vec<u64> = Vec::new();
+    let half_b = matches!(settings.subpel_mode, SrsV2SubpelMode::HalfPel);
+
+    for &(fi, kind) in &schedule {
+        let qp = rc.qp_for_frame(fi, prev);
+        let frame = load_yuv420_frame(raw, expected_frame, fi, args.width, args.height)?;
+        let mut aq_frame = SrsV2AqEncodeStats::default();
+        let mut motion_frame = SrsV2MotionEncodeStats::default();
+        let payload = match kind {
+            BenchEmitKind::I => encode_yuv420_inter_payload(
+                seq,
+                &frame,
+                None,
+                fi,
+                qp,
+                settings,
+                Some(&mut enc_stats),
+                Some(&mut aq_frame),
+                Some(&mut motion_frame),
+            )
+            .map_err(|e| anyhow!("SRSV2 encode I {fi}: {e}"))?,
+            BenchEmitKind::P => {
+                let pl = encode_yuv420_inter_payload(
+                    seq,
+                    &frame,
+                    mgr.primary_ref(),
+                    fi,
+                    qp,
+                    settings,
+                    Some(&mut enc_stats),
+                    Some(&mut aq_frame),
+                    Some(&mut motion_frame),
+                )
+                .map_err(|e| anyhow!("SRSV2 encode P {fi}: {e}"))?;
+                anchor_p_payload_bytes.push(pl.len() as u64);
+                let is_p_wire = matches!(pl.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9));
+                if is_p_wire {
+                    motion_agg.sad_evaluations += motion_frame.sad_evaluations;
+                    motion_agg.skip_subblocks += motion_frame.skip_subblocks;
+                    motion_agg.nonzero_motion_macroblocks +=
+                        motion_frame.nonzero_motion_macroblocks as u64;
+                    motion_agg.sum_mv_l1 += motion_frame.sum_mv_l1;
+                    motion_agg.p_frames += 1;
+                    let mb = (seq.width / 16) as u64 * (seq.height / 16) as u64;
+                    motion_agg.p_macroblocks_total += mb;
+                    motion_agg.subpel_blocks_tested += motion_frame.subpel_blocks_tested;
+                    motion_agg.subpel_blocks_selected += motion_frame.subpel_blocks_selected;
+                    motion_agg.additional_subpel_evaluations +=
+                        motion_frame.additional_subpel_evaluations;
+                    motion_agg.sum_abs_frac_qpel += motion_frame.sum_abs_frac_qpel;
+                }
+                pl
+            }
+            BenchEmitKind::B => {
+                let ref_a = mgr
+                    .frame_at_slot_index(1)
+                    .map_err(|e| anyhow!("B backward ref: {e}"))?;
+                let ref_b = mgr
+                    .frame_at_slot_index(0)
+                    .map_err(|e| anyhow!("B forward ref: {e}"))?;
+                encode_yuv420_b_payload(
+                    seq,
+                    &frame,
+                    ref_a,
+                    ref_b,
+                    fi,
+                    qp,
+                    1,
+                    0,
+                    BBlendModeWire::Average,
+                    half_b,
+                )
+                .map_err(|e| anyhow!("SRSV2 encode B {fi}: {e}"))?
+            }
+        };
+
+        aq_last = aq_frame;
+        let is_i = matches!(payload.get(3).copied(), Some(1 | 3 | 7));
+        qp_hist.push(qp);
+        byte_hist.push(payload.len() as u64);
+        rc.observe_frame(fi, payload.len(), is_i);
+        decode_yuv420_srsv2_payload_managed(seq, &payload, &mut mgr)
+            .map_err(|e| anyhow!("SRSV2 reference refresh {fi}: {e}"))?;
+        payloads.push(payload);
+        psnr_src_frame.push(Some(fi));
+        prev = Some(PreviousFrameRcStats {
+            encoded_bytes: byte_hist.last().copied().unwrap_or(0) as u32,
+            is_keyframe: is_i,
+        });
+
+        if alt_on && matches!(kind, BenchEmitKind::I) {
+            let alt = encode_yuv420_alt_ref_payload(seq, &frame, fi, qp, 1)
+                .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
+            decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
+                .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
+            byte_hist.push(alt.len() as u64);
+            payloads.push(alt);
+            psnr_src_frame.push(None);
+            qp_hist.push(qp);
+        }
+    }
+
+    let enc_secs = t0.elapsed().as_secs_f64();
+    let ylen = (args.width * args.height) as usize;
+    let mut dec_by_frame = vec![vec![0_u8; ylen]; nu];
+    let mut written = vec![false; nu];
+    let mut decode_order_frame_indices: Vec<u32> = Vec::new();
+    let t1 = Instant::now();
+    let mut mgr_dec = SrsV2ReferenceManager::new(seq.max_ref_frames).map_err(|e| anyhow!("{e}"))?;
+    for pl in &payloads {
+        let dec = decode_yuv420_srsv2_payload_managed(seq, pl, &mut mgr_dec)
+            .map_err(|e| anyhow!("SRSV2 decode: {e}"))?;
+        if !dec.is_displayable {
+            continue;
+        }
+        decode_order_frame_indices.push(dec.frame_index);
+        let idx = dec.frame_index as usize;
+        if idx >= nu {
+            bail!(
+                "decoded display frame_index {} out of range for --frames {}",
+                dec.frame_index,
+                n
+            );
+        }
+        if written[idx] {
+            bail!(
+                "duplicate decoded display frame_index {} (benchmark requires unique indices)",
+                dec.frame_index
+            );
+        }
+        written[idx] = true;
+        dec_by_frame[idx] = dec.yuv.y.samples.clone();
+    }
+    for (idx, filled) in written.iter().enumerate() {
+        if !filled {
+            bail!(
+                "missing decoded display frame index {idx}; cannot compute display-order metrics"
+            );
+        }
+    }
+
+    let mut src_luma = Vec::with_capacity(ylen * nu);
+    let mut dec_luma = Vec::with_capacity(ylen * nu);
+    for fi in 0..n {
+        src_luma.extend_from_slice(frame_luma_slice(
+            raw,
+            expected_frame,
+            fi,
+            args.width,
+            args.height,
+        ));
+        dec_luma.extend_from_slice(&dec_by_frame[fi as usize]);
+    }
+    let psnr_y = psnr_u8(&src_luma, &dec_luma, 255.0)?;
+    let ssim_y = avg_ssim_per_frame(&src_luma, &dec_luma, args.width, args.height, n)?;
+    let dec_secs = t1.elapsed().as_secs_f64();
+
+    let mut b_psnr_acc = 0.0_f64;
+    for fi in &b_fis {
+        let s = frame_luma_slice(raw, expected_frame, *fi, args.width, args.height);
+        b_psnr_acc += psnr_u8(s, &dec_by_frame[*fi as usize], 255.0).map_err(|e| anyhow!("{e}"))?;
+    }
+    let mut b_ssim_acc = 0.0_f64;
+    for fi in &b_fis {
+        let s = frame_luma_slice(raw, expected_frame, *fi, args.width, args.height);
+        b_ssim_acc += ssim_u8_simple(
+            s,
+            &dec_by_frame[*fi as usize],
+            args.width as usize,
+            args.height as usize,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
+    }
+
+    let bframe_psnr_y = if b_fis.is_empty() {
+        0.0
+    } else {
+        b_psnr_acc / b_fis.len() as f64
+    };
+    let bframe_ssim_y = if b_fis.is_empty() {
+        0.0
+    } else {
+        b_ssim_acc / b_fis.len() as f64
+    };
+
+    let display_order_frame_indices: Vec<u32> = (0..n).collect();
+    let p_anchor_count = anchor_p_payload_bytes.len() as u32;
+    let avg_anchor_p_bytes = avg_u64(&anchor_p_payload_bytes);
+    let decode_order_count = decode_order_frame_indices.len() as u32;
+
+    Ok(PassNumbers {
+        qp_hist,
+        byte_hist,
+        enc_stats,
+        enc_secs,
+        dec_secs,
+        payloads,
+        psnr_src_frame,
+        psnr_y,
+        ssim_y,
+        legacy_explicit_total_payload_bytes: None,
+        aq_last,
+        motion_agg,
+        decode_order_frame_indices,
+        display_order_frame_indices,
+        bframes_requested: args.bframes,
+        bframes_used: 1,
+        decode_order_count,
+        p_anchor_count,
+        avg_anchor_p_bytes,
+        bframe_psnr_y,
+        bframe_ssim_y,
+        unsupported_bframe_reason: None,
+        bframe_mode_note: "experimental bench GOP: decode-order I₀,P₂,B₁,…; zero-MV B average blend; metrics are display-order".to_string(),
+    })
 }
 
 fn run_srsv2_numbers(
@@ -882,14 +1233,38 @@ fn run_srsv2_numbers(
 
     let t1 = Instant::now();
     let ylen = (args.width * args.height) as usize;
-    let mut dec_by_frame = vec![vec![0u8; ylen]; args.frames as usize];
+    let nf = args.frames as usize;
+    let mut dec_by_frame = vec![vec![0u8; ylen]; nf];
+    let mut written = vec![false; nf];
+    let mut decode_order_frame_indices: Vec<u32> = Vec::new();
     let mut mgr_dec = SrsV2ReferenceManager::new(seq.max_ref_frames)
         .map_err(|e| anyhow!("decode manager: {e}"))?;
-    for (pl, src_ix) in payloads.iter().zip(psnr_src_frame.iter()) {
+    for pl in &payloads {
         let dec = decode_yuv420_srsv2_payload_managed(seq, pl, &mut mgr_dec)
             .map_err(|e| anyhow!("SRSV2 decode: {e}"))?;
-        if let Some(fi) = src_ix {
-            dec_by_frame[*fi as usize] = dec.yuv.y.samples.clone();
+        if !dec.is_displayable {
+            continue;
+        }
+        decode_order_frame_indices.push(dec.frame_index);
+        let idx = dec.frame_index as usize;
+        if idx >= nf {
+            bail!(
+                "decoded frame_index {} out of range for --frames {}",
+                dec.frame_index,
+                args.frames
+            );
+        }
+        if written[idx] {
+            bail!("duplicate decoded display frame_index {}", dec.frame_index);
+        }
+        written[idx] = true;
+        dec_by_frame[idx] = dec.yuv.y.samples.clone();
+    }
+    for (idx, filled) in written.iter().enumerate() {
+        if !filled {
+            bail!(
+                "missing decoded display frame index {idx}; cannot compute display-order metrics"
+            );
         }
     }
     let mut src_luma = Vec::with_capacity(ylen * args.frames as usize);
@@ -940,6 +1315,15 @@ fn run_srsv2_numbers(
             Some(sum)
         };
 
+    let mut p_wire_bytes: Vec<u64> = Vec::new();
+    for pl in &payloads {
+        if matches!(pl.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9)) {
+            p_wire_bytes.push(pl.len() as u64);
+        }
+    }
+    let display_order_frame_indices: Vec<u32> = (0..args.frames).collect();
+    let decode_order_count = decode_order_frame_indices.len() as u32;
+
     Ok(PassNumbers {
         qp_hist,
         byte_hist,
@@ -953,6 +1337,17 @@ fn run_srsv2_numbers(
         legacy_explicit_total_payload_bytes,
         aq_last,
         motion_agg,
+        decode_order_frame_indices,
+        display_order_frame_indices,
+        bframes_requested: args.bframes,
+        bframes_used: 0,
+        decode_order_count,
+        p_anchor_count: p_wire_bytes.len() as u32,
+        avg_anchor_p_bytes: avg_u64(&p_wire_bytes),
+        bframe_psnr_y: 0.0,
+        bframe_ssim_y: 0.0,
+        unsupported_bframe_reason: None,
+        bframe_mode_note: String::new(),
     })
 }
 
@@ -1019,7 +1414,7 @@ fn build_deblock_bench_report(
         let mut seq_off = seq.clone();
         seq_off.disable_loop_filter = true;
         seq_off.deblock_strength = 0;
-        let numbers_off = run_srsv2_numbers(args, &seq_off, raw, settings, expected_frame)?;
+        let numbers_off = run_srsv2_pass(args, &seq_off, raw, settings, expected_frame)?;
         rep.psnr_y_filter_disabled_respin = Some(numbers_off.psnr_y);
         rep.ssim_y_filter_disabled_respin = Some(numbers_off.ssim_y);
         rep.note = "Respin uses disable_loop_filter=true (different bitstream than primary). Deblocking can lower PSNR-Y while improving subjective block edges; compare numbers cautiously.".to_string();
@@ -1084,6 +1479,17 @@ fn pass_to_details(
         aq: Some(aq_report_from_pass(settings, &p.aq_last)),
         motion: Some(motion_report_from_pass(settings, &p.motion_agg)),
         deblock,
+        bframes_requested: p.bframes_requested,
+        bframes_used: p.bframes_used,
+        decode_order_frame_indices: p.decode_order_frame_indices.clone(),
+        display_order_frame_indices: p.display_order_frame_indices.clone(),
+        decode_order_count: p.decode_order_count,
+        p_anchor_count: p.p_anchor_count,
+        avg_anchor_p_bytes: p.avg_anchor_p_bytes,
+        unsupported_bframe_reason: p.unsupported_bframe_reason.clone(),
+        bframe_mode_note: p.bframe_mode_note.clone(),
+        bframe_psnr_y: p.bframe_psnr_y,
+        bframe_ssim_y: p.bframe_ssim_y,
     }
 }
 
@@ -1118,7 +1524,7 @@ fn run_single_report(
 ) -> Result<BenchReport> {
     let re = parse_residual_entropy(&args.residual_entropy)?;
     let settings = build_settings(args, re)?;
-    let numbers = run_srsv2_numbers(args, seq, raw, &settings, expected_frame)?;
+    let numbers = run_srsv2_pass(args, seq, raw, &settings, expected_frame)?;
     let deblock = build_deblock_bench_report(args, seq, &settings, raw, expected_frame, &numbers)?;
     let details = pass_to_details(
         args,
@@ -1227,7 +1633,7 @@ fn run_compare_residual_report(
             ResidualEntropy::Rans => "rans",
         };
 
-        match run_srsv2_numbers(args, seq, raw, &st, expected_frame) {
+        match run_srsv2_pass(args, seq, raw, &st, expected_frame) {
             Ok(numbers) => {
                 let row = pass_to_row(args, label, &numbers);
                 let deblock =
@@ -1316,7 +1722,7 @@ fn run_sweep_file(
                 a.motion_radius = mr;
                 a.residual_entropy = re_str.to_string();
                 let settings = build_settings(&a, re)?;
-                if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
+                if let Ok(numbers) = run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
                     let row = pass_to_row(&a, "SRSV2", &numbers);
                     let deblock = build_deblock_bench_report(
                         &a,
@@ -1359,7 +1765,7 @@ fn run_sweep_file(
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
+            if let Ok(numbers) = run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
                 let row = pass_to_row(&a, "SRSV2", &numbers);
                 let deblock =
                     build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
@@ -1397,7 +1803,7 @@ fn run_sweep_file(
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
+            if let Ok(numbers) = run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
                 let row = pass_to_row(&a, "SRSV2", &numbers);
                 let deblock =
                     build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
@@ -1429,7 +1835,7 @@ fn run_sweep_file(
                 Ok(s) => s,
                 Err(_) => continue,
             };
-            if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
+            if let Ok(numbers) = run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
                 let row = pass_to_row(&a, "SRSV2", &numbers);
                 let deblock =
                     build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
@@ -1827,6 +2233,48 @@ fn to_markdown(r: &BenchReport) -> String {
         r.srsv2.avg_i_bytes,
         r.srsv2.avg_p_bytes
     ));
+    let sv = &r.srsv2;
+    out.push_str(&format!(
+        "- bframes_requested: {}\n- bframes_used: {}\n- decode_order_count: {}\n- decode_order_frame_indices: {:?}\n- display_order_frame_indices: {:?}\n- p_anchor_count: {}\n- avg_anchor_P_bytes: {:.1}\n- bframe_count (wire): {}\n- avg_B_bytes: {:.1}\n- alt_ref_count: {}\n- avg_altref_bytes: {:.1}\n- bframe_psnr_y (B-only aggregate): {:.2}\n- bframe_ssim_y (B-only aggregate): {:.4}\n",
+        sv.bframes_requested,
+        sv.bframes_used,
+        sv.decode_order_count,
+        sv.decode_order_frame_indices,
+        sv.display_order_frame_indices,
+        sv.p_anchor_count,
+        sv.avg_anchor_p_bytes,
+        sv.bframe_count,
+        sv.avg_bframe_bytes,
+        sv.alt_ref_count,
+        sv.avg_altref_bytes,
+        sv.bframe_psnr_y,
+        sv.bframe_ssim_y,
+    ));
+    if let Some(reason) = &sv.unsupported_bframe_reason {
+        out.push_str(&format!("- unsupported_bframe_reason: {reason}\n"));
+    }
+    if !sv.bframe_mode_note.is_empty() {
+        out.push_str(&format!("- bframe_mode_note: {}\n", sv.bframe_mode_note));
+    }
+    out.push_str("\n### Frame kind sizes (wire)\n\n");
+    out.push_str("| Frame kind | Count | Avg bytes |\n");
+    out.push_str("|---|---:|---:|\n");
+    out.push_str(&format!(
+        "| I | {} | {:.1} |\n",
+        sv.keyframes, sv.avg_i_bytes
+    ));
+    out.push_str(&format!(
+        "| P anchor | {} | {:.1} |\n",
+        sv.p_anchor_count, sv.avg_anchor_p_bytes
+    ));
+    out.push_str(&format!(
+        "| B | {} | {:.1} |\n",
+        sv.bframe_count, sv.avg_bframe_bytes
+    ));
+    out.push_str(&format!(
+        "| AltRef | {} | {:.1} |\n",
+        sv.alt_ref_count, sv.avg_altref_bytes
+    ));
     out.push_str(&format!(
         "- residual_entropy setting: {}\n- intra explicit blocks: {}\n- intra rANS blocks: {}\n- P explicit chunks: {}\n- P rANS chunks: {}\n",
         r.srsv2.residual_entropy,
@@ -2050,6 +2498,199 @@ mod tests {
     }
 
     #[test]
+    fn bframes_one_requires_reference_frames_at_least_two() {
+        let mut a = Args {
+            input: PathBuf::from("nope"),
+            width: 16,
+            height: 16,
+            frames: 3,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 1,
+            alt_ref: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+        };
+        assert!(validate_args(&a).is_err());
+        a.reference_frames = 2;
+        assert!(validate_args(&a).is_ok());
+    }
+
+    #[test]
+    fn b_gop_emit_schedule_three_frames_is_decode_order_i0_p2_b1() {
+        let s = b_gop_emit_schedule(3);
+        assert_eq!(
+            s.iter().map(|(fi, _)| *fi).collect::<Vec<_>>(),
+            vec![0, 2, 1]
+        );
+    }
+
+    #[test]
+    fn run_srsv2_pass_b_gop_three_frames_decode_vs_display_indices() {
+        use quality_metrics::DisplayReorderBuffer;
+
+        let w = 16u32;
+        let h = 16u32;
+        let frames = 3u32;
+        let fb = yuv420_frame_bytes(w, h).unwrap();
+        let raw: Vec<u8> = (0..fb * frames as usize).map(|i| (i % 251) as u8).collect();
+        let args = Args {
+            input: PathBuf::from("nope"),
+            width: w,
+            height: h,
+            frames,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 8,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 1,
+            alt_ref: "off".to_string(),
+            gop: 0,
+            reference_frames: 2,
+        };
+        validate_args(&args).unwrap();
+        let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
+        let seq = build_seq_header(&args, &settings);
+        let numbers = run_srsv2_pass(&args, &seq, &raw, &settings, fb).unwrap();
+        assert_eq!(numbers.display_order_frame_indices, vec![0, 1, 2]);
+        assert_eq!(numbers.decode_order_frame_indices, vec![0, 2, 1]);
+        assert_eq!(numbers.bframes_used, 1);
+        assert_eq!(numbers.bframes_requested, 1);
+        assert!(numbers.psnr_y.is_finite());
+        assert!(numbers.ssim_y.is_finite());
+        assert!(numbers.bframe_psnr_y.is_finite());
+
+        let ylen = (w * h) as usize;
+        let mut buf = DisplayReorderBuffer::new(8);
+        for fi in [0u32, 2, 1] {
+            let src = frame_luma_slice(&raw, fb, fi, w, h).to_vec();
+            buf.insert(fi, src).unwrap();
+        }
+        let flat = buf.flatten_expected(&[0, 1, 2], ylen).unwrap();
+        let mut exp = Vec::new();
+        for fi in 0..frames {
+            exp.extend_from_slice(frame_luma_slice(&raw, fb, fi, w, h));
+        }
+        assert_eq!(flat, exp);
+    }
+
+    #[test]
+    fn run_srsv2_pass_ip_only_keeps_bench_aggregate_fields_zero() {
+        let w = 16u32;
+        let h = 16u32;
+        let frames = 2u32;
+        let fb = yuv420_frame_bytes(w, h).unwrap();
+        let raw: Vec<u8> = vec![128u8; fb * frames as usize];
+        let args = Args {
+            input: PathBuf::from("nope"),
+            width: w,
+            height: h,
+            frames,
+            fps: 30,
+            qp: 28,
+            keyint: 1,
+            motion_radius: 8,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+        };
+        let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
+        let seq = build_seq_header(&args, &settings);
+        let numbers = run_srsv2_pass(&args, &seq, &raw, &settings, fb).unwrap();
+        assert_eq!(numbers.bframes_used, 0);
+        assert_eq!(numbers.bframe_psnr_y, 0.0);
+        assert_eq!(numbers.bframe_ssim_y, 0.0);
+        assert_eq!(numbers.decode_order_frame_indices, vec![0, 1]);
+    }
+
+    #[test]
     fn ffmpeg_probe_is_safe() {
         let _ = ffmpeg_available();
     }
@@ -2149,6 +2790,17 @@ mod tests {
                     ssim_y_filter_disabled_respin: None,
                     note: String::new(),
                 },
+                bframes_requested: 0,
+                bframes_used: 0,
+                decode_order_frame_indices: vec![0],
+                display_order_frame_indices: vec![0],
+                p_anchor_count: 0,
+                avg_anchor_p_bytes: 0.0,
+                unsupported_bframe_reason: None,
+                bframe_mode_note: String::new(),
+                bframe_psnr_y: 0.0,
+                bframe_ssim_y: 0.0,
+                decode_order_count: 1,
             },
             x264: None,
             table: vec![CodecRow {
@@ -2217,6 +2869,17 @@ mod tests {
                 aq: None,
                 motion: None,
                 deblock: DeblockBenchReport::default(),
+                bframes_requested: 0,
+                bframes_used: 0,
+                decode_order_frame_indices: Vec::new(),
+                display_order_frame_indices: Vec::new(),
+                p_anchor_count: 0,
+                avg_anchor_p_bytes: 0.0,
+                unsupported_bframe_reason: None,
+                bframe_mode_note: String::new(),
+                bframe_psnr_y: 0.0,
+                bframe_ssim_y: 0.0,
+                decode_order_count: 0,
             },
             x264: None,
             table: vec![],
@@ -2264,6 +2927,17 @@ mod tests {
                     aq: None,
                     motion: None,
                     deblock: DeblockBenchReport::default(),
+                    bframes_requested: 0,
+                    bframes_used: 0,
+                    decode_order_frame_indices: Vec::new(),
+                    display_order_frame_indices: Vec::new(),
+                    p_anchor_count: 0,
+                    avg_anchor_p_bytes: 0.0,
+                    unsupported_bframe_reason: None,
+                    bframe_mode_note: String::new(),
+                    bframe_psnr_y: 0.0,
+                    bframe_ssim_y: 0.0,
+                    decode_order_count: 0,
                 },
             }]),
             sweep: None,
@@ -2325,6 +2999,17 @@ mod tests {
                     aq: None,
                     motion: None,
                     deblock: DeblockBenchReport::default(),
+                    bframes_requested: 0,
+                    bframes_used: 0,
+                    decode_order_frame_indices: Vec::new(),
+                    display_order_frame_indices: Vec::new(),
+                    p_anchor_count: 0,
+                    avg_anchor_p_bytes: 0.0,
+                    unsupported_bframe_reason: None,
+                    bframe_mode_note: String::new(),
+                    bframe_psnr_y: 0.0,
+                    bframe_ssim_y: 0.0,
+                    decode_order_count: 0,
                 },
             }],
             git_commit: None,

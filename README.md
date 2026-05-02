@@ -29,7 +29,7 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 | `.528` container | **Partial / working** | v2 primary; hostile-input limits in I/O (`libsrs_container`) |
 | mux / demux | **Partial / working** | `libsrs_mux` / `libsrs_demux`; cues + index; mux prefers `.srsv2` when elementary video is present |
 | audio codec | **Working prototype** | v2 LPC stream decode in `libsrs_audio` |
-| video codec | **SRSV2 default** | Modern native **8K-first** direction (`docs/srsv2_design_targets.md`). Today: CLI square-gray → `.srsv2` **single intra** (`FR2\x01`). Encoders may emit **intra with adaptive residual entropy** (`FR2\x03`, experimental) and optional **block-level QP deltas** (`FR2\x07`–`\x09`, experimental; see `docs/video_bitstream_v2.md`). **Native import** (SRSV2) uses **`max_ref_frames = 1`** and **P** (`FR2\x02` / **`FR2\x04`** integer MV; optional experimental **`FR2\x05` / `FR2\x06`** half-pel; **`FR2\x08` / `FR2\x09`** with block AQ — see `docs/motion_search.md`). **Experimental B** syntax (`FR2` rev **10**/**11**) is implemented **parser-safe** in `libsrs_video` tests only for now — **not** a claim of parity with mature codecs. Profiles **Baseline…Research** on-wire; most helpers still emit **Main**. **First-pass deterministic rate control** exists for benchmark / encoder-side QP selection (`SrsV2RateController`, `bench_srsv2`; not production-tuned). **Full quarter-pel, production B/GOP, GPU encode/decode, and OS audio/video output** remain roadmap. |
+| video codec | **SRSV2 default** | Modern native **8K-first** direction (`docs/srsv2_design_targets.md`). Today: CLI square-gray → `.srsv2` **single intra** (`FR2\x01`). Encoders may emit **intra with adaptive residual entropy** (`FR2\x03`, experimental) and optional **block-level QP deltas** (`FR2\x07`–`\x09`, experimental; see `docs/video_bitstream_v2.md`). **Native import** (SRSV2) uses **`max_ref_frames = 1`** and **P** (`FR2\x02` / **`FR2\x04`** integer MV; optional experimental **`FR2\x05` / `FR2\x06`** half-pel; **`FR2\x08` / `FR2\x09`** with block AQ — see `docs/motion_search.md`). **Experimental B** (`FR2` rev **10**/**11**) and **alt-ref** (rev **12**) are **parser-safe / baseline** in `libsrs_video`, playback, and optional **`bench_srsv2 --bframes 1`** GOP measurements — **not** parity with mature codecs and **not** a superiority claim vs H.264/HEVC. Profiles **Baseline…Research** on-wire; most helpers still emit **Main**. **First-pass deterministic rate control** exists for benchmark / encoder-side QP selection (`SrsV2RateController`, `bench_srsv2`; not production-tuned). **Full quarter-pel, production B/GOP tuning, GPU encode/decode, and OS audio/video output** remain roadmap. |
 | import / transcode | **Native pipeline partial** | Encode/import/transcode default to SRSV2 video; `--codec srsv1` selects legacy; FFmpeg path feature-gated |
 | playback | **Decode-preview** | `PlaybackSession` uses a bounded **`SrsV2ReferenceManager`** for `codec_id` **3**: **intra** (`FR2` rev **1**/**3**/**7**), experimental **P** (rev **2**/**4**/**5**/**6**/**8**/**9**), experimental **B** (`FR2` rev **10**/**11**) when **`max_ref_frames ≥ 2`** and the stream’s **packet order** supplies both anchors before the **B** (typical **decode order** *I₀ → P₂ → B₁* — not presentation order), experimental **alt-ref** (rev **12**, non-displayable). **B** with **`max_ref_frames < 2`** returns a clear **unsupported** error. SRSV1 (`codec_id` **1**) stays grayscale intra; **SRSA audio** is `codec_id` **2**. OS A/V output is **not** implemented; `srs_player` shows last-frame texture; `srs_cli play` smoke-decodes |
 | GPU | **Planned** | No device presentation or GPU decode here |
@@ -37,6 +37,8 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 | admin / licensing | **Partial / working** | Needs production hardening |
 
 Further playback architecture: `docs/playback_pipeline.md`.
+
+**SRSV2 experimental status (short):** **B-frame** syntax baseline — experimental (rev **10**/integer MV, rev **11**/half-pel). **Alt-ref** (rev **12**) — experimental non-display reference. **Benchmark B-GOP** (`bench_srsv2 --bframes 1`, decode-order *I₀→P₂→B₁…*, metrics in display/`frame_index` order) — implemented for lab use; default remains **`--bframes 0`**. No claim that SRSV2 “beats” H.264 or other codecs.
 
 ### Benchmark tooling (optional, engineering measurements)
 
@@ -57,6 +59,19 @@ Further playback architecture: `docs/playback_pipeline.md`.
     --residual-entropy auto \
     --subpel off --subpel-refinement-radius 1 \
     --report-json var/bench/flat_srsv2.json --report-md var/bench/flat_srsv2.md
+  ```
+
+- **Experimental B-GOP benchmark** (`--bframes 1` only in this slice; requires **`--reference-frames ≥ 2`**, **`--frames ≥ 3`**, 16-aligned size; mutually exclusive with **`--sweep`** / **`--compare-residual-modes`**):
+
+  ```bash
+  cargo run -p quality_metrics --bin gen_synthetic_yuv -- \
+    --pattern moving-square --width 128 --height 128 --frames 30 --fps 30 --seed 2 \
+    --out var/bench/mov.yuv --meta var/bench/mov.json
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/mov.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 --residual-entropy auto \
+    --reference-frames 2 --bframes 1 \
+    --report-json var/bench/mov_b.json --report-md var/bench/mov_b.md
   ```
 
 - **Optional libx264 comparison** (requires `ffmpeg` on `PATH`):

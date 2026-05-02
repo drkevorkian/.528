@@ -1,3 +1,5 @@
+pub mod display_order;
+pub use display_order::{DisplayOrderError, DisplayReorderBuffer};
 pub mod synthetic;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -29,7 +29,7 @@ These are **one machine’s** sanity snapshots before enabling experimental **B*
 | auto / off / half | ~24.3 KiB | mid-26 dB | ~0.989 |
 | auto / block-delta / half | ~25.2 KiB | mid-26 dB | ~0.989 |
 
-Optional **`bench_srsv2`** flags (**defaults unchanged**): `--bframes N` is accepted on the CLI for forward compatibility but **`N > 0` exits with an explicit unsupported error** (B syntax is covered by `libsrs_video` unit tests, not this bench yet). **`--alt-ref off|on`** (requires `--reference-frames >= 2` when **on**), **`--gop N`** (reserved), **`--reference-frames N`** (sequence `max_ref_frames`, default **1**).
+Optional **`bench_srsv2`** flags (**defaults unchanged**): **`--bframes 0`** (default) keeps the historical **I/P** bench loop; **`--bframes 1`** runs an **experimental** decode-order GOP (*I₀→P₂→B₁→…*) with **`SrsV2ReferenceManager`** (**requires** **`--reference-frames ≥ 2`**, **`--frames ≥ 3`**, 16-aligned dimensions; **not** combinable with **`--sweep`** or **`--compare-residual-modes`**). **`--bframes > 1`** fails fast with a clear error in this slice. Reports include **`decode_order_frame_indices`** vs **`display_order_frame_indices`** and B-only quality aggregates; overall PSNR/SSIM are computed in **display** (`frame_index`) order. **`--alt-ref off|on`** (requires **`--reference-frames >= 2`** when **on**) inserts a non-display **rev 12** refresh after each bench **I** when **`--bframes 1`**; with **`--bframes 0`** it behaves as before (extra reference packet after keyframes). **`--gop N`** (reserved), **`--reference-frames N`** (sequence `max_ref_frames`, default **1**).
 
 ### Example: AQ + motion + skip flags (128×128 moving-square)
 
