@@ -22,6 +22,7 @@ pub mod rate_control;
 pub mod reference;
 pub mod residual_entropy;
 pub mod residual_tokens;
+pub mod subpel;
 
 pub use adaptive_quant::{
     resolve_frame_adaptive_qp, validate_adaptive_quant_settings, SrsV2AqEncodeStats,
@@ -36,8 +37,8 @@ pub use deblock::{
 pub use error::SrsV2Error;
 pub use frame::{DecodedVideoFrameV2, EncodedVideoPacketV2, VideoPlane, YuvFrame};
 pub use frame_codec::{
-    decode_yuv420_intra_payload, decode_yuv420_srsv2_payload, encode_yuv420_inter_payload,
-    encode_yuv420_intra_payload,
+    apply_reconstruction_filter_if_enabled, decode_yuv420_intra_payload,
+    decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
 };
 pub use model::{
     decode_sequence_header_v2, encode_sequence_header_v2, ChromaSiting, ColorPrimaries, ColorRange,
@@ -50,7 +51,7 @@ pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2EncodeSettings, SrsV2MotionSearchMode,
-    SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController,
+    SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode,
 };
 pub use reference::ReferenceFrameBuffer;
 

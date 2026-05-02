@@ -16,7 +16,7 @@ use libsrs_video::{
     decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, PixelFormat, PreviousFrameRcStats,
     ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats,
     SrsV2EncodeSettings, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
-    SrsV2RateControlMode, SrsV2RateController, VideoSequenceHeaderV2, YuvFrame,
+    SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -117,6 +117,13 @@ struct Args {
     /// Loop-filter strength byte in the sequence header (`0` = codec default when filter on); ignored when `--loop-filter off`.
     #[arg(long, default_value_t = 0)]
     deblock_strength: u8,
+
+    /// Experimental luma half-pel refinement: `off` (default, integer MV rev 2/4) or `half`.
+    #[arg(long, default_value = "off")]
+    subpel: String,
+
+    #[arg(long, default_value_t = 1)]
+    subpel_refinement_radius: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -207,6 +214,13 @@ struct MotionBenchReport {
     nonzero_motion_macroblocks_total: u64,
     avg_mv_l1_per_nonzero_mb: f64,
     p_frames: u32,
+    subpel_mode: String,
+    subpel_refinement_radius_effective: u8,
+    subpel_blocks_tested_total: u64,
+    subpel_blocks_selected_total: u64,
+    additional_subpel_evaluations_total: u64,
+    /// Mean fractional magnitude in quarter-pel units per macroblock (0 = integer-aligned).
+    avg_fractional_mv_qpel_per_mb: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -462,7 +476,23 @@ fn validate_args(args: &Args) -> Result<()> {
     parse_aq_mode(&args.aq)?;
     parse_motion_search_mode(&args.motion_search)?;
     parse_loop_filter(&args.loop_filter)?;
+    parse_subpel_mode(&args.subpel)?;
     Ok(())
+}
+
+fn parse_subpel_mode(s: &str) -> Result<SrsV2SubpelMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "off" => Ok(SrsV2SubpelMode::Off),
+        "half" => Ok(SrsV2SubpelMode::HalfPel),
+        _ => Err(anyhow!("--subpel must be off or half (got {s})")),
+    }
+}
+
+fn subpel_mode_cli_label(m: SrsV2SubpelMode) -> &'static str {
+    match m {
+        SrsV2SubpelMode::Off => "off",
+        SrsV2SubpelMode::HalfPel => "half",
+    }
 }
 
 fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeSettings> {
@@ -470,6 +500,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let aq_mode = parse_aq_mode(&args.aq)?;
     let motion_mode = parse_motion_search_mode(&args.motion_search)?;
     let loop_filter_mode = parse_loop_filter(&args.loop_filter)?;
+    let subpel_mode = parse_subpel_mode(&args.subpel)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -487,6 +518,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         motion_search_mode: motion_mode,
         early_exit_sad_threshold: args.early_exit_sad_threshold,
         enable_skip_blocks: args.enable_skip_blocks,
+        subpel_mode,
+        subpel_refinement_radius: args.subpel_refinement_radius,
         loop_filter_mode,
         deblock_strength: args.deblock_strength,
         ..Default::default()
@@ -504,6 +537,11 @@ struct MotionAgg {
     nonzero_motion_macroblocks: u64,
     sum_mv_l1: u64,
     p_frames: u32,
+    p_macroblocks_total: u64,
+    subpel_blocks_tested: u64,
+    subpel_blocks_selected: u64,
+    additional_subpel_evaluations: u64,
+    sum_abs_frac_qpel: u64,
 }
 
 struct PassNumbers {
@@ -541,6 +579,11 @@ fn aq_report_from_pass(settings: &SrsV2EncodeSettings, aq: &SrsV2AqEncodeStats) 
 fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> MotionBenchReport {
     let nz = m.nonzero_motion_macroblocks.max(1);
     let avg_mv = m.sum_mv_l1 as f64 / nz as f64;
+    let avg_frac = if m.p_macroblocks_total > 0 {
+        m.sum_abs_frac_qpel as f64 / m.p_macroblocks_total as f64
+    } else {
+        0.0
+    };
     MotionBenchReport {
         motion_search_mode: motion_mode_cli_label(settings.motion_search_mode).to_string(),
         motion_search_radius_effective: settings.clamped_motion_search_radius(),
@@ -551,6 +594,12 @@ fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> Mot
         nonzero_motion_macroblocks_total: m.nonzero_motion_macroblocks,
         avg_mv_l1_per_nonzero_mb: avg_mv,
         p_frames: m.p_frames,
+        subpel_mode: subpel_mode_cli_label(settings.subpel_mode).to_string(),
+        subpel_refinement_radius_effective: settings.clamped_subpel_refinement_radius(),
+        subpel_blocks_tested_total: m.subpel_blocks_tested,
+        subpel_blocks_selected_total: m.subpel_blocks_selected,
+        additional_subpel_evaluations_total: m.additional_subpel_evaluations,
+        avg_fractional_mv_qpel_per_mb: avg_frac,
     }
 }
 
@@ -594,13 +643,19 @@ fn run_srsv2_numbers(
         .map_err(|e| anyhow!("SRSV2 encode: {e}"))?;
 
         aq_last = aq_frame;
-        let is_p = matches!(payload.get(3).copied(), Some(2 | 4));
+        let is_p = matches!(payload.get(3).copied(), Some(2 | 4 | 5 | 6));
         if is_p {
             motion_agg.sad_evaluations += motion_frame.sad_evaluations;
             motion_agg.skip_subblocks += motion_frame.skip_subblocks;
             motion_agg.nonzero_motion_macroblocks += motion_frame.nonzero_motion_macroblocks as u64;
             motion_agg.sum_mv_l1 += motion_frame.sum_mv_l1;
             motion_agg.p_frames += 1;
+            let mb = (seq.width / 16) as u64 * (seq.height / 16) as u64;
+            motion_agg.p_macroblocks_total += mb;
+            motion_agg.subpel_blocks_tested += motion_frame.subpel_blocks_tested;
+            motion_agg.subpel_blocks_selected += motion_frame.subpel_blocks_selected;
+            motion_agg.additional_subpel_evaluations += motion_frame.additional_subpel_evaluations;
+            motion_agg.sum_abs_frac_qpel += motion_frame.sum_abs_frac_qpel;
         }
 
         let is_i = matches!(payload.get(3).copied(), Some(1 | 3));
@@ -770,7 +825,7 @@ fn pass_to_details(
     for pl in &p.payloads {
         match pl.get(3).copied() {
             Some(1 | 3) => i_bytes.push(pl.len() as u64),
-            Some(2 | 4) => p_bytes.push(pl.len() as u64),
+            Some(2 | 4 | 5 | 6) => p_bytes.push(pl.len() as u64),
             _ => {}
         }
     }
@@ -1101,6 +1156,44 @@ fn run_sweep_file(
                     aq: a.aq.clone(),
                     motion_search: a.motion_search.clone(),
                     sweep_variant: Some("extended-aq-motion".to_string()),
+                    row,
+                    details,
+                });
+            }
+        }
+
+        let subpel_grid = [
+            ("integer-diamond", "off", "diamond"),
+            ("halfpel-diamond", "half", "diamond"),
+            ("integer-exhaustive-small", "off", "exhaustive-small"),
+            ("halfpel-exhaustive-small", "half", "exhaustive-small"),
+        ];
+        for (label, sub_s, ms_s) in subpel_grid {
+            let mut a = args.clone();
+            a.qp = 28;
+            a.motion_radius = 8;
+            a.residual_entropy = "auto".to_string();
+            a.aq = "off".to_string();
+            a.motion_search = ms_s.to_string();
+            a.subpel = sub_s.to_string();
+            a.subpel_refinement_radius = 1;
+            let settings = match build_settings(&a, ResidualEntropy::Auto) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
+                let row = pass_to_row(&a, "SRSV2", &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details = pass_to_details(&a, &settings, "auto", &numbers, deblock);
+                sweep.push(SweepRunReport {
+                    qp: 28,
+                    residual_entropy: "auto".to_string(),
+                    motion_radius: 8,
+                    aq: a.aq.clone(),
+                    motion_search: a.motion_search.clone(),
+                    sweep_variant: Some(format!("subpel-{label}")),
                     row,
                     details,
                 });
@@ -1535,7 +1628,7 @@ fn to_markdown(r: &BenchReport) -> String {
         ));
     }
     if let Some(m) = &r.srsv2.motion {
-        out.push_str("\n### Motion search (integer-pel)\n\n");
+        out.push_str("\n### Motion search\n\n");
         out.push_str(&format!(
             "- mode: {}\n- radius (effective): {}\n- early_exit_sad_threshold: {}\n- enable_skip_blocks: {}\n- P-frames: {}\n- SAD evals (total): {}\n- skip subblocks (total): {}\n- nonzero-MV macroblocks (total): {}\n- avg |MV| L1 (nonzero MBs): {:.3}\n",
             m.motion_search_mode,
@@ -1547,6 +1640,15 @@ fn to_markdown(r: &BenchReport) -> String {
             m.skip_subblocks_total,
             m.nonzero_motion_macroblocks_total,
             m.avg_mv_l1_per_nonzero_mb
+        ));
+        out.push_str(&format!(
+            "- subpel: {} (refinement radius effective: {})\n- subpel blocks tested (total): {}\n- subpel blocks selected (total): {}\n- additional subpel SAD evals (total): {}\n- avg fractional |MV| (qpel units per MB): {:.4}\n",
+            m.subpel_mode,
+            m.subpel_refinement_radius_effective,
+            m.subpel_blocks_tested_total,
+            m.subpel_blocks_selected_total,
+            m.additional_subpel_evaluations_total,
+            m.avg_fractional_mv_qpel_per_mb
         ));
     }
     {
@@ -1620,6 +1722,8 @@ mod tests {
             sweep_extended: false,
             loop_filter: "off".to_string(),
             deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -1695,6 +1799,12 @@ mod tests {
                     nonzero_motion_macroblocks_total: 4,
                     avg_mv_l1_per_nonzero_mb: 3.5,
                     p_frames: 3,
+                    subpel_mode: "off".to_string(),
+                    subpel_refinement_radius_effective: 1,
+                    subpel_blocks_tested_total: 0,
+                    subpel_blocks_selected_total: 0,
+                    additional_subpel_evaluations_total: 0,
+                    avg_fractional_mv_qpel_per_mb: 0.0,
                 }),
                 deblock: DeblockBenchReport {
                     loop_filter_mode: "off".to_string(),
@@ -1728,6 +1838,7 @@ mod tests {
         assert!(js.contains("\"motion_search_mode\":\"diamond\""));
         assert!(js.contains("\"mode\":\"off\"") && js.contains("\"aq\""));
         assert!(js.contains("\"loop_filter_mode\":\"off\""));
+        assert!(js.contains("\"subpel_mode\":\"off\""));
     }
 
     #[test]
@@ -1887,6 +1998,8 @@ mod tests {
             sweep_extended: false,
             loop_filter: "off".to_string(),
             deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
@@ -1927,6 +2040,8 @@ mod tests {
             sweep_extended: false,
             loop_filter: "off".to_string(),
             deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
         };
         assert!(validate_args(&a).is_err());
         a.aq = "off".to_string();

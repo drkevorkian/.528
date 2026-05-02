@@ -6,28 +6,28 @@
 
 **SRSV2** is a native bitstream (not MPEG): block prediction, transforms, quantization, and framed residuals. It does **not** interoperate with H.264/HEVC/AV1/VVC elementary streams and does not embed third-party codec sources.
 
-**Default CLI `encode` to `.528`** (square raw → `.srsv2` elementary) is still a **single intra** frame (`FR2\x01`, `max_ref_frames` 0 in the default sequence helper). **`SrsV2EncodeSettings::residual_entropy`** selects intra wire format: **`explicit`** keeps **`FR2\x01`** (tuple-only blocks); **`auto`** / **`rans`** emit **`FR2\x03`** with per-block **explicit vs static rANS** AC packing when enabled (see `docs/video_bitstream_v2.md`). **Native import** (SRSV2 policy) writes **`max_ref_frames = 1`** and emits **P** frames: legacy **`FR2\x02`** when residuals are tuple-only, or **`FR2\x04`** when adaptive residual modes are active. **P-frame status:** **16×16 integer-pel** motion, bounded MV search (`SrsV2EncodeSettings::motion_search_radius`), skip/residual **Y** blocks, chroma from reference with half MVs; import refreshes the encoder reference with **`decode_yuv420_srsv2_payload`** so the chain matches playback.
+**Default CLI `encode` to `.528`** (square raw → `.srsv2` elementary) is still a **single intra** frame (`FR2\x01`, `max_ref_frames` 0 in the default sequence helper). **`SrsV2EncodeSettings::residual_entropy`** selects intra wire format: **`explicit`** keeps **`FR2\x01`** (tuple-only blocks); **`auto`** / **`rans`** emit **`FR2\x03`** with per-block **explicit vs static rANS** AC packing when enabled (see `docs/video_bitstream_v2.md`). **Native import** (SRSV2 policy) writes **`max_ref_frames = 1`** and emits **P** frames: legacy **`FR2\x02`** when residuals are tuple-only and **`SrsV2SubpelMode::Off`**, or **`FR2\x04`** when adaptive residual modes are active (still integer MV); optional experimental **`FR2\x05` / `FR2\x06`** when **`SrsV2SubpelMode::HalfPel`** is enabled (quarter-pel–grid MVs). **P-frame status:** **16×16** macroblocks, bounded MV search (`motion_search_radius`), optional **half-pel** refinement behind **`subpel_mode`** / **`subpel_refinement_radius`**, skip/residual **Y** blocks, chroma from reference (**integer `mv/2`** or **`mv_q/8`** for half-pel streams — chroma sub-pel not implemented); import refreshes the encoder reference with **`decode_yuv420_srsv2_payload`** so the chain matches playback.
 
 **Rate control:** `SrsV2EncodeSettings` includes **`rate_control_mode`** (**fixed QP**, **constant-quality**, **target bitrate**), QP bounds, and a **`SrsV2RateController`** used by benchmark tooling (`bench_srsv2`) for deterministic per-frame QP selection. Details and CLI mapping: **`docs/rate_control.md`**. This is a **first-pass** controller for measurements and encoder-side QP selection — **not** a completed broadcast-grade RC loop.
 
 **Adaptive quantization (experimental):** optional **frame-level** QP derivation from per-MB activity (`docs/adaptive_quantization.md`). The bitstream still carries **one QP byte** per frame; there is no per-block QP delta syntax yet — AQ only affects **which** QP is emitted, not the frame payload layout.
 
-**Motion search (experimental):** integer-pel modes and skip thresholds (`docs/motion_search.md`); still **no sub-pel**.
+**Motion search (experimental):** integer-pel modes, optional **half-pel** refinement (`docs/motion_search.md`). **Quarter-pel**, **B-frames**, and **GPU** motion remain future work.
 
-Sub-pel/B-frames, richer closed-loop RC, GPU codecs, and OS audio/video output remain **future slices**.
+Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future slices**.
 
 ## Implemented in this repository
 
 - 64-byte `SRS2` sequence header (little-endian fields + profile/pixel/color metadata), including **`max_ref_frames`** (capped; enables reference pictures for **P** prototype).
 - YUV420p8 intra frame payloads: **`FR2\x01`** (explicit coefficient tuples only) and experimental **`FR2\x03`** (adaptive explicit vs static rANS per **8×8** block).
-- Experimental P-frame payloads: **`FR2\x02`** (tuple residuals) and **`FR2\x04`** (adaptive residuals); integer MV per 16×16 MB (`libsrs_video::srsv2::p_frame_codec`).
+- Experimental P-frame payloads: **`FR2\x02`** / **`FR2\x04`** (integer **`i16`** MVs); **`FR2\x05`** / **`FR2\x06`** (half-pel grid, **`i32`** quarter-pel MVs; experimental).
 - Elementary `.srsv2` streams (sync + CRC-framed payloads).
 - Container mux/demux with `codec_id == 3` and bounded playback decode for primary video (`decode_yuv420_srsv2_payload`).
 - CLI: `encode --codec srsv2`, `analyze --dump-codec`, decode of `.srsv2` to raw YUV via app services.
 
 ## Planned / not yet merged
 
-- Half-pel motion, **B**-frames, and richer merged MV modes beyond the integer-pel **P** prototype.
+- **Quarter-pel** motion, **B**-frames, and richer merged MV modes beyond half-pel **P** slices.
 - Broader entropy coding (per-file trained models, MV syntax, etc.). Today: **experimental** static rANS **AC residual** tokens only; motion and headers remain structured bytes with bounds checks.
 - **Loop filter (experimental):** when `disable_loop_filter` is **false**, encoder and decoder apply the same **simple luma deblock** on reconstructed **Y** before refreshing the SRSV2 reference (see **`docs/deblock_filter.md`**). **CDEF**, **restoration**, **film grain**, and chroma loop filtering are **not** implemented.
 - GPU backends (`gpu-wgpu`, `gpu-cuda` feature placeholders).

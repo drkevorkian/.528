@@ -7,7 +7,7 @@ This document describes the **optional**, **experimental** post-reconstruction f
 - **Sequence flag:** `VideoSequenceHeaderV2::disable_loop_filter` (**true** = filter **off**, default; **false** = filter **on**).
 - **Strength byte:** offset **25** in the 64-byte sequence header (`deblock_strength`). When the filter is **off**, encoders should write **0**. When the filter is **on**, **`0`** selects the codec-defined default (`libsrs_video::srsv2::deblock::DEFAULT_DEBLOCK_STRENGTH`); **`1…255`** scales smoothing.
 - **Where it runs:** After reconstructing the **Y** plane for an intra or **P** frame, **before** exposing the frame and **before** storing it as the next reference for **P** prediction.
-- **Encoder / decoder match:** Both sides must call the same `apply_loop_filter_y` routine (`libsrs_video::srsv2::deblock`) with the same `SrsV2LoopFilterMode` and resolved strength derived from the sequence header. Reference refresh in tooling uses `decode_yuv420_srsv2_payload`, which applies the filter when signaled — keeping encode and decode chains aligned.
+- **Encoder / decoder match:** Both sides must apply the same reconstruction filter with the same `SrsV2LoopFilterMode` and resolved strength derived from the sequence header. **`decode_yuv420_srsv2_payload`** calls **`apply_reconstruction_filter_if_enabled`** once per decoded picture before reference refresh and return. Low-level **`decode_yuv420_intra_payload`** / **`decode_yuv420_p_payload`** output **unfiltered** reconstruction; callers that bypass the dispatcher must invoke **`apply_reconstruction_filter_if_enabled`** themselves before display or storing a reference. The implementation delegates to **`apply_loop_filter_y`** (`libsrs_video::srsv2::deblock`).
 
 ## Algorithm (high level)
 

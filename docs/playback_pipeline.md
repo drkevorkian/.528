@@ -6,7 +6,7 @@
   - `decode_next_step()` — file-order interleaved A/V (recommended for players).
   - `decode_next_video_frame()` / `decode_next_audio_chunk()` — per-stream pulls with a **bounded** cross-track stash (`MAX_STASH_PACKETS`).
 - **Demux:** `DemuxReader` (`libsrs_demux`) over `BufReader<File>`; packet payloads are already capped by container I/O (`MAX_PACKET_PAYLOAD_BYTES`).
-- **Decoders:** primary video by `codec_id`: **`codec_id` 1** → SRSV1 legacy grayscale intra (`libsrs_video::decode_frame`); **`codec_id` 3** → SRSV2 (`decode_yuv420_srsv2_payload`): intra **`FR2\x01`** YUV420p8 and experimental **P-frame** **`FR2\x02`** when `max_ref_frames ≥ 1` and a reference picture is available; **`codec_id` 2** → SRSA (`libsrs_audio::decode_frame_with_stream_version`, v2 stream payloads).
+- **Decoders:** primary video by `codec_id`: **`codec_id` 1** → SRSV1 legacy grayscale intra (`libsrs_video::decode_frame`); **`codec_id` 3** → SRSV2 (`decode_yuv420_srsv2_payload`): intra **`FR2\x01`** / **`FR2\x03`** YUV420p8 and experimental **P-frame** payloads **`FR2\x02`** / **`FR2\x04`** / **`FR2\x05`** / **`FR2\x06`** when `max_ref_frames ≥ 1` and a reference picture is available; **`codec_id` 2** → SRSA (`libsrs_audio::decode_frame_with_stream_version`, v2 stream payloads).
 - **Errors:** `PlaybackError` (thiserror); no panics on malformed bitstreams in the playback path.
 
 ## Shared between CLI and UI
@@ -25,9 +25,9 @@
 |------------|------|---------|
 | **1** | Video — **SRSV1** legacy | Grayscale intra (`libsrs_video::decode_frame`) |
 | **2** | Audio — **SRSA** | LPC v2 stream decode (`libsrs_audio`, `STREAM_VERSION_V2`) |
-| **3** | Video — **SRSV2** default | Intra YUV420p8 (`FR2\x01`); optional experimental **P** (`FR2\x02`) when sequence allows references |
+| **3** | Video — **SRSV2** default | Intra YUV420p8 (`FR2\x01` / `FR2\x03`); optional experimental **P** (`FR2\x02` / `FR2\x04` / `FR2\x05` / `FR2\x06`) when sequence allows references |
 
-- **SRSV2** (`codec_id` **3**) is the **default** for newly generated `.528` media: 64-byte sequence header in track config; **`PlaybackSession`** holds an internal SRSV2 reference slot when `max_ref_frames > 0` so **P** payloads (`FR2\x02`) decode after at least one successful picture; **`seek_ms`** snaps to the latest prior **video keyframe** (`PacketFlags::KEYFRAME`) and then (with a strict step budget) **decodes forward** toward the requested timeline so SRSV2 reference state is rebuilt. **`stop`** clears the slot and resets demux.
+- **SRSV2** (`codec_id` **3**) is the **default** for newly generated `.528` media: 64-byte sequence header in track config; **`PlaybackSession`** holds an internal SRSV2 reference slot when `max_ref_frames > 0` so **P** payloads decode after at least one successful picture; **`seek_ms`** snaps to the latest prior **video keyframe** (`PacketFlags::KEYFRAME`) and then (with a strict step budget) **decodes forward** toward the requested timeline so SRSV2 reference state is rebuilt. **`stop`** clears the slot and resets demux.
 - **SRSV1** (`codec_id` **1**) is **legacy**; playback uses the older grayscale intra path.
 
 ## Limitations

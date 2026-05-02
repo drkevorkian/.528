@@ -1,6 +1,8 @@
 //! Experimental SRSV2 P-frame payload (`FR2` revision **2** legacy tuples, **4** adaptive entropy): 16×16 integer-pel MC + 8×8 residuals.
 //!
-//! Chroma is predicted by copying reference U/V with half-resolution MV (no chroma residual in this slice).
+//! Half-pel luma (`FR2` rev **5** explicit / **6** entropy) stores MVs in **quarter-pel units** (`±2` == half-pel).
+//!
+//! Chroma is predicted by copying reference U/V with integer MV (`mv/2` integer path; `mv_q/8` half-pel path).
 
 use super::dct::fdct_8x8;
 use super::error::SrsV2Error;
@@ -9,14 +11,21 @@ use super::intra_codec::{decode_residual_block_8x8, encode_residual_block_8x8, q
 use super::limits::{MAX_FRAME_PAYLOAD_BYTES, MAX_MOTION_VECTOR_PELS};
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
 use super::motion_search::{pick_mv, sample_u8_plane, SrsV2MotionEncodeStats};
-use super::rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
+use super::rate_control::{
+    ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings, SrsV2SubpelMode,
+};
 use super::residual_entropy::{
     decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
 };
 use super::residual_tokens::residual_token_model;
+use super::subpel::{refine_half_pel_center, sample_luma_bilinear_qpel, validate_mv_qpel_halfgrid};
 
 pub const FRAME_PAYLOAD_MAGIC_P: [u8; 4] = [b'F', b'R', b'2', 2];
 pub const FRAME_PAYLOAD_MAGIC_P_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 4];
+/// Half-pel P-frame, tuple residuals (same layout as rev **2** after MV width).
+pub const FRAME_PAYLOAD_MAGIC_P_SUBPEL: [u8; 4] = [b'F', b'R', b'2', 5];
+/// Half-pel P-frame, adaptive residual chunks (same layout as rev **4** after MV width).
+pub const FRAME_PAYLOAD_MAGIC_P_SUBPEL_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 6];
 
 /// Default skip threshold when [`SrsV2EncodeSettings::enable_skip_blocks`] is true (Y only).
 const SKIP_ABS_THRESH: i16 = 6;
@@ -26,6 +35,32 @@ fn validate_mv(mvx: i16, mvy: i16) -> Result<(), SrsV2Error> {
         return Err(SrsV2Error::CorruptedMotionVector);
     }
     Ok(())
+}
+
+fn copy_chroma_mb8_qpel(
+    ref_plane: &VideoPlane<u8>,
+    out: &mut VideoPlane<u8>,
+    mb_x: u32,
+    mb_y: u32,
+    mvx_q: i32,
+    mvy_q: i32,
+) {
+    let mvxc = mvx_q / 8;
+    let mvyc = mvy_q / 8;
+    let base_x = (mb_x * 8) as i32;
+    let base_y = (mb_y * 8) as i32;
+    for ry in 0..8 {
+        for rx in 0..8 {
+            let sx = base_x + rx as i32 + mvxc;
+            let sy = base_y + ry as i32 + mvyc;
+            let v = sample_u8_plane(ref_plane, sx, sy);
+            let ox = (mb_x * 8) as usize + rx;
+            let oy = (mb_y * 8) as usize + ry;
+            if ox < out.width as usize && oy < out.height as usize {
+                out.samples[oy * out.stride + ox] = v;
+            }
+        }
+    }
 }
 
 fn copy_chroma_mb8(
@@ -69,6 +104,15 @@ fn read_i16(data: &[u8], cur: &mut usize) -> Result<i16, SrsV2Error> {
     }
     let v = i16::from_le_bytes([data[*cur], data[*cur + 1]]);
     *cur += 2;
+    Ok(v)
+}
+
+fn read_i32(data: &[u8], cur: &mut usize) -> Result<i32, SrsV2Error> {
+    if data.len().saturating_sub(*cur) < 4 {
+        return Err(SrsV2Error::Truncated);
+    }
+    let v = i32::from_le_bytes([data[*cur], data[*cur + 1], data[*cur + 2], data[*cur + 3]]);
+    *cur += 4;
     Ok(v)
 }
 
@@ -131,11 +175,24 @@ pub fn encode_yuv420_p_payload(
     ms.skip_subblocks = 0;
     ms.nonzero_motion_macroblocks = 0;
     ms.sum_mv_l1 = 0;
+    let use_subpel = matches!(settings.subpel_mode, SrsV2SubpelMode::HalfPel);
+    ms.subpel_enabled = use_subpel;
+    ms.subpel_blocks_tested = 0;
+    ms.subpel_blocks_selected = 0;
+    ms.additional_subpel_evaluations = 0;
+    ms.sum_abs_frac_qpel = 0;
 
     let mut out = Vec::new();
-    let magic = match settings.residual_entropy {
-        ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC_P,
-        ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_P_ENTROPY,
+    let magic = if use_subpel {
+        match settings.residual_entropy {
+            ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC_P_SUBPEL,
+            ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_P_SUBPEL_ENTROPY,
+        }
+    } else {
+        match settings.residual_entropy {
+            ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC_P,
+            ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_P_ENTROPY,
+        }
     };
     out.extend_from_slice(&magic);
     out.extend_from_slice(&frame_index.to_le_bytes());
@@ -146,23 +203,72 @@ pub fn encode_yuv420_p_payload(
     for mby in 0..mb_rows {
         for mbx in 0..mb_cols {
             let mut mb_evals = 0_u64;
-            let (mvx, mvy) = pick_mv(
-                settings.motion_search_mode,
-                &cur.y,
-                &reference.y,
-                mbx,
-                mby,
-                radius,
-                settings.early_exit_sad_threshold,
-                Some(&mut mb_evals),
-            );
-            ms.sad_evaluations += mb_evals;
-            if mvx != 0 || mvy != 0 {
-                ms.nonzero_motion_macroblocks += 1;
+            let (mvx, mvy, mvx_q, mvy_q) = if use_subpel {
+                let (ix, iy) = pick_mv(
+                    settings.motion_search_mode,
+                    &cur.y,
+                    &reference.y,
+                    mbx,
+                    mby,
+                    radius,
+                    settings.early_exit_sad_threshold,
+                    Some(&mut mb_evals),
+                );
+                ms.sad_evaluations += mb_evals;
+                let mut ev = 0_u64;
+                let mut tested = 0_u64;
+                let sub_r = settings.clamped_subpel_refinement_radius();
+                let (qx, qy) = refine_half_pel_center(
+                    &cur.y,
+                    &reference.y,
+                    mbx,
+                    mby,
+                    ix,
+                    iy,
+                    sub_r,
+                    &mut ev,
+                    &mut tested,
+                );
+                validate_mv_qpel_halfgrid(qx, qy)?;
+                ms.additional_subpel_evaluations += ev;
+                ms.subpel_blocks_tested += tested;
+                if qx != ix as i32 * 4 || qy != iy as i32 * 4 {
+                    ms.subpel_blocks_selected += 1;
+                }
+                let fx = qx.rem_euclid(4) as u32;
+                let fy = qy.rem_euclid(4) as u32;
+                ms.sum_abs_frac_qpel += (fx + fy) as u64;
+                if qx != 0 || qy != 0 {
+                    ms.nonzero_motion_macroblocks += 1;
+                }
+                ms.sum_mv_l1 += ((qx.unsigned_abs() + qy.unsigned_abs()) / 4) as u64;
+                (ix, iy, qx, qy)
+            } else {
+                let (mvx, mvy) = pick_mv(
+                    settings.motion_search_mode,
+                    &cur.y,
+                    &reference.y,
+                    mbx,
+                    mby,
+                    radius,
+                    settings.early_exit_sad_threshold,
+                    Some(&mut mb_evals),
+                );
+                ms.sad_evaluations += mb_evals;
+                if mvx != 0 || mvy != 0 {
+                    ms.nonzero_motion_macroblocks += 1;
+                }
+                ms.sum_mv_l1 += mvx.unsigned_abs() as u64 + mvy.unsigned_abs() as u64;
+                (mvx, mvy, mvx as i32 * 4, mvy as i32 * 4)
+            };
+
+            if use_subpel {
+                out.extend_from_slice(&mvx_q.to_le_bytes());
+                out.extend_from_slice(&mvy_q.to_le_bytes());
+            } else {
+                out.extend_from_slice(&mvx.to_le_bytes());
+                out.extend_from_slice(&mvy.to_le_bytes());
             }
-            ms.sum_mv_l1 += mvx.unsigned_abs() as u64 + mvy.unsigned_abs() as u64;
-            out.extend_from_slice(&mvx.to_le_bytes());
-            out.extend_from_slice(&mvy.to_le_bytes());
 
             let mut pattern = 0_u8;
             let mut residual_chunks: Vec<Vec<u8>> = Vec::new();
@@ -176,9 +282,19 @@ pub fn encode_yuv420_p_payload(
                         let lx = mbx * 16 + dx + col;
                         let ly = mby * 16 + dy + row;
                         let cx = cur.y.samples[ly as usize * cur.y.stride + lx as usize] as i16;
-                        let rx = lx as i32 + mvx as i32;
-                        let ry = ly as i32 + mvy as i32;
-                        let pred = sample_u8_plane(&reference.y, rx, ry) as i16;
+                        let pred = if use_subpel {
+                            sample_luma_bilinear_qpel(
+                                &reference.y,
+                                lx as i32,
+                                ly as i32,
+                                mvx_q,
+                                mvy_q,
+                            ) as i16
+                        } else {
+                            let rx = lx as i32 + mvx as i32;
+                            let ry = ly as i32 + mvy as i32;
+                            sample_u8_plane(&reference.y, rx, ry) as i16
+                        };
                         let d = cx - pred;
                         blk[row as usize][col as usize] = d;
                         max_abs = max_abs.max(d.abs());
@@ -241,7 +357,9 @@ pub fn encode_yuv420_p_payload(
     Ok(out)
 }
 
-/// Decode `FR2` rev **2** or **4** P-frame into a full YUV420p8 frame (chroma from reference MC).
+/// Decode `FR2` rev **2**, **4**, **5**, or **6** P-frame into **reconstructed** YUV420p8 (no loop filter).
+///
+/// Caller applies [`crate::srsv2::frame_codec::apply_reconstruction_filter_if_enabled`] before display/reference refresh when using raw decode entry points.
 pub fn decode_yuv420_p_payload(
     seq: &VideoSequenceHeaderV2,
     payload: &[u8],
@@ -267,10 +385,11 @@ pub fn decode_yuv420_p_payload(
     if payload.len() < 4 + 4 + 1 {
         return Err(SrsV2Error::Truncated);
     }
-    if payload.len() < 4 || &payload[0..3] != b"FR2" || !matches!(payload[3], 2 | 4) {
+    if payload.len() < 4 || &payload[0..3] != b"FR2" || !matches!(payload[3], 2 | 4 | 5 | 6) {
         return Err(SrsV2Error::BadMagic);
     }
-    let entropy_chunks = payload[3] == 4;
+    let entropy_chunks = matches!(payload[3], 4 | 6);
+    let use_qpel = matches!(payload[3], 5 | 6);
     let mut cur = 4usize;
     let frame_index = read_u32(payload, &mut cur)?;
     let qp = read_u8(payload, &mut cur)?;
@@ -287,9 +406,17 @@ pub fn decode_yuv420_p_payload(
 
     for mby in 0..mb_rows {
         for mbx in 0..mb_cols {
-            let mvx = read_i16(payload, &mut cur)?;
-            let mvy = read_i16(payload, &mut cur)?;
-            validate_mv(mvx, mvy)?;
+            let (mvx_q, mvy_q) = if use_qpel {
+                let mvx_q = read_i32(payload, &mut cur)?;
+                let mvy_q = read_i32(payload, &mut cur)?;
+                validate_mv_qpel_halfgrid(mvx_q, mvy_q)?;
+                (mvx_q, mvy_q)
+            } else {
+                let mvx = read_i16(payload, &mut cur)?;
+                let mvy = read_i16(payload, &mut cur)?;
+                validate_mv(mvx, mvy)?;
+                (mvx as i32 * 4, mvy as i32 * 4)
+            };
             let pattern = read_u8(payload, &mut cur)?;
 
             let sub_offsets = [(0_u32, 0_u32), (8, 0), (0, 8), (8, 8)];
@@ -300,9 +427,13 @@ pub fn decode_yuv420_p_payload(
                         for col in 0..8 {
                             let lx = mbx * 16 + dx + col;
                             let ly = mby * 16 + dy + row;
-                            let rx = lx as i32 + mvx as i32;
-                            let ry = ly as i32 + mvy as i32;
-                            let pv = sample_u8_plane(&reference.y, rx, ry);
+                            let pv = sample_luma_bilinear_qpel(
+                                &reference.y,
+                                lx as i32,
+                                ly as i32,
+                                mvx_q,
+                                mvy_q,
+                            );
                             y_plane.samples[ly as usize * y_plane.stride + lx as usize] = pv;
                         }
                     }
@@ -331,9 +462,13 @@ pub fn decode_yuv420_p_payload(
                         for col in 0..8 {
                             let lx = mbx * 16 + dx + col;
                             let ly = mby * 16 + dy + row;
-                            let rx = lx as i32 + mvx as i32;
-                            let ry = ly as i32 + mvy as i32;
-                            let pred = sample_u8_plane(&reference.y, rx, ry) as i32;
+                            let pred = sample_luma_bilinear_qpel(
+                                &reference.y,
+                                lx as i32,
+                                ly as i32,
+                                mvx_q,
+                                mvy_q,
+                            ) as i32;
                             let pv = (pred + res[row as usize][col as usize] as i32).clamp(0, 255);
                             y_plane.samples[ly as usize * y_plane.stride + lx as usize] = pv as u8;
                         }
@@ -341,20 +476,21 @@ pub fn decode_yuv420_p_payload(
                 }
             }
 
-            copy_chroma_mb8(&reference.u, &mut u_plane, mbx, mby, mvx, mvy);
-            copy_chroma_mb8(&reference.v, &mut v_plane, mbx, mby, mvx, mvy);
+            if use_qpel {
+                copy_chroma_mb8_qpel(&reference.u, &mut u_plane, mbx, mby, mvx_q, mvy_q);
+                copy_chroma_mb8_qpel(&reference.v, &mut v_plane, mbx, mby, mvx_q, mvy_q);
+            } else {
+                let mvx = (mvx_q / 4) as i16;
+                let mvy = (mvy_q / 4) as i16;
+                copy_chroma_mb8(&reference.u, &mut u_plane, mbx, mby, mvx, mvy);
+                copy_chroma_mb8(&reference.v, &mut v_plane, mbx, mby, mvx, mvy);
+            }
         }
     }
 
     if cur != payload.len() {
         return Err(SrsV2Error::syntax("trailing P-frame bytes"));
     }
-
-    super::deblock::apply_loop_filter_y(
-        seq.loop_filter_mode(),
-        seq.effective_deblock_strength_for_filter(),
-        &mut y_plane,
-    );
 
     Ok(DecodedVideoFrameV2 {
         frame_index,
@@ -373,11 +509,12 @@ pub fn decode_yuv420_p_payload(
 mod tests {
     use super::*;
     use crate::srsv2::color::rgb888_full_to_yuv420_bt709;
-    use crate::srsv2::frame_codec::encode_yuv420_intra_payload;
+    use crate::srsv2::frame_codec::{decode_yuv420_srsv2_payload, encode_yuv420_intra_payload};
     use crate::srsv2::model::{
         ChromaSiting, ColorPrimaries, ColorRange, MatrixCoefficients, SrsVideoProfile,
         TransferFunction,
     };
+    use crate::srsv2::rate_control::SrsV2SubpelMode;
 
     fn seq_inter(w: u32, h: u32) -> VideoSequenceHeaderV2 {
         VideoSequenceHeaderV2 {
@@ -693,5 +830,114 @@ mod tests {
         hdr[24] = 99;
         let err = crate::srsv2::model::decode_sequence_header_v2(&hdr).unwrap_err();
         assert!(matches!(err, SrsV2Error::ExcessiveReferenceFrames(99)));
+    }
+
+    #[test]
+    fn subpel_off_keeps_fr2_rev2_explicit() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![200_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            subpel_mode: SrsV2SubpelMode::Off,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let p = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+        assert_eq!(p[3], 2);
+    }
+
+    #[test]
+    fn subpel_half_emits_fr2_rev5_explicit_residual() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![200_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            subpel_mode: SrsV2SubpelMode::HalfPel,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let p = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+        assert_eq!(p[3], 5);
+    }
+
+    #[test]
+    fn rev5_odd_qpel_mv_rejected_as_syntax() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            subpel_mode: SrsV2SubpelMode::HalfPel,
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+        let mv_off = 9;
+        payload[mv_off..mv_off + 4].copy_from_slice(&1i32.to_le_bytes());
+        let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_)));
+    }
+
+    #[test]
+    fn half_pel_dispatcher_matches_raw_p_decode_when_loop_filter_off() {
+        let mut seq = seq_inter(64, 64);
+        seq.disable_loop_filter = true;
+        let mut rgb0 = vec![20_u8; 64 * 64 * 3];
+        for y in 20..44 {
+            for x in 20..44 {
+                let i = (y * 64 + x) * 3;
+                rgb0[i] = 240;
+                rgb0[i + 1] = 240;
+                rgb0[i + 2] = 240;
+            }
+        }
+        let mut rgb1 = vec![20_u8; 64 * 64 * 3];
+        for y in 20..44 {
+            for x in 24..48 {
+                let i = (y * 64 + x) * 3;
+                rgb1[i] = 240;
+                rgb1[i + 1] = 240;
+                rgb1[i + 2] = 240;
+            }
+        }
+        let y0 = rgb888_full_to_yuv420_bt709(&rgb0, 64, 64, ColorRange::Limited).unwrap();
+        let y1 = rgb888_full_to_yuv420_bt709(&rgb1, 64, 64, ColorRange::Limited).unwrap();
+        let qp = 24_u8;
+        let settings = SrsV2EncodeSettings {
+            subpel_mode: SrsV2SubpelMode::HalfPel,
+            motion_search_radius: 16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let i_payload =
+            encode_yuv420_intra_payload(&seq, &y0, 0, qp, &settings, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &i_payload, &mut slot).unwrap();
+        let ref_y = slot.as_ref().unwrap();
+        let p_payload =
+            encode_yuv420_p_payload(&seq, &y1, ref_y, 1, qp, &settings, None, None).unwrap();
+        assert_eq!(p_payload[3], 5);
+        let mut slot2 = Some(ref_y.clone());
+        let via_disp = decode_yuv420_srsv2_payload(&seq, &p_payload, &mut slot2).unwrap();
+        let dec_raw = decode_yuv420_p_payload(&seq, &p_payload, ref_y).unwrap();
+        assert_eq!(via_disp.yuv.y.samples, dec_raw.yuv.y.samples);
+    }
+
+    #[test]
+    fn subpel_encode_populates_motion_stats() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![130_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            subpel_mode: SrsV2SubpelMode::HalfPel,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let mut ms = SrsV2MotionEncodeStats::default();
+        encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, Some(&mut ms)).unwrap();
+        assert!(ms.subpel_enabled);
+        assert!(ms.subpel_blocks_tested > 0);
+        assert!(ms.additional_subpel_evaluations > 0);
     }
 }

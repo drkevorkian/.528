@@ -11,8 +11,9 @@ use clap::Parser;
 use libsrs_container::{FileHeader, TrackDescriptor, TrackKind};
 use libsrs_mux::MuxWriter;
 use libsrs_video::{
-    decode_yuv420_intra_payload, encode_sequence_header_v2, encode_yuv420_intra_payload,
-    gray8_packed_to_yuv420p8_neutral, SrsV2EncodeSettings, VideoSequenceHeaderV2,
+    apply_reconstruction_filter_if_enabled, decode_yuv420_intra_payload, encode_sequence_header_v2,
+    encode_yuv420_intra_payload, gray8_packed_to_yuv420p8_neutral, SrsV2EncodeSettings,
+    VideoSequenceHeaderV2,
 };
 use quality_metrics::{compression_ratio, psnr_u8, synthetic::SyntheticMeta};
 use serde::Serialize;
@@ -141,7 +142,8 @@ fn main() -> Result<()> {
     let mut luma_dec = Vec::with_capacity((w * h * frames) as usize);
     let t1 = Instant::now();
     for pl in payloads.iter() {
-        let dec = decode_yuv420_intra_payload(&seq, pl).map_err(|e| anyhow!("{e}"))?;
+        let mut dec = decode_yuv420_intra_payload(&seq, pl).map_err(|e| anyhow!("{e}"))?;
+        apply_reconstruction_filter_if_enabled(&seq, &mut dec);
         luma_dec.extend_from_slice(dec.yuv.y.samples.as_slice());
     }
     let dec_secs = t1.elapsed().as_secs_f64();

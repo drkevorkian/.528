@@ -103,7 +103,7 @@ fn bench_aq_activity_populates_report() {
 }
 
 #[test]
-fn sweep_extended_adds_two_rows() {
+fn sweep_extended_adds_fixed_extra_rows() {
     let golden = golden_yuv_path();
     let out_dir = std::env::temp_dir().join("qm-sweep-ext");
     fs::create_dir_all(&out_dir).unwrap();
@@ -142,8 +142,8 @@ fn sweep_extended_adds_two_rows() {
     let sweep = v["sweep"].as_array().unwrap();
     assert_eq!(
         sweep.len(),
-        26,
-        "24 base grid rows + 2 extended AQ/motion variants"
+        30,
+        "24 base grid rows + 2 extended AQ/motion variants + 4 subpel integer/half-pel rows"
     );
     let variants: Vec<_> = sweep
         .iter()
@@ -152,6 +152,10 @@ fn sweep_extended_adds_two_rows() {
     assert!(
         variants.contains(&"extended-aq-motion"),
         "expected extended variant rows"
+    );
+    assert!(
+        variants.iter().any(|s| s.starts_with("subpel-")),
+        "expected subpel sweep_variant rows"
     );
 }
 

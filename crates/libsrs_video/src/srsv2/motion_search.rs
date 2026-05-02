@@ -11,6 +11,12 @@ pub struct SrsV2MotionEncodeStats {
     pub skip_subblocks: u64,
     pub nonzero_motion_macroblocks: u32,
     pub sum_mv_l1: u64,
+    pub subpel_enabled: bool,
+    pub subpel_blocks_tested: u64,
+    pub subpel_blocks_selected: u64,
+    pub additional_subpel_evaluations: u64,
+    /// Sum of `|mvx_q.rem_euclid(4)| + |mvy_q.rem_euclid(4)|` over macroblocks (for averages).
+    pub sum_abs_frac_qpel: u64,
 }
 
 pub(crate) fn sample_u8_plane(plane: &VideoPlane<u8>, x: i32, y: i32) -> u8 {

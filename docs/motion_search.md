@@ -1,11 +1,19 @@
-# SRSV2 motion search (integer-pel, experimental)
+# SRSV2 motion search (experimental)
 
-P-frame motion estimation is **integer-pel only** (no sub-pel). `SrsV2MotionSearchMode` selects the search strategy within `SrsV2EncodeSettings::motion_search_radius` (clamped for hostile-input safety).
+## Integer-pel search
 
-Implemented modes include **None**, **Diamond**, **Hex**, **Hierarchical**, **ExhaustiveSmall** (full window). **`early_exit_sad_threshold`** may terminate search early when best SAD is already at or below the threshold. **`enable_skip_blocks`**: when **true**, a Y **8×8** sub-block may be skipped when residual max-abs is below an encoder threshold; when **false**, **never** emit skip bits — every non-skipped path carries quantized residuals (benchmark **`skip_subblocks_total`** must be zero).
+`SrsV2MotionSearchMode` selects the **integer-pel** strategy within `SrsV2EncodeSettings::motion_search_radius` (clamped for hostile-input safety). Implemented modes include **None**, **Diamond**, **Hex**, **Hierarchical**, **ExhaustiveSmall** (full window). **`early_exit_sad_threshold`** may terminate search early when best SAD is already at or below the threshold. **`enable_skip_blocks`**: when **true**, a Y **8×8** sub-block may be skipped when residual max-abs is below an encoder threshold; when **false**, never emit skip bits — every non-skipped path carries quantized residuals (benchmark **`skip_subblocks_total`** must be zero).
 
-Skip and motion syntax follow **`FR2` revision 2 / 4** (`docs/video_bitstream_v2.md`). Malformed motion or pattern bytes must fail decode safely (decoder limits).
+Legacy predicted payloads **`FR2` revision 2 / 4** carry **`i16`** motion vectors in **full-pixel** units only.
 
-**Sub-pel**, **B-frames**, and **GPU** motion are not implemented. Use `bench_srsv2` flags `--motion-search`, `--early-exit-sad-threshold`, and `--enable-skip-blocks true|false` for measurements; do not assume one mode is universally faster or better without benchmarking your content.
+## Half-pel (experimental, opt-in)
 
-When an experimental **loop filter** is enabled (`docs/deblock_filter.md`), motion-compensated prediction uses the **filtered** reference—the encoder refreshes its reference with the same decode step as the decoder, so MV choices stay consistent with reconstruction.
+When **`SrsV2EncodeSettings::subpel_mode == HalfPel`**, the encoder keeps the same integer search, then optionally refines each macroblock on an **eight-offset half-pel ring** in **quarter-pel units** (`±2` == half-pel on the ¼ grid). Wire format: **`FR2\x05`** (tuple residuals, same layout as rev **2** after MV width) or **`FR2\x06`** (adaptive residuals like rev **4**). MVs are stored as **`i32` LE** in **quarter-pel** luma units; decoders reject **odd** quarter values (not on the half-pel grid).
+
+**`SrsV2EncodeSettings::subpel_refinement_radius`** is clamped ( **`0`** skips refinement; **`1`** runs the default eight probes). **Quarter-pel** and **B-frames** are not implemented. **GPU** motion search is not implemented.
+
+**Chroma** still uses an **integer** copy with **`mv_q / 8`** (approximation); full chroma sub-pel is future work — benchmark before claiming chroma-aware gains.
+
+Use `bench_srsv2` **`--subpel off|half`** and **`--subpel-refinement-radius N`** for measurements. **Default remains integer-only (`Off`).** Do not assume half-pel improves bitrate or objective scores without measuring your content.
+
+When an experimental **loop filter** is enabled (`docs/deblock_filter.md`), prediction uses the **filtered** reference — the encoder refreshes its reference with the same **`decode_yuv420_srsv2_payload`** step as playback, so MV choices stay consistent with reconstruction.

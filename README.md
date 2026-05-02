@@ -29,9 +29,9 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 | `.528` container | **Partial / working** | v2 primary; hostile-input limits in I/O (`libsrs_container`) |
 | mux / demux | **Partial / working** | `libsrs_mux` / `libsrs_demux`; cues + index; mux prefers `.srsv2` when elementary video is present |
 | audio codec | **Working prototype** | v2 LPC stream decode in `libsrs_audio` |
-| video codec | **SRSV2 default** | Modern native **8K-first** direction (`docs/srsv2_design_targets.md`). Today: CLI square-gray → `.srsv2` **single intra** (`FR2\x01`). Encoders may emit **intra with adaptive residual entropy** (`FR2\x03`, experimental; see `docs/video_bitstream_v2.md`). **Native import** (SRSV2) uses **`max_ref_frames = 1`** and **P** (`FR2\x02` legacy tuples or **`FR2\x04`** adaptive residuals). Profiles **Baseline…Research** on-wire; most helpers still emit **Main**. **First-pass deterministic rate control** exists for benchmark / encoder-side QP selection (`SrsV2RateController`, `bench_srsv2`; not production-tuned). **Sub-pel motion, B-frames, GPU encode/decode, and OS audio/video output** remain roadmap. |
+| video codec | **SRSV2 default** | Modern native **8K-first** direction (`docs/srsv2_design_targets.md`). Today: CLI square-gray → `.srsv2` **single intra** (`FR2\x01`). Encoders may emit **intra with adaptive residual entropy** (`FR2\x03`, experimental; see `docs/video_bitstream_v2.md`). **Native import** (SRSV2) uses **`max_ref_frames = 1`** and **P** (`FR2\x02` / **`FR2\x04`** integer MV; optional experimental **`FR2\x05` / `FR2\x06`** half-pel via encode settings — see `docs/motion_search.md`). Profiles **Baseline…Research** on-wire; most helpers still emit **Main**. **First-pass deterministic rate control** exists for benchmark / encoder-side QP selection (`SrsV2RateController`, `bench_srsv2`; not production-tuned). **Quarter-pel, B-frames, GPU encode/decode, and OS audio/video output** remain roadmap. |
 | import / transcode | **Native pipeline partial** | Encode/import/transcode default to SRSV2 video; `--codec srsv1` selects legacy; FFmpeg path feature-gated |
-| playback | **Decode-preview** | `PlaybackSession` decodes SRSV2 **intra** + experimental **P** (`codec_id` **3**, `FR2\x02` when a reference slot is filled), and SRSV1 (`codec_id` **1**); **SRSA audio** is `codec_id` **2**. OS audio/video presentation is **not** implemented; `srs_player` shows last-frame texture; `srs_cli play` smoke-decodes |
+| playback | **Decode-preview** | `PlaybackSession` decodes SRSV2 **intra** + experimental **P** (`codec_id` **3**, predicted `FR2` rev **2**/**4**/**5**/**6** when a reference slot is filled), and SRSV1 (`codec_id` **1**); **SRSA audio** is `codec_id` **2**. OS audio/video presentation is **not** implemented; `srs_player` shows last-frame texture; `srs_cli play` smoke-decodes |
 | GPU | **Planned** | No device presentation or GPU decode here |
 | lossy video v2 | **Planned** | |
 | admin / licensing | **Partial / working** | Needs production hardening |
@@ -55,6 +55,7 @@ Further playback architecture: `docs/playback_pipeline.md`.
     --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
     --qp 28 --keyint 30 --motion-radius 16 \
     --residual-entropy auto \
+    --subpel off --subpel-refinement-radius 1 \
     --report-json var/bench/flat_srsv2.json --report-md var/bench/flat_srsv2.md
   ```
 

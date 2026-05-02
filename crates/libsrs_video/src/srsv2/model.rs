@@ -467,3 +467,42 @@ mod profile_roundtrip_tests {
         assert_eq!(got.deblock_strength, 88);
     }
 }
+
+#[cfg(test)]
+mod loop_filter_header_mapping_tests {
+    use super::VideoSequenceHeaderV2;
+    use crate::srsv2::deblock::{SrsV2LoopFilterMode, DEFAULT_DEBLOCK_STRENGTH};
+
+    #[test]
+    fn disable_loop_filter_true_maps_to_off() {
+        let mut s = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(64, 64);
+        s.disable_loop_filter = true;
+        assert_eq!(s.loop_filter_mode(), SrsV2LoopFilterMode::Off);
+    }
+
+    #[test]
+    fn disable_loop_filter_false_maps_to_simple_deblock() {
+        let mut s = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(64, 64);
+        s.disable_loop_filter = false;
+        assert_eq!(s.loop_filter_mode(), SrsV2LoopFilterMode::SimpleDeblock);
+    }
+
+    #[test]
+    fn deblock_strength_zero_uses_default_when_filter_enabled() {
+        let mut s = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(64, 64);
+        s.disable_loop_filter = false;
+        s.deblock_strength = 0;
+        assert_eq!(
+            s.effective_deblock_strength_for_filter(),
+            DEFAULT_DEBLOCK_STRENGTH
+        );
+    }
+
+    #[test]
+    fn nonzero_deblock_strength_preserved_when_filter_enabled() {
+        let mut s = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(64, 64);
+        s.disable_loop_filter = false;
+        s.deblock_strength = 93;
+        assert_eq!(s.effective_deblock_strength_for_filter(), 93);
+    }
+}

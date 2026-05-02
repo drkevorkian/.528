@@ -78,6 +78,20 @@ pub fn encode_yuv420_intra_payload(
     Ok(out)
 }
 
+/// Apply sequence-signaled **in-loop** / reconstruction luma filter exactly once (Y plane only).
+///
+/// Call after intra or P **reconstruction** and before display or copying into a reference slot.
+pub fn apply_reconstruction_filter_if_enabled(
+    seq: &VideoSequenceHeaderV2,
+    frame: &mut DecodedVideoFrameV2,
+) {
+    apply_loop_filter_y(
+        seq.loop_filter_mode(),
+        seq.effective_deblock_strength_for_filter(),
+        &mut frame.yuv.y,
+    );
+}
+
 fn push_chunk(out: &mut Vec<u8>, chunk: &[u8]) -> Result<(), SrsV2Error> {
     let len = u32::try_from(chunk.len()).map_err(|_| SrsV2Error::syntax("chunk length"))?;
     out.extend_from_slice(&len.to_le_bytes());
@@ -85,6 +99,10 @@ fn push_chunk(out: &mut Vec<u8>, chunk: &[u8]) -> Result<(), SrsV2Error> {
     Ok(())
 }
 
+/// Decode intra payload into **reconstructed** samples **without** loop filtering.
+///
+/// Use [`decode_yuv420_srsv2_payload`] for mux playback (filter applied once there), or call
+/// [`apply_reconstruction_filter_if_enabled`] after decode when displaying or refreshing references.
 pub fn decode_yuv420_intra_payload(
     seq: &VideoSequenceHeaderV2,
     payload: &[u8],
@@ -187,12 +205,6 @@ pub fn decode_yuv420_intra_payload(
         _ => return Err(SrsV2Error::BadMagic),
     }
 
-    apply_loop_filter_y(
-        seq.loop_filter_mode(),
-        seq.effective_deblock_strength_for_filter(),
-        &mut y_plane,
-    );
-
     Ok(DecodedVideoFrameV2 {
         frame_index,
         width: w,
@@ -255,28 +267,25 @@ pub fn decode_yuv420_srsv2_payload(
     if payload.len() < 4 {
         return Err(SrsV2Error::Truncated);
     }
-    match payload[3] {
-        1 | 3 => {
-            let dec = decode_yuv420_intra_payload(seq, payload)?;
-            if seq.max_ref_frames > 0 {
-                ref_slot.replace(dec.yuv.clone());
-            }
-            Ok(dec)
-        }
-        2 | 4 => {
+    let mut dec = match payload[3] {
+        1 | 3 => decode_yuv420_intra_payload(seq, payload)?,
+        2 | 4 | 5 | 6 => {
             let reference = ref_slot
                 .as_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
-            let dec = p_frame_codec::decode_yuv420_p_payload(seq, payload, reference)?;
-            if seq.max_ref_frames > 0 {
-                ref_slot.replace(dec.yuv.clone());
-            }
-            Ok(dec)
+            p_frame_codec::decode_yuv420_p_payload(seq, payload, reference)?
         }
-        _ => Err(SrsV2Error::Unsupported(
-            "unknown SRSV2 frame payload revision",
-        )),
+        _ => {
+            return Err(SrsV2Error::Unsupported(
+                "unknown SRSV2 frame payload revision",
+            ));
+        }
+    };
+    apply_reconstruction_filter_if_enabled(seq, &mut dec);
+    if seq.max_ref_frames > 0 {
+        ref_slot.replace(dec.yuv.clone());
     }
+    Ok(dec)
 }
 
 fn read_u32(data: &[u8], cur: &mut usize) -> Result<u32, SrsV2Error> {
@@ -409,10 +418,12 @@ mod roundtrip_tests {
             ..Default::default()
         };
         let payload = encode_yuv420_intra_payload(&seq_off, &yuv, 0, 22, &st, None, None).unwrap();
-        let dec_off = decode_yuv420_intra_payload(&seq_off, &payload).unwrap();
+        let mut dec_off = decode_yuv420_intra_payload(&seq_off, &payload).unwrap();
+        apply_reconstruction_filter_if_enabled(&seq_off, &mut dec_off);
         let mut seq_on = seq_off.clone();
         seq_on.disable_loop_filter = false;
-        let dec_on = decode_yuv420_intra_payload(&seq_on, &payload).unwrap();
+        let mut dec_on = decode_yuv420_intra_payload(&seq_on, &payload).unwrap();
+        apply_reconstruction_filter_if_enabled(&seq_on, &mut dec_on);
         let mut diff = 0usize;
         for i in 0..dec_off.yuv.y.samples.len() {
             if dec_off.yuv.y.samples[i] != dec_on.yuv.y.samples[i] {
@@ -592,5 +603,88 @@ mod roundtrip_tests {
         let (b0, b1) = decode_twice(&seq, &intra, &p);
         assert_eq!(a0, b0);
         assert_eq!(a1, b1);
+    }
+
+    #[test]
+    fn dispatcher_matches_raw_intra_plus_single_reconstruction_filter() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: false,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = explicit_only_settings();
+        let payload = encode_yuv420_intra_payload(&seq, &yuv, 2, 22, &st, None, None).unwrap();
+        let via_dispatcher = decode_yuv420_srsv2_payload(&seq, &payload, &mut None).unwrap();
+        let mut via_raw = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        apply_reconstruction_filter_if_enabled(&seq, &mut via_raw);
+        assert_eq!(
+            via_dispatcher.yuv.y.samples, via_raw.yuv.y.samples,
+            "dispatcher must apply reconstruction filter exactly once"
+        );
+        assert_eq!(via_dispatcher.frame_index, via_raw.frame_index);
+    }
+
+    #[test]
+    fn dispatcher_intra_twice_from_clean_state_is_identical() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: false,
+            deblock_strength: 41,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![90_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = explicit_only_settings();
+        let intra = encode_yuv420_intra_payload(&seq, &yuv, 0, 24, &st, None, None).unwrap();
+        let mut slot_a = None;
+        let mut slot_b = None;
+        let da = decode_yuv420_srsv2_payload(&seq, &intra, &mut slot_a).unwrap();
+        let db = decode_yuv420_srsv2_payload(&seq, &intra, &mut slot_b).unwrap();
+        assert_eq!(da.yuv.y.samples, db.yuv.y.samples);
+    }
+
+    #[test]
+    fn reference_slot_y_matches_decoded_after_filtered_intra() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: false,
+            deblock_strength: 22,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![111_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = explicit_only_settings();
+        let intra = encode_yuv420_intra_payload(&seq, &yuv, 0, 21, &st, None, None).unwrap();
+        let mut slot = None;
+        let dec = decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let got = slot.expect("ref slot");
+        assert_eq!(got.y.samples, dec.yuv.y.samples);
     }
 }

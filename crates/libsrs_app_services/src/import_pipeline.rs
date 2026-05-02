@@ -627,7 +627,7 @@ mod import_tests {
             "first SRSV2 video packet should be intra (FR2 rev 1 or entropy intra rev 3)"
         );
         assert!(
-            matches!(p1.packet.payload.get(3).copied(), Some(2 | 4),),
+            matches!(p1.packet.payload.get(3).copied(), Some(2 | 4 | 5 | 6),),
             "second frame should be P (FR2 rev 2 or entropy rev 4)"
         );
         let mut slot = None;

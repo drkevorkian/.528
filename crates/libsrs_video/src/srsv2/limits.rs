@@ -14,6 +14,8 @@ pub const MAX_REF_FRAMES: u8 = 16;
 pub const MAX_MOTION_VECTOR_PELS: i16 = 256;
 /// Encoder search radius cap (integer pel); must be ≤ [`MAX_MOTION_VECTOR_PELS`].
 pub const MAX_MOTION_SEARCH_RADIUS: i16 = 128;
+/// Cap for [`super::rate_control::SrsV2EncodeSettings::subpel_refinement_radius`] (hostile-input / encoder sanity).
+pub const MAX_SUBPEL_REFINEMENT_RADIUS: u8 = 2;
 /// Maximum sequence metadata extension bytes.
 pub const MAX_METADATA_BYTES: usize = 16 * 1024;
 /// Superblock size (baseline intra path uses recursive splits down to 8×8).

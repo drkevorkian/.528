@@ -1,7 +1,9 @@
 //! Encoder-side rate control: QP selection for benchmarks and future encode loops.
 
 use super::deblock::SrsV2LoopFilterMode;
-use super::limits::{MAX_MOTION_SEARCH_RADIUS, MAX_MOTION_VECTOR_PELS};
+use super::limits::{
+    MAX_MOTION_SEARCH_RADIUS, MAX_MOTION_VECTOR_PELS, MAX_SUBPEL_REFINEMENT_RADIUS,
+};
 
 /// How 8×8 residual blocks choose explicit tuples vs static rANS (`FR2` rev 3/4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,6 +81,15 @@ pub enum SrsV2AdaptiveQuantizationMode {
     ScreenAware,
 }
 
+/// Sub-pixel motion refinement (luma). **`Off`** keeps legacy `FR2` rev **2**/**4** integer MVs only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2SubpelMode {
+    #[default]
+    Off,
+    /// Half-pel on the quarter-pel grid (`FR2` rev **5**/**6**); chroma uses integer `mv_q/8`.
+    HalfPel,
+}
+
 /// Integer-pel motion search strategy for experimental P-frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2MotionSearchMode {
@@ -120,6 +131,10 @@ pub struct SrsV2EncodeSettings {
     pub early_exit_sad_threshold: u32,
     pub enable_skip_blocks: bool,
 
+    pub subpel_mode: SrsV2SubpelMode,
+    /// Half-pel refinement radius: **`0`** skips the eight half-pel probes; **`1`** runs one ring (default).
+    pub subpel_refinement_radius: u8,
+
     pub loop_filter_mode: SrsV2LoopFilterMode,
     /// Written to the sequence header when [`SrsV2LoopFilterMode::SimpleDeblock`] is selected; **`0`** uses codec default strength.
     pub deblock_strength: u8,
@@ -150,6 +165,9 @@ impl Default for SrsV2EncodeSettings {
             early_exit_sad_threshold: 0,
             enable_skip_blocks: true,
 
+            subpel_mode: SrsV2SubpelMode::Off,
+            subpel_refinement_radius: 1,
+
             loop_filter_mode: SrsV2LoopFilterMode::Off,
             deblock_strength: 0,
         }
@@ -162,6 +180,11 @@ impl SrsV2EncodeSettings {
         self.motion_search_radius
             .clamp(0, MAX_MOTION_SEARCH_RADIUS)
             .min(MAX_MOTION_VECTOR_PELS)
+    }
+
+    pub fn clamped_subpel_refinement_radius(&self) -> u8 {
+        self.subpel_refinement_radius
+            .min(MAX_SUBPEL_REFINEMENT_RADIUS)
     }
 
     pub fn clamp_qp(&self, qp: u8) -> u8 {
@@ -472,5 +495,18 @@ mod tests {
         let s = SrsV2EncodeSettings::default();
         assert_eq!(s.motion_search_radius, 16);
         assert_eq!(s.clamped_motion_search_radius(), 16);
+    }
+
+    #[test]
+    fn subpel_refinement_radius_clamps_to_max() {
+        use super::super::limits::MAX_SUBPEL_REFINEMENT_RADIUS;
+        let s = SrsV2EncodeSettings {
+            subpel_refinement_radius: 255,
+            ..Default::default()
+        };
+        assert_eq!(
+            s.clamped_subpel_refinement_radius(),
+            MAX_SUBPEL_REFINEMENT_RADIUS
+        );
     }
 }

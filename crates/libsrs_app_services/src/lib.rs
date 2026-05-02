@@ -15,10 +15,10 @@ use libsrs_licensing_proto::{EntitlementClaims, LicensedFeature};
 use libsrs_mux::MuxWriter;
 use libsrs_pipeline::TranscodePipeline;
 use libsrs_video::{
-    classify_srsv2_payload, decode_sequence_header_v2, decode_yuv420_intra_payload,
-    encode_sequence_header_v2, encode_yuv420_intra_payload, FrameType, SrsV2EncodeSettings,
-    Srsv2PayloadKind, VideoFrame, VideoSequenceHeaderV2, VideoStreamReader, VideoStreamReaderV2,
-    VideoStreamWriter, VideoStreamWriterV2, SEQUENCE_HEADER_BYTES,
+    apply_reconstruction_filter_if_enabled, classify_srsv2_payload, decode_sequence_header_v2,
+    decode_yuv420_intra_payload, encode_sequence_header_v2, encode_yuv420_intra_payload, FrameType,
+    SrsV2EncodeSettings, Srsv2PayloadKind, VideoFrame, VideoSequenceHeaderV2, VideoStreamReader,
+    VideoStreamReaderV2, VideoStreamWriter, VideoStreamWriterV2, SEQUENCE_HEADER_BYTES,
 };
 use thiserror::Error;
 
@@ -658,8 +658,9 @@ fn decode_srsv2_video_to_raw(input: &Path, output: &Path) -> Result<()> {
         .read_next_payload()
         .map_err(|e| anyhow!("SRSV2 elementary read: {}", e))?
     {
-        let dec = decode_yuv420_intra_payload(&seq, &payload)
+        let mut dec = decode_yuv420_intra_payload(&seq, &payload)
             .map_err(|e| anyhow!("SRSV2 decode: {}", e))?;
+        apply_reconstruction_filter_if_enabled(&seq, &mut dec);
         append_plane_tight(&mut out, &dec.yuv.y);
         append_plane_tight(&mut out, &dec.yuv.u);
         append_plane_tight(&mut out, &dec.yuv.v);

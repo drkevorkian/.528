@@ -32,6 +32,14 @@ Prefix matches **`FR2\x03`**. Same top-level layout as revision **1** (`frame_in
 
 Same macroblock grid and motion syntax as revision **2**. Non-skipped **8×8** Y residuals use either legacy tuple blobs or an **adaptive** layout byte **`1`** followed by the same per-block explicit vs rANS tagging as intra **rev 3**. **Rev 2** remains the tuple-only P payload for backward compatibility.
 
+### Revision 5 — P-frame with half-pel luma MVs (`FR2\x05`) — experimental
+
+Same macroblock grid and residual blob layout as revision **2**, except each macroblock carries **`mv_x_q`, `mv_y_q` as `i32` LE** in **quarter-pel** luma units (half-pel steps are **`±2`**). Values must lie within decoder MV caps and be **even** in quarter-pel space (odd values are **malformed**). Chroma prediction uses integer **`mv_q / 8`** (limited approximation).
+
+### Revision 6 — P-frame half-pel MVs + adaptive residuals (`FR2\x06`) — experimental
+
+Same as revision **5** for motion, with non-skipped residual packing matching revision **4** (adaptive explicit vs rANS).
+
 ## Elementary `.srsv2` file
 
 Starts with the 64-byte sequence header, then repeating framed records: VP packet sync (`PACKET_SYNC` from `libsrs_video`), version/type bytes, `frame_index`, payload length, CRC32 of header fields + payload, payload bytes.
@@ -41,4 +49,4 @@ Starts with the 64-byte sequence header, then repeating framed records: VP packe
 - Ignore reserved trailing bytes in the 64-byte sequence header for schema **1** (decoders read defined offsets only); encoders should zero-fill unused slots.
 - Reject unknown sequence schema version.
 - Enforce `MAX_FRAME_PAYLOAD_BYTES`, dimension caps, and CRC mismatches as hard errors.
-- **FR2** revisions **1** and **2** must remain decodable unchanged; **3** and **4** add optional entropy-coded residuals and are **experimental** (see `docs/srsv2_codec.md`).
+- **FR2** revisions **1**–**4** remain the integer-MV baseline; **5** and **6** add **half-pel** luma MVs (experimental). **3** and **4** add optional entropy-coded intra/P residuals (see `docs/srsv2_codec.md`).
