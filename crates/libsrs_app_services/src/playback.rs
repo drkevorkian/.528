@@ -3,7 +3,7 @@
 //! # Reality check (Phase 0)
 //! - **Demux:** [`libsrs_demux::DemuxReader`] over `Read+Seek` — already enforces container limits
 //!   (`MAX_PACKET_PAYLOAD_BYTES`, etc.) per `libsrs_container::io`.
-//! - **Video decode:** [`libsrs_video::decode_frame`] for **`codec_id` 1**; [`libsrs_video::decode_yuv420_srsv2_payload_managed`] for **`codec_id` 3** (intra, experimental **P**, experimental **B** `FR2` rev **10–11**, experimental **alt-ref** rev **12** via bounded [`libsrs_video::SrsV2ReferenceManager`]).
+//! - **Video decode:** [`libsrs_video::decode_frame`] for **`codec_id` 1**; [`libsrs_video::decode_yuv420_srsv2_payload_managed`] for **`codec_id` 3** (intra, experimental **P**, experimental **B** **`FR2` rev **10–11** when **`max_ref_frames ≥ 2`** and references are already populated — typically **bitstream/decode order** *I₀ → P₂ → B₁*, not presentation order), experimental **alt-ref** rev **12** via bounded [`libsrs_video::SrsV2ReferenceManager`]. **`FR2` rev **10–11** with `max_ref_frames < 2`** returns [`PlaybackError::Unsupported`] (sequence advertises too few reference slots).
 //! - **Audio decode:** [`libsrs_audio::decode_frame_with_stream_version`] with v2 stream payloads.
 //! - **App inspect:** [`crate::inspect_native_container`](super) lists tracks; playback uses the same file layout.
 //! - **Player (before this module):** `playing=true` and wall-clock `position_ms` were scaffold-only.
@@ -647,6 +647,16 @@ impl PlaybackSession {
                         "SRSV2 reference manager missing from session".to_string(),
                     )
                 })?;
+                if p.packet.payload.len() >= 4
+                    && &p.packet.payload[0..3] == b"FR2"
+                    && matches!(p.packet.payload[3], 10 | 11)
+                    && seq.max_ref_frames < 2
+                {
+                    return Err(PlaybackError::Unsupported(
+                        "SRSV2 B-frame (FR2 rev 10–11) requires max_ref_frames >= 2 in track config"
+                            .to_string(),
+                    ));
+                }
                 let dec = decode_yuv420_srsv2_payload_managed(seq, &p.packet.payload, mgr)
                     .map_err(|e| PlaybackError::VideoDecode(format!("srsv2: {e}")))?;
                 self.update_position_from_pts(p.packet.header.pts, timescale);
@@ -881,9 +891,9 @@ mod playback_tests {
     use libsrs_mux::MuxWriter;
     use libsrs_video::{
         decode_yuv420_srsv2_payload, encode_frame, encode_sequence_header_v2,
-        encode_yuv420_inter_payload, encode_yuv420_intra_payload, gray8_packed_to_yuv420p8_neutral,
-        FrameType, ResidualEntropy, SrsV2EncodeSettings, VideoFrame, VideoSequenceHeaderV2,
-        SEQUENCE_HEADER_BYTES,
+        encode_yuv420_b_payload, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
+        gray8_packed_to_yuv420p8_neutral, BBlendModeWire, FrameType, ResidualEntropy,
+        SrsV2EncodeSettings, VideoFrame, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
     };
 
     fn mux_srsv2_settings() -> SrsV2EncodeSettings {
@@ -1177,6 +1187,129 @@ mod playback_tests {
         assert_eq!(f.width, 8);
         assert_eq!(f.height, 8);
         assert!(!f.gray8.is_empty());
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn srsv2_b_frame_playback_rejects_when_max_ref_below_two() {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!(
+            "pb-srsv2-b-ref1-{}.528",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let w = 16u32;
+        let h = 16u32;
+        let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited_one_ref(w, h);
+        assert_eq!(seq.max_ref_frames, 1);
+        let gray = vec![0x55u8; (w * h) as usize];
+        let yuv = gray8_packed_to_yuv420p8_neutral(&gray, w, h).unwrap();
+        let st = mux_srsv2_settings();
+        let enc0 = encode_yuv420_intra_payload(&seq, &yuv, 0, 28, &st, None, None).unwrap();
+        let stub_b = vec![b'F', b'R', b'2', 10u8];
+        let cfg = encode_sequence_header_v2(&seq).to_vec();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg,
+        }];
+        let f = File::create(&p).unwrap();
+        let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, &enc0).unwrap();
+        mux.write_packet(1, 3000, 3000, false, &stub_b).unwrap();
+        mux.finalize().unwrap();
+
+        let mut s = PlaybackSession::open(&p).unwrap();
+        assert!(matches!(
+            s.decode_next_step().unwrap(),
+            PlaybackEvent::Video(_)
+        ));
+        let err = s.decode_next_step().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PlaybackError::Unsupported(ref msg)
+                    if msg.contains("max_ref_frames") && msg.contains("B-frame")
+            ),
+            "{err:?}"
+        );
+        std::fs::remove_file(&p).ok();
+    }
+
+    /// Decode order **I₀ → P₂ → B₁** (not presentation order); mux packets in that order.
+    #[test]
+    fn srsv2_b_frame_playback_decode_order_smoke() {
+        let dir = std::env::temp_dir();
+        let p = dir.join(format!(
+            "pb-srsv2-bok-{}.528",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let w = 16u32;
+        let h = 16u32;
+        let mut seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited_one_ref(w, h);
+        seq.max_ref_frames = 2;
+
+        let st = mux_srsv2_settings();
+        let yuv0 = gray8_packed_to_yuv420p8_neutral(&vec![0x22u8; (w * h) as usize], w, h).unwrap();
+        let yuv1 = gray8_packed_to_yuv420p8_neutral(&vec![0x77u8; (w * h) as usize], w, h).unwrap();
+        let yuv2 = gray8_packed_to_yuv420p8_neutral(&vec![0xEEu8; (w * h) as usize], w, h).unwrap();
+
+        let enc_i = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28, &st, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &enc_i, &mut slot).unwrap();
+        let enc_p =
+            encode_yuv420_inter_payload(&seq, &yuv2, slot.as_ref(), 2, 28, &st, None, None, None)
+                .unwrap();
+        decode_yuv420_srsv2_payload(&seq, &enc_p, &mut slot).unwrap();
+        let enc_b = encode_yuv420_b_payload(
+            &seq,
+            &yuv1,
+            &yuv0,
+            &yuv2,
+            1,
+            28,
+            1,
+            0,
+            BBlendModeWire::Average,
+            false,
+        )
+        .unwrap();
+        assert_eq!(enc_b.get(3).copied(), Some(10));
+
+        let cfg = encode_sequence_header_v2(&seq).to_vec();
+        let tracks = vec![TrackDescriptor {
+            track_id: 1,
+            kind: TrackKind::Video,
+            codec_id: 3,
+            flags: 0,
+            timescale: 90_000,
+            config: cfg,
+        }];
+        let f = File::create(&p).unwrap();
+        let mut mux = MuxWriter::new(f, FileHeader::new(1, 4), tracks).unwrap();
+        mux.write_packet(1, 0, 0, true, &enc_i).unwrap();
+        mux.write_packet(1, 3000, 3000, false, &enc_p).unwrap();
+        mux.write_packet(1, 6000, 6000, false, &enc_b).unwrap();
+        mux.finalize().unwrap();
+
+        let mut s = PlaybackSession::open(&p).unwrap();
+        let f0 = s.decode_next_video_frame().unwrap().unwrap();
+        let f1 = s.decode_next_video_frame().unwrap().unwrap();
+        let f2 = s.decode_next_video_frame().unwrap().unwrap();
+        assert_eq!(f0.frame_index, 0);
+        assert_eq!(f1.frame_index, 2);
+        assert_eq!(f2.frame_index, 1);
+        assert!(!f0.gray8.is_empty() && !f1.gray8.is_empty() && !f2.gray8.is_empty());
+        assert_ne!(f0.gray8[0], f1.gray8[0]);
+        assert_ne!(f1.gray8[0], f2.gray8[0]);
         std::fs::remove_file(&p).ok();
     }
 

@@ -54,7 +54,7 @@ Same as revision **8** for **`qp_delta`** placement, clipping header, and **luma
 
 ### Revision 10 — experimental B-frame, integer MV (`FR2\x0A`)
 
-Bidirectional **macroblock** syntax (16-aligned canvas): `frame_index`, `qp`, **`slot_a`**, **`slot_b`**, blend mode, per-MB MV pair(s) (`i16` when rev **10**), adaptive residual packing akin to **P** rev **4**. Requires **`max_ref_frames ≥ 2`**, valid populated slots, backward reference strictly **before** the current picture in `frame_index` order and forward reference strictly **after**, and a supported blend (**weighted** on wire value **3** is reserved / rejected). Parser rejects malformed residuals, bad MVs, and oversize payloads.
+B-frame **macroblock** syntax (16-aligned canvas; mux/policy may still classify **`FR2\x0A`/`\x0B`** as generic **predicted** / non-keyframe): `frame_index`, `qp`, **`slot_a`**, **`slot_b`**, blend mode, per-MB MV pair(s) (`i16` when rev **10**), adaptive residual packing akin to **P** rev **4**. Requires **`max_ref_frames ≥ 2`**, valid populated slots, backward reference strictly **before** the current picture in `frame_index` order and forward reference strictly **after**, and a supported blend (**weighted** on wire value **3** is reserved / rejected). Parser rejects malformed residuals, bad MVs, and oversize payloads.
 
 ### Revision 11 — experimental B-frame, half-pel MV (`FR2\x0B`)
 

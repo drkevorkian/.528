@@ -12,7 +12,7 @@
 
 **Adaptive quantization (experimental):** optional **frame-level** QP derivation from per-MB activity (`docs/adaptive_quantization.md`). Optional **block-level** **`qp_delta`** syntax is **versioned** (**`FR2\x07`–`\x09`**) and **off by default** (`SrsV2BlockAqMode`). Frame-level AQ still picks the **`base_qp`** byte before per-block deltas apply. **Intra rev 7** carries **`qp_delta` on Y/U/V 8×8 blocks**; **P rev 8/9** carries **`qp_delta` on luma residuals only** (chroma has no residual syntax in this prototype).
 
-**Motion search (experimental):** integer-pel modes, optional **half-pel** refinement (`docs/motion_search.md`). **Experimental B** (`FR2\x0A`/`\x0B`) and **alt-ref** (`FR2\x0C`) exist behind **`decode_yuv420_srsv2_payload_managed`** / **`SrsV2ReferenceManager`** — quality and tooling are **not** production-grade. Finer **GPU** motion remains roadmap.
+**Motion search (experimental):** integer-pel modes, optional **half-pel** refinement (`docs/motion_search.md`). **Experimental B** (`FR2\x0A`/`\x0B`) and **alt-ref** (`FR2\x0C`) decode through **`decode_yuv420_srsv2_payload_managed`** / **`SrsV2ReferenceManager`** (parser-safe baseline). **Playback** accepts **B** when **`max_ref_frames ≥ 2`** and packet order matches decode needs (often *I₀ → P₂ → B₁*); **`max_ref_frames < 2`** → **`PlaybackError::Unsupported`**. **`classify_srsv2_payload`** treats rev **10**/**11** like other **non-keyframe** **predicted** kinds for mux/index policy. Quality and tooling are **not** production-grade. Finer **GPU** motion remains roadmap.
 
 Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future slices**.
 

@@ -242,6 +242,13 @@ mod tests {
     }
 
     #[test]
+    fn max_ref_zero_rejects_inter_reference_access() {
+        let m = SrsV2ReferenceManager::new(0).unwrap();
+        assert!(m.validate_slot_index(0).is_err());
+        assert!(m.frame_at_slot_index(0).is_err());
+    }
+
+    #[test]
     fn max_ref_one_keeps_last_in_slot_zero() {
         let mut m = SrsV2ReferenceManager::new(1).unwrap();
         m.push_displayable_last(0, tiny_gray_frame(40));

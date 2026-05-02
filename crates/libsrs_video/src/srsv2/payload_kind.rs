@@ -7,10 +7,8 @@ use super::error::SrsV2Error;
 pub enum Srsv2PayloadKind {
     /// `FR2\\x01` — intra / refresh picture (should be indexed as a keyframe).
     Intra,
-    /// `FR2\\x02` — experimental predicted picture (not a keyframe).
+    /// `FR2\\x02` … `FR2\\x09` — forward/inter predicted; **`FR2\\x0A` / `FR2\\x0B`** are experimental **B** syntax but classified here as predicted for mux/policy (not keyframes).
     Predicted,
-    /// `FR2\\x0A` / `FR2\\x0B` — experimental B (`FR2` rev **10** / **11**).
-    Bidirectional,
     /// `FR2\\x0C` — experimental non-displayable alt-ref (`FR2` rev **12**).
     AltRef,
     /// `FR2` with an unsupported revision byte (must not be muxed without decoder support).
@@ -20,8 +18,7 @@ pub enum Srsv2PayloadKind {
 /// Classify a mux/elementary SRSV2 frame payload by its `FR2` revision.
 ///
 /// - `FR2\\x01` / `FR2\\x03` / `FR2\\x07` → [`Srsv2PayloadKind::Intra`] (rev 3/7 use entropy residuals; rev 7 adds block `qp_delta`)
-/// - `FR2\\x02` / `FR2\\x04` / `FR2\\x05` / `FR2\\x06` / `FR2\\x08` / `FR2\\x09` → [`Srsv2PayloadKind::Predicted`]
-/// - `FR2\\x0A` / `FR2\\x0B` → [`Srsv2PayloadKind::Bidirectional`]
+/// - `FR2\\x02` / `FR2\\x04` / `FR2\\x05` / `FR2\\x06` / `FR2\\x08` / `FR2\\x09` / `FR2\\x0A` / `FR2\\x0B` → [`Srsv2PayloadKind::Predicted`]
 /// - `FR2\\x0C` → [`Srsv2PayloadKind::AltRef`]
 /// - Other `FR2\\x??` → [`Srsv2PayloadKind::Unknown`]
 /// - Too short or bad magic → [`SrsV2Error`]
@@ -34,8 +31,7 @@ pub fn classify_srsv2_payload(payload: &[u8]) -> Result<Srsv2PayloadKind, SrsV2E
     }
     Ok(match payload[3] {
         1 | 3 | 7 => Srsv2PayloadKind::Intra,
-        2 | 4 | 5 | 6 | 8 | 9 => Srsv2PayloadKind::Predicted,
-        10 | 11 => Srsv2PayloadKind::Bidirectional,
+        2 | 4 | 5 | 6 | 8 | 9 | 10 | 11 => Srsv2PayloadKind::Predicted,
         12 => Srsv2PayloadKind::AltRef,
         _ => Srsv2PayloadKind::Unknown,
     })
@@ -128,14 +124,14 @@ mod classify_tests {
     }
 
     #[test]
-    fn fr2_rev10_rev11_are_bidirectional() {
+    fn fr2_rev10_rev11_are_predicted_b_syntax() {
         assert_eq!(
             classify_srsv2_payload(&[b'F', b'R', b'2', 10]).unwrap(),
-            Srsv2PayloadKind::Bidirectional
+            Srsv2PayloadKind::Predicted
         );
         assert_eq!(
             classify_srsv2_payload(&[b'F', b'R', b'2', 11]).unwrap(),
-            Srsv2PayloadKind::Bidirectional
+            Srsv2PayloadKind::Predicted
         );
     }
 

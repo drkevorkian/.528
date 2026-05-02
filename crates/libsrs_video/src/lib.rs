@@ -17,8 +17,8 @@ pub use srsv2::limits::MAX_LUMA_SAMPLES;
 pub use srsv2::model::SEQUENCE_HEADER_BYTES;
 pub use srsv2::{
     apply_loop_filter_y, apply_reconstruction_filter_if_enabled, classify_srsv2_payload,
-    decode_sequence_header_v2, decode_yuv420_alt_ref_payload, decode_yuv420_intra_payload,
-    decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
+    decode_sequence_header_v2, decode_yuv420_alt_ref_payload, decode_yuv420_b_payload,
+    decode_yuv420_intra_payload, decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
     elementary::{peek_is_srsv2, VideoStreamReaderV2, VideoStreamWriterV2},
     encode_sequence_header_v2, encode_yuv420_alt_ref_payload, encode_yuv420_b_payload,
     encode_yuv420_inter_payload, encode_yuv420_intra_payload, gray8_packed_to_yuv420p8_neutral,

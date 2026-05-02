@@ -14,11 +14,11 @@ use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
-    encode_yuv420_alt_ref_payload, encode_yuv420_b_payload, encode_yuv420_inter_payload,
-    BBlendModeWire, PixelFormat, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
-    SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2RateControlMode,
-    SrsV2RateController, SrsV2ReferenceManager, SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
+    encode_yuv420_alt_ref_payload, encode_yuv420_inter_payload, PixelFormat, PreviousFrameRcStats,
+    ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats,
+    SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2LoopFilterMode, SrsV2MotionEncodeStats,
+    SrsV2MotionSearchMode, SrsV2RateControlMode, SrsV2RateController, SrsV2ReferenceManager,
+    SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -138,7 +138,7 @@ struct Args {
     #[arg(long, default_value_t = 6)]
     block_aq_delta_max: i8,
 
-    /// Experimental B-frames per GOP interior (`0` = off; **default** preserves legacy I/P-only bench).
+    /// Reserved for future bench B-GOP wiring; **`> 0` is rejected** (use `libsrs_video` B-frame tests).
     #[arg(long, default_value_t = 0)]
     bframes: u32,
 
@@ -146,7 +146,7 @@ struct Args {
     #[arg(long, default_value = "off")]
     alt_ref: String,
 
-    /// GOP length for experimental B layout (`--bframes` > 0); defaults to `--keyint` when unset logic applies.
+    /// Reserved GOP hint for a future B-bench mode (ignored while `--bframes` stays unsupported).
     #[arg(long, default_value_t = 0)]
     gop: u32,
 
@@ -598,6 +598,11 @@ fn validate_args(args: &Args) -> Result<()> {
     parse_subpel_mode(&args.subpel)?;
     parse_block_aq_mode(&args.block_aq)?;
     let _ = parse_alt_ref_flag(&args.alt_ref)?;
+    if args.bframes > 0 {
+        bail!(
+            "--bframes > 0 is not supported in bench_srsv2; keep --bframes 0 (B syntax is covered by libsrs_video unit tests)"
+        );
+    }
     Ok(())
 }
 
@@ -786,284 +791,6 @@ fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> Mot
     }
 }
 
-fn run_srsv2_numbers_b_layout(
-    args: &Args,
-    seq: &VideoSequenceHeaderV2,
-    raw: &[u8],
-    settings: &SrsV2EncodeSettings,
-    expected_frame: usize,
-    alt_on: bool,
-) -> Result<PassNumbers> {
-    if args.frames < 3 {
-        bail!("--bframes > 0 requires frames >= 3");
-    }
-    let mut rc = SrsV2RateController::new(settings, args.fps.max(1), 1)
-        .map_err(|e| anyhow!("rate controller: {e}"))?;
-    let mut mgr = SrsV2ReferenceManager::new(seq.max_ref_frames)
-        .map_err(|e| anyhow!("reference manager: {e}"))?;
-    let t0 = Instant::now();
-    let mut payloads: Vec<Vec<u8>> = Vec::new();
-    let mut psnr_src_frame: Vec<Option<u32>> = Vec::new();
-    let mut byte_hist: Vec<u64> = Vec::new();
-    let mut enc_stats = ResidualEncodeStats::default();
-    let mut qp_hist = vec![args.qp; args.frames as usize];
-    let mut prev: Option<PreviousFrameRcStats> = None;
-    let mut motion_agg = MotionAgg::default();
-    let half_pel = matches!(settings.subpel_mode, SrsV2SubpelMode::HalfPel);
-
-    let acc_motion_p = |motion_frame: &SrsV2MotionEncodeStats, motion_agg: &mut MotionAgg| {
-        motion_agg.sad_evaluations += motion_frame.sad_evaluations;
-        motion_agg.skip_subblocks += motion_frame.skip_subblocks;
-        motion_agg.nonzero_motion_macroblocks += motion_frame.nonzero_motion_macroblocks as u64;
-        motion_agg.sum_mv_l1 += motion_frame.sum_mv_l1;
-        motion_agg.p_frames += 1;
-        let mb = (seq.width / 16) as u64 * (seq.height / 16) as u64;
-        motion_agg.p_macroblocks_total += mb;
-        motion_agg.subpel_blocks_tested += motion_frame.subpel_blocks_tested;
-        motion_agg.subpel_blocks_selected += motion_frame.subpel_blocks_selected;
-        motion_agg.additional_subpel_evaluations += motion_frame.additional_subpel_evaluations;
-        motion_agg.sum_abs_frac_qpel += motion_frame.sum_abs_frac_qpel;
-    };
-
-    let y0 = load_yuv420_frame(raw, expected_frame, 0, args.width, args.height)?;
-    let qp0 = rc.qp_for_frame(0, prev);
-    let mut aq0 = SrsV2AqEncodeStats::default();
-    let mut m0 = SrsV2MotionEncodeStats::default();
-    let p0 = encode_yuv420_inter_payload(
-        seq,
-        &y0,
-        mgr.primary_ref(),
-        0,
-        qp0,
-        settings,
-        Some(&mut enc_stats),
-        Some(&mut aq0),
-        Some(&mut m0),
-    )
-    .map_err(|e| anyhow!("SRSV2 encode f0: {e}"))?;
-    qp_hist[0] = qp0;
-    let is_i0 = matches!(p0.get(3).copied(), Some(1 | 3 | 7));
-    byte_hist.push(p0.len() as u64);
-    rc.observe_frame(0, p0.len(), is_i0);
-    decode_yuv420_srsv2_payload_managed(seq, &p0, &mut mgr)
-        .map_err(|e| anyhow!("decode f0: {e}"))?;
-    payloads.push(p0);
-    psnr_src_frame.push(Some(0));
-    prev = Some(PreviousFrameRcStats {
-        encoded_bytes: payloads.last().unwrap().len() as u32,
-        is_keyframe: is_i0,
-    });
-    if alt_on && is_i0 {
-        let alt = encode_yuv420_alt_ref_payload(seq, &y0, 0, qp0, 1)
-            .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
-        decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
-            .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
-        byte_hist.push(alt.len() as u64);
-        payloads.push(alt);
-        psnr_src_frame.push(None);
-    }
-
-    let y2 = load_yuv420_frame(raw, expected_frame, 2, args.width, args.height)?;
-    let qp2 = rc.qp_for_frame(2, prev);
-    let mut aq2 = SrsV2AqEncodeStats::default();
-    let mut m2 = SrsV2MotionEncodeStats::default();
-    let p2 = encode_yuv420_inter_payload(
-        seq,
-        &y2,
-        mgr.primary_ref(),
-        2,
-        qp2,
-        settings,
-        Some(&mut enc_stats),
-        Some(&mut aq2),
-        Some(&mut m2),
-    )
-    .map_err(|e| anyhow!("SRSV2 encode f2: {e}"))?;
-    let mut aq_last = aq2;
-    qp_hist[2] = qp2;
-    let is_p2 = matches!(p2.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9));
-    if is_p2 {
-        acc_motion_p(&m2, &mut motion_agg);
-    }
-    let is_i2 = matches!(p2.get(3).copied(), Some(1 | 3 | 7));
-    byte_hist.push(p2.len() as u64);
-    rc.observe_frame(2, p2.len(), is_i2);
-    decode_yuv420_srsv2_payload_managed(seq, &p2, &mut mgr)
-        .map_err(|e| anyhow!("decode f2: {e}"))?;
-    let p2_len = p2.len();
-    payloads.push(p2);
-    psnr_src_frame.push(Some(2));
-    prev = Some(PreviousFrameRcStats {
-        encoded_bytes: p2_len as u32,
-        is_keyframe: is_i2,
-    });
-    if alt_on && is_i2 {
-        let alt = encode_yuv420_alt_ref_payload(seq, &y2, 2, qp2, 1)
-            .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
-        decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
-            .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
-        byte_hist.push(alt.len() as u64);
-        payloads.push(alt);
-        psnr_src_frame.push(None);
-    }
-
-    let y1 = load_yuv420_frame(raw, expected_frame, 1, args.width, args.height)?;
-    let qp1 = rc.qp_for_frame(1, prev);
-    let ref_a = mgr
-        .frame_at_slot_index(1)
-        .map_err(|e| anyhow!("B backward ref: {e}"))?;
-    let ref_b = mgr
-        .frame_at_slot_index(0)
-        .map_err(|e| anyhow!("B forward ref: {e}"))?;
-    let pb = encode_yuv420_b_payload(
-        seq,
-        &y1,
-        ref_a,
-        ref_b,
-        1,
-        qp1,
-        1,
-        0,
-        BBlendModeWire::Average,
-        half_pel,
-    )
-    .map_err(|e| anyhow!("B encode: {e}"))?;
-    qp_hist[1] = qp1;
-    byte_hist.push(pb.len() as u64);
-    rc.observe_frame(1, pb.len(), false);
-    decode_yuv420_srsv2_payload_managed(seq, &pb, &mut mgr)
-        .map_err(|e| anyhow!("decode B: {e}"))?;
-    let pb_len = pb.len();
-    payloads.push(pb);
-    psnr_src_frame.push(Some(1));
-    prev = Some(PreviousFrameRcStats {
-        encoded_bytes: pb_len as u32,
-        is_keyframe: false,
-    });
-
-    for fi in 3..args.frames {
-        let qp = rc.qp_for_frame(fi, prev);
-        let frame = load_yuv420_frame(raw, expected_frame, fi, args.width, args.height)?;
-        let mut aq_frame = SrsV2AqEncodeStats::default();
-        let mut motion_frame = SrsV2MotionEncodeStats::default();
-        let payload = encode_yuv420_inter_payload(
-            seq,
-            &frame,
-            mgr.primary_ref(),
-            fi,
-            qp,
-            settings,
-            Some(&mut enc_stats),
-            Some(&mut aq_frame),
-            Some(&mut motion_frame),
-        )
-        .map_err(|e| anyhow!("SRSV2 encode: {e}"))?;
-        aq_last = aq_frame;
-        let is_p = matches!(payload.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9));
-        if is_p {
-            acc_motion_p(&motion_frame, &mut motion_agg);
-        }
-        let is_i = matches!(payload.get(3).copied(), Some(1 | 3 | 7));
-        qp_hist[fi as usize] = qp;
-        byte_hist.push(payload.len() as u64);
-        rc.observe_frame(fi, payload.len(), is_i);
-        decode_yuv420_srsv2_payload_managed(seq, &payload, &mut mgr)
-            .map_err(|e| anyhow!("SRSV2 reference refresh: {e}"))?;
-        prev = Some(PreviousFrameRcStats {
-            encoded_bytes: payload.len() as u32,
-            is_keyframe: is_i,
-        });
-        payloads.push(payload);
-        psnr_src_frame.push(Some(fi));
-        if alt_on && is_i {
-            let alt = encode_yuv420_alt_ref_payload(seq, &frame, fi, qp, 1)
-                .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
-            decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
-                .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
-            byte_hist.push(alt.len() as u64);
-            payloads.push(alt);
-            psnr_src_frame.push(None);
-        }
-    }
-
-    let enc_secs = t0.elapsed().as_secs_f64();
-
-    let t1 = Instant::now();
-    let mut mgr_dec = SrsV2ReferenceManager::new(seq.max_ref_frames)
-        .map_err(|e| anyhow!("decode manager: {e}"))?;
-    let ylen = (args.width * args.height) as usize;
-    let mut dec_by_frame = vec![vec![0u8; ylen]; args.frames as usize];
-    for (pl, src_ix) in payloads.iter().zip(psnr_src_frame.iter()) {
-        let dec = decode_yuv420_srsv2_payload_managed(seq, pl, &mut mgr_dec)
-            .map_err(|e| anyhow!("SRSV2 decode: {e}"))?;
-        if let Some(fi) = src_ix {
-            dec_by_frame[*fi as usize] = dec.yuv.y.samples.clone();
-        }
-    }
-    let dec_secs = t1.elapsed().as_secs_f64();
-
-    let mut src_luma = Vec::with_capacity(ylen * args.frames as usize);
-    let mut dec_luma = Vec::with_capacity(src_luma.capacity());
-    for fi in 0..args.frames {
-        src_luma.extend_from_slice(frame_luma_slice(
-            raw,
-            expected_frame,
-            fi,
-            args.width,
-            args.height,
-        ));
-        dec_luma.extend_from_slice(&dec_by_frame[fi as usize]);
-    }
-    let psnr_y = psnr_u8(&src_luma, &dec_luma, 255.0)?;
-    let ssim_y = avg_ssim_per_frame(&src_luma, &dec_luma, args.width, args.height, args.frames)?;
-
-    let legacy_explicit_total_payload_bytes =
-        if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
-            None
-        } else {
-            let mut settings_leg = settings.clone();
-            settings_leg.residual_entropy = ResidualEntropy::Explicit;
-            settings_leg.block_aq_mode = SrsV2BlockAqMode::Off;
-            let mut sum = 0_u64;
-            let mut slot = None::<YuvFrame>;
-            for fi in 0..args.frames {
-                let frame = load_yuv420_frame(raw, expected_frame, fi, args.width, args.height)?;
-                let qpi = *qp_hist.get(fi as usize).unwrap_or(&args.qp);
-                let pl = encode_yuv420_inter_payload(
-                    seq,
-                    &frame,
-                    slot.as_ref(),
-                    fi,
-                    qpi,
-                    &settings_leg,
-                    None,
-                    None,
-                    None,
-                )
-                .map_err(|e| anyhow!("SRSV2 legacy explicit encode: {e}"))?;
-                let _ = decode_yuv420_srsv2_payload(seq, &pl, &mut slot)
-                    .map_err(|e| anyhow!("SRSV2 legacy reference refresh: {e}"))?;
-                sum += pl.len() as u64;
-            }
-            Some(sum)
-        };
-
-    Ok(PassNumbers {
-        qp_hist,
-        byte_hist,
-        enc_stats,
-        enc_secs,
-        dec_secs,
-        payloads,
-        psnr_src_frame,
-        psnr_y,
-        ssim_y,
-        legacy_explicit_total_payload_bytes,
-        aq_last,
-        motion_agg,
-    })
-}
-
 fn run_srsv2_numbers(
     args: &Args,
     seq: &VideoSequenceHeaderV2,
@@ -1072,15 +799,6 @@ fn run_srsv2_numbers(
     expected_frame: usize,
 ) -> Result<PassNumbers> {
     let alt_on = parse_alt_ref_flag(&args.alt_ref)?;
-    if args.bframes > 0 {
-        if seq.max_ref_frames < 2 {
-            bail!("--bframes > 0 requires --reference-frames >= 2");
-        }
-        if !seq.width.is_multiple_of(16) || !seq.height.is_multiple_of(16) {
-            bail!("--bframes > 0 requires width and height divisible by 16");
-        }
-        return run_srsv2_numbers_b_layout(args, seq, raw, settings, expected_frame, alt_on);
-    }
     if alt_on && seq.max_ref_frames < 2 {
         bail!("--alt-ref on requires --reference-frames >= 2");
     }
@@ -2280,6 +1998,55 @@ mod tests {
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
         assert!(raw.len() != fb * a.frames as usize);
         let _ = fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn bframes_positive_rejected_by_validate_args() {
+        let mut a = Args {
+            input: PathBuf::from("nope"),
+            width: 64,
+            height: 64,
+            frames: 1,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: std::env::temp_dir().join("xb.json"),
+            report_md: std::env::temp_dir().join("xb.md"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 2,
+            alt_ref: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+        };
+        assert!(validate_args(&a).is_err());
+        a.bframes = 0;
+        assert!(validate_args(&a).is_ok());
     }
 
     #[test]

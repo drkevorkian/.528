@@ -561,10 +561,14 @@ pub fn decode_yuv420_b_payload(
 mod tests {
     use super::*;
     use crate::srsv2::color::gray8_packed_to_yuv420p8_neutral;
+    use crate::srsv2::frame_codec::{
+        decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
+    };
     use crate::srsv2::model::{
         ChromaSiting, ColorPrimaries, ColorRange, MatrixCoefficients, SrsVideoProfile,
         TransferFunction,
     };
+    use crate::srsv2::rate_control::{ResidualEntropy, SrsV2EncodeSettings};
 
     fn seq_b(w: u32, h: u32) -> VideoSequenceHeaderV2 {
         VideoSequenceHeaderV2 {
@@ -581,6 +585,11 @@ mod tests {
             deblock_strength: 0,
             max_ref_frames: 2,
         }
+    }
+
+    fn flat_yuv(w: u32, h: u32, yv: u8) -> YuvFrame {
+        let g = vec![yv; (w * h) as usize];
+        gray8_packed_to_yuv420p8_neutral(&g, w, h).unwrap()
     }
 
     #[test]
@@ -607,5 +616,212 @@ mod tests {
     #[test]
     fn weighted_blend_wire_mode_is_reserved() {
         assert!(BBlendModeWire::from_u8(3).is_err());
+    }
+
+    #[test]
+    fn b_average_blend_decode_near_lossless_flat_scene() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 100);
+        let ref_a = flat_yuv(16, 16, 80);
+        let ref_b = flat_yuv(16, 16, 120);
+        let pay = encode_yuv420_b_payload(
+            &seq,
+            &cur,
+            &ref_a,
+            &ref_b,
+            5,
+            18,
+            1,
+            0,
+            BBlendModeWire::Average,
+            false,
+        )
+        .unwrap();
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        let dec = decode_yuv420_b_payload(&seq, &pay, &mgr).unwrap();
+        let mut max_abs = 0_u8;
+        for i in 0..dec.yuv.y.samples.len() {
+            let d = dec.yuv.y.samples[i].abs_diff(cur.y.samples[i]);
+            max_abs = max_abs.max(d);
+        }
+        assert!(
+            max_abs <= 8,
+            "expected small quantization error on flat average-blend B, got max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn decode_b_missing_backward_slot_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 90);
+        let ref_a = flat_yuv(16, 16, 70);
+        let ref_b = flat_yuv(16, 16, 110);
+        let pay = encode_yuv420_b_payload(
+            &seq,
+            &cur,
+            &ref_a,
+            &ref_b,
+            5,
+            28,
+            1,
+            0,
+            BBlendModeWire::Average,
+            false,
+        )
+        .unwrap();
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(6, ref_b);
+        assert!(decode_yuv420_b_payload(&seq, &pay, &mgr).is_err());
+    }
+
+    #[test]
+    fn decode_b_missing_forward_slot_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 90);
+        let ref_a = flat_yuv(16, 16, 70);
+        let ref_b = flat_yuv(16, 16, 110);
+        let pay = encode_yuv420_b_payload(
+            &seq,
+            &cur,
+            &ref_a,
+            &ref_b,
+            5,
+            28,
+            1,
+            0,
+            BBlendModeWire::Average,
+            false,
+        )
+        .unwrap();
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        assert!(decode_yuv420_b_payload(&seq, &pay, &mgr).is_err());
+    }
+
+    #[test]
+    fn decode_b_invalid_slot_index_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 90);
+        let ref_a = flat_yuv(16, 16, 70);
+        let ref_b = flat_yuv(16, 16, 110);
+        let mut pay = encode_yuv420_b_payload(
+            &seq,
+            &cur,
+            &ref_a,
+            &ref_b,
+            5,
+            28,
+            1,
+            0,
+            BBlendModeWire::Average,
+            false,
+        )
+        .unwrap();
+        pay[9] = 7;
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        assert!(decode_yuv420_b_payload(&seq, &pay, &mgr).is_err());
+    }
+
+    #[test]
+    fn decode_b_weighted_blend_wire_rejected() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 90);
+        let ref_a = flat_yuv(16, 16, 70);
+        let ref_b = flat_yuv(16, 16, 110);
+        let mut pay = encode_yuv420_b_payload(
+            &seq,
+            &cur,
+            &ref_a,
+            &ref_b,
+            5,
+            28,
+            1,
+            0,
+            BBlendModeWire::Average,
+            false,
+        )
+        .unwrap();
+        pay[11] = 3;
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        let err = decode_yuv420_b_payload(&seq, &pay, &mgr).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn decode_b_truncated_payload_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 90);
+        let ref_a = flat_yuv(16, 16, 70);
+        let ref_b = flat_yuv(16, 16, 110);
+        let mut pay = encode_yuv420_b_payload(
+            &seq,
+            &cur,
+            &ref_a,
+            &ref_b,
+            5,
+            28,
+            1,
+            0,
+            BBlendModeWire::Average,
+            false,
+        )
+        .unwrap();
+        pay.truncate(12);
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        assert!(decode_yuv420_b_payload(&seq, &pay, &mgr).is_err());
+    }
+
+    #[test]
+    fn decode_b_rev11_odd_qpel_mv_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 100);
+        let ref_a = flat_yuv(16, 16, 90);
+        let ref_b = flat_yuv(16, 16, 110);
+        let mut pay = encode_yuv420_b_payload(
+            &seq,
+            &cur,
+            &ref_a,
+            &ref_b,
+            5,
+            28,
+            1,
+            0,
+            BBlendModeWire::Average,
+            true,
+        )
+        .unwrap();
+        assert_eq!(pay[3], 11);
+        pay[12..16].copy_from_slice(&1_i32.to_le_bytes());
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        assert!(decode_yuv420_b_payload(&seq, &pay, &mgr).is_err());
+    }
+
+    #[test]
+    fn legacy_intra_then_inter_rev2_still_decodes() {
+        let seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited_one_ref(16, 16);
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let yuv0 = flat_yuv(16, 16, 0x33);
+        let yuv1 = flat_yuv(16, 16, 0xCC);
+        let enc0 = encode_yuv420_intra_payload(&seq, &yuv0, 0, 28, &st, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &enc0, &mut slot).unwrap();
+        let enc1 =
+            encode_yuv420_inter_payload(&seq, &yuv1, slot.as_ref(), 1, 28, &st, None, None, None)
+                .unwrap();
+        assert_eq!(enc1[3], 2);
+        decode_yuv420_srsv2_payload(&seq, &enc1, &mut slot).unwrap();
     }
 }

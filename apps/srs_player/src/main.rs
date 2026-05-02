@@ -1623,7 +1623,11 @@ mod tests {
         app.schedule_next_auto_refresh();
         let wait = app.next_auto_refresh_at.duration_since(start);
         assert!(wait >= Duration::from_secs(1));
-        assert!(wait <= Duration::from_secs(90));
+        // Interval is at most 90s, but `Instant::now()` differs between `start` and scheduling.
+        assert!(
+            wait <= Duration::from_secs(91),
+            "expected refresh deadline within PRNG interval + scheduling slack, got {wait:?}"
+        );
     }
 
     #[test]

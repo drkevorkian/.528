@@ -29,7 +29,7 @@ These are **one machine’s** sanity snapshots before enabling experimental **B*
 | auto / off / half | ~24.3 KiB | mid-26 dB | ~0.989 |
 | auto / block-delta / half | ~25.2 KiB | mid-26 dB | ~0.989 |
 
-Optional **`bench_srsv2`** flags for multi-reference experiments (**defaults unchanged**): `--bframes N` (requires `--reference-frames >= 2`, 16-aligned size, `frames >= 3`), `--alt-ref off|on` (requires `--reference-frames >= 2`), `--gop N` (reserved for future GOP wiring; **B** prototype uses a fixed first-GOP layout today), `--reference-frames N` (sequence `max_ref_frames`, default **1**).
+Optional **`bench_srsv2`** flags (**defaults unchanged**): `--bframes N` is accepted on the CLI for forward compatibility but **`N > 0` exits with an explicit unsupported error** (B syntax is covered by `libsrs_video` unit tests, not this bench yet). **`--alt-ref off|on`** (requires `--reference-frames >= 2` when **on**), **`--gop N`** (reserved), **`--reference-frames N`** (sequence `max_ref_frames`, default **1**).
 
 ### Example: AQ + motion + skip flags (128×128 moving-square)
 
