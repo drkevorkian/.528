@@ -224,6 +224,48 @@ mod tests {
     }
 
     #[test]
+    fn aq_off_keeps_effective_qp_equal_base() {
+        let yuv = gray_frame(100, 64, 64);
+        let s = SrsV2EncodeSettings {
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
+            ..Default::default()
+        };
+        let (eff, st) = resolve_frame_adaptive_qp(33, &yuv, &s).unwrap();
+        assert_eq!(eff, 33);
+        assert_eq!(st.base_qp, 33);
+        assert_eq!(st.effective_qp, 33);
+        assert!(!st.aq_enabled);
+    }
+
+    #[test]
+    fn aq_respects_min_max_qp_after_resolve() {
+        let mut yuv = gray_frame(80, 64, 64);
+        for y in 0..64usize {
+            for x in 32..64usize {
+                let v = if (x / 4 + y / 4) % 2 == 0 {
+                    40_u8
+                } else {
+                    220_u8
+                };
+                yuv.y.samples[y * 64 + x] = v;
+            }
+        }
+        let s = SrsV2EncodeSettings {
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Activity,
+            aq_strength: 24,
+            min_qp: 12,
+            max_qp: 18,
+            min_block_qp_delta: -8,
+            max_block_qp_delta: 8,
+            ..Default::default()
+        };
+        let (eff, st) = resolve_frame_adaptive_qp(40, &yuv, &s).unwrap();
+        assert!((12..=18).contains(&eff));
+        assert!((12..=18).contains(&st.min_block_qp_used));
+        assert!((12..=18).contains(&st.max_block_qp_used));
+    }
+
+    #[test]
     fn validation_rejects_inverted_delta_range() {
         let s = SrsV2EncodeSettings {
             min_block_qp_delta: 4,
@@ -284,5 +326,37 @@ mod tests {
             0
         );
         assert!(st_edge.positive_qp_delta_blocks + st_edge.negative_qp_delta_blocks > 0);
+    }
+
+    #[test]
+    fn aq_activity_mixed_detail_changes_effective_qp_from_base() {
+        let mut yuv = gray_frame(120, 64, 64);
+        for y in 0..64usize {
+            for x in 32..64usize {
+                let v = if (x / 4 + y / 4) % 2 == 0 {
+                    60_u8
+                } else {
+                    200_u8
+                };
+                yuv.y.samples[y * 64 + x] = v;
+            }
+        }
+        let s = SrsV2EncodeSettings {
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Activity,
+            aq_strength: 12,
+            min_qp: 8,
+            max_qp: 48,
+            min_block_qp_delta: -6,
+            max_block_qp_delta: 8,
+            ..Default::default()
+        };
+        let (eff, st) = resolve_frame_adaptive_qp(22, &yuv, &s).unwrap();
+        assert!(st.aq_enabled);
+        assert_eq!(st.effective_qp, eff);
+        assert!(
+            st.positive_qp_delta_blocks > 0 || st.negative_qp_delta_blocks > 0,
+            "mixed-detail activity should propose ± block QP deltas"
+        );
+        assert_ne!(st.min_block_qp_used, st.max_block_qp_used);
     }
 }

@@ -10,7 +10,7 @@
 
 **Rate control:** `SrsV2EncodeSettings` includes **`rate_control_mode`** (**fixed QP**, **constant-quality**, **target bitrate**), QP bounds, and a **`SrsV2RateController`** used by benchmark tooling (`bench_srsv2`) for deterministic per-frame QP selection. Details and CLI mapping: **`docs/rate_control.md`**. This is a **first-pass** controller for measurements and encoder-side QP selection — **not** a completed broadcast-grade RC loop.
 
-**Adaptive quantization (experimental):** optional frame-level QP derivation from per-MB activity (`docs/adaptive_quantization.md`). The bitstream still carries **one QP byte** per frame; there is no per-block QP delta syntax yet.
+**Adaptive quantization (experimental):** optional **frame-level** QP derivation from per-MB activity (`docs/adaptive_quantization.md`). The bitstream still carries **one QP byte** per frame; there is no per-block QP delta syntax yet — AQ only affects **which** QP is emitted, not the frame payload layout.
 
 **Motion search (experimental):** integer-pel modes and skip thresholds (`docs/motion_search.md`); still **no sub-pel**.
 
@@ -29,7 +29,7 @@ Sub-pel/B-frames, richer closed-loop RC, GPU codecs, and OS audio/video output r
 
 - Half-pel motion, **B**-frames, and richer merged MV modes beyond the integer-pel **P** prototype.
 - Broader entropy coding (per-file trained models, MV syntax, etc.). Today: **experimental** static rANS **AC residual** tokens only; motion and headers remain structured bytes with bounds checks.
-- Loop filters beyond optional stubs, HDR signaling beyond sequence fields, 10-bit encode/decode paths.
+- **Loop filter (experimental):** when `disable_loop_filter` is **false**, encoder and decoder apply the same **simple luma deblock** on reconstructed **Y** before refreshing the SRSV2 reference (see **`docs/deblock_filter.md`**). **CDEF**, **restoration**, **film grain**, and chroma loop filtering are **not** implemented.
 - GPU backends (`gpu-wgpu`, `gpu-cuda` feature placeholders).
 
 ## Security model

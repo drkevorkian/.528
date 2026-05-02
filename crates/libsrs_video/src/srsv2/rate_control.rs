@@ -1,5 +1,6 @@
 //! Encoder-side rate control: QP selection for benchmarks and future encode loops.
 
+use super::deblock::SrsV2LoopFilterMode;
 use super::limits::{MAX_MOTION_SEARCH_RADIUS, MAX_MOTION_VECTOR_PELS};
 
 /// How 8×8 residual blocks choose explicit tuples vs static rANS (`FR2` rev 3/4).
@@ -118,6 +119,10 @@ pub struct SrsV2EncodeSettings {
     /// When non-zero, motion search may stop early once best SAD ≤ threshold.
     pub early_exit_sad_threshold: u32,
     pub enable_skip_blocks: bool,
+
+    pub loop_filter_mode: SrsV2LoopFilterMode,
+    /// Written to the sequence header when [`SrsV2LoopFilterMode::SimpleDeblock`] is selected; **`0`** uses codec default strength.
+    pub deblock_strength: u8,
 }
 
 impl Default for SrsV2EncodeSettings {
@@ -144,6 +149,9 @@ impl Default for SrsV2EncodeSettings {
             motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
             early_exit_sad_threshold: 0,
             enable_skip_blocks: true,
+
+            loop_filter_mode: SrsV2LoopFilterMode::Off,
+            deblock_strength: 0,
         }
     }
 }

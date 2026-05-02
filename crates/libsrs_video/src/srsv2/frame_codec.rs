@@ -1,6 +1,7 @@
 //! Serialized SRSV2 **frame** payload (inside mux packet or elementary stream).
 
 use super::adaptive_quant::{resolve_frame_adaptive_qp, SrsV2AqEncodeStats};
+use super::deblock::apply_loop_filter_y;
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::intra_codec::{decode_plane_intra, encode_plane_intra};
@@ -186,6 +187,12 @@ pub fn decode_yuv420_intra_payload(
         _ => return Err(SrsV2Error::BadMagic),
     }
 
+    apply_loop_filter_y(
+        seq.loop_filter_mode(),
+        seq.effective_deblock_strength_for_filter(),
+        &mut y_plane,
+    );
+
     Ok(DecodedVideoFrameV2 {
         frame_index,
         width: w,
@@ -284,12 +291,15 @@ fn read_u32(data: &[u8], cur: &mut usize) -> Result<u32, SrsV2Error> {
 #[cfg(test)]
 mod roundtrip_tests {
     use super::*;
+    use crate::srsv2::adaptive_quant::SrsV2AqEncodeStats;
     use crate::srsv2::color::rgb888_full_to_yuv420_bt709;
     use crate::srsv2::model::{
         ChromaSiting, ColorPrimaries, ColorRange, MatrixCoefficients, PixelFormat, SrsVideoProfile,
         TransferFunction, VideoSequenceHeaderV2,
     };
-    use crate::srsv2::rate_control::SrsV2EncodeSettings;
+    use crate::srsv2::rate_control::{
+        ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2EncodeSettings,
+    };
 
     fn explicit_only_settings() -> SrsV2EncodeSettings {
         SrsV2EncodeSettings {
@@ -313,6 +323,7 @@ mod roundtrip_tests {
             chroma_siting: ChromaSiting::Center,
             range: ColorRange::Limited,
             disable_loop_filter: true,
+            deblock_strength: 0,
             max_ref_frames: 1,
         };
         let rgb = vec![128_u8; (w * h * 3) as usize];
@@ -347,6 +358,7 @@ mod roundtrip_tests {
             chroma_siting: ChromaSiting::Center,
             range: ColorRange::Limited,
             disable_loop_filter: true,
+            deblock_strength: 0,
             max_ref_frames: 0,
         };
         let rgb = vec![128_u8; 64 * 64 * 3];
@@ -359,6 +371,55 @@ mod roundtrip_tests {
         assert_eq!(dec.width, 64);
         assert_eq!(dec.height, 64);
         assert_eq!(dec.yuv.y.samples.len(), yuv.y.samples.len());
+    }
+
+    #[test]
+    fn intra_decode_deblock_changes_y_when_loop_filter_disabled() {
+        let seq_off = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let mut rgb = vec![30_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let v = if (x / 16 + y / 16) % 2 == 0 {
+                    240_u8
+                } else {
+                    40_u8
+                };
+                let i = (y * 64 + x) * 3;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let payload = encode_yuv420_intra_payload(&seq_off, &yuv, 0, 22, &st, None, None).unwrap();
+        let dec_off = decode_yuv420_intra_payload(&seq_off, &payload).unwrap();
+        let mut seq_on = seq_off.clone();
+        seq_on.disable_loop_filter = false;
+        let dec_on = decode_yuv420_intra_payload(&seq_on, &payload).unwrap();
+        let mut diff = 0usize;
+        for i in 0..dec_off.yuv.y.samples.len() {
+            if dec_off.yuv.y.samples[i] != dec_on.yuv.y.samples[i] {
+                diff += 1;
+            }
+        }
+        assert!(diff > 0, "deblocking should alter some luma samples");
     }
 
     #[test]
@@ -376,6 +437,7 @@ mod roundtrip_tests {
             chroma_siting: ChromaSiting::Center,
             range: ColorRange::Limited,
             disable_loop_filter: true,
+            deblock_strength: 0,
             max_ref_frames: 1,
         };
         let rgb = vec![200_u8; (w * h * 3) as usize];
@@ -410,6 +472,7 @@ mod roundtrip_tests {
             chroma_siting: ChromaSiting::Center,
             range: ColorRange::Limited,
             disable_loop_filter: true,
+            deblock_strength: 0,
             max_ref_frames: 0,
         };
         let rgb = vec![90_u8; 64 * 64 * 3];
@@ -430,5 +493,104 @@ mod roundtrip_tests {
         assert_eq!(dec_exp.yuv.y.samples, dec_auto.yuv.y.samples);
         assert_eq!(dec_exp.yuv.u.samples, dec_auto.yuv.u.samples);
         assert_eq!(dec_exp.yuv.v.samples, dec_auto.yuv.v.samples);
+    }
+
+    #[test]
+    fn aq_activity_qp_byte_matches_effective_qp_stats() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let mut yuv =
+            rgb888_full_to_yuv420_bt709(&vec![128_u8; 64 * 64 * 3], 64, 64, ColorRange::Limited)
+                .unwrap();
+        for y in 0..64usize {
+            for x in 32..64usize {
+                let v = if (x / 4 + y / 4) % 2 == 0 {
+                    60_u8
+                } else {
+                    200_u8
+                };
+                yuv.y.samples[y * 64 + x] = v;
+            }
+        }
+        let st = SrsV2EncodeSettings {
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Activity,
+            aq_strength: 12,
+            min_qp: 10,
+            max_qp: 45,
+            min_block_qp_delta: -6,
+            max_block_qp_delta: 8,
+            residual_entropy: ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let mut aq = SrsV2AqEncodeStats::default();
+        let payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, 22, &st, None, Some(&mut aq)).unwrap();
+        assert!(aq.aq_enabled);
+        assert_eq!(payload[8], aq.effective_qp);
+        assert!(
+            aq.positive_qp_delta_blocks > 0 || aq.negative_qp_delta_blocks > 0,
+            "encode path should record AQ deltas on mixed-detail Y"
+        );
+    }
+
+    #[test]
+    fn p_decode_chain_is_deterministic_with_loop_filter_enabled() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: false,
+            deblock_strength: 41,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![140_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut rgb2 = rgb.clone();
+        for y in 16..48usize {
+            for x in 16..48usize {
+                let i = (y * 64 + x) * 3;
+                rgb2[i] = 40;
+                rgb2[i + 1] = 40;
+                rgb2[i + 2] = 40;
+            }
+        }
+        let yuv2 = rgb888_full_to_yuv420_bt709(&rgb2, 64, 64, ColorRange::Limited).unwrap();
+        let st = explicit_only_settings();
+        let intra = encode_yuv420_intra_payload(&seq, &yuv, 0, 26, &st, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let p =
+            encode_yuv420_inter_payload(&seq, &yuv2, slot.as_ref(), 1, 26, &st, None, None, None)
+                .unwrap();
+
+        fn decode_twice(seq: &VideoSequenceHeaderV2, intra: &[u8], p: &[u8]) -> (Vec<u8>, Vec<u8>) {
+            let mut slot = None;
+            let d0 = decode_yuv420_srsv2_payload(seq, intra, &mut slot).unwrap();
+            let d1 = decode_yuv420_srsv2_payload(seq, p, &mut slot).unwrap();
+            (d0.yuv.y.samples.clone(), d1.yuv.y.samples.clone())
+        }
+
+        let (a0, a1) = decode_twice(&seq, &intra, &p);
+        let (b0, b1) = decode_twice(&seq, &intra, &p);
+        assert_eq!(a0, b0);
+        assert_eq!(a1, b1);
     }
 }

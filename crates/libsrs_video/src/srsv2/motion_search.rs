@@ -303,6 +303,7 @@ mod tests {
             chroma_siting: ChromaSiting::Center,
             range: ColorRange::Limited,
             disable_loop_filter: true,
+            deblock_strength: 0,
             max_ref_frames: 1,
         };
         let mut rgb0 = vec![20_u8; (w * h * 3) as usize];

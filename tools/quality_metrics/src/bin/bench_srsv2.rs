@@ -9,14 +9,14 @@ use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{ArgAction, Parser};
 use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, PixelFormat, PreviousFrameRcStats,
     ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats,
-    SrsV2EncodeSettings, SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2RateControlMode,
-    SrsV2RateController, VideoSequenceHeaderV2, YuvFrame,
+    SrsV2EncodeSettings, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
+    SrsV2RateControlMode, SrsV2RateController, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -96,12 +96,27 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     early_exit_sad_threshold: u32,
 
-    #[arg(long, default_value_t = true)]
+    /// P-frame Y sub-block skip (see `SrsV2EncodeSettings::enable_skip_blocks`). Use `false` to force all residuals on-wire.
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        action = ArgAction::Set
+    )]
     enable_skip_blocks: bool,
 
     /// Append a small optional grid (AQ off vs activity × diamond vs exhaustive-small); not default.
     #[arg(long, default_value_t = false)]
     sweep_extended: bool,
+
+    /// Experimental luma loop filter: `off` (default) or `simple` (maps to sequence `disable_loop_filter=false`).
+    #[arg(long, default_value = "off")]
+    loop_filter: String,
+
+    /// Loop-filter strength byte in the sequence header (`0` = codec default when filter on); ignored when `--loop-filter off`.
+    #[arg(long, default_value_t = 0)]
+    deblock_strength: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +168,35 @@ struct AqBenchReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct DeblockBenchReport {
+    loop_filter_mode: String,
+    deblock_strength_byte: u8,
+    deblock_strength_effective: u8,
+    psnr_y: f64,
+    ssim_y: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    psnr_y_filter_disabled_respin: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssim_y_filter_disabled_respin: Option<f64>,
+    note: String,
+}
+
+impl Default for DeblockBenchReport {
+    fn default() -> Self {
+        Self {
+            loop_filter_mode: "off".to_string(),
+            deblock_strength_byte: 0,
+            deblock_strength_effective: 0,
+            psnr_y: 0.0,
+            ssim_y: 0.0,
+            psnr_y_filter_disabled_respin: None,
+            ssim_y_filter_disabled_respin: None,
+            note: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct MotionBenchReport {
     motion_search_mode: String,
     motion_search_radius_effective: i16,
@@ -186,6 +230,7 @@ struct Srsv2Details {
     aq: Option<AqBenchReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     motion: Option<MotionBenchReport>,
+    deblock: DeblockBenchReport,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -287,6 +332,43 @@ fn parse_motion_search_mode(s: &str) -> Result<SrsV2MotionSearchMode> {
     }
 }
 
+fn parse_loop_filter(s: &str) -> Result<SrsV2LoopFilterMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "off" => Ok(SrsV2LoopFilterMode::Off),
+        "simple" => Ok(SrsV2LoopFilterMode::SimpleDeblock),
+        _ => Err(anyhow!("--loop-filter must be off or simple (got {s})")),
+    }
+}
+
+fn loop_filter_cli_label(m: SrsV2LoopFilterMode) -> &'static str {
+    match m {
+        SrsV2LoopFilterMode::Off => "off",
+        SrsV2LoopFilterMode::SimpleDeblock => "simple",
+    }
+}
+
+fn build_seq_header(args: &Args, settings: &SrsV2EncodeSettings) -> VideoSequenceHeaderV2 {
+    let disable_loop_filter = matches!(settings.loop_filter_mode, SrsV2LoopFilterMode::Off);
+    VideoSequenceHeaderV2 {
+        width: args.width,
+        height: args.height,
+        profile: libsrs_video::SrsVideoProfile::Main,
+        pixel_format: PixelFormat::Yuv420p8,
+        color_primaries: libsrs_video::ColorPrimaries::Bt709,
+        transfer: libsrs_video::TransferFunction::Sdr,
+        matrix: libsrs_video::MatrixCoefficients::Bt709,
+        chroma_siting: libsrs_video::ChromaSiting::Center,
+        range: libsrs_video::ColorRange::Limited,
+        disable_loop_filter,
+        deblock_strength: if disable_loop_filter {
+            0
+        } else {
+            settings.deblock_strength
+        },
+        max_ref_frames: 1,
+    }
+}
+
 fn aq_mode_cli_label(m: SrsV2AdaptiveQuantizationMode) -> &'static str {
     match m {
         SrsV2AdaptiveQuantizationMode::Off => "off",
@@ -379,6 +461,7 @@ fn validate_args(args: &Args) -> Result<()> {
     }
     parse_aq_mode(&args.aq)?;
     parse_motion_search_mode(&args.motion_search)?;
+    parse_loop_filter(&args.loop_filter)?;
     Ok(())
 }
 
@@ -386,6 +469,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let rc = parse_rc_mode(&args.rc)?;
     let aq_mode = parse_aq_mode(&args.aq)?;
     let motion_mode = parse_motion_search_mode(&args.motion_search)?;
+    let loop_filter_mode = parse_loop_filter(&args.loop_filter)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -403,6 +487,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         motion_search_mode: motion_mode,
         early_exit_sad_threshold: args.early_exit_sad_threshold,
         enable_skip_blocks: args.enable_skip_blocks,
+        loop_filter_mode,
+        deblock_strength: args.deblock_strength,
         ..Default::default()
     };
     s.validate_rate_control()
@@ -636,11 +722,48 @@ fn rc_report_from_pass(
     }
 }
 
+fn build_deblock_bench_report(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    settings: &SrsV2EncodeSettings,
+    raw: &[u8],
+    expected_frame: usize,
+    numbers: &PassNumbers,
+) -> Result<DeblockBenchReport> {
+    let mode_label = loop_filter_cli_label(settings.loop_filter_mode).to_string();
+    let mut rep = DeblockBenchReport {
+        loop_filter_mode: mode_label,
+        deblock_strength_byte: seq.deblock_strength,
+        deblock_strength_effective: seq.effective_deblock_strength_for_filter(),
+        psnr_y: numbers.psnr_y,
+        ssim_y: numbers.ssim_y,
+        psnr_y_filter_disabled_respin: None,
+        ssim_y_filter_disabled_respin: None,
+        note: String::new(),
+    };
+    if matches!(
+        settings.loop_filter_mode,
+        SrsV2LoopFilterMode::SimpleDeblock
+    ) {
+        let mut seq_off = seq.clone();
+        seq_off.disable_loop_filter = true;
+        seq_off.deblock_strength = 0;
+        let numbers_off = run_srsv2_numbers(args, &seq_off, raw, settings, expected_frame)?;
+        rep.psnr_y_filter_disabled_respin = Some(numbers_off.psnr_y);
+        rep.ssim_y_filter_disabled_respin = Some(numbers_off.ssim_y);
+        rep.note = "Respin uses disable_loop_filter=true (different bitstream than primary). Deblocking can lower PSNR-Y while improving subjective block edges; compare numbers cautiously.".to_string();
+    } else {
+        rep.note = "Loop filter off; no respin.".to_string();
+    }
+    Ok(rep)
+}
+
 fn pass_to_details(
     args: &Args,
     settings: &SrsV2EncodeSettings,
     residual_label: &str,
     p: &PassNumbers,
+    deblock: DeblockBenchReport,
 ) -> Srsv2Details {
     let mut i_bytes = Vec::new();
     let mut p_bytes = Vec::new();
@@ -668,6 +791,7 @@ fn pass_to_details(
         rc: Some(rc_report_from_pass(args, settings, p)),
         aq: Some(aq_report_from_pass(settings, &p.aq_last)),
         motion: Some(motion_report_from_pass(settings, &p.motion_agg)),
+        deblock,
     }
 }
 
@@ -703,7 +827,8 @@ fn run_single_report(
     let re = parse_residual_entropy(&args.residual_entropy)?;
     let settings = build_settings(args, re)?;
     let numbers = run_srsv2_numbers(args, seq, raw, &settings, expected_frame)?;
-    let details = pass_to_details(args, &settings, &args.residual_entropy, &numbers);
+    let deblock = build_deblock_bench_report(args, seq, &settings, raw, expected_frame, &numbers)?;
+    let details = pass_to_details(args, &settings, &args.residual_entropy, &numbers, deblock);
     let srsv2_row = pass_to_row(args, "SRSV2", &numbers);
     let mut table = vec![srsv2_row.clone()];
 
@@ -803,6 +928,7 @@ fn run_compare_residual_report(
                         rc: None,
                         aq: None,
                         motion: None,
+                        deblock: DeblockBenchReport::default(),
                     },
                 });
                 table.push(entries.last().unwrap().row.clone());
@@ -819,7 +945,10 @@ fn run_compare_residual_report(
         match run_srsv2_numbers(args, seq, raw, &st, expected_frame) {
             Ok(numbers) => {
                 let row = pass_to_row(args, label, &numbers);
-                let details = pass_to_details(args, &st, res_entropy_str, &numbers);
+                let deblock =
+                    build_deblock_bench_report(args, seq, &st, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details = pass_to_details(args, &st, res_entropy_str, &numbers, deblock);
                 if primary_details.is_none() || label == "SRSV2-auto" {
                     primary_details = Some(details.clone());
                 }
@@ -865,6 +994,7 @@ fn run_compare_residual_report(
                         rc: None,
                         aq: None,
                         motion: None,
+                        deblock: DeblockBenchReport::default(),
                     },
                 });
                 table.push(entries.last().unwrap().row.clone());
@@ -917,7 +1047,16 @@ fn run_sweep_file(
                 let settings = build_settings(&a, re)?;
                 if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
                     let row = pass_to_row(&a, "SRSV2", &numbers);
-                    let details = pass_to_details(&a, &settings, re_str, &numbers);
+                    let deblock = build_deblock_bench_report(
+                        &a,
+                        seq,
+                        &settings,
+                        raw,
+                        expected_frame,
+                        &numbers,
+                    )
+                    .unwrap_or_else(|_| DeblockBenchReport::default());
+                    let details = pass_to_details(&a, &settings, re_str, &numbers, deblock);
                     sweep.push(SweepRunReport {
                         qp,
                         residual_entropy: re_str.to_string(),
@@ -951,7 +1090,10 @@ fn run_sweep_file(
             };
             if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
                 let row = pass_to_row(&a, "SRSV2", &numbers);
-                let details = pass_to_details(&a, &settings, "auto", &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details = pass_to_details(&a, &settings, "auto", &numbers, deblock);
                 sweep.push(SweepRunReport {
                     qp,
                     residual_entropy: "auto".to_string(),
@@ -1031,19 +1173,9 @@ fn main() -> Result<()> {
         ));
     }
 
-    let seq = VideoSequenceHeaderV2 {
-        width: args.width,
-        height: args.height,
-        profile: libsrs_video::SrsVideoProfile::Main,
-        pixel_format: PixelFormat::Yuv420p8,
-        color_primaries: libsrs_video::ColorPrimaries::Bt709,
-        transfer: libsrs_video::TransferFunction::Sdr,
-        matrix: libsrs_video::MatrixCoefficients::Bt709,
-        chroma_siting: libsrs_video::ChromaSiting::Center,
-        range: libsrs_video::ColorRange::Limited,
-        disable_loop_filter: true,
-        max_ref_frames: 1,
-    };
+    let re = parse_residual_entropy(&args.residual_entropy)?;
+    let settings = build_settings(&args, re)?;
+    let seq = build_seq_header(&args, &settings);
 
     if args.sweep {
         return run_sweep_file(&args, &seq, &raw, expected_frame);
@@ -1417,6 +1549,30 @@ fn to_markdown(r: &BenchReport) -> String {
             m.avg_mv_l1_per_nonzero_mb
         ));
     }
+    {
+        let d = &r.srsv2.deblock;
+        out.push_str("\n### Loop filter (experimental)\n\n");
+        out.push_str(&format!(
+            "- mode: {}\n- deblock_strength_byte: {}\n- effective strength: {}\n- PSNR-Y / SSIM-Y (primary): {:.2} / {:.4}\n",
+            d.loop_filter_mode,
+            d.deblock_strength_byte,
+            d.deblock_strength_effective,
+            d.psnr_y,
+            d.ssim_y,
+        ));
+        if let (Some(py), Some(sy)) = (
+            d.psnr_y_filter_disabled_respin,
+            d.ssim_y_filter_disabled_respin,
+        ) {
+            out.push_str(&format!(
+                "- PSNR-Y / SSIM-Y (filter-disabled respin): {:.2} / {:.4}\n",
+                py, sy,
+            ));
+        }
+        if !d.note.is_empty() {
+            out.push_str(&format!("- note: {}\n", d.note));
+        }
+    }
     if let Some(x) = &r.x264 {
         out.push_str("\n## x264 details\n\n");
         out.push_str(&format!("- status: {}\n", x.status));
@@ -1462,6 +1618,8 @@ mod tests {
             early_exit_sad_threshold: 0,
             enable_skip_blocks: true,
             sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -1538,6 +1696,16 @@ mod tests {
                     avg_mv_l1_per_nonzero_mb: 3.5,
                     p_frames: 3,
                 }),
+                deblock: DeblockBenchReport {
+                    loop_filter_mode: "off".to_string(),
+                    deblock_strength_byte: 0,
+                    deblock_strength_effective: 0,
+                    psnr_y: 99.0,
+                    ssim_y: 1.0,
+                    psnr_y_filter_disabled_respin: None,
+                    ssim_y_filter_disabled_respin: None,
+                    note: String::new(),
+                },
             },
             x264: None,
             table: vec![CodecRow {
@@ -1559,6 +1727,7 @@ mod tests {
         let js = serde_json::to_string(&r).unwrap();
         assert!(js.contains("\"motion_search_mode\":\"diamond\""));
         assert!(js.contains("\"mode\":\"off\"") && js.contains("\"aq\""));
+        assert!(js.contains("\"loop_filter_mode\":\"off\""));
     }
 
     #[test]
@@ -1589,6 +1758,7 @@ mod tests {
                 rc: None,
                 aq: None,
                 motion: None,
+                deblock: DeblockBenchReport::default(),
             },
             x264: None,
             table: vec![],
@@ -1624,6 +1794,7 @@ mod tests {
                     rc: None,
                     aq: None,
                     motion: None,
+                    deblock: DeblockBenchReport::default(),
                 },
             }]),
             sweep: None,
@@ -1673,6 +1844,7 @@ mod tests {
                     rc: None,
                     aq: None,
                     motion: None,
+                    deblock: DeblockBenchReport::default(),
                 },
             }],
             git_commit: None,
@@ -1713,6 +1885,8 @@ mod tests {
             early_exit_sad_threshold: 0,
             enable_skip_blocks: true,
             sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
@@ -1751,6 +1925,8 @@ mod tests {
             early_exit_sad_threshold: 0,
             enable_skip_blocks: true,
             sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
         };
         assert!(validate_args(&a).is_err());
         a.aq = "off".to_string();

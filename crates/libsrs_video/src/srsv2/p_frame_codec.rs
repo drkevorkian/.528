@@ -119,11 +119,7 @@ pub fn encode_yuv420_p_payload(
     let radius = settings.clamped_motion_search_radius();
     let mb_cols = w / 16;
     let mb_rows = h / 16;
-    let skip_thresh: i16 = if settings.enable_skip_blocks {
-        SKIP_ABS_THRESH
-    } else {
-        i16::MAX
-    };
+    let allow_skip = settings.enable_skip_blocks;
 
     let mut motion_discard = SrsV2MotionEncodeStats::default();
     let ms = match motion_stats {
@@ -188,7 +184,7 @@ pub fn encode_yuv420_p_payload(
                         max_abs = max_abs.max(d.abs());
                     }
                 }
-                if max_abs <= skip_thresh {
+                if allow_skip && max_abs <= SKIP_ABS_THRESH {
                     pattern |= 1 << si;
                     ms.skip_subblocks += 1;
                 } else {
@@ -354,6 +350,12 @@ pub fn decode_yuv420_p_payload(
         return Err(SrsV2Error::syntax("trailing P-frame bytes"));
     }
 
+    super::deblock::apply_loop_filter_y(
+        seq.loop_filter_mode(),
+        seq.effective_deblock_strength_for_filter(),
+        &mut y_plane,
+    );
+
     Ok(DecodedVideoFrameV2 {
         frame_index,
         width: w,
@@ -389,6 +391,7 @@ mod tests {
             chroma_siting: ChromaSiting::Center,
             range: ColorRange::Limited,
             disable_loop_filter: true,
+            deblock_strength: 0,
             max_ref_frames: 1,
         }
     }
@@ -488,6 +491,196 @@ mod tests {
         }
         let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
         assert!(matches!(err, SrsV2Error::CorruptedMotionVector));
+    }
+
+    fn compare_luma_mae(a: &VideoPlane<u8>, b: &VideoPlane<u8>) -> f64 {
+        assert_eq!(a.width, b.width);
+        assert_eq!(a.height, b.height);
+        let mut sum = 0u64;
+        let mut n = 0u64;
+        for y in 0..a.height {
+            for x in 0..a.width {
+                sum += a.samples[y as usize * a.stride + x as usize]
+                    .abs_diff(b.samples[y as usize * b.stride + x as usize])
+                    as u64;
+                n += 1;
+            }
+        }
+        sum as f64 / n.max(1) as f64
+    }
+
+    fn compare_luma_max_abs(a: &VideoPlane<u8>, b: &VideoPlane<u8>) -> u8 {
+        assert_eq!(a.width, b.width);
+        assert_eq!(a.height, b.height);
+        let mut m = 0_u8;
+        for y in 0..a.height {
+            for x in 0..a.width {
+                let d = a.samples[y as usize * a.stride + x as usize]
+                    .abs_diff(b.samples[y as usize * b.stride + x as usize]);
+                m = m.max(d);
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn identical_frames_skip_enabled_emits_skipped_subblocks() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![200_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            enable_skip_blocks: true,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let mut ms = SrsV2MotionEncodeStats::default();
+        encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, Some(&mut ms)).unwrap();
+        assert!(ms.skip_subblocks > 0);
+    }
+
+    #[test]
+    fn identical_frames_skip_disabled_emits_zero_skipped_subblocks() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![200_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            enable_skip_blocks: false,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let mut ms = SrsV2MotionEncodeStats::default();
+        encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, Some(&mut ms)).unwrap();
+        assert_eq!(ms.skip_subblocks, 0);
+    }
+
+    #[test]
+    fn skip_disabled_tracks_small_dc_bias_closer_than_skip_enabled() {
+        // Same geometry with MV (0,0): tiny uniform residual (≤ SKIP_ABS_THRESH) is skipped when
+        // enable_skip_blocks, wiping the bias; disabled path keeps quantized residuals.
+        let seq = seq_inter(64, 64);
+        let rgb = vec![120_u8; 64 * 64 * 3];
+        let y_ref = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut y_cur = y_ref.clone();
+        for y in 0..64 {
+            for x in 0..64 {
+                let ix = y as usize * y_ref.y.stride + x as usize;
+                y_cur.y.samples[ix] = y_ref.y.samples[ix].saturating_add(4);
+            }
+        }
+        let qp = 26_u8;
+        let on = SrsV2EncodeSettings {
+            enable_skip_blocks: true,
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let off = SrsV2EncodeSettings {
+            enable_skip_blocks: false,
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let p_on = encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, qp, &on, None, None).unwrap();
+        let p_off = encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, qp, &off, None, None).unwrap();
+        let dec_on = decode_yuv420_p_payload(&seq, &p_on, &y_ref).unwrap();
+        let dec_off = decode_yuv420_p_payload(&seq, &p_off, &y_ref).unwrap();
+        let mae_on = compare_luma_mae(&y_cur.y, &dec_on.yuv.y);
+        let mae_off = compare_luma_mae(&y_cur.y, &dec_off.yuv.y);
+        assert!(
+            mae_off < mae_on - 0.25,
+            "skip disabled should preserve small residuals: off={mae_off} on={mae_on}"
+        );
+    }
+
+    #[test]
+    fn skip_disabled_decode_differs_from_reference_plane() {
+        let seq = seq_inter(64, 64);
+        let rgb0 = vec![40_u8; 64 * 64 * 3];
+        let mut rgb1 = vec![40_u8; 64 * 64 * 3];
+        for y in 10..54 {
+            for x in 10..54 {
+                let i = ((y * 64 + x) * 3) as usize;
+                rgb1[i] = 220;
+                rgb1[i + 1] = 180;
+                rgb1[i + 2] = 140;
+            }
+        }
+        let y0 = rgb888_full_to_yuv420_bt709(&rgb0, 64, 64, ColorRange::Limited).unwrap();
+        let y1 = rgb888_full_to_yuv420_bt709(&rgb1, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            enable_skip_blocks: false,
+            motion_search_radius: 16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let payload =
+            encode_yuv420_p_payload(&seq, &y1, &y0, 1, 26, &settings, None, None).unwrap();
+        let dec = decode_yuv420_p_payload(&seq, &payload, &y0).unwrap();
+        assert!(
+            compare_luma_max_abs(&dec.yuv.y, &y0.y) > 8,
+            "decoded P should diverge from raw reference when current differs"
+        );
+    }
+
+    #[test]
+    fn corrupted_skip_pattern_errors_as_syntax_or_truncated() {
+        let seq = seq_inter(16, 16);
+        let rgb = vec![100_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            enable_skip_blocks: false,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+        let pat_idx = 9 + 4;
+        payload[pat_idx] = 0x0F;
+        let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
+        assert!(
+            matches!(err, SrsV2Error::Truncated | SrsV2Error::Syntax(_)),
+            "unexpected err: {err:?}"
+        );
+    }
+
+    #[test]
+    fn corrupted_residual_chunk_length_errors_truncated() {
+        let seq = seq_inter(16, 16);
+        let rgb = vec![100_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            enable_skip_blocks: false,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+        let chunk_len_idx = 9 + 4 + 1;
+        payload[chunk_len_idx..chunk_len_idx + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
+        assert!(matches!(
+            err,
+            SrsV2Error::Truncated | SrsV2Error::Overflow(_)
+        ));
+    }
+
+    #[test]
+    fn identical_p_decode_near_source_with_quant_tolerance() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![180_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            enable_skip_blocks: true,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        let payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+        let dec = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap();
+        assert!(
+            compare_luma_max_abs(&yuv.y, &dec.yuv.y) <= 8,
+            "identical MC + tiny residuals should reconstruct within small tolerance"
+        );
     }
 
     #[test]

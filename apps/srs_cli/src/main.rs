@@ -494,6 +494,7 @@ fn encode_srsv2_elementary_file(
         chroma_siting: ChromaSiting::Center,
         range: ColorRange::Limited,
         disable_loop_filter: true,
+        deblock_strength: 0,
         max_ref_frames: 0,
     };
     let yuv = rgb888_full_to_yuv420_bt709(&rgb, width, height, ColorRange::Limited)

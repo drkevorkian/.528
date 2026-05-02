@@ -7,6 +7,7 @@ pub mod activity;
 pub mod adaptive_quant;
 pub mod color;
 mod dct;
+pub mod deblock;
 pub mod error;
 pub mod frame;
 pub mod frame_codec;
@@ -27,6 +28,10 @@ pub use adaptive_quant::{
 };
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
+};
+pub use deblock::{
+    apply_loop_filter_y, apply_simple_mb_boundary_deblock_y, resolve_deblock_strength,
+    SrsV2LoopFilterMode, DEFAULT_DEBLOCK_STRENGTH,
 };
 pub use error::SrsV2Error;
 pub use frame::{DecodedVideoFrameV2, EncodedVideoPacketV2, VideoPlane, YuvFrame};

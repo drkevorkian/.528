@@ -8,7 +8,7 @@
 - Schema byte `1`.
 - Width / height: `u32` LE each (must satisfy decoder caps in `libsrs_video::srsv2::limits`).
 - **Profile** byte (see `SrsVideoProfile` in `libsrs_video::srsv2::model`): **0** Baseline, **1** Main, **2** Pro, **3** Lossless, **4** Screen, **5** Ultra, **6** Research — semantics in **`docs/srsv2_design_targets.md`**.
-- Pixel format, color primaries, transfer, matrix, chroma siting, range, loop-filter disable flag, max reference frames.
+- Pixel format, color primaries, transfer, matrix, chroma siting, range, **loop-filter disable** flag (`disable_loop_filter`: when **false**, SRSV2 applies an experimental **luma loop filter** after reconstructing Y — see [`docs/deblock_filter.md`](deblock_filter.md)), **`deblock_strength`** byte at offset **25** (**`0`** = codec default strength when the filter is enabled; ignored when `disable_loop_filter` is **true**), max reference frames.
 
 Embedded verbatim in `.528` **video track config** when `codec_id == 3`.
 
@@ -38,6 +38,7 @@ Starts with the 64-byte sequence header, then repeating framed records: VP packe
 
 ## Decoder requirements
 
+- Ignore reserved trailing bytes in the 64-byte sequence header for schema **1** (decoders read defined offsets only); encoders should zero-fill unused slots.
 - Reject unknown sequence schema version.
 - Enforce `MAX_FRAME_PAYLOAD_BYTES`, dimension caps, and CRC mismatches as hard errors.
 - **FR2** revisions **1** and **2** must remain decodable unchanged; **3** and **4** add optional entropy-coded residuals and are **experimental** (see `docs/srsv2_codec.md`).

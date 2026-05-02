@@ -11,12 +11,29 @@ Workspace tools (engineering measurements):
 - **Compare residual modes** (single command, three encode passes — **no FFmpeg**): `--compare-residual-modes` produces rows **SRSV2-explicit**, **SRSV2-auto**, **SRSV2-rans**. If forced **rans** fails (e.g. coefficients outside the static rANS alphabet), that row is marked failed with an error string and the other rows still appear.
 - **Rate control** (benchmark loop only; see `docs/rate_control.md`): `--rc fixed-qp|quality|target-bitrate` with `--quality`, `--target-bitrate-kbps`, optional `--max-bitrate-kbps`, and `--min-qp` / `--max-qp` / `--qp-step-limit`. Reports include achieved vs target bitrate and QP history summaries.
 - **Adaptive quantization** (experimental; frame-level only — see `docs/adaptive_quantization.md`): `--aq off|activity|edge-aware|screen-aware`, `--aq-strength N`.
-- **Motion search** (integer-pel; see `docs/motion_search.md`): `--motion-search none|diamond|hex|hierarchical|exhaustive-small`, `--early-exit-sad-threshold N`, `--enable-skip-blocks` / `--no-enable-skip-blocks` (clap boolean). JSON/Markdown reports include **`aq`** and **`motion`** detail objects when the main SRSV2 pass succeeds.
+- **Motion search** (integer-pel; see `docs/motion_search.md`): `--motion-search none|diamond|hex|hierarchical|exhaustive-small`, `--early-exit-sad-threshold N`, `--enable-skip-blocks` optional bool (`true` default; pass `--enable-skip-blocks false` to disable P-frame skip markers — integration tests assert **`skip_subblocks_total == 0`**). JSON/Markdown reports include **`aq`** and **`motion`** detail objects when the main SRSV2 pass succeeds.
 - **Sweep grid** (optional regression / weak-spot finder): `--sweep` runs a fixed grid of QP values `{18, 22, 28, 34}` × residual `{explicit, auto}` × motion radius `{0, 8, 16}` and writes a JSON array plus a Markdown table (`--compare-residual-modes` and `--sweep` are mutually exclusive). **`--sweep-extended`** appends a **small** optional comparison (e.g. AQ off vs activity × diamond vs exhaustive-small at fixed QP) — not enabled by default.
 
 Legacy helper: `cargo run -p codec_compare -- --help` (optional **libx264** branch via `ffmpeg`).
 
 This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders (for example a common **AVC** baseline). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge. This is a **compression engineering** step for the native codec, **not** a claim about beating H.264 or any other standard encoder.
+
+### Example: AQ + motion + skip flags (128×128 moving-square)
+
+After generating `var/bench/moving_square.yuv` (or any raw YUV420p8 clip):
+
+```bash
+cargo run -p quality_metrics --bin bench_srsv2 -- \
+  --input var/bench/moving_square.yuv \
+  --width 128 --height 128 --frames 30 --fps 30 \
+  --qp 28 --keyint 30 \
+  --motion-search diamond \
+  --enable-skip-blocks true \
+  --aq activity \
+  --residual-entropy auto \
+  --report-json var/bench/moving_square_aq_motion.json \
+  --report-md var/bench/moving_square_aq_motion.md
+```
 
 ## Example: 128×128, 30 frames, `flat` pattern (auto residual)
 

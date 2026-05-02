@@ -186,8 +186,10 @@ pub struct VideoSequenceHeaderV2 {
     pub matrix: MatrixCoefficients,
     pub chroma_siting: ChromaSiting,
     pub range: ColorRange,
-    /// When true, deblock filter stage is skipped (baseline intra default).
+    /// When **true** (default), skip the optional **luma loop filter** after reconstructing Y (intra and P). When **false**, apply [`super::deblock::apply_loop_filter_y`] with [`super::deblock::SrsV2LoopFilterMode::SimpleDeblock`] (experimental).
     pub disable_loop_filter: bool,
+    /// Loop-filter blend strength when [`Self::disable_loop_filter`] is **false**. **`0`** means “use documented default” ([`super::deblock::DEFAULT_DEBLOCK_STRENGTH`]); **`1…255`** scales smoothing. Ignored when the loop filter is off (should be written as **0**).
+    pub deblock_strength: u8,
     pub max_ref_frames: u8,
 }
 
@@ -205,6 +207,7 @@ impl VideoSequenceHeaderV2 {
             chroma_siting: ChromaSiting::Center,
             range: ColorRange::Limited,
             disable_loop_filter: true,
+            deblock_strength: 0,
             max_ref_frames: 0,
         }
     }
@@ -214,6 +217,24 @@ impl VideoSequenceHeaderV2 {
         let mut s = Self::intra_main_yuv420_bt709_limited(width, height);
         s.max_ref_frames = 1;
         s
+    }
+
+    /// Loop-filter mode derived from [`Self::disable_loop_filter`].
+    pub fn loop_filter_mode(&self) -> super::deblock::SrsV2LoopFilterMode {
+        if self.disable_loop_filter {
+            super::deblock::SrsV2LoopFilterMode::Off
+        } else {
+            super::deblock::SrsV2LoopFilterMode::SimpleDeblock
+        }
+    }
+
+    /// Strength passed to [`super::deblock::apply_loop_filter_y`] when the filter is on; **`0`** if off.
+    pub fn effective_deblock_strength_for_filter(&self) -> u8 {
+        if self.disable_loop_filter {
+            0
+        } else {
+            super::deblock::resolve_deblock_strength(self.deblock_strength)
+        }
     }
 }
 
@@ -255,6 +276,7 @@ pub fn encode_sequence_header_v2(seq: &VideoSequenceHeaderV2) -> [u8; SEQUENCE_H
     b[22] = seq.range as u8;
     b[23] = u8::from(seq.disable_loop_filter);
     b[24] = seq.max_ref_frames;
+    b[25] = seq.deblock_strength;
     b
 }
 
@@ -301,6 +323,7 @@ pub fn decode_sequence_header_v2(
         range: decode_range(buf[22])?,
         disable_loop_filter: buf[23] != 0,
         max_ref_frames: buf[24],
+        deblock_strength: buf[25],
     })
 }
 
@@ -422,6 +445,7 @@ mod profile_roundtrip_tests {
                 chroma_siting: ChromaSiting::Center,
                 range: ColorRange::Limited,
                 disable_loop_filter: true,
+                deblock_strength: 0,
                 max_ref_frames: 4,
             };
             let b = encode_sequence_header_v2(&seq);
@@ -430,5 +454,16 @@ mod profile_roundtrip_tests {
             assert_eq!(d.width, 7680);
             assert_eq!(d.height, 4320);
         }
+    }
+
+    #[test]
+    fn sequence_header_deblock_strength_byte_roundtrips() {
+        let mut seq = VideoSequenceHeaderV2::intra_main_yuv420_bt709_limited(128, 128);
+        seq.disable_loop_filter = false;
+        seq.deblock_strength = 88;
+        let bytes = encode_sequence_header_v2(&seq);
+        let got = decode_sequence_header_v2(&bytes).expect("decode hdr");
+        assert!(!got.disable_loop_filter);
+        assert_eq!(got.deblock_strength, 88);
     }
 }
