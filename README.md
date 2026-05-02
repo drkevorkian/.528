@@ -61,7 +61,7 @@ Further playback architecture: `docs/playback_pipeline.md`.
     --report-json var/bench/flat_srsv2.json --report-md var/bench/flat_srsv2.md
   ```
 
-- **Experimental B-GOP benchmark** (`--bframes 1` only in this slice; requires **`--reference-frames ≥ 2`**, **`--frames ≥ 3`**, 16-aligned size; mutually exclusive with **`--sweep`** / **`--compare-residual-modes`**):
+- **Experimental B-GOP benchmark** (`--bframes 1` only in this slice; requires **`--reference-frames ≥ 2`**, **`--frames ≥ 3`**, 16-aligned size; mutually exclusive with **`--sweep`** / **`--compare-residual-modes`**). Optional **`--b-motion-search independent-forward-backward`** enables integer **B** ME (**FR2** rev **13**); default **`off`** keeps zero MVs for **B** while still choosing per-MB blend by SAD:
 
   ```bash
   cargo run -p quality_metrics --bin gen_synthetic_yuv -- \
@@ -70,7 +70,7 @@ Further playback architecture: `docs/playback_pipeline.md`.
   cargo run -p quality_metrics --bin bench_srsv2 -- \
     --input var/bench/mov.yuv --width 128 --height 128 --frames 30 --fps 30 \
     --qp 28 --keyint 30 --motion-radius 16 --residual-entropy auto \
-    --reference-frames 2 --bframes 1 \
+    --reference-frames 2 --bframes 1 --b-motion-search off \
     --report-json var/bench/mov_b.json --report-md var/bench/mov_b.md
   ```
 
