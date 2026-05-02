@@ -3,7 +3,7 @@
 //! # Reality check (Phase 0)
 //! - **Demux:** [`libsrs_demux::DemuxReader`] over `Read+Seek` — already enforces container limits
 //!   (`MAX_PACKET_PAYLOAD_BYTES`, etc.) per `libsrs_container::io`.
-//! - **Video decode:** [`libsrs_video::decode_frame`] for **`codec_id` 1**; [`libsrs_video::decode_yuv420_srsv2_payload`] for **`codec_id` 3** (intra `FR2\x01` and experimental P `FR2\x02` when a reference is available).
+//! - **Video decode:** [`libsrs_video::decode_frame`] for **`codec_id` 1**; [`libsrs_video::decode_yuv420_srsv2_payload_managed`] for **`codec_id` 3** (intra, experimental **P**, experimental **B** `FR2` rev **10–11**, experimental **alt-ref** rev **12** via bounded [`libsrs_video::SrsV2ReferenceManager`]).
 //! - **Audio decode:** [`libsrs_audio::decode_frame_with_stream_version`] with v2 stream payloads.
 //! - **App inspect:** [`crate::inspect_native_container`](super) lists tracks; playback uses the same file layout.
 //! - **Player (before this module):** `playing=true` and wall-clock `position_ms` were scaffold-only.
@@ -18,8 +18,9 @@ use libsrs_audio::{decode_frame_with_stream_version, AudioFrame, STREAM_VERSION_
 use libsrs_container::{PacketFlags, TrackDescriptor, TrackKind};
 use libsrs_demux::{DemuxReader, DemuxedPacket};
 use libsrs_video::{
-    decode_frame, decode_sequence_header_v2, decode_yuv420_srsv2_payload, FrameType, VideoFrame,
-    VideoSequenceHeaderV2, YuvFrame, MAX_LUMA_SAMPLES, SEQUENCE_HEADER_BYTES,
+    decode_frame, decode_sequence_header_v2, decode_yuv420_srsv2_payload_managed, FrameType,
+    SrsV2ReferenceManager, VideoFrame, VideoSequenceHeaderV2, MAX_LUMA_SAMPLES,
+    SEQUENCE_HEADER_BYTES,
 };
 use thiserror::Error;
 
@@ -283,8 +284,8 @@ pub struct PlaybackSession {
     last_error: Option<String>,
     /// Parsed SRSV2 sequence header when primary video uses `codec_id == 3`.
     video_v2_seq: Option<VideoSequenceHeaderV2>,
-    /// Last decoded SRSV2 picture for experimental P-frame payloads (`FR2` rev 2).
-    video_v2_ref_slot: Option<YuvFrame>,
+    /// Bounded SRSV2 reference store (`FR2` rev **1–12**); cleared on seek/stop.
+    video_v2_ref_manager: Option<SrsV2ReferenceManager>,
 }
 
 impl std::fmt::Debug for PlaybackSession {
@@ -368,6 +369,14 @@ impl PlaybackSession {
             })
             .transpose()?;
 
+        let video_v2_ref_manager = video_v2_seq
+            .as_ref()
+            .map(|seq| {
+                SrsV2ReferenceManager::new(seq.max_ref_frames)
+                    .map_err(|e| PlaybackError::Malformed(format!("SRSV2 reference manager: {e}")))
+            })
+            .transpose()?;
+
         let ts_for_duration = primary_video
             .as_ref()
             .map(|v| v.timescale_hz)
@@ -401,7 +410,7 @@ impl PlaybackSession {
             decoded_audio_chunks: 0,
             last_error: None,
             video_v2_seq,
-            video_v2_ref_slot: None,
+            video_v2_ref_manager,
         })
     }
 
@@ -633,13 +642,17 @@ impl PlaybackSession {
                         "SRSV2 sequence header missing from session".to_string(),
                     )
                 })?;
-                let dec = decode_yuv420_srsv2_payload(
-                    seq,
-                    &p.packet.payload,
-                    &mut self.video_v2_ref_slot,
-                )
-                .map_err(|e| PlaybackError::VideoDecode(format!("srsv2: {e}")))?;
+                let mgr = self.video_v2_ref_manager.as_mut().ok_or_else(|| {
+                    PlaybackError::Malformed(
+                        "SRSV2 reference manager missing from session".to_string(),
+                    )
+                })?;
+                let dec = decode_yuv420_srsv2_payload_managed(seq, &p.packet.payload, mgr)
+                    .map_err(|e| PlaybackError::VideoDecode(format!("srsv2: {e}")))?;
                 self.update_position_from_pts(p.packet.header.pts, timescale);
+                if !dec.is_displayable {
+                    return Ok(None);
+                }
                 self.decoded_video_frames += 1;
                 let payload_crc32c = crc32c(&p.packet.payload);
                 Ok(Some(DecodedVideoFrame {
@@ -725,7 +738,9 @@ impl PlaybackSession {
         self.decoded_video_frames = 0;
         self.decoded_audio_chunks = 0;
         self.last_error = None;
-        self.video_v2_ref_slot = None;
+        if let Some(m) = self.video_v2_ref_manager.as_mut() {
+            m.clear();
+        }
         Ok(())
     }
 
@@ -737,7 +752,7 @@ impl PlaybackSession {
     /// Then, with a strict budget, playback **decodes forward in file order** until it reaches the requested PTS
     /// (or end-of-stream). This primes SRSV2 reference state so the next decode does not fail on a P payload.
     ///
-    /// Clears the SRSV2 reference slot; the first successful video decode after seek initializes it from the keyframe.
+    /// Clears the SRSV2 reference manager; recovery decodes forward from the keyframe so **P**/**B** state is consistent.
     pub fn seek_ms(&mut self, target_ms: u64) -> Result<(), PlaybackError> {
         const RECOVERY_STEP_BUDGET: usize = 8192;
         self.seek_video_keyframe_before_or_at_ms(target_ms)?;
@@ -760,7 +775,9 @@ impl PlaybackSession {
         let target_pts = target_ms.saturating_mul(ts).saturating_div(1000);
         self.video_stash.clear();
         self.audio_stash.clear();
-        self.video_v2_ref_slot = None;
+        if let Some(m) = self.video_v2_ref_manager.as_mut() {
+            m.clear();
+        }
 
         let ent = if let Some(v) = &self.primary_video {
             match self

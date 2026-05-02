@@ -18,6 +18,19 @@ Legacy helper: `cargo run -p codec_compare -- --help` (optional **libx264** bran
 
 This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders (for example a common **AVC** baseline). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge. This is a **compression engineering** step for the native codec, **not** a claim about beating H.264 or any other standard encoder.
 
+### Local sample numbers (moving-square 128×128, 30 frames, seed 528)
+
+These are **one machine’s** sanity snapshots before enabling experimental **B** / **alt-ref** tooling; your totals will differ by OS, CPU, and build profile. Clip: `gen_synthetic_yuv` pattern **moving-square**, **128×128**, **30** frames, **30** fps. Commands used four `bench_srsv2` runs writing JSON/Markdown under `var/bench/`:
+
+| Configuration (residual-entropy / block-aq / subpel) | Total SRSV2 payload bytes (approx.) | PSNR-Y (approx.) | SSIM-Y (approx.) |
+|-----------------------------------------------------|--------------------------------------|------------------|------------------|
+| auto / off / off | ~16.7 KiB | mid-26 dB | ~0.988 |
+| auto / block-delta / off | ~17.6 KiB | mid-26 dB | ~0.988 |
+| auto / off / half | ~24.3 KiB | mid-26 dB | ~0.989 |
+| auto / block-delta / half | ~25.2 KiB | mid-26 dB | ~0.989 |
+
+Optional **`bench_srsv2`** flags for multi-reference experiments (**defaults unchanged**): `--bframes N` (requires `--reference-frames >= 2`, 16-aligned size, `frames >= 3`), `--alt-ref off|on` (requires `--reference-frames >= 2`), `--gop N` (reserved for future GOP wiring; **B** prototype uses a fixed first-GOP layout today), `--reference-frames N` (sequence `max_ref_frames`, default **1**).
+
 ### Example: AQ + motion + skip flags (128×128 moving-square)
 
 After generating `var/bench/moving_square.yuv` (or any raw YUV420p8 clip):

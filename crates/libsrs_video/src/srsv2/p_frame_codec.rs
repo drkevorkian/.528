@@ -46,7 +46,7 @@ fn validate_mv(mvx: i16, mvy: i16) -> Result<(), SrsV2Error> {
     Ok(())
 }
 
-fn copy_chroma_mb8_qpel(
+pub(crate) fn copy_chroma_mb8_qpel(
     ref_plane: &VideoPlane<u8>,
     out: &mut VideoPlane<u8>,
     mb_x: u32,
@@ -72,7 +72,7 @@ fn copy_chroma_mb8_qpel(
     }
 }
 
-fn copy_chroma_mb8(
+pub(crate) fn copy_chroma_mb8(
     ref_plane: &VideoPlane<u8>,
     out: &mut VideoPlane<u8>,
     mb_x: u32,
@@ -608,6 +608,7 @@ pub fn decode_yuv420_p_payload(
         frame_index,
         width: w,
         height: h,
+        is_displayable: true,
         yuv: YuvFrame {
             format: PixelFormat::Yuv420p8,
             y: y_plane,

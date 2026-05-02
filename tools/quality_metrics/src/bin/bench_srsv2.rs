@@ -13,11 +13,12 @@ use clap::{ArgAction, Parser};
 use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::{
-    decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, PixelFormat, PreviousFrameRcStats,
-    ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats,
-    SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2LoopFilterMode, SrsV2MotionEncodeStats,
-    SrsV2MotionSearchMode, SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode,
-    VideoSequenceHeaderV2, YuvFrame,
+    decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
+    encode_yuv420_alt_ref_payload, encode_yuv420_b_payload, encode_yuv420_inter_payload,
+    BBlendModeWire, PixelFormat, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
+    SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats, SrsV2BlockAqMode, SrsV2EncodeSettings,
+    SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2RateControlMode,
+    SrsV2RateController, SrsV2ReferenceManager, SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -136,6 +137,22 @@ struct Args {
 
     #[arg(long, default_value_t = 6)]
     block_aq_delta_max: i8,
+
+    /// Experimental B-frames per GOP interior (`0` = off; **default** preserves legacy I/P-only bench).
+    #[arg(long, default_value_t = 0)]
+    bframes: u32,
+
+    /// Experimental alt-ref refresh after keyframes: `off` (default) or `on`.
+    #[arg(long, default_value = "off")]
+    alt_ref: String,
+
+    /// GOP length for experimental B layout (`--bframes` > 0); defaults to `--keyint` when unset logic applies.
+    #[arg(long, default_value_t = 0)]
+    gop: u32,
+
+    /// SRSV2 sequence `max_ref_frames` (**default `1`** — unchanged vs historical bench).
+    #[arg(long, default_value_t = 1)]
+    reference_frames: u8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -216,6 +233,9 @@ struct Fr2RevisionCounts {
     rev7: u32,
     rev8: u32,
     rev9: u32,
+    rev10: u32,
+    rev11: u32,
+    rev12: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -274,6 +294,17 @@ struct Srsv2Details {
     pframes: u32,
     avg_i_bytes: f64,
     avg_p_bytes: f64,
+    /// Experimental multi-reference summary (defaults keep prior bench semantics).
+    bframes_enabled: bool,
+    bframe_count: u32,
+    alt_ref_count: u32,
+    display_frame_count: u32,
+    reference_frames_used: u8,
+    avg_bframe_bytes: f64,
+    avg_altref_bytes: f64,
+    compression_ratio_displayed_vs_raw: f64,
+    psnr_y_displayed_frames: f64,
+    ssim_y_displayed_frames: f64,
     encode_seconds: f64,
     decode_seconds: f64,
     residual_entropy: String,
@@ -290,6 +321,41 @@ struct Srsv2Details {
     #[serde(skip_serializing_if = "Option::is_none")]
     motion: Option<MotionBenchReport>,
     deblock: DeblockBenchReport,
+}
+
+impl Default for Srsv2Details {
+    fn default() -> Self {
+        Self {
+            frames: 0,
+            keyframes: 0,
+            pframes: 0,
+            avg_i_bytes: 0.0,
+            avg_p_bytes: 0.0,
+            bframes_enabled: false,
+            bframe_count: 0,
+            alt_ref_count: 0,
+            display_frame_count: 0,
+            reference_frames_used: 1,
+            avg_bframe_bytes: 0.0,
+            avg_altref_bytes: 0.0,
+            compression_ratio_displayed_vs_raw: 0.0,
+            psnr_y_displayed_frames: 0.0,
+            ssim_y_displayed_frames: 0.0,
+            encode_seconds: 0.0,
+            decode_seconds: 0.0,
+            residual_entropy: String::new(),
+            intra_explicit_blocks: 0,
+            intra_rans_blocks: 0,
+            p_explicit_chunks: 0,
+            p_rans_chunks: 0,
+            fr2_revision_counts: Fr2RevisionCounts::default(),
+            legacy_explicit_total_payload_bytes: None,
+            rc: None,
+            aq: None,
+            motion: None,
+            deblock: DeblockBenchReport::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -406,6 +472,14 @@ fn loop_filter_cli_label(m: SrsV2LoopFilterMode) -> &'static str {
     }
 }
 
+fn parse_alt_ref_flag(s: &str) -> Result<bool> {
+    match s.to_ascii_lowercase().as_str() {
+        "off" | "false" | "0" => Ok(false),
+        "on" | "true" | "1" => Ok(true),
+        _ => Err(anyhow!("--alt-ref must be off or on (got {s})")),
+    }
+}
+
 fn build_seq_header(args: &Args, settings: &SrsV2EncodeSettings) -> VideoSequenceHeaderV2 {
     let disable_loop_filter = matches!(settings.loop_filter_mode, SrsV2LoopFilterMode::Off);
     VideoSequenceHeaderV2 {
@@ -424,7 +498,7 @@ fn build_seq_header(args: &Args, settings: &SrsV2EncodeSettings) -> VideoSequenc
         } else {
             settings.deblock_strength
         },
-        max_ref_frames: 1,
+        max_ref_frames: args.reference_frames,
     }
 }
 
@@ -523,6 +597,7 @@ fn validate_args(args: &Args) -> Result<()> {
     parse_loop_filter(&args.loop_filter)?;
     parse_subpel_mode(&args.subpel)?;
     parse_block_aq_mode(&args.block_aq)?;
+    let _ = parse_alt_ref_flag(&args.alt_ref)?;
     Ok(())
 }
 
@@ -620,6 +695,9 @@ struct PassNumbers {
     enc_secs: f64,
     dec_secs: f64,
     payloads: Vec<Vec<u8>>,
+    /// Parallel to `payloads`: source frame index for PSNR when picture is displayable.
+    #[allow(dead_code)]
+    psnr_src_frame: Vec<Option<u32>>,
     psnr_y: f64,
     ssim_y: f64,
     legacy_explicit_total_payload_bytes: Option<u64>,
@@ -672,6 +750,9 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             7 => c.rev7 += 1,
             8 => c.rev8 += 1,
             9 => c.rev9 += 1,
+            10 => c.rev10 += 1,
+            11 => c.rev11 += 1,
+            12 => c.rev12 += 1,
             _ => {}
         }
     }
@@ -705,6 +786,284 @@ fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> Mot
     }
 }
 
+fn run_srsv2_numbers_b_layout(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    settings: &SrsV2EncodeSettings,
+    expected_frame: usize,
+    alt_on: bool,
+) -> Result<PassNumbers> {
+    if args.frames < 3 {
+        bail!("--bframes > 0 requires frames >= 3");
+    }
+    let mut rc = SrsV2RateController::new(settings, args.fps.max(1), 1)
+        .map_err(|e| anyhow!("rate controller: {e}"))?;
+    let mut mgr = SrsV2ReferenceManager::new(seq.max_ref_frames)
+        .map_err(|e| anyhow!("reference manager: {e}"))?;
+    let t0 = Instant::now();
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    let mut psnr_src_frame: Vec<Option<u32>> = Vec::new();
+    let mut byte_hist: Vec<u64> = Vec::new();
+    let mut enc_stats = ResidualEncodeStats::default();
+    let mut qp_hist = vec![args.qp; args.frames as usize];
+    let mut prev: Option<PreviousFrameRcStats> = None;
+    let mut motion_agg = MotionAgg::default();
+    let half_pel = matches!(settings.subpel_mode, SrsV2SubpelMode::HalfPel);
+
+    let acc_motion_p = |motion_frame: &SrsV2MotionEncodeStats, motion_agg: &mut MotionAgg| {
+        motion_agg.sad_evaluations += motion_frame.sad_evaluations;
+        motion_agg.skip_subblocks += motion_frame.skip_subblocks;
+        motion_agg.nonzero_motion_macroblocks += motion_frame.nonzero_motion_macroblocks as u64;
+        motion_agg.sum_mv_l1 += motion_frame.sum_mv_l1;
+        motion_agg.p_frames += 1;
+        let mb = (seq.width / 16) as u64 * (seq.height / 16) as u64;
+        motion_agg.p_macroblocks_total += mb;
+        motion_agg.subpel_blocks_tested += motion_frame.subpel_blocks_tested;
+        motion_agg.subpel_blocks_selected += motion_frame.subpel_blocks_selected;
+        motion_agg.additional_subpel_evaluations += motion_frame.additional_subpel_evaluations;
+        motion_agg.sum_abs_frac_qpel += motion_frame.sum_abs_frac_qpel;
+    };
+
+    let y0 = load_yuv420_frame(raw, expected_frame, 0, args.width, args.height)?;
+    let qp0 = rc.qp_for_frame(0, prev);
+    let mut aq0 = SrsV2AqEncodeStats::default();
+    let mut m0 = SrsV2MotionEncodeStats::default();
+    let p0 = encode_yuv420_inter_payload(
+        seq,
+        &y0,
+        mgr.primary_ref(),
+        0,
+        qp0,
+        settings,
+        Some(&mut enc_stats),
+        Some(&mut aq0),
+        Some(&mut m0),
+    )
+    .map_err(|e| anyhow!("SRSV2 encode f0: {e}"))?;
+    qp_hist[0] = qp0;
+    let is_i0 = matches!(p0.get(3).copied(), Some(1 | 3 | 7));
+    byte_hist.push(p0.len() as u64);
+    rc.observe_frame(0, p0.len(), is_i0);
+    decode_yuv420_srsv2_payload_managed(seq, &p0, &mut mgr)
+        .map_err(|e| anyhow!("decode f0: {e}"))?;
+    payloads.push(p0);
+    psnr_src_frame.push(Some(0));
+    prev = Some(PreviousFrameRcStats {
+        encoded_bytes: payloads.last().unwrap().len() as u32,
+        is_keyframe: is_i0,
+    });
+    if alt_on && is_i0 {
+        let alt = encode_yuv420_alt_ref_payload(seq, &y0, 0, qp0, 1)
+            .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
+        decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
+            .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
+        byte_hist.push(alt.len() as u64);
+        payloads.push(alt);
+        psnr_src_frame.push(None);
+    }
+
+    let y2 = load_yuv420_frame(raw, expected_frame, 2, args.width, args.height)?;
+    let qp2 = rc.qp_for_frame(2, prev);
+    let mut aq2 = SrsV2AqEncodeStats::default();
+    let mut m2 = SrsV2MotionEncodeStats::default();
+    let p2 = encode_yuv420_inter_payload(
+        seq,
+        &y2,
+        mgr.primary_ref(),
+        2,
+        qp2,
+        settings,
+        Some(&mut enc_stats),
+        Some(&mut aq2),
+        Some(&mut m2),
+    )
+    .map_err(|e| anyhow!("SRSV2 encode f2: {e}"))?;
+    let mut aq_last = aq2;
+    qp_hist[2] = qp2;
+    let is_p2 = matches!(p2.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9));
+    if is_p2 {
+        acc_motion_p(&m2, &mut motion_agg);
+    }
+    let is_i2 = matches!(p2.get(3).copied(), Some(1 | 3 | 7));
+    byte_hist.push(p2.len() as u64);
+    rc.observe_frame(2, p2.len(), is_i2);
+    decode_yuv420_srsv2_payload_managed(seq, &p2, &mut mgr)
+        .map_err(|e| anyhow!("decode f2: {e}"))?;
+    let p2_len = p2.len();
+    payloads.push(p2);
+    psnr_src_frame.push(Some(2));
+    prev = Some(PreviousFrameRcStats {
+        encoded_bytes: p2_len as u32,
+        is_keyframe: is_i2,
+    });
+    if alt_on && is_i2 {
+        let alt = encode_yuv420_alt_ref_payload(seq, &y2, 2, qp2, 1)
+            .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
+        decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
+            .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
+        byte_hist.push(alt.len() as u64);
+        payloads.push(alt);
+        psnr_src_frame.push(None);
+    }
+
+    let y1 = load_yuv420_frame(raw, expected_frame, 1, args.width, args.height)?;
+    let qp1 = rc.qp_for_frame(1, prev);
+    let ref_a = mgr
+        .frame_at_slot_index(1)
+        .map_err(|e| anyhow!("B backward ref: {e}"))?;
+    let ref_b = mgr
+        .frame_at_slot_index(0)
+        .map_err(|e| anyhow!("B forward ref: {e}"))?;
+    let pb = encode_yuv420_b_payload(
+        seq,
+        &y1,
+        ref_a,
+        ref_b,
+        1,
+        qp1,
+        1,
+        0,
+        BBlendModeWire::Average,
+        half_pel,
+    )
+    .map_err(|e| anyhow!("B encode: {e}"))?;
+    qp_hist[1] = qp1;
+    byte_hist.push(pb.len() as u64);
+    rc.observe_frame(1, pb.len(), false);
+    decode_yuv420_srsv2_payload_managed(seq, &pb, &mut mgr)
+        .map_err(|e| anyhow!("decode B: {e}"))?;
+    let pb_len = pb.len();
+    payloads.push(pb);
+    psnr_src_frame.push(Some(1));
+    prev = Some(PreviousFrameRcStats {
+        encoded_bytes: pb_len as u32,
+        is_keyframe: false,
+    });
+
+    for fi in 3..args.frames {
+        let qp = rc.qp_for_frame(fi, prev);
+        let frame = load_yuv420_frame(raw, expected_frame, fi, args.width, args.height)?;
+        let mut aq_frame = SrsV2AqEncodeStats::default();
+        let mut motion_frame = SrsV2MotionEncodeStats::default();
+        let payload = encode_yuv420_inter_payload(
+            seq,
+            &frame,
+            mgr.primary_ref(),
+            fi,
+            qp,
+            settings,
+            Some(&mut enc_stats),
+            Some(&mut aq_frame),
+            Some(&mut motion_frame),
+        )
+        .map_err(|e| anyhow!("SRSV2 encode: {e}"))?;
+        aq_last = aq_frame;
+        let is_p = matches!(payload.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9));
+        if is_p {
+            acc_motion_p(&motion_frame, &mut motion_agg);
+        }
+        let is_i = matches!(payload.get(3).copied(), Some(1 | 3 | 7));
+        qp_hist[fi as usize] = qp;
+        byte_hist.push(payload.len() as u64);
+        rc.observe_frame(fi, payload.len(), is_i);
+        decode_yuv420_srsv2_payload_managed(seq, &payload, &mut mgr)
+            .map_err(|e| anyhow!("SRSV2 reference refresh: {e}"))?;
+        prev = Some(PreviousFrameRcStats {
+            encoded_bytes: payload.len() as u32,
+            is_keyframe: is_i,
+        });
+        payloads.push(payload);
+        psnr_src_frame.push(Some(fi));
+        if alt_on && is_i {
+            let alt = encode_yuv420_alt_ref_payload(seq, &frame, fi, qp, 1)
+                .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
+            decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
+                .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
+            byte_hist.push(alt.len() as u64);
+            payloads.push(alt);
+            psnr_src_frame.push(None);
+        }
+    }
+
+    let enc_secs = t0.elapsed().as_secs_f64();
+
+    let t1 = Instant::now();
+    let mut mgr_dec = SrsV2ReferenceManager::new(seq.max_ref_frames)
+        .map_err(|e| anyhow!("decode manager: {e}"))?;
+    let ylen = (args.width * args.height) as usize;
+    let mut dec_by_frame = vec![vec![0u8; ylen]; args.frames as usize];
+    for (pl, src_ix) in payloads.iter().zip(psnr_src_frame.iter()) {
+        let dec = decode_yuv420_srsv2_payload_managed(seq, pl, &mut mgr_dec)
+            .map_err(|e| anyhow!("SRSV2 decode: {e}"))?;
+        if let Some(fi) = src_ix {
+            dec_by_frame[*fi as usize] = dec.yuv.y.samples.clone();
+        }
+    }
+    let dec_secs = t1.elapsed().as_secs_f64();
+
+    let mut src_luma = Vec::with_capacity(ylen * args.frames as usize);
+    let mut dec_luma = Vec::with_capacity(src_luma.capacity());
+    for fi in 0..args.frames {
+        src_luma.extend_from_slice(frame_luma_slice(
+            raw,
+            expected_frame,
+            fi,
+            args.width,
+            args.height,
+        ));
+        dec_luma.extend_from_slice(&dec_by_frame[fi as usize]);
+    }
+    let psnr_y = psnr_u8(&src_luma, &dec_luma, 255.0)?;
+    let ssim_y = avg_ssim_per_frame(&src_luma, &dec_luma, args.width, args.height, args.frames)?;
+
+    let legacy_explicit_total_payload_bytes =
+        if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
+            None
+        } else {
+            let mut settings_leg = settings.clone();
+            settings_leg.residual_entropy = ResidualEntropy::Explicit;
+            settings_leg.block_aq_mode = SrsV2BlockAqMode::Off;
+            let mut sum = 0_u64;
+            let mut slot = None::<YuvFrame>;
+            for fi in 0..args.frames {
+                let frame = load_yuv420_frame(raw, expected_frame, fi, args.width, args.height)?;
+                let qpi = *qp_hist.get(fi as usize).unwrap_or(&args.qp);
+                let pl = encode_yuv420_inter_payload(
+                    seq,
+                    &frame,
+                    slot.as_ref(),
+                    fi,
+                    qpi,
+                    &settings_leg,
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(|e| anyhow!("SRSV2 legacy explicit encode: {e}"))?;
+                let _ = decode_yuv420_srsv2_payload(seq, &pl, &mut slot)
+                    .map_err(|e| anyhow!("SRSV2 legacy reference refresh: {e}"))?;
+                sum += pl.len() as u64;
+            }
+            Some(sum)
+        };
+
+    Ok(PassNumbers {
+        qp_hist,
+        byte_hist,
+        enc_stats,
+        enc_secs,
+        dec_secs,
+        payloads,
+        psnr_src_frame,
+        psnr_y,
+        ssim_y,
+        legacy_explicit_total_payload_bytes,
+        aq_last,
+        motion_agg,
+    })
+}
+
 fn run_srsv2_numbers(
     args: &Args,
     seq: &VideoSequenceHeaderV2,
@@ -712,12 +1071,28 @@ fn run_srsv2_numbers(
     settings: &SrsV2EncodeSettings,
     expected_frame: usize,
 ) -> Result<PassNumbers> {
+    let alt_on = parse_alt_ref_flag(&args.alt_ref)?;
+    if args.bframes > 0 {
+        if seq.max_ref_frames < 2 {
+            bail!("--bframes > 0 requires --reference-frames >= 2");
+        }
+        if !seq.width.is_multiple_of(16) || !seq.height.is_multiple_of(16) {
+            bail!("--bframes > 0 requires width and height divisible by 16");
+        }
+        return run_srsv2_numbers_b_layout(args, seq, raw, settings, expected_frame, alt_on);
+    }
+    if alt_on && seq.max_ref_frames < 2 {
+        bail!("--alt-ref on requires --reference-frames >= 2");
+    }
+
     let mut rc = SrsV2RateController::new(settings, args.fps.max(1), 1)
         .map_err(|e| anyhow!("rate controller: {e}"))?;
 
     let t0 = Instant::now();
-    let mut ref_slot: Option<YuvFrame> = None;
+    let mut mgr = SrsV2ReferenceManager::new(seq.max_ref_frames)
+        .map_err(|e| anyhow!("reference manager: {e}"))?;
     let mut payloads = Vec::with_capacity(args.frames as usize);
+    let mut psnr_src_frame = Vec::with_capacity(args.frames as usize);
     let mut enc_stats = ResidualEncodeStats::default();
     let mut qp_hist = Vec::with_capacity(args.frames as usize);
     let mut byte_hist = Vec::with_capacity(args.frames as usize);
@@ -734,7 +1109,7 @@ fn run_srsv2_numbers(
         let payload = encode_yuv420_inter_payload(
             seq,
             &frame,
-            ref_slot.as_ref(),
+            mgr.primary_ref(),
             fi,
             qp,
             settings,
@@ -765,7 +1140,7 @@ fn run_srsv2_numbers(
         byte_hist.push(payload.len() as u64);
         rc.observe_frame(fi, payload.len(), is_i);
 
-        let _ = decode_yuv420_srsv2_payload(seq, &payload, &mut ref_slot)
+        decode_yuv420_srsv2_payload_managed(seq, &payload, &mut mgr)
             .map_err(|e| anyhow!("SRSV2 reference refresh: {e}"))?;
 
         prev = Some(PreviousFrameRcStats {
@@ -773,16 +1148,35 @@ fn run_srsv2_numbers(
             is_keyframe: is_i,
         });
         payloads.push(payload);
+        psnr_src_frame.push(Some(fi));
+
+        if alt_on && is_i {
+            let alt = encode_yuv420_alt_ref_payload(seq, &frame, fi, qp, 1)
+                .map_err(|e| anyhow!("alt-ref encode: {e}"))?;
+            decode_yuv420_srsv2_payload_managed(seq, &alt, &mut mgr)
+                .map_err(|e| anyhow!("alt-ref decode: {e}"))?;
+            byte_hist.push(alt.len() as u64);
+            payloads.push(alt);
+            psnr_src_frame.push(None);
+        }
     }
     let enc_secs = t0.elapsed().as_secs_f64();
 
     let t1 = Instant::now();
-    let mut dec_luma = Vec::with_capacity((args.width * args.height * args.frames) as usize);
-    let mut src_luma = Vec::with_capacity(dec_luma.capacity());
-    let mut decode_slot = None::<YuvFrame>;
-    for fi in 0..args.frames {
-        let dec = decode_yuv420_srsv2_payload(seq, &payloads[fi as usize], &mut decode_slot)
+    let ylen = (args.width * args.height) as usize;
+    let mut dec_by_frame = vec![vec![0u8; ylen]; args.frames as usize];
+    let mut mgr_dec = SrsV2ReferenceManager::new(seq.max_ref_frames)
+        .map_err(|e| anyhow!("decode manager: {e}"))?;
+    for (pl, src_ix) in payloads.iter().zip(psnr_src_frame.iter()) {
+        let dec = decode_yuv420_srsv2_payload_managed(seq, pl, &mut mgr_dec)
             .map_err(|e| anyhow!("SRSV2 decode: {e}"))?;
+        if let Some(fi) = src_ix {
+            dec_by_frame[*fi as usize] = dec.yuv.y.samples.clone();
+        }
+    }
+    let mut src_luma = Vec::with_capacity(ylen * args.frames as usize);
+    let mut dec_luma = Vec::with_capacity(src_luma.capacity());
+    for fi in 0..args.frames {
         src_luma.extend_from_slice(frame_luma_slice(
             raw,
             expected_frame,
@@ -790,7 +1184,7 @@ fn run_srsv2_numbers(
             args.width,
             args.height,
         ));
-        dec_luma.extend_from_slice(&dec.yuv.y.samples);
+        dec_luma.extend_from_slice(&dec_by_frame[fi as usize]);
     }
     let dec_secs = t1.elapsed().as_secs_f64();
 
@@ -835,6 +1229,7 @@ fn run_srsv2_numbers(
         enc_secs,
         dec_secs,
         payloads,
+        psnr_src_frame,
         psnr_y,
         ssim_y,
         legacy_explicit_total_payload_bytes,
@@ -918,6 +1313,7 @@ fn build_deblock_bench_report(
 
 fn pass_to_details(
     args: &Args,
+    seq: &VideoSequenceHeaderV2,
     settings: &SrsV2EncodeSettings,
     residual_label: &str,
     p: &PassNumbers,
@@ -925,19 +1321,38 @@ fn pass_to_details(
 ) -> Srsv2Details {
     let mut i_bytes = Vec::new();
     let mut p_bytes = Vec::new();
+    let mut b_bytes = Vec::new();
+    let mut alt_bytes = Vec::new();
     for pl in &p.payloads {
         match pl.get(3).copied() {
             Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
             Some(2 | 4 | 5 | 6 | 8 | 9) => p_bytes.push(pl.len() as u64),
+            Some(10 | 11) => b_bytes.push(pl.len() as u64),
+            Some(12) => alt_bytes.push(pl.len() as u64),
             _ => {}
         }
     }
+    let fr2 = fr2_revision_counts(&p.payloads);
+    let bframe_count = fr2.rev10 + fr2.rev11;
+    let alt_ref_count = fr2.rev12;
+    let enc_bytes: u64 = p.byte_hist.iter().sum();
+    let raw_bytes = raw_len_for_bitrate(args);
     Srsv2Details {
         frames: args.frames,
         keyframes: i_bytes.len() as u32,
         pframes: p_bytes.len() as u32,
         avg_i_bytes: avg_u64(&i_bytes),
         avg_p_bytes: avg_u64(&p_bytes),
+        bframes_enabled: args.bframes > 0,
+        bframe_count,
+        alt_ref_count,
+        display_frame_count: args.frames,
+        reference_frames_used: seq.max_ref_frames,
+        avg_bframe_bytes: avg_u64(&b_bytes),
+        avg_altref_bytes: avg_u64(&alt_bytes),
+        compression_ratio_displayed_vs_raw: compression_ratio(raw_bytes, enc_bytes),
+        psnr_y_displayed_frames: p.psnr_y,
+        ssim_y_displayed_frames: p.ssim_y,
         encode_seconds: p.enc_secs,
         decode_seconds: p.dec_secs,
         residual_entropy: residual_label.to_string(),
@@ -945,7 +1360,7 @@ fn pass_to_details(
         intra_rans_blocks: p.enc_stats.intra_rans_blocks,
         p_explicit_chunks: p.enc_stats.p_explicit_chunks,
         p_rans_chunks: p.enc_stats.p_rans_chunks,
-        fr2_revision_counts: fr2_revision_counts(&p.payloads),
+        fr2_revision_counts: fr2,
         legacy_explicit_total_payload_bytes: p.legacy_explicit_total_payload_bytes,
         rc: Some(rc_report_from_pass(args, settings, p)),
         aq: Some(aq_report_from_pass(settings, &p.aq_last)),
@@ -987,7 +1402,14 @@ fn run_single_report(
     let settings = build_settings(args, re)?;
     let numbers = run_srsv2_numbers(args, seq, raw, &settings, expected_frame)?;
     let deblock = build_deblock_bench_report(args, seq, &settings, raw, expected_frame, &numbers)?;
-    let details = pass_to_details(args, &settings, &args.residual_entropy, &numbers, deblock);
+    let details = pass_to_details(
+        args,
+        seq,
+        &settings,
+        &args.residual_entropy,
+        &numbers,
+        deblock,
+    );
     let srsv2_row = pass_to_row(args, "SRSV2", &numbers);
     let mut table = vec![srsv2_row.clone()];
 
@@ -1072,23 +1494,8 @@ fn run_compare_residual_report(
                     },
                     details: Srsv2Details {
                         frames: args.frames,
-                        keyframes: 0,
-                        pframes: 0,
-                        avg_i_bytes: 0.0,
-                        avg_p_bytes: 0.0,
-                        encode_seconds: 0.0,
-                        decode_seconds: 0.0,
                         residual_entropy: format!("{re:?}"),
-                        intra_explicit_blocks: 0,
-                        intra_rans_blocks: 0,
-                        p_explicit_chunks: 0,
-                        p_rans_chunks: 0,
-                        fr2_revision_counts: Fr2RevisionCounts::default(),
-                        legacy_explicit_total_payload_bytes: None,
-                        rc: None,
-                        aq: None,
-                        motion: None,
-                        deblock: DeblockBenchReport::default(),
+                        ..Default::default()
                     },
                 });
                 table.push(entries.last().unwrap().row.clone());
@@ -1108,7 +1515,7 @@ fn run_compare_residual_report(
                 let deblock =
                     build_deblock_bench_report(args, seq, &st, raw, expected_frame, &numbers)
                         .unwrap_or_else(|_| DeblockBenchReport::default());
-                let details = pass_to_details(args, &st, res_entropy_str, &numbers, deblock);
+                let details = pass_to_details(args, seq, &st, res_entropy_str, &numbers, deblock);
                 if primary_details.is_none() || label == "SRSV2-auto" {
                     primary_details = Some(details.clone());
                 }
@@ -1139,23 +1546,8 @@ fn run_compare_residual_report(
                     },
                     details: Srsv2Details {
                         frames: args.frames,
-                        keyframes: 0,
-                        pframes: 0,
-                        avg_i_bytes: 0.0,
-                        avg_p_bytes: 0.0,
-                        encode_seconds: 0.0,
-                        decode_seconds: 0.0,
                         residual_entropy: res_entropy_str.to_string(),
-                        intra_explicit_blocks: 0,
-                        intra_rans_blocks: 0,
-                        p_explicit_chunks: 0,
-                        p_rans_chunks: 0,
-                        fr2_revision_counts: Fr2RevisionCounts::default(),
-                        legacy_explicit_total_payload_bytes: None,
-                        rc: None,
-                        aq: None,
-                        motion: None,
-                        deblock: DeblockBenchReport::default(),
+                        ..Default::default()
                     },
                 });
                 table.push(entries.last().unwrap().row.clone());
@@ -1217,7 +1609,7 @@ fn run_sweep_file(
                         &numbers,
                     )
                     .unwrap_or_else(|_| DeblockBenchReport::default());
-                    let details = pass_to_details(&a, &settings, re_str, &numbers, deblock);
+                    let details = pass_to_details(&a, seq, &settings, re_str, &numbers, deblock);
                     sweep.push(SweepRunReport {
                         qp,
                         residual_entropy: re_str.to_string(),
@@ -1254,7 +1646,7 @@ fn run_sweep_file(
                 let deblock =
                     build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
                         .unwrap_or_else(|_| DeblockBenchReport::default());
-                let details = pass_to_details(&a, &settings, "auto", &numbers, deblock);
+                let details = pass_to_details(&a, seq, &settings, "auto", &numbers, deblock);
                 sweep.push(SweepRunReport {
                     qp,
                     residual_entropy: "auto".to_string(),
@@ -1292,7 +1684,7 @@ fn run_sweep_file(
                 let deblock =
                     build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
                         .unwrap_or_else(|_| DeblockBenchReport::default());
-                let details = pass_to_details(&a, &settings, "auto", &numbers, deblock);
+                let details = pass_to_details(&a, seq, &settings, "auto", &numbers, deblock);
                 sweep.push(SweepRunReport {
                     qp: 28,
                     residual_entropy: "auto".to_string(),
@@ -1324,7 +1716,7 @@ fn run_sweep_file(
                 let deblock =
                     build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
                         .unwrap_or_else(|_| DeblockBenchReport::default());
-                let details = pass_to_details(&a, &settings, "auto", &numbers, deblock);
+                let details = pass_to_details(&a, seq, &settings, "auto", &numbers, deblock);
                 sweep.push(SweepRunReport {
                     qp: 28,
                     residual_entropy: "auto".to_string(),
@@ -1879,6 +2271,10 @@ mod tests {
             block_aq: "off".to_string(),
             block_aq_delta_min: -6,
             block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -1908,6 +2304,16 @@ mod tests {
                 pframes: 0,
                 avg_i_bytes: 10.0,
                 avg_p_bytes: 0.0,
+                bframes_enabled: false,
+                bframe_count: 0,
+                alt_ref_count: 0,
+                display_frame_count: 1,
+                reference_frames_used: 1,
+                avg_bframe_bytes: 0.0,
+                avg_altref_bytes: 0.0,
+                compression_ratio_displayed_vs_raw: 0.0,
+                psnr_y_displayed_frames: 99.0,
+                ssim_y_displayed_frames: 1.0,
                 encode_seconds: 0.1,
                 decode_seconds: 0.1,
                 residual_entropy: "auto".to_string(),
@@ -2001,6 +2407,7 @@ mod tests {
         assert!(js.contains("\"block_aq_mode\":\"off\""));
         assert!(js.contains("\"loop_filter_mode\":\"off\""));
         assert!(js.contains("\"subpel_mode\":\"off\""));
+        assert!(js.contains("\"bframes_enabled\":false"));
     }
 
     #[test]
@@ -2020,6 +2427,16 @@ mod tests {
                 pframes: 0,
                 avg_i_bytes: 10.0,
                 avg_p_bytes: 0.0,
+                bframes_enabled: false,
+                bframe_count: 0,
+                alt_ref_count: 0,
+                display_frame_count: 1,
+                reference_frames_used: 1,
+                avg_bframe_bytes: 0.0,
+                avg_altref_bytes: 0.0,
+                compression_ratio_displayed_vs_raw: 0.0,
+                psnr_y_displayed_frames: 0.0,
+                ssim_y_displayed_frames: 0.0,
                 encode_seconds: 0.1,
                 decode_seconds: 0.1,
                 residual_entropy: "auto".to_string(),
@@ -2057,6 +2474,16 @@ mod tests {
                     pframes: 0,
                     avg_i_bytes: 5.0,
                     avg_p_bytes: 0.0,
+                    bframes_enabled: false,
+                    bframe_count: 0,
+                    alt_ref_count: 0,
+                    display_frame_count: 1,
+                    reference_frames_used: 1,
+                    avg_bframe_bytes: 0.0,
+                    avg_altref_bytes: 0.0,
+                    compression_ratio_displayed_vs_raw: 0.0,
+                    psnr_y_displayed_frames: 40.0,
+                    ssim_y_displayed_frames: 1.0,
                     encode_seconds: 0.1,
                     decode_seconds: 0.1,
                     residual_entropy: "explicit".to_string(),
@@ -2108,6 +2535,16 @@ mod tests {
                     pframes: 1,
                     avg_i_bytes: 5.0,
                     avg_p_bytes: 4.0,
+                    bframes_enabled: false,
+                    bframe_count: 0,
+                    alt_ref_count: 0,
+                    display_frame_count: 2,
+                    reference_frames_used: 1,
+                    avg_bframe_bytes: 0.0,
+                    avg_altref_bytes: 0.0,
+                    compression_ratio_displayed_vs_raw: 0.0,
+                    psnr_y_displayed_frames: 30.0,
+                    ssim_y_displayed_frames: 0.9,
                     encode_seconds: 0.2,
                     decode_seconds: 0.2,
                     residual_entropy: "auto".to_string(),
@@ -2168,6 +2605,10 @@ mod tests {
             block_aq: "off".to_string(),
             block_aq_delta_min: -6,
             block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
@@ -2213,6 +2654,10 @@ mod tests {
             block_aq: "off".to_string(),
             block_aq_delta_min: -6,
             block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
         };
         assert!(validate_args(&a).is_err());
         a.aq = "off".to_string();

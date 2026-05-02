@@ -57,6 +57,8 @@ pub struct DecodedVideoFrameV2 {
     pub frame_index: u32,
     pub width: u32,
     pub height: u32,
+    /// When **false**, mux playback must not count this as a displayed picture (experimental alt-ref).
+    pub is_displayable: bool,
     pub yuv: YuvFrame,
 }
 

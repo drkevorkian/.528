@@ -9,6 +9,10 @@ pub enum Srsv2PayloadKind {
     Intra,
     /// `FR2\\x02` — experimental predicted picture (not a keyframe).
     Predicted,
+    /// `FR2\\x0A` / `FR2\\x0B` — experimental B (`FR2` rev **10** / **11**).
+    Bidirectional,
+    /// `FR2\\x0C` — experimental non-displayable alt-ref (`FR2` rev **12**).
+    AltRef,
     /// `FR2` with an unsupported revision byte (must not be muxed without decoder support).
     Unknown,
 }
@@ -17,6 +21,8 @@ pub enum Srsv2PayloadKind {
 ///
 /// - `FR2\\x01` / `FR2\\x03` / `FR2\\x07` → [`Srsv2PayloadKind::Intra`] (rev 3/7 use entropy residuals; rev 7 adds block `qp_delta`)
 /// - `FR2\\x02` / `FR2\\x04` / `FR2\\x05` / `FR2\\x06` / `FR2\\x08` / `FR2\\x09` → [`Srsv2PayloadKind::Predicted`]
+/// - `FR2\\x0A` / `FR2\\x0B` → [`Srsv2PayloadKind::Bidirectional`]
+/// - `FR2\\x0C` → [`Srsv2PayloadKind::AltRef`]
 /// - Other `FR2\\x??` → [`Srsv2PayloadKind::Unknown`]
 /// - Too short or bad magic → [`SrsV2Error`]
 pub fn classify_srsv2_payload(payload: &[u8]) -> Result<Srsv2PayloadKind, SrsV2Error> {
@@ -29,6 +35,8 @@ pub fn classify_srsv2_payload(payload: &[u8]) -> Result<Srsv2PayloadKind, SrsV2E
     Ok(match payload[3] {
         1 | 3 | 7 => Srsv2PayloadKind::Intra,
         2 | 4 | 5 | 6 | 8 | 9 => Srsv2PayloadKind::Predicted,
+        10 | 11 => Srsv2PayloadKind::Bidirectional,
+        12 => Srsv2PayloadKind::AltRef,
         _ => Srsv2PayloadKind::Unknown,
     })
 }
@@ -116,6 +124,26 @@ mod classify_tests {
         assert_eq!(
             classify_srsv2_payload(&[b'F', b'R', b'2', 9]).unwrap(),
             Srsv2PayloadKind::Predicted
+        );
+    }
+
+    #[test]
+    fn fr2_rev10_rev11_are_bidirectional() {
+        assert_eq!(
+            classify_srsv2_payload(&[b'F', b'R', b'2', 10]).unwrap(),
+            Srsv2PayloadKind::Bidirectional
+        );
+        assert_eq!(
+            classify_srsv2_payload(&[b'F', b'R', b'2', 11]).unwrap(),
+            Srsv2PayloadKind::Bidirectional
+        );
+    }
+
+    #[test]
+    fn fr2_rev12_is_alt_ref() {
+        assert_eq!(
+            classify_srsv2_payload(&[b'F', b'R', b'2', 12]).unwrap(),
+            Srsv2PayloadKind::AltRef
         );
     }
 }

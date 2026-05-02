@@ -52,6 +52,20 @@ Same macroblock grid and motion syntax as revision **4**, with the same **`clip_
 
 Same as revision **8** for **`qp_delta`** placement, clipping header, and **luma-only** residual deltas (chroma MV-copy only), with motion syntax matching revision **6** (**`i32` LE** quarter-pel MVs, even quarter-pel grid).
 
+### Revision 10 — experimental B-frame, integer MV (`FR2\x0A`)
+
+Bidirectional **macroblock** syntax (16-aligned canvas): `frame_index`, `qp`, **`slot_a`**, **`slot_b`**, blend mode, per-MB MV pair(s) (`i16` when rev **10**), adaptive residual packing akin to **P** rev **4**. Requires **`max_ref_frames ≥ 2`**, valid populated slots, backward reference strictly **before** the current picture in `frame_index` order and forward reference strictly **after**, and a supported blend (**weighted** on wire value **3** is reserved / rejected). Parser rejects malformed residuals, bad MVs, and oversize payloads.
+
+### Revision 11 — experimental B-frame, half-pel MV (`FR2\x0B`)
+
+Same as revision **10** but MVs are **`i32` LE** quarter-pel (even grid), matching **P** rev **6** motion packing.
+
+### Revision 12 — experimental alt-ref / hidden reference (`FR2\x0C`)
+
+Non-displayable intra-coded planes (same entropy style as **rev 3** in this slice): `frame_index`, `qp`, **`target_slot`**, **`reserved`** (must be **0**). Picture updates **`SrsV2ReferenceManager`** at **`target_slot`** with **`is_displayable == false`**; playback must **not** treat it as a presented frame.
+
+**Compatibility:** Revisions **1**–**9** remain the stable interchange baseline. **10**–**12** are **experimental**; the legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**12** — use **`decode_yuv420_srsv2_payload_managed`**.
+
 ## Elementary `.srsv2` file
 
 Starts with the 64-byte sequence header, then repeating framed records: VP packet sync (`PACKET_SYNC` from `libsrs_video`), version/type bytes, `frame_index`, payload length, CRC32 of header fields + payload, payload bytes.

@@ -115,11 +115,16 @@ pub enum ColorRange {
 pub enum FrameTypeV2 {
     Intra = 0,
     Predicted = 1,
+    /// Experimental bidirectional (`FR2` rev **10**/**11**).
+    Bidirectional = 2,
+    /// Experimental non-displayable reference (`FR2` rev **12**).
+    AltRef = 3,
 }
 
 impl FrameTypeV2 {
     pub const I: Self = Self::Intra;
     pub const P: Self = Self::Predicted;
+    pub const B: Self = Self::Bidirectional;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

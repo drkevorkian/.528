@@ -450,7 +450,9 @@ impl NativeEncoderSink for MuxNativeImportSink {
                 .map_err(|e| anyhow!("SRSV2 payload classification: {e}"))?
             {
                 Srsv2PayloadKind::Intra => true,
-                Srsv2PayloadKind::Predicted => false,
+                Srsv2PayloadKind::Predicted
+                | Srsv2PayloadKind::Bidirectional
+                | Srsv2PayloadKind::AltRef => false,
                 Srsv2PayloadKind::Unknown => {
                     return Err(anyhow!(
                         "unsupported SRSV2 FR2 revision in mux path; refusing to mux"

@@ -12,7 +12,7 @@
 
 **Adaptive quantization (experimental):** optional **frame-level** QP derivation from per-MB activity (`docs/adaptive_quantization.md`). Optional **block-level** **`qp_delta`** syntax is **versioned** (**`FR2\x07`–`\x09`**) and **off by default** (`SrsV2BlockAqMode`). Frame-level AQ still picks the **`base_qp`** byte before per-block deltas apply. **Intra rev 7** carries **`qp_delta` on Y/U/V 8×8 blocks**; **P rev 8/9** carries **`qp_delta` on luma residuals only** (chroma has no residual syntax in this prototype).
 
-**Motion search (experimental):** integer-pel modes, optional **half-pel** refinement (`docs/motion_search.md`). **Quarter-pel**, **B-frames**, and **GPU** motion remain future work.
+**Motion search (experimental):** integer-pel modes, optional **half-pel** refinement (`docs/motion_search.md`). **Experimental B** (`FR2\x0A`/`\x0B`) and **alt-ref** (`FR2\x0C`) exist behind **`decode_yuv420_srsv2_payload_managed`** / **`SrsV2ReferenceManager`** — quality and tooling are **not** production-grade. Finer **GPU** motion remains roadmap.
 
 Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future slices**.
 
@@ -21,13 +21,14 @@ Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future sli
 - 64-byte `SRS2` sequence header (little-endian fields + profile/pixel/color metadata), including **`max_ref_frames`** (capped; enables reference pictures for **P** prototype).
 - YUV420p8 intra frame payloads: **`FR2\x01`** (explicit coefficient tuples only); experimental **`FR2\x03`** (adaptive explicit vs static rANS per **8×8** block); experimental **`FR2\x07`** (rev **3** block layout + per-block **`qp_delta`**).
 - Experimental P-frame payloads: **`FR2\x02`** / **`FR2\x04`** (integer **`i16`** MVs); **`FR2\x05`** / **`FR2\x06`** (half-pel grid, **`i32`** quarter-pel MVs); **`FR2\x08`** / **`FR2\x09`** (rev **4**/**6** residuals + per-chunk **`qp_delta`**).
+- Experimental **B** payloads **`FR2\x0A`** (integer MV) / **`FR2\x0B`** (half-pel MV) and **alt-ref** **`FR2\x0C`** (non-display reference refresh), parser-safe and bounded by **`max_ref_frames`**.
 - Elementary `.srsv2` streams (sync + CRC-framed payloads).
-- Container mux/demux with `codec_id == 3` and bounded playback decode for primary video (`decode_yuv420_srsv2_payload`).
+- Container mux/demux with `codec_id == 3` and bounded playback decode for primary video (`decode_yuv420_srsv2_payload_managed`; legacy **`decode_yuv420_srsv2_payload`** remains for **FR2** rev **1**–**9** single-slot callers).
 - CLI: `encode --codec srsv2`, `analyze --dump-codec`, decode of `.srsv2` to raw YUV via app services.
 
 ## Planned / not yet merged
 
-- **Quarter-pel** motion, **B**-frames, and richer merged MV modes beyond half-pel **P** slices.
+- General **quarter-pel** motion beyond the current half-pel grid, richer **B** search / weighted prediction, and production-grade **GOP** / **B** placement.
 - Broader entropy coding (per-file trained models, MV syntax, etc.). Today: **experimental** static rANS **AC residual** tokens only; motion and headers remain structured bytes with bounds checks.
 - **Loop filter (experimental):** when `disable_loop_filter` is **false**, encoder and decoder apply the same **simple luma deblock** on reconstructed **Y** before refreshing the SRSV2 reference (see **`docs/deblock_filter.md`**). **CDEF**, **restoration**, **film grain**, and chroma loop filtering are **not** implemented.
 - GPU backends (`gpu-wgpu`, `gpu-cuda` feature placeholders).

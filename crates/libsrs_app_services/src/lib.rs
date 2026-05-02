@@ -776,7 +776,9 @@ fn mux_elementary_streams(input: &Path, output: &Path) -> Result<()> {
                 anyhow!("SRSV2 elementary payload classification for mux index: {e}")
             })? {
                 Srsv2PayloadKind::Intra => true,
-                Srsv2PayloadKind::Predicted => false,
+                Srsv2PayloadKind::Predicted
+                | Srsv2PayloadKind::Bidirectional
+                | Srsv2PayloadKind::AltRef => false,
                 Srsv2PayloadKind::Unknown => {
                     return Err(anyhow!(
                         "SRSV2 elementary uses unsupported FR2 revision; refusing mux"

@@ -5,6 +5,7 @@
 
 pub mod activity;
 pub mod adaptive_quant;
+pub mod b_frame_codec;
 pub mod block_aq;
 pub mod color;
 mod dct;
@@ -21,6 +22,7 @@ pub mod p_frame_codec;
 pub mod payload_kind;
 pub mod rate_control;
 pub mod reference;
+pub mod reference_manager;
 pub mod residual_entropy;
 pub mod residual_tokens;
 pub mod subpel;
@@ -28,6 +30,9 @@ pub mod subpel;
 pub use adaptive_quant::{
     accumulate_block_aq_wire_plane, resolve_frame_adaptive_qp, validate_adaptive_quant_settings,
     SrsV2AqEncodeStats, SrsV2BlockAqWireStats,
+};
+pub use b_frame_codec::{
+    encode_yuv420_b_payload, BBlendModeWire, FRAME_PAYLOAD_MAGIC_B, FRAME_PAYLOAD_MAGIC_B_SUBPEL,
 };
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
@@ -39,8 +44,10 @@ pub use deblock::{
 pub use error::SrsV2Error;
 pub use frame::{DecodedVideoFrameV2, EncodedVideoPacketV2, VideoPlane, YuvFrame};
 pub use frame_codec::{
-    apply_reconstruction_filter_if_enabled, decode_yuv420_intra_payload,
-    decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
+    apply_reconstruction_filter_if_enabled, decode_yuv420_alt_ref_payload,
+    decode_yuv420_intra_payload, decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
+    encode_yuv420_alt_ref_payload, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
+    FRAME_PAYLOAD_MAGIC_ALT_REF,
 };
 pub use model::{
     decode_sequence_header_v2, encode_sequence_header_v2, ChromaSiting, ColorPrimaries, ColorRange,
@@ -56,6 +63,7 @@ pub use rate_control::{
     SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode,
 };
 pub use reference::ReferenceFrameBuffer;
+pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};
 
 pub use gpu_traits::{
     ColorConvertBackend, CpuVideoAccelerator, GpuVideoAccelerator, MotionSearchBackend,

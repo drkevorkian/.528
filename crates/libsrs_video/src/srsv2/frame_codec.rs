@@ -3,6 +3,7 @@
 use super::adaptive_quant::{
     accumulate_block_aq_wire_plane, resolve_frame_adaptive_qp, SrsV2AqEncodeStats,
 };
+use super::b_frame_codec;
 use super::block_aq::validate_qp_clip_range;
 use super::deblock::apply_loop_filter_y;
 use super::error::SrsV2Error;
@@ -15,6 +16,7 @@ use super::p_frame_codec;
 use super::rate_control::{
     ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode, SrsV2EncodeSettings,
 };
+use super::reference_manager::SrsV2ReferenceManager;
 use super::residual_entropy::{
     decode_plane_intra_entropy, decode_plane_intra_entropy_block_aq, encode_plane_intra_entropy,
     encode_plane_intra_entropy_block_aq,
@@ -23,6 +25,8 @@ use super::residual_entropy::{
 pub const FRAME_PAYLOAD_MAGIC: [u8; 4] = [b'F', b'R', b'2', 1];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 3];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 7];
+/// Non-displayable reference refresh (`FR2` rev **12**, experimental).
+pub const FRAME_PAYLOAD_MAGIC_ALT_REF: [u8; 4] = [b'F', b'R', b'2', 12];
 
 fn intra_magic_matches(payload: &[u8]) -> bool {
     payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3 | 7)
@@ -357,6 +361,7 @@ pub fn decode_yuv420_intra_payload(
         frame_index,
         width: w,
         height: h,
+        is_displayable: true,
         yuv: YuvFrame {
             format: PixelFormat::Yuv420p8,
             y: y_plane,
@@ -410,7 +415,208 @@ pub fn encode_yuv420_inter_payload(
     )
 }
 
+/// Decode **alt-ref** (`FR2` rev **12**): intra-coded planes stored into `manager` at `target_slot`; not displayable.
+pub fn decode_yuv420_alt_ref_payload(
+    seq: &VideoSequenceHeaderV2,
+    payload: &[u8],
+    manager: &mut SrsV2ReferenceManager,
+) -> Result<DecodedVideoFrameV2, SrsV2Error> {
+    if seq.pixel_format != PixelFormat::Yuv420p8 {
+        return Err(SrsV2Error::Unsupported(
+            "decode path only supports YUV420p8 in this slice",
+        ));
+    }
+    if seq.max_ref_frames == 0 {
+        return Err(SrsV2Error::syntax("alt-ref requires max_ref_frames >= 1"));
+    }
+    if payload.len() < 4 + 4 + 1 + 1 + 1 + 12 {
+        return Err(SrsV2Error::Truncated);
+    }
+    if payload.len() < 4 || payload[0..4] != FRAME_PAYLOAD_MAGIC_ALT_REF {
+        return Err(SrsV2Error::BadMagic);
+    }
+    let mut cur = 4usize;
+    let frame_index = read_u32(payload, &mut cur)?;
+    let base_qp = read_u8_intra(payload, &mut cur)?;
+    let target_slot = read_u8_intra(payload, &mut cur)?;
+    let reserved = read_u8_intra(payload, &mut cur)?;
+    if reserved != 0 {
+        return Err(SrsV2Error::syntax("alt-ref header reserved"));
+    }
+    manager.validate_slot_index(target_slot)?;
+    let qp_i = base_qp.max(1) as i16;
+
+    let y_len = read_u32(payload, &mut cur)? as usize;
+    let y_end = cur
+        .checked_add(y_len)
+        .ok_or(SrsV2Error::Overflow("alt-ref y chunk"))?;
+    if y_end > payload.len() {
+        return Err(SrsV2Error::Truncated);
+    }
+    let y_data = &payload[cur..y_end];
+    cur = y_end;
+
+    let u_len = read_u32(payload, &mut cur)? as usize;
+    let u_end = cur
+        .checked_add(u_len)
+        .ok_or(SrsV2Error::Overflow("alt-ref u chunk"))?;
+    if u_end > payload.len() {
+        return Err(SrsV2Error::Truncated);
+    }
+    let u_data = &payload[cur..u_end];
+    cur = u_end;
+
+    let v_len = read_u32(payload, &mut cur)? as usize;
+    let v_end = cur
+        .checked_add(v_len)
+        .ok_or(SrsV2Error::Overflow("alt-ref v chunk"))?;
+    if v_end > payload.len() {
+        return Err(SrsV2Error::Truncated);
+    }
+    let v_data = &payload[cur..v_end];
+    cur = v_end;
+    if cur != payload.len() {
+        return Err(SrsV2Error::syntax("trailing alt-ref bytes"));
+    }
+
+    let w = seq.width;
+    let h = seq.height;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+
+    let mut y_plane = VideoPlane::<u8>::try_new(w, h, w as usize)?;
+    let mut u_plane = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;
+    let mut v_plane = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;
+
+    let mut c = 0usize;
+    decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i)?;
+    if c != y_data.len() {
+        return Err(SrsV2Error::syntax("alt-ref y plane trailing bits"));
+    }
+    c = 0;
+    decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i)?;
+    if c != u_data.len() {
+        return Err(SrsV2Error::syntax("alt-ref u plane trailing bits"));
+    }
+    c = 0;
+    decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i)?;
+    if c != v_data.len() {
+        return Err(SrsV2Error::syntax("alt-ref v plane trailing bits"));
+    }
+
+    let yuv = YuvFrame {
+        format: PixelFormat::Yuv420p8,
+        y: y_plane,
+        u: u_plane,
+        v: v_plane,
+    };
+    manager.store_alt_ref_at(target_slot, frame_index, yuv.clone())?;
+
+    Ok(DecodedVideoFrameV2 {
+        frame_index,
+        width: w,
+        height: h,
+        is_displayable: false,
+        yuv,
+    })
+}
+
+/// Encode experimental **alt-ref** (`FR2` rev **12**) using rev **3**-style entropy planes.
+pub fn encode_yuv420_alt_ref_payload(
+    seq: &VideoSequenceHeaderV2,
+    yuv: &YuvFrame,
+    frame_index: u32,
+    qp: u8,
+    target_slot: u8,
+) -> Result<Vec<u8>, SrsV2Error> {
+    if seq.pixel_format != PixelFormat::Yuv420p8 || yuv.format != PixelFormat::Yuv420p8 {
+        return Err(SrsV2Error::Unsupported(
+            "encode path only supports YUV420p8 in this slice",
+        ));
+    }
+    if seq.max_ref_frames == 0 {
+        return Err(SrsV2Error::syntax("alt-ref requires max_ref_frames >= 1"));
+    }
+    let probe = SrsV2ReferenceManager::new(seq.max_ref_frames)?;
+    probe.validate_slot_index(target_slot)?;
+    let qp_i = qp.max(1) as i16;
+    let mut out = Vec::new();
+    out.extend_from_slice(&FRAME_PAYLOAD_MAGIC_ALT_REF);
+    out.extend_from_slice(&frame_index.to_le_bytes());
+    out.push(qp);
+    out.push(target_slot);
+    out.push(0_u8);
+
+    let mut acc = ResidualEncodeStats::default();
+    let mut yb = Vec::new();
+    let mut ub = Vec::new();
+    let mut vb = Vec::new();
+    encode_plane_intra_entropy(&yuv.y, qp_i, ResidualEntropy::Auto, &mut acc, &mut yb)?;
+    encode_plane_intra_entropy(&yuv.u, qp_i, ResidualEntropy::Auto, &mut acc, &mut ub)?;
+    encode_plane_intra_entropy(&yuv.v, qp_i, ResidualEntropy::Auto, &mut acc, &mut vb)?;
+    push_chunk(&mut out, &yb)?;
+    push_chunk(&mut out, &ub)?;
+    push_chunk(&mut out, &vb)?;
+    if out.len() > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(SrsV2Error::AllocationLimit {
+            context: "encoded alt-ref frame",
+        });
+    }
+    Ok(out)
+}
+
+/// Multi-reference decode entry point for mux / playback (`FR2` rev **1**–**12**).
+///
+/// Updates `manager` for intra, **P**, and **alt-ref**; **B** frames (**10**/**11**) do not advance the last-displayed slot.
+pub fn decode_yuv420_srsv2_payload_managed(
+    seq: &VideoSequenceHeaderV2,
+    payload: &[u8],
+    manager: &mut SrsV2ReferenceManager,
+) -> Result<DecodedVideoFrameV2, SrsV2Error> {
+    if payload.len() < 4 {
+        return Err(SrsV2Error::Truncated);
+    }
+    let rev = payload[3];
+    let mut dec = match rev {
+        1 | 3 | 7 => {
+            let d = decode_yuv420_intra_payload(seq, payload)?;
+            if seq.max_ref_frames > 0 {
+                manager.replace_after_keyframe(d.frame_index, d.yuv.clone());
+            }
+            d
+        }
+        2 | 4 | 5 | 6 | 8 | 9 => {
+            let reference = manager
+                .primary_ref()
+                .ok_or(SrsV2Error::PFrameWithoutReference)?;
+            let d = p_frame_codec::decode_yuv420_p_payload(seq, payload, reference)?;
+            if seq.max_ref_frames > 0 {
+                manager.push_displayable_last(d.frame_index, d.yuv.clone());
+            }
+            d
+        }
+        10 | 11 => {
+            if seq.max_ref_frames < 2 {
+                return Err(SrsV2Error::syntax(
+                    "B-frame requires max_ref_frames >= 2 in sequence header",
+                ));
+            }
+            b_frame_codec::decode_yuv420_b_payload(seq, payload, manager)?
+        }
+        12 => decode_yuv420_alt_ref_payload(seq, payload, manager)?,
+        _ => {
+            return Err(SrsV2Error::Unsupported(
+                "unknown SRSV2 frame payload revision",
+            ));
+        }
+    };
+    apply_reconstruction_filter_if_enabled(seq, &mut dec);
+    Ok(dec)
+}
+
 /// Decode intra or P SRSV2 payload; updates `ref_slot` when `max_ref_frames > 0` after a successful decode.
+///
+/// **`FR2` revision 10–12** (`B` / **alt-ref**) require [`decode_yuv420_srsv2_payload_managed`].
 pub fn decode_yuv420_srsv2_payload(
     seq: &VideoSequenceHeaderV2,
     payload: &[u8],
@@ -418,6 +624,11 @@ pub fn decode_yuv420_srsv2_payload(
 ) -> Result<DecodedVideoFrameV2, SrsV2Error> {
     if payload.len() < 4 {
         return Err(SrsV2Error::Truncated);
+    }
+    if matches!(payload[3], 10..=12) {
+        return Err(SrsV2Error::Unsupported(
+            "multi-reference SRSV2 payloads require decode_yuv420_srsv2_payload_managed",
+        ));
     }
     let mut dec = match payload[3] {
         1 | 3 | 7 => decode_yuv420_intra_payload(seq, payload)?,
@@ -985,5 +1196,31 @@ mod roundtrip_tests {
         let qp_delta_off = y_off + 1 + 2 + 1;
         payload[qp_delta_off] = 25_u8;
         assert!(decode_yuv420_intra_payload(&seq, &payload).is_err());
+    }
+
+    #[test]
+    fn legacy_dispatcher_rejects_fr2_rev10_through_12() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 16,
+            height: 16,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 2,
+        };
+        let mut slot = None::<YuvFrame>;
+        for rev in [10_u8, 11, 12] {
+            let pl = vec![b'F', b'R', b'2', rev];
+            assert!(matches!(
+                decode_yuv420_srsv2_payload(&seq, &pl, &mut slot),
+                Err(crate::srsv2::error::SrsV2Error::Unsupported(_))
+            ));
+        }
     }
 }
