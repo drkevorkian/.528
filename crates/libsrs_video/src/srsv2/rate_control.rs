@@ -81,6 +81,17 @@ pub enum SrsV2AdaptiveQuantizationMode {
     ScreenAware,
 }
 
+/// Per-**8×8** QP delta on wire (`FR2` rev **7**/**8**/**9**). Legacy payloads omit deltas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2BlockAqMode {
+    #[default]
+    Off,
+    /// Same bitstream as **`Off`**; label for “frame QP only” tooling.
+    FrameOnly,
+    /// Emit versioned block **`qp_delta`** syntax (requires adaptive residual path where defined).
+    BlockDelta,
+}
+
 /// Sub-pixel motion refinement (luma). **`Off`** keeps legacy `FR2` rev **2**/**4** integer MVs only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2SubpelMode {
@@ -135,6 +146,8 @@ pub struct SrsV2EncodeSettings {
     /// Half-pel refinement radius: **`0`** skips the eight half-pel probes; **`1`** runs one ring (default).
     pub subpel_refinement_radius: u8,
 
+    pub block_aq_mode: SrsV2BlockAqMode,
+
     pub loop_filter_mode: SrsV2LoopFilterMode,
     /// Written to the sequence header when [`SrsV2LoopFilterMode::SimpleDeblock`] is selected; **`0`** uses codec default strength.
     pub deblock_strength: u8,
@@ -167,6 +180,8 @@ impl Default for SrsV2EncodeSettings {
 
             subpel_mode: SrsV2SubpelMode::Off,
             subpel_refinement_radius: 1,
+
+            block_aq_mode: SrsV2BlockAqMode::Off,
 
             loop_filter_mode: SrsV2LoopFilterMode::Off,
             deblock_strength: 0,

@@ -5,6 +5,7 @@
 
 pub mod activity;
 pub mod adaptive_quant;
+pub mod block_aq;
 pub mod color;
 mod dct;
 pub mod deblock;
@@ -25,7 +26,8 @@ pub mod residual_tokens;
 pub mod subpel;
 
 pub use adaptive_quant::{
-    resolve_frame_adaptive_qp, validate_adaptive_quant_settings, SrsV2AqEncodeStats,
+    accumulate_block_aq_wire_plane, resolve_frame_adaptive_qp, validate_adaptive_quant_settings,
+    SrsV2AqEncodeStats, SrsV2BlockAqWireStats,
 };
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
@@ -50,7 +52,7 @@ pub use motion_search::SrsV2MotionEncodeStats;
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
-    SrsV2AdaptiveQuantizationMode, SrsV2EncodeSettings, SrsV2MotionSearchMode,
+    SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2MotionSearchMode,
     SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode,
 };
 pub use reference::ReferenceFrameBuffer;

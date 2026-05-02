@@ -15,8 +15,9 @@ use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, PixelFormat, PreviousFrameRcStats,
     ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats,
-    SrsV2EncodeSettings, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
-    SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
+    SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2LoopFilterMode, SrsV2MotionEncodeStats,
+    SrsV2MotionSearchMode, SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode,
+    VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -124,6 +125,17 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     subpel_refinement_radius: u8,
+
+    /// Block-level adaptive QP on wire: `off` (default), `frame-only` (label; same as off), or `block-delta` (`FR2` rev 7/8/9 with adaptive residuals).
+    #[arg(long, default_value = "off")]
+    block_aq: String,
+
+    /// Encoder clamp for per-block `qp_delta` (must stay within wire ±24 when `--block-aq block-delta`).
+    #[arg(long, default_value_t = -6)]
+    block_aq_delta_min: i8,
+
+    #[arg(long, default_value_t = 6)]
+    block_aq_delta_max: i8,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,21 +169,53 @@ struct RcBenchReport {
     frame_bytes_summary: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-struct AqBenchReport {
-    mode: String,
-    aq_strength: u8,
-    min_block_qp_delta: i8,
-    max_block_qp_delta: i8,
-    aq_enabled: bool,
-    base_qp: u8,
-    effective_qp: u8,
+#[derive(Debug, Clone, Serialize, Default)]
+struct BlockAqWireBenchReport {
+    block_aq_enabled: bool,
     min_block_qp_used: u8,
     max_block_qp_used: u8,
     avg_block_qp: f64,
     positive_qp_delta_blocks: u32,
     negative_qp_delta_blocks: u32,
     unchanged_qp_blocks: u32,
+}
+
+/// Per-frame adaptive QP derived from **16×16** luma macroblock activity (not written per MB on the wire).
+#[derive(Debug, Clone, Serialize, Default)]
+struct FrameAqBenchReport {
+    enabled: bool,
+    base_qp: u8,
+    effective_qp: u8,
+    mb_activity_min_qp: u8,
+    mb_activity_max_qp: u8,
+    mb_activity_avg_qp: f64,
+    mb_activity_positive_delta_count: u32,
+    mb_activity_negative_delta_count: u32,
+    mb_activity_unchanged_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AqBenchReport {
+    mode: String,
+    aq_strength: u8,
+    min_block_qp_delta: i8,
+    max_block_qp_delta: i8,
+    block_aq_mode: String,
+    frame_aq: FrameAqBenchReport,
+    block_aq_wire: BlockAqWireBenchReport,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct Fr2RevisionCounts {
+    rev1: u32,
+    rev2: u32,
+    rev3: u32,
+    rev4: u32,
+    rev5: u32,
+    rev6: u32,
+    rev7: u32,
+    rev8: u32,
+    rev9: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +281,7 @@ struct Srsv2Details {
     intra_rans_blocks: u64,
     p_explicit_chunks: u64,
     p_rans_chunks: u64,
+    fr2_revision_counts: Fr2RevisionCounts,
     legacy_explicit_total_payload_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rc: Option<RcBenchReport>,
@@ -477,6 +522,7 @@ fn validate_args(args: &Args) -> Result<()> {
     parse_motion_search_mode(&args.motion_search)?;
     parse_loop_filter(&args.loop_filter)?;
     parse_subpel_mode(&args.subpel)?;
+    parse_block_aq_mode(&args.block_aq)?;
     Ok(())
 }
 
@@ -485,6 +531,25 @@ fn parse_subpel_mode(s: &str) -> Result<SrsV2SubpelMode> {
         "off" => Ok(SrsV2SubpelMode::Off),
         "half" => Ok(SrsV2SubpelMode::HalfPel),
         _ => Err(anyhow!("--subpel must be off or half (got {s})")),
+    }
+}
+
+fn parse_block_aq_mode(s: &str) -> Result<SrsV2BlockAqMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "off" => Ok(SrsV2BlockAqMode::Off),
+        "frame-only" => Ok(SrsV2BlockAqMode::FrameOnly),
+        "block-delta" => Ok(SrsV2BlockAqMode::BlockDelta),
+        _ => Err(anyhow!(
+            "--block-aq must be off, frame-only, or block-delta (got {s})"
+        )),
+    }
+}
+
+fn block_aq_cli_label(m: SrsV2BlockAqMode) -> &'static str {
+    match m {
+        SrsV2BlockAqMode::Off => "off",
+        SrsV2BlockAqMode::FrameOnly => "frame-only",
+        SrsV2BlockAqMode::BlockDelta => "block-delta",
     }
 }
 
@@ -501,6 +566,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let motion_mode = parse_motion_search_mode(&args.motion_search)?;
     let loop_filter_mode = parse_loop_filter(&args.loop_filter)?;
     let subpel_mode = parse_subpel_mode(&args.subpel)?;
+    let block_aq_mode = parse_block_aq_mode(&args.block_aq)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -515,11 +581,14 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         residual_entropy: residual,
         adaptive_quantization_mode: aq_mode,
         aq_strength: args.aq_strength,
+        min_block_qp_delta: args.block_aq_delta_min,
+        max_block_qp_delta: args.block_aq_delta_max,
         motion_search_mode: motion_mode,
         early_exit_sad_threshold: args.early_exit_sad_threshold,
         enable_skip_blocks: args.enable_skip_blocks,
         subpel_mode,
         subpel_refinement_radius: args.subpel_refinement_radius,
+        block_aq_mode,
         loop_filter_mode,
         deblock_strength: args.deblock_strength,
         ..Default::default()
@@ -559,21 +628,54 @@ struct PassNumbers {
 }
 
 fn aq_report_from_pass(settings: &SrsV2EncodeSettings, aq: &SrsV2AqEncodeStats) -> AqBenchReport {
+    let w = &aq.block_wire;
     AqBenchReport {
         mode: aq_mode_cli_label(settings.adaptive_quantization_mode).to_string(),
         aq_strength: settings.aq_strength,
         min_block_qp_delta: settings.min_block_qp_delta,
         max_block_qp_delta: settings.max_block_qp_delta,
-        aq_enabled: aq.aq_enabled,
-        base_qp: aq.base_qp,
-        effective_qp: aq.effective_qp,
-        min_block_qp_used: aq.min_block_qp_used,
-        max_block_qp_used: aq.max_block_qp_used,
-        avg_block_qp: aq.avg_block_qp,
-        positive_qp_delta_blocks: aq.positive_qp_delta_blocks,
-        negative_qp_delta_blocks: aq.negative_qp_delta_blocks,
-        unchanged_qp_blocks: aq.unchanged_qp_blocks,
+        block_aq_mode: block_aq_cli_label(settings.block_aq_mode).to_string(),
+        frame_aq: FrameAqBenchReport {
+            enabled: aq.aq_enabled,
+            base_qp: aq.base_qp,
+            effective_qp: aq.effective_qp,
+            mb_activity_min_qp: aq.min_block_qp_used,
+            mb_activity_max_qp: aq.max_block_qp_used,
+            mb_activity_avg_qp: aq.avg_block_qp,
+            mb_activity_positive_delta_count: aq.positive_qp_delta_blocks,
+            mb_activity_negative_delta_count: aq.negative_qp_delta_blocks,
+            mb_activity_unchanged_count: aq.unchanged_qp_blocks,
+        },
+        block_aq_wire: BlockAqWireBenchReport {
+            block_aq_enabled: w.block_aq_enabled,
+            min_block_qp_used: w.min_block_qp_used,
+            max_block_qp_used: w.max_block_qp_used,
+            avg_block_qp: w.avg_block_qp,
+            positive_qp_delta_blocks: w.positive_qp_delta_blocks,
+            negative_qp_delta_blocks: w.negative_qp_delta_blocks,
+            unchanged_qp_blocks: w.unchanged_qp_blocks,
+        },
     }
+}
+
+fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
+    let mut c = Fr2RevisionCounts::default();
+    for p in payloads {
+        let Some(&b) = p.get(3) else { continue };
+        match b {
+            1 => c.rev1 += 1,
+            2 => c.rev2 += 1,
+            3 => c.rev3 += 1,
+            4 => c.rev4 += 1,
+            5 => c.rev5 += 1,
+            6 => c.rev6 += 1,
+            7 => c.rev7 += 1,
+            8 => c.rev8 += 1,
+            9 => c.rev9 += 1,
+            _ => {}
+        }
+    }
+    c
 }
 
 fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> MotionBenchReport {
@@ -643,7 +745,7 @@ fn run_srsv2_numbers(
         .map_err(|e| anyhow!("SRSV2 encode: {e}"))?;
 
         aq_last = aq_frame;
-        let is_p = matches!(payload.get(3).copied(), Some(2 | 4 | 5 | 6));
+        let is_p = matches!(payload.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9));
         if is_p {
             motion_agg.sad_evaluations += motion_frame.sad_evaluations;
             motion_agg.skip_subblocks += motion_frame.skip_subblocks;
@@ -658,7 +760,7 @@ fn run_srsv2_numbers(
             motion_agg.sum_abs_frac_qpel += motion_frame.sum_abs_frac_qpel;
         }
 
-        let is_i = matches!(payload.get(3).copied(), Some(1 | 3));
+        let is_i = matches!(payload.get(3).copied(), Some(1 | 3 | 7));
         qp_hist.push(qp);
         byte_hist.push(payload.len() as u64);
         rc.observe_frame(fi, payload.len(), is_i);
@@ -701,6 +803,7 @@ fn run_srsv2_numbers(
         } else {
             let mut settings_leg = settings.clone();
             settings_leg.residual_entropy = ResidualEntropy::Explicit;
+            settings_leg.block_aq_mode = SrsV2BlockAqMode::Off;
             let mut sum = 0_u64;
             let mut slot = None::<YuvFrame>;
             for fi in 0..args.frames {
@@ -824,8 +927,8 @@ fn pass_to_details(
     let mut p_bytes = Vec::new();
     for pl in &p.payloads {
         match pl.get(3).copied() {
-            Some(1 | 3) => i_bytes.push(pl.len() as u64),
-            Some(2 | 4 | 5 | 6) => p_bytes.push(pl.len() as u64),
+            Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
+            Some(2 | 4 | 5 | 6 | 8 | 9) => p_bytes.push(pl.len() as u64),
             _ => {}
         }
     }
@@ -842,6 +945,7 @@ fn pass_to_details(
         intra_rans_blocks: p.enc_stats.intra_rans_blocks,
         p_explicit_chunks: p.enc_stats.p_explicit_chunks,
         p_rans_chunks: p.enc_stats.p_rans_chunks,
+        fr2_revision_counts: fr2_revision_counts(&p.payloads),
         legacy_explicit_total_payload_bytes: p.legacy_explicit_total_payload_bytes,
         rc: Some(rc_report_from_pass(args, settings, p)),
         aq: Some(aq_report_from_pass(settings, &p.aq_last)),
@@ -901,7 +1005,7 @@ fn run_single_report(
 
     Ok(BenchReport {
         note: "Engineering measurement only; not a marketing claim.",
-        residual_note: "Residual entropy (FR2 rev 3 intra / rev 4 P) is experimental; auto mode never chooses a larger representation than explicit tuples per block.",
+        residual_note: "Residual entropy (FR2 rev 3 intra / rev 4 P; rev 7–9 add optional block qp_delta with adaptive residuals) is experimental; auto mode never chooses a larger representation than explicit tuples per block.",
         command: std::env::args().collect::<Vec<_>>().join(" "),
         raw_bytes: raw.len() as u64,
         width: args.width,
@@ -979,6 +1083,7 @@ fn run_compare_residual_report(
                         intra_rans_blocks: 0,
                         p_explicit_chunks: 0,
                         p_rans_chunks: 0,
+                        fr2_revision_counts: Fr2RevisionCounts::default(),
                         legacy_explicit_total_payload_bytes: None,
                         rc: None,
                         aq: None,
@@ -1045,6 +1150,7 @@ fn run_compare_residual_report(
                         intra_rans_blocks: 0,
                         p_explicit_chunks: 0,
                         p_rans_chunks: 0,
+                        fr2_revision_counts: Fr2RevisionCounts::default(),
                         legacy_explicit_total_payload_bytes: None,
                         rc: None,
                         aq: None,
@@ -1194,6 +1300,38 @@ fn run_sweep_file(
                     aq: a.aq.clone(),
                     motion_search: a.motion_search.clone(),
                     sweep_variant: Some(format!("subpel-{label}")),
+                    row,
+                    details,
+                });
+            }
+        }
+
+        for (label, baq) in [("blockaq-off", "off"), ("blockaq-delta", "block-delta")] {
+            let mut a = args.clone();
+            a.qp = 28;
+            a.motion_radius = 8;
+            a.residual_entropy = "auto".to_string();
+            a.aq = "off".to_string();
+            a.motion_search = "diamond".to_string();
+            a.subpel = "off".to_string();
+            a.block_aq = baq.to_string();
+            let settings = match build_settings(&a, ResidualEntropy::Auto) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            if let Ok(numbers) = run_srsv2_numbers(&a, seq, raw, &settings, expected_frame) {
+                let row = pass_to_row(&a, "SRSV2", &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details = pass_to_details(&a, &settings, "auto", &numbers, deblock);
+                sweep.push(SweepRunReport {
+                    qp: 28,
+                    residual_entropy: "auto".to_string(),
+                    motion_radius: 8,
+                    aq: a.aq.clone(),
+                    motion_search: a.motion_search.clone(),
+                    sweep_variant: Some(label.to_string()),
                     row,
                     details,
                 });
@@ -1609,22 +1747,36 @@ fn to_markdown(r: &BenchReport) -> String {
         ));
     }
     if let Some(aq) = &r.srsv2.aq {
+        let fa = &aq.frame_aq;
+        let bw = &aq.block_aq_wire;
         out.push_str("\n### Adaptive quantization (experimental)\n\n");
         out.push_str(&format!(
-            "- mode: {}\n- aq_strength: {}\n- qp delta range: {} … {}\n- enabled: {}\n- base/effective QP: {}/{}\n- block QP min/max/avg: {}/{}/{:.2}\n- +/−/0 delta blocks: {}/{}/{}\n",
-            aq.mode,
-            aq.aq_strength,
-            aq.min_block_qp_delta,
-            aq.max_block_qp_delta,
-            aq.aq_enabled,
-            aq.base_qp,
-            aq.effective_qp,
-            aq.min_block_qp_used,
-            aq.max_block_qp_used,
-            aq.avg_block_qp,
-            aq.positive_qp_delta_blocks,
-            aq.negative_qp_delta_blocks,
-            aq.unchanged_qp_blocks
+            "- mode: {}\n- aq_strength: {}\n- encoder qp_delta clamp: {} … {}\n- block_aq_mode: {}\n",
+            aq.mode, aq.aq_strength, aq.min_block_qp_delta, aq.max_block_qp_delta, aq.block_aq_mode
+        ));
+        out.push_str("\n**Frame-level AQ** (16×16 MB activity → one effective QP / picture):\n\n");
+        out.push_str(&format!(
+            "- enabled: {}\n- base_qp / effective_qp: {} / {}\n- MB hint QP min/max/avg: {}/{}/{:.2}\n- MB hints +/−/0 vs base: {}/{}/{}\n",
+            fa.enabled,
+            fa.base_qp,
+            fa.effective_qp,
+            fa.mb_activity_min_qp,
+            fa.mb_activity_max_qp,
+            fa.mb_activity_avg_qp,
+            fa.mb_activity_positive_delta_count,
+            fa.mb_activity_negative_delta_count,
+            fa.mb_activity_unchanged_count
+        ));
+        out.push_str("\n**Block-level AQ on wire** (FR2 rev 7–9, per 8×8 `qp_delta`):\n\n");
+        out.push_str(&format!(
+            "- enabled: {}\n- effective QP min/max/avg (blocks): {}/{}/{:.2}\n- +/−/0 qp_delta blocks: {}/{}/{}\n",
+            bw.block_aq_enabled,
+            bw.min_block_qp_used,
+            bw.max_block_qp_used,
+            bw.avg_block_qp,
+            bw.positive_qp_delta_blocks,
+            bw.negative_qp_delta_blocks,
+            bw.unchanged_qp_blocks
         ));
     }
     if let Some(m) = &r.srsv2.motion {
@@ -1724,6 +1876,9 @@ mod tests {
             deblock_strength: 0,
             subpel: "off".to_string(),
             subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -1760,6 +1915,7 @@ mod tests {
                 intra_rans_blocks: 0,
                 p_explicit_chunks: 0,
                 p_rans_chunks: 0,
+                fr2_revision_counts: Fr2RevisionCounts::default(),
                 legacy_explicit_total_payload_bytes: None,
                 rc: Some(RcBenchReport {
                     mode: "fixed-qp".to_string(),
@@ -1779,15 +1935,19 @@ mod tests {
                     aq_strength: 4,
                     min_block_qp_delta: -6,
                     max_block_qp_delta: 6,
-                    aq_enabled: false,
-                    base_qp: 28,
-                    effective_qp: 28,
-                    min_block_qp_used: 28,
-                    max_block_qp_used: 28,
-                    avg_block_qp: 28.0,
-                    positive_qp_delta_blocks: 0,
-                    negative_qp_delta_blocks: 0,
-                    unchanged_qp_blocks: 16,
+                    block_aq_mode: "off".to_string(),
+                    frame_aq: FrameAqBenchReport {
+                        enabled: false,
+                        base_qp: 28,
+                        effective_qp: 28,
+                        mb_activity_min_qp: 28,
+                        mb_activity_max_qp: 28,
+                        mb_activity_avg_qp: 28.0,
+                        mb_activity_positive_delta_count: 0,
+                        mb_activity_negative_delta_count: 0,
+                        mb_activity_unchanged_count: 16,
+                    },
+                    block_aq_wire: BlockAqWireBenchReport::default(),
                 }),
                 motion: Some(MotionBenchReport {
                     motion_search_mode: "diamond".to_string(),
@@ -1837,6 +1997,8 @@ mod tests {
         let js = serde_json::to_string(&r).unwrap();
         assert!(js.contains("\"motion_search_mode\":\"diamond\""));
         assert!(js.contains("\"mode\":\"off\"") && js.contains("\"aq\""));
+        assert!(js.contains("\"frame_aq\""));
+        assert!(js.contains("\"block_aq_mode\":\"off\""));
         assert!(js.contains("\"loop_filter_mode\":\"off\""));
         assert!(js.contains("\"subpel_mode\":\"off\""));
     }
@@ -1865,6 +2027,7 @@ mod tests {
                 intra_rans_blocks: 0,
                 p_explicit_chunks: 0,
                 p_rans_chunks: 0,
+                fr2_revision_counts: Fr2RevisionCounts::default(),
                 legacy_explicit_total_payload_bytes: None,
                 rc: None,
                 aq: None,
@@ -1901,6 +2064,7 @@ mod tests {
                     intra_rans_blocks: 0,
                     p_explicit_chunks: 0,
                     p_rans_chunks: 0,
+                    fr2_revision_counts: Fr2RevisionCounts::default(),
                     legacy_explicit_total_payload_bytes: None,
                     rc: None,
                     aq: None,
@@ -1951,6 +2115,7 @@ mod tests {
                     intra_rans_blocks: 0,
                     p_explicit_chunks: 0,
                     p_rans_chunks: 0,
+                    fr2_revision_counts: Fr2RevisionCounts::default(),
                     legacy_explicit_total_payload_bytes: None,
                     rc: None,
                     aq: None,
@@ -2000,6 +2165,9 @@ mod tests {
             deblock_strength: 0,
             subpel: "off".to_string(),
             subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
@@ -2042,10 +2210,16 @@ mod tests {
             deblock_strength: 0,
             subpel: "off".to_string(),
             subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
         };
         assert!(validate_args(&a).is_err());
         a.aq = "off".to_string();
         a.motion_search = "turbo-fast".to_string();
+        assert!(validate_args(&a).is_err());
+        a.motion_search = "exhaustive-small".to_string();
+        a.block_aq = "maybe-later".to_string();
         assert!(validate_args(&a).is_err());
     }
 }

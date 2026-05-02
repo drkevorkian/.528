@@ -1,16 +1,16 @@
 //! Frame-level adaptive quantization (experimental): derives one effective QP from per-MB activity.
-//! Per-block QP deltas are **not** written to the bitstream in this slice—only a single frame QP.
+//! Optional **block-level** `qp_delta` bytes use versioned `FR2` rev **7**/**8**/**9**.
 
 use super::activity::{mb_activity_y16, screen_activity_score, BlockActivity};
 use super::error::SrsV2Error;
 use super::frame::YuvFrame;
-use super::rate_control::{SrsV2AdaptiveQuantizationMode, SrsV2EncodeSettings};
+use super::limits::{QP_DELTA_WIRE_MAX, QP_DELTA_WIRE_MIN};
+use super::rate_control::{SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode, SrsV2EncodeSettings};
 
+/// Statistics for **on-wire** per-**8×8** `qp_delta` when using [`SrsV2BlockAqMode::BlockDelta`].
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct SrsV2AqEncodeStats {
-    pub aq_enabled: bool,
-    pub base_qp: u8,
-    pub effective_qp: u8,
+pub struct SrsV2BlockAqWireStats {
+    pub block_aq_enabled: bool,
     pub min_block_qp_used: u8,
     pub max_block_qp_used: u8,
     pub avg_block_qp: f64,
@@ -19,9 +19,27 @@ pub struct SrsV2AqEncodeStats {
     pub unchanged_qp_blocks: u32,
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SrsV2AqEncodeStats {
+    pub aq_enabled: bool,
+    pub base_qp: u8,
+    pub effective_qp: u8,
+    /// When frame-level AQ is on: min per-**macroblock** hinted QP (not per 8×8 wire delta).
+    pub min_block_qp_used: u8,
+    pub max_block_qp_used: u8,
+    pub avg_block_qp: f64,
+    /// Frame-level AQ: counts of MBs with QP hint above / below / equal to `base_qp`.
+    pub positive_qp_delta_blocks: u32,
+    pub negative_qp_delta_blocks: u32,
+    pub unchanged_qp_blocks: u32,
+    /// On-wire **8×8** block `qp_delta` stats when [`SrsV2BlockAqMode::BlockDelta`] is active.
+    pub block_wire: SrsV2BlockAqWireStats,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SrsV2AqError {
     InvalidDeltaRange { min_d: i8, max_d: i8 },
+    BlockAqWireDeltaRange { min_d: i8, max_d: i8 },
 }
 
 impl std::fmt::Display for SrsV2AqError {
@@ -33,6 +51,11 @@ impl std::fmt::Display for SrsV2AqError {
                     "min_block_qp_delta ({min_d}) must be <= max_block_qp_delta ({max_d})"
                 )
             }
+            Self::BlockAqWireDeltaRange { min_d, max_d } => write!(
+                f,
+                "block qp_delta clamp [{min_d},{max_d}] must stay within wire [{},{}]",
+                QP_DELTA_WIRE_MIN, QP_DELTA_WIRE_MAX
+            ),
         }
     }
 }
@@ -48,7 +71,51 @@ pub fn validate_adaptive_quant_settings(
             max_d: settings.max_block_qp_delta,
         });
     }
+    if settings.block_aq_mode == SrsV2BlockAqMode::BlockDelta
+        && (settings.min_block_qp_delta < QP_DELTA_WIRE_MIN
+            || settings.max_block_qp_delta > QP_DELTA_WIRE_MAX)
+    {
+        return Err(SrsV2AqError::BlockAqWireDeltaRange {
+            min_d: settings.min_block_qp_delta,
+            max_d: settings.max_block_qp_delta,
+        });
+    }
     Ok(())
+}
+
+/// Fold plane-level block-AQ counters into frame stats (`min`/`max`/`avg` re-derived from totals).
+#[allow(clippy::too_many_arguments)]
+pub fn accumulate_block_aq_wire_plane(
+    acc: &mut SrsV2BlockAqWireStats,
+    plane_blocks: u32,
+    sum_eff_qp: u64,
+    min_qp: u8,
+    max_qp: u8,
+    pos_d: u32,
+    neg_d: u32,
+    zero_d: u32,
+) {
+    if plane_blocks == 0 {
+        return;
+    }
+    if !acc.block_aq_enabled {
+        acc.block_aq_enabled = true;
+        acc.min_block_qp_used = min_qp;
+        acc.max_block_qp_used = max_qp;
+        acc.avg_block_qp = 0.0;
+    } else {
+        acc.min_block_qp_used = acc.min_block_qp_used.min(min_qp);
+        acc.max_block_qp_used = acc.max_block_qp_used.max(max_qp);
+    }
+    let prev_total =
+        acc.positive_qp_delta_blocks + acc.negative_qp_delta_blocks + acc.unchanged_qp_blocks;
+    let new_total = prev_total + plane_blocks;
+    let prev_sum = (acc.avg_block_qp * prev_total as f64).round() as u64;
+    let sum_all = prev_sum + sum_eff_qp;
+    acc.avg_block_qp = sum_all as f64 / new_total as f64;
+    acc.positive_qp_delta_blocks += pos_d;
+    acc.negative_qp_delta_blocks += neg_d;
+    acc.unchanged_qp_blocks += zero_d;
 }
 
 fn score_for_mode(mode: SrsV2AdaptiveQuantizationMode, act: &BlockActivity) -> u64 {
@@ -114,6 +181,7 @@ pub fn resolve_frame_adaptive_qp(
                 positive_qp_delta_blocks: 0,
                 negative_qp_delta_blocks: 0,
                 unchanged_qp_blocks: 0,
+                block_wire: SrsV2BlockAqWireStats::default(),
             },
         ));
     }
@@ -135,6 +203,7 @@ pub fn resolve_frame_adaptive_qp(
                 positive_qp_delta_blocks: 0,
                 negative_qp_delta_blocks: 0,
                 unchanged_qp_blocks: 1,
+                block_wire: SrsV2BlockAqWireStats::default(),
             },
         ));
     }
@@ -195,6 +264,7 @@ pub fn resolve_frame_adaptive_qp(
             positive_qp_delta_blocks: pos,
             negative_qp_delta_blocks: neg,
             unchanged_qp_blocks: zero,
+            block_wire: SrsV2BlockAqWireStats::default(),
         },
     ))
 }
@@ -273,6 +343,21 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_adaptive_quant_settings(&s).is_err());
+    }
+
+    #[test]
+    fn block_aq_wire_rejects_delta_clamp_outside_of_plus_minus_24() {
+        use crate::srsv2::rate_control::SrsV2BlockAqMode;
+        let s = SrsV2EncodeSettings {
+            block_aq_mode: SrsV2BlockAqMode::BlockDelta,
+            min_block_qp_delta: -30,
+            max_block_qp_delta: 6,
+            ..Default::default()
+        };
+        assert!(matches!(
+            validate_adaptive_quant_settings(&s),
+            Err(SrsV2AqError::BlockAqWireDeltaRange { .. })
+        ));
     }
 
     #[test]

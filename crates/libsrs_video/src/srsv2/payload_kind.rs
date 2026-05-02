@@ -15,8 +15,8 @@ pub enum Srsv2PayloadKind {
 
 /// Classify a mux/elementary SRSV2 frame payload by its `FR2` revision.
 ///
-/// - `FR2\\x01` / `FR2\\x03` → [`Srsv2PayloadKind::Intra`] (rev 3 uses entropy residuals)
-/// - `FR2\\x02` / `FR2\\x04` / `FR2\\x05` / `FR2\\x06` → [`Srsv2PayloadKind::Predicted`]
+/// - `FR2\\x01` / `FR2\\x03` / `FR2\\x07` → [`Srsv2PayloadKind::Intra`] (rev 3/7 use entropy residuals; rev 7 adds block `qp_delta`)
+/// - `FR2\\x02` / `FR2\\x04` / `FR2\\x05` / `FR2\\x06` / `FR2\\x08` / `FR2\\x09` → [`Srsv2PayloadKind::Predicted`]
 /// - Other `FR2\\x??` → [`Srsv2PayloadKind::Unknown`]
 /// - Too short or bad magic → [`SrsV2Error`]
 pub fn classify_srsv2_payload(payload: &[u8]) -> Result<Srsv2PayloadKind, SrsV2Error> {
@@ -27,8 +27,8 @@ pub fn classify_srsv2_payload(payload: &[u8]) -> Result<Srsv2PayloadKind, SrsV2E
         return Err(SrsV2Error::BadMagic);
     }
     Ok(match payload[3] {
-        1 | 3 => Srsv2PayloadKind::Intra,
-        2 | 4 | 5 | 6 => Srsv2PayloadKind::Predicted,
+        1 | 3 | 7 => Srsv2PayloadKind::Intra,
+        2 | 4 | 5 | 6 | 8 | 9 => Srsv2PayloadKind::Predicted,
         _ => Srsv2PayloadKind::Unknown,
     })
 }
@@ -95,6 +95,26 @@ mod classify_tests {
         );
         assert_eq!(
             classify_srsv2_payload(&[b'F', b'R', b'2', 6]).unwrap(),
+            Srsv2PayloadKind::Predicted
+        );
+    }
+
+    #[test]
+    fn fr2_rev7_is_intra() {
+        assert_eq!(
+            classify_srsv2_payload(&[b'F', b'R', b'2', 7]).unwrap(),
+            Srsv2PayloadKind::Intra
+        );
+    }
+
+    #[test]
+    fn fr2_rev8_rev9_are_predicted() {
+        assert_eq!(
+            classify_srsv2_payload(&[b'F', b'R', b'2', 8]).unwrap(),
+            Srsv2PayloadKind::Predicted
+        );
+        assert_eq!(
+            classify_srsv2_payload(&[b'F', b'R', b'2', 9]).unwrap(),
             Srsv2PayloadKind::Predicted
         );
     }

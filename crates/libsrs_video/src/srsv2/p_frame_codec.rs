@@ -4,6 +4,11 @@
 //!
 //! Chroma is predicted by copying reference U/V with integer MV (`mv/2` integer path; `mv_q/8` half-pel path).
 
+use super::adaptive_quant::{accumulate_block_aq_wire_plane, SrsV2BlockAqWireStats};
+use super::block_aq::{
+    apply_qp_delta_clamped, choose_block_qp_delta, collect_p_subblock_variances,
+    validate_qp_clip_range, validate_wire_qp_delta,
+};
 use super::dct::fdct_8x8;
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
@@ -12,7 +17,7 @@ use super::limits::{MAX_FRAME_PAYLOAD_BYTES, MAX_MOTION_VECTOR_PELS};
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
 use super::motion_search::{pick_mv, sample_u8_plane, SrsV2MotionEncodeStats};
 use super::rate_control::{
-    ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings, SrsV2SubpelMode,
+    ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2SubpelMode,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
@@ -26,6 +31,10 @@ pub const FRAME_PAYLOAD_MAGIC_P_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 4];
 pub const FRAME_PAYLOAD_MAGIC_P_SUBPEL: [u8; 4] = [b'F', b'R', b'2', 5];
 /// Half-pel P-frame, adaptive residual chunks (same layout as rev **4** after MV width).
 pub const FRAME_PAYLOAD_MAGIC_P_SUBPEL_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 6];
+/// Integer MV P-frame + adaptive residuals + per-chunk **`qp_delta`** (clip range after base QP).
+pub const FRAME_PAYLOAD_MAGIC_P_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 8];
+/// Half-pel P-frame + adaptive residuals + per-chunk **`qp_delta`**.
+pub const FRAME_PAYLOAD_MAGIC_P_SUBPEL_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 9];
 
 /// Default skip threshold when [`SrsV2EncodeSettings::enable_skip_blocks`] is true (Y only).
 const SKIP_ABS_THRESH: i16 = 6;
@@ -136,6 +145,7 @@ pub fn encode_yuv420_p_payload(
     settings: &SrsV2EncodeSettings,
     mut stats: Option<&mut ResidualEncodeStats>,
     motion_stats: Option<&mut SrsV2MotionEncodeStats>,
+    mut block_wire_acc: Option<&mut SrsV2BlockAqWireStats>,
 ) -> Result<Vec<u8>, SrsV2Error> {
     if seq.pixel_format != PixelFormat::Yuv420p8
         || cur.format != PixelFormat::Yuv420p8
@@ -159,7 +169,19 @@ pub fn encode_yuv420_p_payload(
         return Err(SrsV2Error::syntax("plane geometry mismatch"));
     }
 
-    let qp_i = qp.max(1) as i16;
+    let block_aq_wire = matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
+        && matches!(
+            settings.residual_entropy,
+            ResidualEntropy::Auto | ResidualEntropy::Rans
+        );
+    if matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
+        && matches!(settings.residual_entropy, ResidualEntropy::Explicit)
+    {
+        return Err(SrsV2Error::syntax(
+            "block AQ (FR2 rev 8/9) requires adaptive residual entropy (Auto or Rans)",
+        ));
+    }
+
     let radius = settings.clamped_motion_search_radius();
     let mb_cols = w / 16;
     let mb_rows = h / 16;
@@ -183,20 +205,46 @@ pub fn encode_yuv420_p_payload(
     ms.sum_abs_frac_qpel = 0;
 
     let mut out = Vec::new();
-    let magic = if use_subpel {
-        match settings.residual_entropy {
+    let magic = match (use_subpel, block_aq_wire) {
+        (true, true) => FRAME_PAYLOAD_MAGIC_P_SUBPEL_BLOCK_AQ,
+        (false, true) => FRAME_PAYLOAD_MAGIC_P_BLOCK_AQ,
+        (true, false) => match settings.residual_entropy {
             ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC_P_SUBPEL,
             ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_P_SUBPEL_ENTROPY,
-        }
-    } else {
-        match settings.residual_entropy {
+        },
+        (false, false) => match settings.residual_entropy {
             ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC_P,
             ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_P_ENTROPY,
-        }
+        },
     };
     out.extend_from_slice(&magic);
     out.extend_from_slice(&frame_index.to_le_bytes());
     out.push(qp);
+    if block_aq_wire {
+        validate_qp_clip_range(settings.min_qp, settings.max_qp)?;
+        out.push(settings.min_qp);
+        out.push(settings.max_qp);
+    }
+
+    let sub_vars = if block_aq_wire {
+        collect_p_subblock_variances(&cur.y, mb_cols, mb_rows)
+    } else {
+        Vec::new()
+    };
+    let median_var = if block_aq_wire {
+        let mut s = sub_vars.clone();
+        s.sort_unstable();
+        let mid = s.len() / 2;
+        if s.is_empty() {
+            0_u64
+        } else if s.len().is_multiple_of(2) {
+            (s[mid - 1] as u64 + s[mid] as u64) / 2
+        } else {
+            s[mid] as u64
+        }
+    } else {
+        0_u64
+    };
 
     let rans_model = residual_token_model();
 
@@ -271,7 +319,8 @@ pub fn encode_yuv420_p_payload(
             }
 
             let mut pattern = 0_u8;
-            let mut residual_chunks: Vec<Vec<u8>> = Vec::new();
+            // Pairs of `(qp_delta, residual)`; `qp_delta` is written only when `block_aq_wire`.
+            let mut residual_entries: Vec<(i8, Vec<u8>)> = Vec::new();
 
             let sub_offsets = [(0_u32, 0_u32), (8, 0), (0, 8), (8, 8)];
             for (si, &(dx, dy)) in sub_offsets.iter().enumerate() {
@@ -304,9 +353,32 @@ pub fn encode_yuv420_p_payload(
                     pattern |= 1 << si;
                     ms.skip_subblocks += 1;
                 } else {
+                    let idx = ((mby * mb_cols + mbx) * 4 + si as u32) as usize;
+                    let qp_delta = if block_aq_wire {
+                        let bv = sub_vars[idx];
+                        choose_block_qp_delta(
+                            bv,
+                            median_var,
+                            settings.aq_strength,
+                            settings.min_block_qp_delta,
+                            settings.max_block_qp_delta,
+                        )
+                    } else {
+                        0_i8
+                    };
+                    if block_aq_wire {
+                        validate_wire_qp_delta(qp_delta)?;
+                    }
+                    let eff_qp_u8 = if block_aq_wire {
+                        apply_qp_delta_clamped(qp, qp_delta, settings.min_qp, settings.max_qp)
+                    } else {
+                        qp
+                    };
+                    let eff_i = eff_qp_u8.max(1) as i16;
+
                     let chunk = if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
                         let mut c = Vec::new();
-                        encode_residual_block_8x8(&blk, qp_i, &mut c)?;
+                        encode_residual_block_8x8(&blk, eff_i, &mut c)?;
                         if let Some(s) = stats.as_mut() {
                             s.p_explicit_chunks += 1;
                         }
@@ -319,7 +391,7 @@ pub fn encode_yuv420_p_payload(
                             }
                         }
                         let f = fdct_8x8(&linear);
-                        let qf = quantize(&f, qp_i);
+                        let qf = quantize(&f, eff_i);
                         let (c, kind) =
                             encode_p_residual_chunk(&qf, settings.residual_entropy, &rans_model)?;
                         if let Some(s) = stats.as_mut() {
@@ -337,11 +409,33 @@ pub fn encode_yuv420_p_payload(
                         }
                         c
                     };
-                    residual_chunks.push(chunk);
+                    if block_aq_wire {
+                        if let Some(acc) = block_wire_acc.as_mut() {
+                            let pos = u32::from(qp_delta > 0);
+                            let neg = u32::from(qp_delta < 0);
+                            let zero = u32::from(qp_delta == 0);
+                            accumulate_block_aq_wire_plane(
+                                acc,
+                                1,
+                                u64::from(eff_qp_u8),
+                                eff_qp_u8,
+                                eff_qp_u8,
+                                pos,
+                                neg,
+                                zero,
+                            );
+                        }
+                        residual_entries.push((qp_delta, chunk));
+                    } else {
+                        residual_entries.push((0, chunk));
+                    }
                 }
             }
             out.push(pattern);
-            for chunk in residual_chunks {
+            for (qp_delta, chunk) in residual_entries {
+                if block_aq_wire {
+                    out.push(qp_delta as u8);
+                }
                 let len = u32::try_from(chunk.len()).map_err(|_| SrsV2Error::Overflow("chunk"))?;
                 out.extend_from_slice(&len.to_le_bytes());
                 out.extend_from_slice(&chunk);
@@ -357,7 +451,7 @@ pub fn encode_yuv420_p_payload(
     Ok(out)
 }
 
-/// Decode `FR2` rev **2**, **4**, **5**, or **6** P-frame into **reconstructed** YUV420p8 (no loop filter).
+/// Decode `FR2` rev **2**, **4**, **5**, **6**, **8**, or **9** P-frame into **reconstructed** YUV420p8 (no loop filter).
 ///
 /// Caller applies [`crate::srsv2::frame_codec::apply_reconstruction_filter_if_enabled`] before display/reference refresh when using raw decode entry points.
 pub fn decode_yuv420_p_payload(
@@ -385,15 +479,25 @@ pub fn decode_yuv420_p_payload(
     if payload.len() < 4 + 4 + 1 {
         return Err(SrsV2Error::Truncated);
     }
-    if payload.len() < 4 || &payload[0..3] != b"FR2" || !matches!(payload[3], 2 | 4 | 5 | 6) {
+    if payload.len() < 4 || &payload[0..3] != b"FR2" || !matches!(payload[3], 2 | 4 | 5 | 6 | 8 | 9)
+    {
         return Err(SrsV2Error::BadMagic);
     }
-    let entropy_chunks = matches!(payload[3], 4 | 6);
-    let use_qpel = matches!(payload[3], 5 | 6);
+    let entropy_chunks = matches!(payload[3], 4 | 6 | 8 | 9);
+    let use_qpel = matches!(payload[3], 5 | 6 | 9);
+    let block_aq_wire = matches!(payload[3], 8 | 9);
     let mut cur = 4usize;
     let frame_index = read_u32(payload, &mut cur)?;
     let qp = read_u8(payload, &mut cur)?;
     let qp_i = qp.max(1) as i16;
+    let (clip_min, clip_max) = if block_aq_wire {
+        let a = read_u8(payload, &mut cur)?;
+        let b = read_u8(payload, &mut cur)?;
+        validate_qp_clip_range(a, b)?;
+        (a, b)
+    } else {
+        (1_u8, 51_u8)
+    };
 
     let cw = w.div_ceil(2);
     let ch = h.div_ceil(2);
@@ -438,6 +542,14 @@ pub fn decode_yuv420_p_payload(
                         }
                     }
                 } else {
+                    let eff_i = if block_aq_wire {
+                        let d = read_u8(payload, &mut cur)? as i8;
+                        validate_wire_qp_delta(d)?;
+                        let eff = apply_qp_delta_clamped(qp, d, clip_min, clip_max);
+                        eff.max(1) as i16
+                    } else {
+                        qp_i
+                    };
                     let chunk_len = read_u32(payload, &mut cur)? as usize;
                     let chunk_start = cur;
                     let chunk_end = chunk_start
@@ -448,10 +560,10 @@ pub fn decode_yuv420_p_payload(
                     }
                     let chunk = &payload[chunk_start..chunk_end];
                     let res = if entropy_chunks {
-                        decode_p_residual_chunk(chunk, qp_i)?
+                        decode_p_residual_chunk(chunk, eff_i)?
                     } else {
                         let mut c = 0usize;
-                        let r = decode_residual_block_8x8(chunk, &mut c, qp_i)?;
+                        let r = decode_residual_block_8x8(chunk, &mut c, eff_i)?;
                         if c != chunk.len() {
                             return Err(SrsV2Error::syntax("residual chunk length mismatch"));
                         }
@@ -550,7 +662,7 @@ mod tests {
         let i_payload =
             encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &settings, None, None).unwrap();
         let p_payload =
-            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, qp, &settings, None, None).unwrap();
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, qp, &settings, None, None, None).unwrap();
         assert!(
             p_payload.len() < i_payload.len(),
             "expected P payload smaller than I for identical texture: p={} i={}",
@@ -591,7 +703,7 @@ mod tests {
             ..Default::default()
         };
         let p_payload =
-            encode_yuv420_p_payload(&seq, &y1, &y0, 1, qp, &settings, None, None).unwrap();
+            encode_yuv420_p_payload(&seq, &y1, &y0, 1, qp, &settings, None, None, None).unwrap();
         let dec = decode_yuv420_p_payload(&seq, &p_payload, &y0).unwrap();
         let mean_dec: u32 = dec.yuv.y.samples.iter().map(|&x| x as u32).sum::<u32>()
             / dec.yuv.y.samples.len() as u32;
@@ -617,6 +729,7 @@ mod tests {
             1,
             28,
             &SrsV2EncodeSettings::default(),
+            None,
             None,
             None,
         )
@@ -671,7 +784,18 @@ mod tests {
             ..Default::default()
         };
         let mut ms = SrsV2MotionEncodeStats::default();
-        encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, Some(&mut ms)).unwrap();
+        encode_yuv420_p_payload(
+            &seq,
+            &yuv,
+            &yuv,
+            1,
+            28,
+            &settings,
+            None,
+            Some(&mut ms),
+            None,
+        )
+        .unwrap();
         assert!(ms.skip_subblocks > 0);
     }
 
@@ -686,7 +810,18 @@ mod tests {
             ..Default::default()
         };
         let mut ms = SrsV2MotionEncodeStats::default();
-        encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, Some(&mut ms)).unwrap();
+        encode_yuv420_p_payload(
+            &seq,
+            &yuv,
+            &yuv,
+            1,
+            28,
+            &settings,
+            None,
+            Some(&mut ms),
+            None,
+        )
+        .unwrap();
         assert_eq!(ms.skip_subblocks, 0);
     }
 
@@ -717,8 +852,10 @@ mod tests {
             residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
             ..Default::default()
         };
-        let p_on = encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, qp, &on, None, None).unwrap();
-        let p_off = encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, qp, &off, None, None).unwrap();
+        let p_on =
+            encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, qp, &on, None, None, None).unwrap();
+        let p_off =
+            encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, qp, &off, None, None, None).unwrap();
         let dec_on = decode_yuv420_p_payload(&seq, &p_on, &y_ref).unwrap();
         let dec_off = decode_yuv420_p_payload(&seq, &p_off, &y_ref).unwrap();
         let mae_on = compare_luma_mae(&y_cur.y, &dec_on.yuv.y);
@@ -751,7 +888,7 @@ mod tests {
             ..Default::default()
         };
         let payload =
-            encode_yuv420_p_payload(&seq, &y1, &y0, 1, 26, &settings, None, None).unwrap();
+            encode_yuv420_p_payload(&seq, &y1, &y0, 1, 26, &settings, None, None, None).unwrap();
         let dec = decode_yuv420_p_payload(&seq, &payload, &y0).unwrap();
         assert!(
             compare_luma_max_abs(&dec.yuv.y, &y0.y) > 8,
@@ -770,7 +907,7 @@ mod tests {
             ..Default::default()
         };
         let mut payload =
-            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
         let pat_idx = 9 + 4;
         payload[pat_idx] = 0x0F;
         let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
@@ -791,7 +928,7 @@ mod tests {
             ..Default::default()
         };
         let mut payload =
-            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
         let chunk_len_idx = 9 + 4 + 1;
         payload[chunk_len_idx..chunk_len_idx + 4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
         let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
@@ -812,7 +949,7 @@ mod tests {
             ..Default::default()
         };
         let payload =
-            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
         let dec = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap();
         assert!(
             compare_luma_max_abs(&yuv.y, &dec.yuv.y) <= 8,
@@ -842,7 +979,8 @@ mod tests {
             residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
             ..Default::default()
         };
-        let p = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+        let p =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
         assert_eq!(p[3], 2);
     }
 
@@ -856,7 +994,8 @@ mod tests {
             residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
             ..Default::default()
         };
-        let p = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+        let p =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
         assert_eq!(p[3], 5);
     }
 
@@ -872,7 +1011,7 @@ mod tests {
             ..Default::default()
         };
         let mut payload =
-            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None).unwrap();
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
         let mv_off = 9;
         payload[mv_off..mv_off + 4].copy_from_slice(&1i32.to_le_bytes());
         let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
@@ -916,7 +1055,7 @@ mod tests {
         decode_yuv420_srsv2_payload(&seq, &i_payload, &mut slot).unwrap();
         let ref_y = slot.as_ref().unwrap();
         let p_payload =
-            encode_yuv420_p_payload(&seq, &y1, ref_y, 1, qp, &settings, None, None).unwrap();
+            encode_yuv420_p_payload(&seq, &y1, ref_y, 1, qp, &settings, None, None, None).unwrap();
         assert_eq!(p_payload[3], 5);
         let mut slot2 = Some(ref_y.clone());
         let via_disp = decode_yuv420_srsv2_payload(&seq, &p_payload, &mut slot2).unwrap();
@@ -935,7 +1074,18 @@ mod tests {
             ..Default::default()
         };
         let mut ms = SrsV2MotionEncodeStats::default();
-        encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, Some(&mut ms)).unwrap();
+        encode_yuv420_p_payload(
+            &seq,
+            &yuv,
+            &yuv,
+            1,
+            28,
+            &settings,
+            None,
+            Some(&mut ms),
+            None,
+        )
+        .unwrap();
         assert!(ms.subpel_enabled);
         assert!(ms.subpel_blocks_tested > 0);
         assert!(ms.additional_subpel_evaluations > 0);

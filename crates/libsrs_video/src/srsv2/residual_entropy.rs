@@ -1,14 +1,19 @@
-//! FR2 rev 3/4 residual packing — explicit AC tuples vs static rANS tokens per block.
+//! FR2 rev 3/4/7 residual packing — explicit AC tuples vs static rANS tokens per block.
+//! Rev **7** inserts a signed **`qp_delta`** byte after DC (before the residual coding tag).
 
 use libsrs_bitio::RansModel;
 
+use super::block_aq::{
+    apply_qp_delta_clamped, choose_block_qp_delta, collect_plane_block_variances,
+    validate_qp_clip_range, validate_wire_qp_delta,
+};
 use super::dct::ZIGZAG;
 use super::dct::{fdct_8x8, idct_8x8};
 use super::error::SrsV2Error;
 use super::frame::VideoPlane;
 use super::intra_codec::{dequantize, pick_mode, predict_block, quantize, PredMode};
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
-use super::rate_control::{ResidualEncodeStats, ResidualEntropy};
+use super::rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
 use super::residual_tokens::{
     detokenize_ac, rans_decode_tokens, rans_encode_tokens, residual_token_model, tokenize_ac,
     MAX_SYMBOLS_PER_BLOCK,
@@ -128,8 +133,16 @@ fn explicit_wire_len(freq: &[i16; 64]) -> usize {
     1 + 2 + 1 + explicit_ac_only_len(freq)
 }
 
+fn explicit_wire_len_rev7(freq: &[i16; 64]) -> usize {
+    1 + 2 + 1 + 1 + explicit_ac_only_len(freq)
+}
+
 fn rans_wire_len(enc_len: usize) -> usize {
     1 + 2 + 1 + 2 + 2 + enc_len
+}
+
+fn rans_wire_len_rev7(enc_len: usize) -> usize {
+    1 + 2 + 1 + 1 + 2 + 2 + enc_len
 }
 
 pub(crate) fn encode_intra_block_residual(
@@ -228,6 +241,119 @@ pub(crate) fn decode_intra_block_residual(
     }
 }
 
+pub(crate) fn encode_intra_block_residual_rev7(
+    mode: PredMode,
+    freq: &[i16; 64],
+    qp_delta: i8,
+    policy: ResidualEntropy,
+    model: &RansModel,
+    out: &mut Vec<u8>,
+) -> Result<BlockResidualCoding, SrsV2Error> {
+    validate_wire_qp_delta(qp_delta)?;
+    let explicit_full = explicit_wire_len_rev7(freq);
+    let rans_choice = try_rans_payload(freq, model)?;
+
+    let coding = match policy {
+        ResidualEntropy::Explicit => BlockResidualCoding::ExplicitTuples,
+        ResidualEntropy::Rans => {
+            if rans_choice.is_none() {
+                return Err(SrsV2Error::syntax(
+                    "forced rANS but coefficients out of range",
+                ));
+            }
+            BlockResidualCoding::RansV1
+        }
+        ResidualEntropy::Auto => match &rans_choice {
+            Some((_, enc)) => {
+                let rfull = rans_wire_len_rev7(enc.len());
+                if rfull < explicit_full {
+                    BlockResidualCoding::RansV1
+                } else {
+                    BlockResidualCoding::ExplicitTuples
+                }
+            }
+            None => BlockResidualCoding::ExplicitTuples,
+        },
+    };
+
+    out.push(mode as u8);
+    out.extend_from_slice(&freq[0].to_le_bytes());
+    out.push(qp_delta as u8);
+
+    match coding {
+        BlockResidualCoding::ExplicitTuples => {
+            out.push(TAG_EXPLICIT_AC);
+            write_explicit_ac_only(freq, out)?;
+            Ok(BlockResidualCoding::ExplicitTuples)
+        }
+        BlockResidualCoding::RansV1 => {
+            let (sym_ct, enc) = rans_choice.expect("rans payload");
+            out.push(TAG_RANS_AC);
+            let sc = u16::try_from(sym_ct).map_err(|_| SrsV2Error::syntax("rans sym count"))?;
+            let bl =
+                u16::try_from(enc.len()).map_err(|_| SrsV2Error::syntax("rans blob length"))?;
+            out.extend_from_slice(&sc.to_le_bytes());
+            out.extend_from_slice(&bl.to_le_bytes());
+            out.extend_from_slice(&enc);
+            Ok(BlockResidualCoding::RansV1)
+        }
+    }
+}
+
+pub(crate) fn decode_intra_block_residual_rev7(
+    data: &[u8],
+    cur: &mut usize,
+) -> Result<(PredMode, i8, [i16; 64]), SrsV2Error> {
+    let mode_b = read_u8(data, cur)?;
+    let mode = PredMode::from_u8(mode_b)?;
+    let mut freq = [0_i16; 64];
+    freq[0] = read_i16(data, cur)?;
+    let qp_delta = read_u8(data, cur)? as i8;
+    validate_wire_qp_delta(qp_delta)?;
+    let tag = read_u8(data, cur)?;
+    match tag {
+        TAG_EXPLICIT_AC => {
+            let ac = read_explicit_ac_only(data, cur)?;
+            for &k in ZIGZAG.iter().skip(1) {
+                freq[k] = ac[k];
+            }
+            Ok((mode, qp_delta, freq))
+        }
+        TAG_RANS_AC => {
+            let sym_ct = read_u16(data, cur)? as usize;
+            let bl = read_u16(data, cur)? as usize;
+            if sym_ct > MAX_SYMBOLS_PER_BLOCK {
+                return Err(SrsV2Error::syntax("rans symbol count"));
+            }
+            let end = cur
+                .checked_add(bl)
+                .ok_or(SrsV2Error::Overflow("rans blob"))?;
+            if end > data.len() {
+                return Err(SrsV2Error::Truncated);
+            }
+            let blob = &data[*cur..end];
+            *cur = end;
+            let model = residual_token_model();
+            let syms = rans_decode_tokens(&model, blob, sym_ct)?;
+            detokenize_ac(&syms, &mut freq)?;
+            Ok((mode, qp_delta, freq))
+        }
+        _ => Err(SrsV2Error::syntax("bad residual coding tag")),
+    }
+}
+
+/// Per-plane counters for folding into [`crate::srsv2::adaptive_quant::SrsV2BlockAqWireStats`].
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PlaneBlockAqSummary {
+    pub blocks: u32,
+    pub sum_eff_qp: u64,
+    pub min_eff_qp: u8,
+    pub max_eff_qp: u8,
+    pub pos_delta: u32,
+    pub neg_delta: u32,
+    pub zero_delta: u32,
+}
+
 pub(crate) fn encode_plane_intra_entropy(
     plane: &VideoPlane<u8>,
     qp: i16,
@@ -297,6 +423,113 @@ pub(crate) fn encode_plane_intra_entropy(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_plane_intra_entropy_block_aq(
+    plane: &VideoPlane<u8>,
+    base_qp: u8,
+    clip_min: u8,
+    clip_max: u8,
+    policy: ResidualEntropy,
+    stats: &mut ResidualEncodeStats,
+    settings: &SrsV2EncodeSettings,
+    out: &mut Vec<u8>,
+) -> Result<PlaneBlockAqSummary, SrsV2Error> {
+    validate_qp_clip_range(clip_min, clip_max)?;
+    let model = residual_token_model();
+    let w = plane.width as usize;
+    let h = plane.height as usize;
+    let stride = plane.stride;
+    let pw = (w + 7) & !7;
+    let ph = (h + 7) & !7;
+    let mut rec = vec![128_u8; pw.saturating_mul(ph)];
+    let bw = pw / 8;
+    let bh = ph / 8;
+    let (vars, median_var) = collect_plane_block_variances(plane);
+
+    let mut acc = PlaneBlockAqSummary::default();
+    if bw == 0 || bh == 0 {
+        return Ok(acc);
+    }
+    acc.min_eff_qp = u8::MAX;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let idx = by * bw + bx;
+            let block_var = vars[idx];
+            let qp_delta = choose_block_qp_delta(
+                block_var,
+                median_var,
+                settings.aq_strength,
+                settings.min_block_qp_delta,
+                settings.max_block_qp_delta,
+            );
+            validate_wire_qp_delta(qp_delta)?;
+            let eff_qp = apply_qp_delta_clamped(base_qp, qp_delta, clip_min, clip_max);
+            let qp_i = eff_qp.max(1) as i16;
+
+            acc.blocks += 1;
+            acc.sum_eff_qp += u64::from(eff_qp);
+            acc.min_eff_qp = acc.min_eff_qp.min(eff_qp);
+            acc.max_eff_qp = acc.max_eff_qp.max(eff_qp);
+            if qp_delta > 0 {
+                acc.pos_delta += 1;
+            } else if qp_delta < 0 {
+                acc.neg_delta += 1;
+            } else {
+                acc.zero_delta += 1;
+            }
+
+            let mut orig = [[0_i16; 8]; 8];
+            for (r, row) in orig.iter_mut().enumerate() {
+                for (c, cell) in row.iter_mut().enumerate() {
+                    let x = bx * 8 + c;
+                    let y = by * 8 + r;
+                    let v = if x < w && y < h {
+                        plane.samples[y * stride + x] as i16
+                    } else {
+                        128
+                    };
+                    *cell = v;
+                }
+            }
+            let mode = pick_mode(&rec, pw, pw, ph, bx, by, &orig);
+            let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
+            let mut diff = [[0_i16; 8]; 8];
+            for r in 0..8 {
+                for c in 0..8 {
+                    diff[r][c] = orig[r][c] - pred[r][c];
+                }
+            }
+            let mut blk = [0_i16; 64];
+            for r in 0..8 {
+                for c in 0..8 {
+                    blk[r * 8 + c] = diff[r][c];
+                }
+            }
+            let freq = fdct_8x8(&blk);
+            let qfreq = quantize(&freq, qp_i);
+            let kind =
+                encode_intra_block_residual_rev7(mode, &qfreq, qp_delta, policy, &model, out)?;
+            match kind {
+                BlockResidualCoding::ExplicitTuples => stats.intra_explicit_blocks += 1,
+                BlockResidualCoding::RansV1 => stats.intra_rans_blocks += 1,
+            }
+            let recon_freq = dequantize(&qfreq, qp_i);
+            let rpix = idct_8x8(&recon_freq);
+            for r in 0..8 {
+                for c in 0..8 {
+                    let x = bx * 8 + c;
+                    let y = by * 8 + r;
+                    let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
+                    if x < pw && y < ph {
+                        rec[y * pw + x] = pv as u8;
+                    }
+                }
+            }
+        }
+    }
+    Ok(acc)
+}
+
 pub(crate) fn decode_plane_intra_entropy(
     data: &[u8],
     cursor: &mut usize,
@@ -316,6 +549,51 @@ pub(crate) fn decode_plane_intra_entropy(
             let (mode, freq) = decode_intra_block_residual(data, cursor)?;
             let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
             let recon_freq = dequantize(&freq, qp);
+            let rpix = idct_8x8(&recon_freq);
+            for r in 0..8 {
+                for c in 0..8 {
+                    let x = bx * 8 + c;
+                    let y = by * 8 + r;
+                    let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
+                    if x < pw && y < ph {
+                        rec[y * pw + x] = pv as u8;
+                    }
+                }
+            }
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            plane.samples[y * stride + x] = rec[y * pw + x];
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_plane_intra_entropy_block_aq(
+    data: &[u8],
+    cursor: &mut usize,
+    plane: &mut VideoPlane<u8>,
+    base_qp: u8,
+    clip_min: u8,
+    clip_max: u8,
+) -> Result<(), SrsV2Error> {
+    validate_qp_clip_range(clip_min, clip_max)?;
+    let w = plane.width as usize;
+    let h = plane.height as usize;
+    let stride = plane.stride;
+    let pw = (w + 7) & !7;
+    let ph = (h + 7) & !7;
+    let mut rec = vec![128_u8; pw.saturating_mul(ph)];
+    let bw = pw / 8;
+    let bh = ph / 8;
+    for by in 0..bh {
+        for bx in 0..bw {
+            let (mode, qp_delta, freq) = decode_intra_block_residual_rev7(data, cursor)?;
+            let eff_qp = apply_qp_delta_clamped(base_qp, qp_delta, clip_min, clip_max);
+            let qp_i = eff_qp.max(1) as i16;
+            let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
+            let recon_freq = dequantize(&freq, qp_i);
             let rpix = idct_8x8(&recon_freq);
             for r in 0..8 {
                 for c in 0..8 {

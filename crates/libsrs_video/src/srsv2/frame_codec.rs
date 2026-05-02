@@ -1,6 +1,9 @@
 //! Serialized SRSV2 **frame** payload (inside mux packet or elementary stream).
 
-use super::adaptive_quant::{resolve_frame_adaptive_qp, SrsV2AqEncodeStats};
+use super::adaptive_quant::{
+    accumulate_block_aq_wire_plane, resolve_frame_adaptive_qp, SrsV2AqEncodeStats,
+};
+use super::block_aq::validate_qp_clip_range;
 use super::deblock::apply_loop_filter_y;
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
@@ -9,14 +12,28 @@ use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
 use super::motion_search::SrsV2MotionEncodeStats;
 use super::p_frame_codec;
-use super::rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
-use super::residual_entropy::{decode_plane_intra_entropy, encode_plane_intra_entropy};
+use super::rate_control::{
+    ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode, SrsV2EncodeSettings,
+};
+use super::residual_entropy::{
+    decode_plane_intra_entropy, decode_plane_intra_entropy_block_aq, encode_plane_intra_entropy,
+    encode_plane_intra_entropy_block_aq,
+};
 
 pub const FRAME_PAYLOAD_MAGIC: [u8; 4] = [b'F', b'R', b'2', 1];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 3];
+pub const FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 7];
 
 fn intra_magic_matches(payload: &[u8]) -> bool {
-    payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3)
+    payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3 | 7)
+}
+
+fn intra_use_block_aq_wire(settings: &SrsV2EncodeSettings) -> bool {
+    matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
+        && matches!(
+            settings.residual_entropy,
+            ResidualEntropy::Auto | ResidualEntropy::Rans
+        )
 }
 
 pub fn encode_yuv420_intra_payload(
@@ -33,18 +50,34 @@ pub fn encode_yuv420_intra_payload(
             "encode path only supports YUV420p8 in this slice",
         ));
     }
-    let (eff_qp, aq_st) = resolve_frame_adaptive_qp(qp, yuv, settings)?;
-    if let Some(a) = aq_out {
-        *a = aq_st;
+    if matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
+        && matches!(settings.residual_entropy, ResidualEntropy::Explicit)
+    {
+        return Err(SrsV2Error::syntax(
+            "block AQ (FR2 rev 7) requires adaptive residual entropy (Auto or Rans)",
+        ));
     }
+    let (eff_qp, mut aq_st) = resolve_frame_adaptive_qp(qp, yuv, settings)?;
     let mut out = Vec::new();
-    let magic = match settings.residual_entropy {
-        ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC,
-        ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY,
+    let magic = if intra_use_block_aq_wire(settings) {
+        FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ
+    } else {
+        match settings.residual_entropy {
+            ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC,
+            ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY,
+        }
     };
     out.extend_from_slice(&magic);
     out.extend_from_slice(&frame_index.to_le_bytes());
     out.push(eff_qp);
+
+    let clip_min = settings.min_qp;
+    let clip_max = settings.max_qp;
+    if intra_use_block_aq_wire(settings) {
+        validate_qp_clip_range(clip_min, clip_max)?;
+        out.push(clip_min);
+        out.push(clip_max);
+    }
 
     let qp_i = eff_qp.max(1) as i16;
     let mut yb = Vec::new();
@@ -60,10 +93,77 @@ pub fn encode_yuv420_intra_payload(
         ResidualEntropy::Auto | ResidualEntropy::Rans => {
             let mut noop = ResidualEncodeStats::default();
             let acc: &mut ResidualEncodeStats = stats.unwrap_or(&mut noop);
-            encode_plane_intra_entropy(&yuv.y, qp_i, settings.residual_entropy, acc, &mut yb)?;
-            encode_plane_intra_entropy(&yuv.u, qp_i, settings.residual_entropy, acc, &mut ub)?;
-            encode_plane_intra_entropy(&yuv.v, qp_i, settings.residual_entropy, acc, &mut vb)?;
+            if intra_use_block_aq_wire(settings) {
+                let sy = encode_plane_intra_entropy_block_aq(
+                    &yuv.y,
+                    eff_qp,
+                    clip_min,
+                    clip_max,
+                    settings.residual_entropy,
+                    acc,
+                    settings,
+                    &mut yb,
+                )?;
+                let su = encode_plane_intra_entropy_block_aq(
+                    &yuv.u,
+                    eff_qp,
+                    clip_min,
+                    clip_max,
+                    settings.residual_entropy,
+                    acc,
+                    settings,
+                    &mut ub,
+                )?;
+                let sv = encode_plane_intra_entropy_block_aq(
+                    &yuv.v,
+                    eff_qp,
+                    clip_min,
+                    clip_max,
+                    settings.residual_entropy,
+                    acc,
+                    settings,
+                    &mut vb,
+                )?;
+                accumulate_block_aq_wire_plane(
+                    &mut aq_st.block_wire,
+                    sy.blocks,
+                    sy.sum_eff_qp,
+                    sy.min_eff_qp,
+                    sy.max_eff_qp,
+                    sy.pos_delta,
+                    sy.neg_delta,
+                    sy.zero_delta,
+                );
+                accumulate_block_aq_wire_plane(
+                    &mut aq_st.block_wire,
+                    su.blocks,
+                    su.sum_eff_qp,
+                    su.min_eff_qp,
+                    su.max_eff_qp,
+                    su.pos_delta,
+                    su.neg_delta,
+                    su.zero_delta,
+                );
+                accumulate_block_aq_wire_plane(
+                    &mut aq_st.block_wire,
+                    sv.blocks,
+                    sv.sum_eff_qp,
+                    sv.min_eff_qp,
+                    sv.max_eff_qp,
+                    sv.pos_delta,
+                    sv.neg_delta,
+                    sv.zero_delta,
+                );
+            } else {
+                encode_plane_intra_entropy(&yuv.y, qp_i, settings.residual_entropy, acc, &mut yb)?;
+                encode_plane_intra_entropy(&yuv.u, qp_i, settings.residual_entropy, acc, &mut ub)?;
+                encode_plane_intra_entropy(&yuv.v, qp_i, settings.residual_entropy, acc, &mut vb)?;
+            }
         }
+    }
+
+    if let Some(a) = aq_out {
+        *a = aq_st;
     }
 
     push_chunk(&mut out, &yb)?;
@@ -112,7 +212,11 @@ pub fn decode_yuv420_intra_payload(
             "decode path only supports YUV420p8 in this slice",
         ));
     }
-    if payload.len() < 4 + 4 + 1 + 4 * 3 {
+    let min_hdr = match payload.get(3).copied() {
+        Some(7) => 4 + 4 + 1 + 2 + 4 * 3,
+        _ => 4 + 4 + 1 + 4 * 3,
+    };
+    if payload.len() < min_hdr {
         return Err(SrsV2Error::Truncated);
     }
     if !intra_magic_matches(payload) {
@@ -121,9 +225,15 @@ pub fn decode_yuv420_intra_payload(
     let rev = payload[3];
     let mut cur = 4usize;
     let frame_index = read_u32(payload, &mut cur)?;
-    let qp = payload[cur];
-    cur += 1;
-    let qp_i = qp.max(1) as i16;
+    let base_qp = read_u8_intra(payload, &mut cur)?;
+    let (clip_min, clip_max, qp_i) = if rev == 7 {
+        let clip_min = read_u8_intra(payload, &mut cur)?;
+        let clip_max = read_u8_intra(payload, &mut cur)?;
+        validate_qp_clip_range(clip_min, clip_max)?;
+        (clip_min, clip_max, base_qp.max(1) as i16)
+    } else {
+        (1_u8, 51_u8, base_qp.max(1) as i16)
+    };
 
     let y_len = read_u32(payload, &mut cur)? as usize;
     let y_end = cur
@@ -202,6 +312,44 @@ pub fn decode_yuv420_intra_payload(
                 return Err(SrsV2Error::syntax("v plane trailing bits"));
             }
         }
+        7 => {
+            let mut c = 0usize;
+            decode_plane_intra_entropy_block_aq(
+                y_data,
+                &mut c,
+                &mut y_plane,
+                base_qp,
+                clip_min,
+                clip_max,
+            )?;
+            if c != y_data.len() {
+                return Err(SrsV2Error::syntax("y plane trailing bits"));
+            }
+            c = 0;
+            decode_plane_intra_entropy_block_aq(
+                u_data,
+                &mut c,
+                &mut u_plane,
+                base_qp,
+                clip_min,
+                clip_max,
+            )?;
+            if c != u_data.len() {
+                return Err(SrsV2Error::syntax("u plane trailing bits"));
+            }
+            c = 0;
+            decode_plane_intra_entropy_block_aq(
+                v_data,
+                &mut c,
+                &mut v_plane,
+                base_qp,
+                clip_min,
+                clip_max,
+            )?;
+            if c != v_data.len() {
+                return Err(SrsV2Error::syntax("v plane trailing bits"));
+            }
+        }
         _ => return Err(SrsV2Error::BadMagic),
     }
 
@@ -243,9 +391,12 @@ pub fn encode_yuv420_inter_payload(
         return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats, aq_out);
     }
     let (eff_qp, aq_st) = resolve_frame_adaptive_qp(qp, cur, settings)?;
-    if let Some(a) = aq_out {
+    let block_wire = if let Some(a) = aq_out {
         *a = aq_st;
-    }
+        Some(&mut a.block_wire)
+    } else {
+        None
+    };
     p_frame_codec::encode_yuv420_p_payload(
         seq,
         cur,
@@ -255,6 +406,7 @@ pub fn encode_yuv420_inter_payload(
         settings,
         stats,
         motion_out,
+        block_wire,
     )
 }
 
@@ -268,8 +420,8 @@ pub fn decode_yuv420_srsv2_payload(
         return Err(SrsV2Error::Truncated);
     }
     let mut dec = match payload[3] {
-        1 | 3 => decode_yuv420_intra_payload(seq, payload)?,
-        2 | 4 | 5 | 6 => {
+        1 | 3 | 7 => decode_yuv420_intra_payload(seq, payload)?,
+        2 | 4 | 5 | 6 | 8 | 9 => {
             let reference = ref_slot
                 .as_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -286,6 +438,15 @@ pub fn decode_yuv420_srsv2_payload(
         ref_slot.replace(dec.yuv.clone());
     }
     Ok(dec)
+}
+
+fn read_u8_intra(data: &[u8], cur: &mut usize) -> Result<u8, SrsV2Error> {
+    if *cur >= data.len() {
+        return Err(SrsV2Error::Truncated);
+    }
+    let v = data[*cur];
+    *cur += 1;
+    Ok(v)
 }
 
 fn read_u32(data: &[u8], cur: &mut usize) -> Result<u32, SrsV2Error> {
@@ -307,7 +468,7 @@ mod roundtrip_tests {
         TransferFunction, VideoSequenceHeaderV2,
     };
     use crate::srsv2::rate_control::{
-        ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2EncodeSettings,
+        ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
     };
 
     fn explicit_only_settings() -> SrsV2EncodeSettings {
@@ -686,5 +847,143 @@ mod roundtrip_tests {
         let dec = decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
         let got = slot.expect("ref slot");
         assert_eq!(got.y.samples, dec.yuv.y.samples);
+    }
+
+    #[test]
+    fn intra_rev7_block_aq_roundtrips() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let rgb = vec![90_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Auto,
+            block_aq_mode: SrsV2BlockAqMode::BlockDelta,
+            keyframe_interval: 1,
+            ..Default::default()
+        };
+        let mut aq = SrsV2AqEncodeStats::default();
+        let payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 3, 24, &st, None, Some(&mut aq)).unwrap();
+        assert_eq!(payload[3], 7);
+        assert!(aq.block_wire.block_aq_enabled);
+        let dec = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        assert_eq!(dec.frame_index, 3);
+    }
+
+    #[test]
+    fn p_rev8_block_aq_roundtrips() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![120_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Auto,
+            block_aq_mode: SrsV2BlockAqMode::BlockDelta,
+            keyframe_interval: 30,
+            ..Default::default()
+        };
+        let intra = encode_yuv420_intra_payload(&seq, &yuv, 0, 26, &st, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let p =
+            encode_yuv420_inter_payload(&seq, &yuv, slot.as_ref(), 1, 26, &st, None, None, None)
+                .unwrap();
+        assert_eq!(p[3], 8);
+        slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        decode_yuv420_srsv2_payload(&seq, &p, &mut slot).unwrap();
+    }
+
+    #[test]
+    fn p_rev9_block_aq_half_pel_roundtrips() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![130_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Auto,
+            block_aq_mode: SrsV2BlockAqMode::BlockDelta,
+            subpel_mode: crate::srsv2::rate_control::SrsV2SubpelMode::HalfPel,
+            keyframe_interval: 30,
+            ..Default::default()
+        };
+        let intra = encode_yuv420_intra_payload(&seq, &yuv, 0, 26, &st, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let p =
+            encode_yuv420_inter_payload(&seq, &yuv, slot.as_ref(), 1, 26, &st, None, None, None)
+                .unwrap();
+        assert_eq!(p[3], 9);
+        slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        decode_yuv420_srsv2_payload(&seq, &p, &mut slot).unwrap();
+    }
+
+    #[test]
+    fn rev7_decode_rejects_wire_qp_delta_out_of_range() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let rgb = vec![90_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Auto,
+            block_aq_mode: SrsV2BlockAqMode::BlockDelta,
+            keyframe_interval: 1,
+            ..Default::default()
+        };
+        let mut payload = encode_yuv420_intra_payload(&seq, &yuv, 0, 24, &st, None, None).unwrap();
+        assert_eq!(payload[3], 7);
+        let y_off = 4 + 4 + 1 + 2 + 4;
+        let qp_delta_off = y_off + 1 + 2 + 1;
+        payload[qp_delta_off] = 25_u8;
+        assert!(decode_yuv420_intra_payload(&seq, &payload).is_err());
     }
 }

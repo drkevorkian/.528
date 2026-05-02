@@ -22,3 +22,7 @@ pub const MAX_METADATA_BYTES: usize = 16 * 1024;
 pub const SUPERBLOCK_SIZE: u32 = 64;
 /// Minimum coding unit (after splits).
 pub const MIN_CU_SIZE: u32 = 8;
+/// Hard decoder bounds for wire **`qp_delta`** (`FR2` rev **7**/**8**/**9**).
+pub const QP_DELTA_WIRE_MIN: i8 = -24;
+/// Hard decoder bounds for wire **`qp_delta`** (`FR2` rev **7**/**8**/**9**).
+pub const QP_DELTA_WIRE_MAX: i8 = 24;

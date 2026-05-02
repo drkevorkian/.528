@@ -18,7 +18,7 @@ Embedded verbatim in `.528` **video track config** when `codec_id == 3`.
 
 Prefix `FR2\x01`, `frame_index` LE `u32`, `qp` byte, then three length-prefixed plane bitstreams (Y, U, V) for YUV420p8 intra.
 
-**QP byte:** encoders may choose this value using rate control and/or **experimental frame-level adaptive quantization**; decoders interpret it as the quantizer for the frame. **Per-macroblock QP deltas are not encoded** in current revisions — adaptive quantization affects **which** single QP is written, not the syntax layout.
+**QP byte (`base_qp`):** encoders may choose this value using rate control and/or **experimental frame-level adaptive quantization**. For revisions **1**–**6**, decoders use this single byte as the frame quantizer (no per-block deltas). **Revision 7**–**9** add optional **per-8×8 `qp_delta`** bytes (see below); effective QP per block clamps **`base_qp + qp_delta`** using **`clip_min` / `clip_max`** carried in the payload header.
 
 ### Revision 2 — experimental P (`FR2\x02`)
 
@@ -40,6 +40,18 @@ Same macroblock grid and residual blob layout as revision **2**, except each mac
 
 Same as revision **5** for motion, with non-skipped residual packing matching revision **4** (adaptive explicit vs rANS).
 
+### Revision 7 — intra + adaptive residuals + block `qp_delta` (`FR2\x07`) — experimental
+
+Prefix **`FR2\x07`**. After `frame_index` (`u32` LE) and **`base_qp`** (`u8`), **`clip_min`** and **`clip_max`** (`u8` each, inclusive QP clip range; decoders reject `clip_min == 0`, `clip_min > clip_max`, or `clip_max > 51`). Three length-prefixed Y/U/V planes follow. Within **each** plane, each **8×8** block is: prediction **mode**, **DC** (`i16` LE), signed **`qp_delta`** (`i8`, wire range **−24..24**), then the same **tag** + AC payload as revision **3**. U and V use **independent** variance-driven deltas per chroma **8×8** block (not tied to collocated luma `qp_delta`). Decoders validate **`qp_delta`** and compute effective QP per block before dequantization.
+
+### Revision 8 — P-frame integer MV + adaptive residuals + block `qp_delta` (`FR2\x08`) — experimental
+
+Same macroblock grid and motion syntax as revision **4**, with the same **`clip_min` / `clip_max`** bytes after **`qp`** as revision **7**. For each non-skipped **luma** **8×8** residual chunk: **`qp_delta`** (`i8`) precedes the **`u32` LE chunk length** and chunk bytes (layout **`0`** legacy tuple or **`1`** adaptive, matching rev **4**). Skipped sub-blocks omit **`qp_delta`** and chunk payload. Chroma remains **reference copy** only (no chroma residual, hence **no** chroma **`qp_delta`**).
+
+### Revision 9 — P-frame half-pel + adaptive residuals + block `qp_delta` (`FR2\x09`) — experimental
+
+Same as revision **8** for **`qp_delta`** placement, clipping header, and **luma-only** residual deltas (chroma MV-copy only), with motion syntax matching revision **6** (**`i32` LE** quarter-pel MVs, even quarter-pel grid).
+
 ## Elementary `.srsv2` file
 
 Starts with the 64-byte sequence header, then repeating framed records: VP packet sync (`PACKET_SYNC` from `libsrs_video`), version/type bytes, `frame_index`, payload length, CRC32 of header fields + payload, payload bytes.
@@ -49,4 +61,4 @@ Starts with the 64-byte sequence header, then repeating framed records: VP packe
 - Ignore reserved trailing bytes in the 64-byte sequence header for schema **1** (decoders read defined offsets only); encoders should zero-fill unused slots.
 - Reject unknown sequence schema version.
 - Enforce `MAX_FRAME_PAYLOAD_BYTES`, dimension caps, and CRC mismatches as hard errors.
-- **FR2** revisions **1**–**4** remain the integer-MV baseline; **5** and **6** add **half-pel** luma MVs (experimental). **3** and **4** add optional entropy-coded intra/P residuals (see `docs/srsv2_codec.md`).
+- **FR2** revisions **1**–**4** remain the integer-MV baseline; **5** and **6** add **half-pel** luma MVs (experimental). **3** and **4** add optional entropy-coded intra/P residuals; **7**–**9** add optional **block `qp_delta`** with adaptive residuals (see `docs/srsv2_codec.md`).

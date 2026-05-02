@@ -219,7 +219,7 @@ mod tests {
         let mut cur = VideoPlane::<u8>::try_new(w, w, w as usize).unwrap();
         for y in 0..16 {
             for x in 0..16 {
-                let v = sample_luma_bilinear_qpel(&refp, x as i32, y as i32, -2, 0);
+                let v = sample_luma_bilinear_qpel(&refp, x, y, -2, 0);
                 cur.samples[y as usize * cur.stride + x as usize] = v;
             }
         }

@@ -99,7 +99,23 @@ fn bench_aq_activity_populates_report() {
     let v = run_bench_json(&["--aq", "activity", "--aq-strength", "6"]);
     let aq = &v["srsv2"]["aq"];
     assert_eq!(aq["mode"], "activity");
-    assert_eq!(aq["aq_enabled"], true);
+    assert_eq!(aq["frame_aq"]["enabled"], true);
+}
+
+#[test]
+fn bench_frame_aq_and_block_delta_both_reported() {
+    let v = run_bench_json(&[
+        "--aq",
+        "activity",
+        "--aq-strength",
+        "6",
+        "--block-aq",
+        "block-delta",
+    ]);
+    let aq = &v["srsv2"]["aq"];
+    assert_eq!(aq["frame_aq"]["enabled"], true);
+    assert_eq!(aq["block_aq_wire"]["block_aq_enabled"], true);
+    assert_eq!(aq["block_aq_mode"], "block-delta");
 }
 
 #[test]
@@ -142,8 +158,8 @@ fn sweep_extended_adds_fixed_extra_rows() {
     let sweep = v["sweep"].as_array().unwrap();
     assert_eq!(
         sweep.len(),
-        30,
-        "24 base grid rows + 2 extended AQ/motion variants + 4 subpel integer/half-pel rows"
+        32,
+        "24 base grid rows + 2 extended AQ/motion variants + 4 subpel rows + 2 block-AQ rows"
     );
     let variants: Vec<_> = sweep
         .iter()
@@ -157,6 +173,8 @@ fn sweep_extended_adds_fixed_extra_rows() {
         variants.iter().any(|s| s.starts_with("subpel-")),
         "expected subpel sweep_variant rows"
     );
+    assert!(variants.contains(&"blockaq-off"));
+    assert!(variants.contains(&"blockaq-delta"));
 }
 
 #[test]

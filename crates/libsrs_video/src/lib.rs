@@ -25,11 +25,11 @@ pub use srsv2::{
     ColorPrimaries, ColorRange, CpuVideoAccelerator, DecodedVideoFrameV2, GpuVideoAccelerator,
     MatrixCoefficients, MotionSearchBackend, PixelFormat, PreviousFrameRcStats, QuantBackend,
     ReferenceFrameBuffer, ResidualEncodeStats, ResidualEntropy, SrsElementaryVideoCodecId,
-    SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats, SrsV2EncodeSettings, SrsV2Error,
-    SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2RateControlError,
-    SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode, SrsVideoCodecId, SrsVideoProfile,
-    Srsv2PayloadKind, TransferFunction, TransformBackend, VideoPlane, VideoSequenceHeaderV2,
-    YuvFrame, DEFAULT_DEBLOCK_STRENGTH,
+    SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats, SrsV2BlockAqMode, SrsV2EncodeSettings,
+    SrsV2Error, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
+    SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2SubpelMode,
+    SrsVideoCodecId, SrsVideoProfile, Srsv2PayloadKind, TransferFunction, TransformBackend,
+    VideoPlane, VideoSequenceHeaderV2, YuvFrame, DEFAULT_DEBLOCK_STRENGTH,
 };
 
 #[cfg(test)]
