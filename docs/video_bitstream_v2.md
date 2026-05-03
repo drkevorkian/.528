@@ -91,11 +91,27 @@ After `frame_index`, `qp`, `slot_a`, `slot_b`, **`flags`** (`u8`: bit **0** half
 
 Same header and dual grids as rev **16**, but each grid’s compact byte sequence is wrapped as **sym_count**, **blob_len**, **rANS blob** (two sections), then per-MB residuals. **Static** rANS model only; bounded decode.
 
+### Revision 19 — experimental **P** variable partition + compact MV (`FR2\x13`) — **opt-in**
+
+After `frame_index`, `qp`, **`flags`** (same low three bits as **P** rev **15**: subpel, block AQ, entropy residuals), optional **`clip_min`/`clip_max`**, **`n_mb`** partition-type bytes (**2** bits **MB type**: **0** = 16×16, **1** = 16×8, **2** = 8×16, **3** = 8×8; reserved high bits rejected), compact partitioned MV byte stream (median prediction), then per **8×8** luma region **ctrl** (**skip**, **transform**: **8×8** vs **4×4** vs reserved **16×16** marker) and length-prefixed residual chunks compatible with **`decode_p_residual_chunk`** / **`decode_p_residual_chunk_4x4`**. **Maximum partition units per frame** = **`macroblocks × 4`** (decoder-enforced). Chroma follows **first PU MV** per macroblock (same approximation family as other **P** revisions).
+
+### Revision 20 — experimental **P** variable partition + entropy MV (`FR2\x14`) — **opt-in**
+
+Same as rev **19**, but the compact MV bytes are wrapped **`sym_count`**, **`blob_len`**, static **rANS** blob (bounded).
+
+### Revision 21 — experimental **B** variable partition + compact inter (`FR2\x15`) — **parser placeholder**
+
+Magic is reserved and classified as **bidirectional** for mux policy; **decode returns structured `Unsupported` in this slice** (no silent pretend-decode).
+
+### Revision 22 — experimental **B** variable partition + entropy inter (`FR2\x16`) — **parser placeholder**
+
+Same honesty rule as rev **21**.
+
 ### Revision 12 — experimental alt-ref / hidden reference (`FR2\x0C`)
 
 Non-displayable intra-coded planes (same entropy style as **rev 3** in this slice): `frame_index`, `qp`, **`target_slot`**, **`reserved`** (must be **0**). Picture updates **`SrsV2ReferenceManager`** at **`target_slot`** with **`is_displayable == false`**; playback must **not** treat it as a presented frame.
 
-**Compatibility:** Revisions **1**–**14** remain readable; **15**–**18** add **opt-in** compact/entropy inter MV/header packing (**experimental**). The legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**18** — use **`decode_yuv420_srsv2_payload_managed`** for **B** and newer inter revisions.
+**Compatibility:** Revisions **1**–**14** remain readable; **15**–**22** extend **opt-in** inter experiments (**15**–**18**: fixed-MB compact/entropy MV; **19**–**20**: **P** variable partitions; **21**–**22**: **B** variable partitions — **not implemented**, honest **`Unsupported`**). The legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**18** and **B**-class **21**/**22** — use **`decode_yuv420_srsv2_payload_managed`** for **B** and managed reference paths.
 
 ## Elementary `.srsv2` file
 

@@ -23,7 +23,8 @@ use super::model::{PixelFormat, VideoSequenceHeaderV2};
 use super::motion_search::{pick_mv, sad_16x16, sample_u8_plane, SrsV2MotionEncodeStats};
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode,
-    SrsV2EncodeSettings, SrsV2InterSyntaxMode, SrsV2RdoMode, SrsV2SubpelMode,
+    SrsV2EncodeSettings, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2RdoMode,
+    SrsV2SubpelMode,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
@@ -504,6 +505,25 @@ pub fn encode_yuv420_p_payload(
         ));
     }
 
+    if settings.inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16 {
+        if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::RawLegacy) {
+            return Err(SrsV2Error::syntax(
+                "variable inter partitions require compact or entropy inter syntax (FR2 rev15+); raw legacy cannot represent partitioned MV",
+            ));
+        }
+        return super::p_var_partition::encode_yuv420_p_payload_var_partition(
+            seq,
+            cur,
+            reference,
+            frame_index,
+            qp,
+            settings,
+            stats,
+            motion_stats,
+            block_wire_acc,
+        );
+    }
+
     let radius = settings.clamped_motion_search_radius();
     let mb_cols = w / 16;
     let mb_rows = h / 16;
@@ -527,6 +547,11 @@ pub fn encode_yuv420_p_payload(
     ms.subpel_blocks_selected = 0;
     ms.additional_subpel_evaluations = 0;
     ms.sum_abs_frac_qpel = 0;
+    ms.partition = crate::srsv2::motion_search::SrsV2PartitionEncodeStats {
+        inter_partition_mode_label: "fixed16x16",
+        partition_16x16_count: (mb_cols as u64).saturating_mul(mb_rows as u64),
+        ..Default::default()
+    };
 
     let sub_vars = if block_aq_wire {
         collect_p_subblock_variances(&cur.y, mb_cols, mb_rows)
@@ -869,10 +894,15 @@ pub fn decode_yuv420_p_payload(
         return Err(SrsV2Error::Truncated);
     }
     let rev = payload[3];
-    if payload.len() < 4
-        || &payload[0..3] != b"FR2"
-        || !matches!(rev, 2 | 4 | 5 | 6 | 8 | 9 | 15 | 17)
-    {
+    if payload.len() < 4 || &payload[0..3] != b"FR2" {
+        return Err(SrsV2Error::BadMagic);
+    }
+    if matches!(rev, 19 | 20) {
+        return super::p_var_partition::decode_yuv420_p_payload_var_partition(
+            seq, payload, reference, rev,
+        );
+    }
+    if !matches!(rev, 2 | 4 | 5 | 6 | 8 | 9 | 15 | 17) {
         return Err(SrsV2Error::BadMagic);
     }
     let inter_compact = matches!(rev, 15 | 17);
@@ -1084,7 +1114,7 @@ pub fn decode_yuv420_p_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::srsv2::color::rgb888_full_to_yuv420_bt709;
+    use crate::srsv2::color::{gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709};
     use crate::srsv2::frame_codec::{decode_yuv420_srsv2_payload, encode_yuv420_intra_payload};
     use crate::srsv2::model::{
         ChromaSiting, ColorPrimaries, ColorRange, MatrixCoefficients, SrsVideoProfile,
@@ -1707,5 +1737,140 @@ mod tests {
         assert!(ms.subpel_enabled);
         assert!(ms.subpel_blocks_tested > 0);
         assert!(ms.additional_subpel_evaluations > 0);
+    }
+
+    #[test]
+    fn p_var_partition_split8x8_rev19_roundtrip_smoke() {
+        let seq = seq_inter(16, 16);
+        let mut rgb_cur = vec![80_u8; 16 * 16 * 3];
+        let rgb_ref = vec![120_u8; 16 * 16 * 3];
+        for y in 0..16 {
+            for x in 8..16 {
+                let i = (y * 16 + x) * 3;
+                rgb_cur[i] = 200;
+                rgb_cur[i + 1] = 200;
+                rgb_cur[i + 2] = 200;
+            }
+        }
+        let y_cur = rgb888_full_to_yuv420_bt709(&rgb_cur, 16, 16, ColorRange::Limited).unwrap();
+        let y_ref = rgb888_full_to_yuv420_bt709(&rgb_ref, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: crate::srsv2::rate_control::SrsV2InterPartitionMode::Split8x8,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: crate::srsv2::rate_control::SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let payload =
+            encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, 28, &settings, None, None, None)
+                .unwrap();
+        assert_eq!(payload[3], 19);
+        let dec = decode_yuv420_p_payload(&seq, &payload, &y_ref).unwrap();
+        assert_eq!(dec.frame_index, 1);
+    }
+
+    #[test]
+    fn p_var_partition_raw_inter_syntax_errors() {
+        let seq = seq_inter(16, 16);
+        let rgb = vec![128_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            inter_partition_mode: crate::srsv2::rate_control::SrsV2InterPartitionMode::Split8x8,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::RawLegacy,
+            ..Default::default()
+        };
+        assert!(
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).is_err()
+        );
+    }
+
+    #[test]
+    fn p_var_partition_reserved_partition_byte_rejected() {
+        let seq = seq_inter(16, 16);
+        let rgb = vec![100_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: crate::srsv2::rate_control::SrsV2InterPartitionMode::Split8x8,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
+        payload[10] |= 0x04;
+        assert!(decode_yuv420_p_payload(&seq, &payload, &yuv).is_err());
+    }
+
+    #[test]
+    fn p_var_partition_auto_fast_can_pick_split8x8() {
+        let seq = seq_inter(16, 16);
+        // Reference luma is spatially varying; current frame matches ref under ±4 horizontal
+        // shifts on the left/right 8×8 halves respectively — one 16×16 MV cannot match both.
+        let mut g_ref = vec![0_u8; 16 * 16];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                g_ref[y * 16 + x] =
+                    ((x.wrapping_mul(17)).wrapping_add(y.wrapping_mul(5)) & 255) as u8;
+            }
+        }
+        let mut g_cur = vec![0_u8; 16 * 16];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let sx = if x < 8 { x + 4 } else { x - 4 };
+                g_cur[y * 16 + x] = g_ref[y * 16 + sx];
+            }
+        }
+        let y_ref = gray8_packed_to_yuv420p8_neutral(&g_ref, 16, 16).unwrap();
+        let y_cur = gray8_packed_to_yuv420p8_neutral(&g_cur, 16, 16).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::ExhaustiveSmall,
+            motion_search_radius: 8,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: crate::srsv2::rate_control::SrsV2InterPartitionMode::AutoFast,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: crate::srsv2::rate_control::SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let mut ms = SrsV2MotionEncodeStats::default();
+        encode_yuv420_p_payload(
+            &seq,
+            &y_cur,
+            &y_ref,
+            1,
+            28,
+            &settings,
+            None,
+            Some(&mut ms),
+            None,
+        )
+        .unwrap();
+        assert!(
+            ms.partition.partition_8x8_count >= 1,
+            "expected AutoFast to emit at least one 8×8 partition on mixed-motion synthetic"
+        );
+    }
+
+    #[test]
+    fn p_var_partition_rev20_entropy_mv_roundtrip_smoke() {
+        let seq = seq_inter(16, 16);
+        let rgb = vec![128_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::EntropyV1,
+            inter_partition_mode: crate::srsv2::rate_control::SrsV2InterPartitionMode::Split8x8,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Auto,
+            enable_skip_blocks: false,
+            ..Default::default()
+        };
+        let payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
+        assert_eq!(payload[3], 20);
+        decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap();
     }
 }

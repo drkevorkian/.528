@@ -20,6 +20,7 @@ pub mod limits;
 pub mod model;
 pub mod motion_search;
 pub mod p_frame_codec;
+pub mod p_var_partition;
 pub mod payload_kind;
 pub mod rate_control;
 pub mod reference;
@@ -61,13 +62,19 @@ pub use model::{
     PixelFormat, SrsElementaryVideoCodecId, SrsVideoCodecId, SrsVideoProfile, TileHeaderV2,
     TransferFunction, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
 };
-pub use motion_search::{SrsV2InterMvBenchStats, SrsV2MotionEncodeStats, SrsV2RdoBenchStats};
+pub use motion_search::{
+    SrsV2InterMvBenchStats, SrsV2MotionEncodeStats, SrsV2PartitionEncodeStats, SrsV2RdoBenchStats,
+};
+pub use p_var_partition::{
+    FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR, FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
+};
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2RateControlError, SrsV2RateControlMode,
-    SrsV2RateController, SrsV2RdoMode, SrsV2SubpelMode,
+    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2RateControlError,
+    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformSize,
+    SrsV2TransformSizeMode,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};

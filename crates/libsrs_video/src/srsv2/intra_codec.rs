@@ -164,6 +164,25 @@ pub(crate) fn dequantize(block: &[i16; 64], qp: i16) -> [i16; 64] {
     o
 }
 
+pub(crate) fn quantize_4x4(block: &[i16; 16], qp: i16) -> [i16; 16] {
+    let q = qp.max(1);
+    let mut o = [0_i16; 16];
+    for i in 0..16 {
+        o[i] = ((block[i] as i32 + (q as i32 / 2) * block[i].signum() as i32) / q as i32)
+            .clamp(-32768, 32767) as i16;
+    }
+    o
+}
+
+pub(crate) fn dequantize_4x4(block: &[i16; 16], qp: i16) -> [i16; 16] {
+    let q = qp.max(1);
+    let mut o = [0_i16; 16];
+    for i in 0..16 {
+        o[i] = (block[i] as i32 * q as i32).clamp(-32768, 32767) as i16;
+    }
+    o
+}
+
 pub(crate) fn encode_plane_intra(
     plane: &VideoPlane<u8>,
     qp: i16,

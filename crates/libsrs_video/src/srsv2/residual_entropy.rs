@@ -7,11 +7,12 @@ use super::block_aq::{
     apply_qp_delta_clamped, choose_block_qp_delta, collect_plane_block_variances,
     validate_qp_clip_range, validate_wire_qp_delta,
 };
-use super::dct::ZIGZAG;
-use super::dct::{fdct_8x8, idct_8x8};
+use super::dct::{fdct_8x8, idct_4x4, idct_8x8, ZIGZAG, ZIGZAG_4X4};
 use super::error::SrsV2Error;
 use super::frame::VideoPlane;
-use super::intra_codec::{dequantize, pick_mode, predict_block, quantize, PredMode};
+use super::intra_codec::{
+    dequantize, dequantize_4x4, pick_mode, predict_block, quantize, PredMode,
+};
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::rate_control::{ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings};
 use super::residual_tokens::{
@@ -671,6 +672,85 @@ pub fn encode_p_residual_chunk(
     }
 }
 
+pub(crate) fn write_explicit_ac_only_4x4(
+    freq: &[i16; 16],
+    out: &mut Vec<u8>,
+) -> Result<(), SrsV2Error> {
+    let mut pairs = 0_usize;
+    let mut tmp = Vec::new();
+    for &k in ZIGZAG_4X4.iter().skip(1) {
+        let v = freq[k];
+        if v != 0 {
+            if pairs >= 15 {
+                return Err(SrsV2Error::syntax("too many 4x4 ac coeffs"));
+            }
+            tmp.push(k as u8);
+            tmp.extend_from_slice(&v.to_le_bytes());
+            pairs += 1;
+        }
+    }
+    let pairs_u16 = u16::try_from(pairs).map_err(|_| SrsV2Error::syntax("4x4 ac pairs"))?;
+    out.extend_from_slice(&pairs_u16.to_le_bytes());
+    out.extend_from_slice(&tmp);
+    if out.len() > MAX_FRAME_PAYLOAD_BYTES {
+        return Err(SrsV2Error::AllocationLimit {
+            context: "plane bitstream",
+        });
+    }
+    Ok(())
+}
+
+/// Packed **`FR2` rev 19+** 4×4 residual chunk (explicit tuples only in this slice).
+pub fn encode_p_residual_chunk_4x4(qfreq: &[i16; 16]) -> Result<Vec<u8>, SrsV2Error> {
+    let mut legacy = Vec::new();
+    legacy.push(PredMode::Dc as u8);
+    legacy.extend_from_slice(&qfreq[0].to_le_bytes());
+    write_explicit_ac_only_4x4(qfreq, &mut legacy)?;
+    let mut out = Vec::with_capacity(1 + legacy.len());
+    out.push(0);
+    out.extend_from_slice(&legacy);
+    Ok(out)
+}
+
+pub fn decode_p_residual_chunk_4x4(chunk: &[u8], qp: i16) -> Result<[[i16; 4]; 4], SrsV2Error> {
+    if chunk.is_empty() {
+        return Err(SrsV2Error::Truncated);
+    }
+    let layout = chunk[0];
+    let body = &chunk[1..];
+    let mut cur = 0usize;
+    if layout != 0 {
+        return Err(SrsV2Error::syntax("bad P 4x4 residual layout"));
+    }
+    let mode_b = read_u8(body, &mut cur)?;
+    PredMode::from_u8(mode_b)?;
+    let mut freq = [0_i16; 16];
+    freq[0] = read_i16(body, &mut cur)?;
+    let pairs = read_u16(body, &mut cur)? as usize;
+    if pairs > 15 {
+        return Err(SrsV2Error::syntax("4x4 ac pairs overflow"));
+    }
+    for _ in 0..pairs {
+        let pos = read_u8(body, &mut cur)? as usize;
+        if pos == 0 || pos > 15 {
+            return Err(SrsV2Error::syntax("bad 4x4 coeff index"));
+        }
+        freq[pos] = read_i16(body, &mut cur)?;
+    }
+    if cur != body.len() {
+        return Err(SrsV2Error::syntax("p 4x4 residual trailing"));
+    }
+    let recon_freq = dequantize_4x4(&freq, qp);
+    let rpix = idct_4x4(&recon_freq);
+    let mut out = [[0_i16; 4]; 4];
+    for r in 0..4 {
+        for c in 0..4 {
+            out[r][c] = rpix[r * 4 + c];
+        }
+    }
+    Ok(out)
+}
+
 pub fn decode_p_residual_chunk(chunk: &[u8], qp: i16) -> Result<[[i16; 8]; 8], SrsV2Error> {
     if chunk.is_empty() {
         return Err(SrsV2Error::Truncated);
@@ -744,6 +824,16 @@ mod residual_entropy_tests {
             f[k] = 1;
         }
         f
+    }
+
+    #[test]
+    fn p_residual_chunk_4x4_roundtrip_explicit() {
+        let mut q = [0_i16; 16];
+        q[0] = 5;
+        q[1] = 2;
+        let enc = encode_p_residual_chunk_4x4(&q).unwrap();
+        let pix = decode_p_residual_chunk_4x4(&enc, 18).unwrap();
+        assert!(pix.iter().flatten().any(|&v| v != 0));
     }
 
     #[test]

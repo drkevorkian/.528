@@ -19,6 +19,7 @@ Workspace tools (engineering measurements):
 - **Compare B modes (single command, no FFmpeg):** `--compare-b-modes` runs **SRSV2-P-only**, **SRSV2-B-int**, **SRSV2-B-half**, and **SRSV2-B-weighted** rows using the same clip/QP/motion/AQ settings; failures surface as **`error`** on that row (no silent downgrade). Combine with **`--compare-x264`** to append an optional x264 row when FFmpeg works.
 - **Inter MV/header syntax (experimental, opt-in):** **`--inter-syntax raw|compact|entropy`** selects legacy **FR2** rev **2/4/5/6/8/9** (**P**) / **10–14** (**B**) vs compact **15**/**16** vs entropy **17**/**18** when applicable. **`--compare-inter-syntax`** runs **SRSV2-raw**, **SRSV2-compact**, and **SRSV2-entropy** in one report; a failed variant (e.g. entropy) keeps an **error row** without aborting siblings. JSON **`srsv2`** (and each compare row’s **`details`**) includes **`mv_*`** aggregates (**`mv_prediction_mode`** is **`median-left-top-topright`** when populated), **`inter_header_bytes`**, **`inter_residual_bytes`**, and **`fr2_revision_counts`** for **rev15–18**.
 - **Fast RDO (experimental):** **`--rdo off|fast`** and **`--rdo-lambda-scale N`** (fixed-point; **256 ≈ 1.0**). **`--compare-rdo`** emits **SRSV2-rdo-off** vs **SRSV2-rdo-fast**. Reports include **`rdo_*`** counters (candidates tested, per-mode decisions, **`estimated_bits_used_for_decision`**). **Heuristic only** — not production Lagrangian RDO.
+- **Variable inter partitions (experimental, FR2 rev19+ on wire):** **`--inter-partition fixed16x16|split8x8|rect16x8|rect8x16|auto-fast`** (default **`fixed16x16`**), **`--transform-size auto|tx4x4|tx8x8`**. Non-default partitions require **`--inter-syntax compact`** or **`entropy`**. **`--compare-partitions`** runs three rows (**fixed16x16**, **split8x8**, **auto-fast**) with **`--inter-syntax compact`** for comparable MV packing; JSON/Markdown include nested **`partition`** counters (**`partition_*_count`**, **`transform_*_count`**, **`partition_*_bytes`**, **`rdo_partition_candidates_tested`**). **`AutoFast`** is a **bounded deterministic** heuristic — not full partition **RDO**.
 - **Sweep grid** (optional regression / weak-spot finder): `--sweep` runs a fixed grid of QP values `{18, 22, 28, 34}` × residual `{explicit, auto}` × motion radius `{0, 8, 16}` and writes a JSON array plus a Markdown table (`--compare-residual-modes` and `--sweep` are mutually exclusive). **`--sweep-extended`** appends optional rows: AQ/motion comparisons, a small **integer vs half-pel** grid (`subpel-*`), and **`blockaq-off` vs `blockaq-delta`** rows — not enabled by default.
 
 Legacy helper: `cargo run -p codec_compare -- --help` (optional **libx264** branch via `ffmpeg`).
@@ -48,6 +49,19 @@ Optional **`bench_srsv2`** flags (**defaults unchanged**): **`--bframes 0`** kee
 | B-weighted (optional) | 29318 | 24.24 | 0.9887 | Weight candidates exercised (**`b_weighted_candidates_tested` > 0**) but **no** MB picked weighted vs forward/back/avg on this clip. |
 
 **Local engineering baseline (not marketing proof):** numbers vary by CPU, OS, and build profile; re-run benches rather than treating this table as a product scorecard.
+
+### Local partition sweep (`var/bench/partition/`, 128×128, 16 frames, 30 fps, QP 28, keyint 30, `--residual-entropy explicit`, `--inter-syntax compact`, `--compare-partitions`)
+
+Reports: **`moving-square_128_compare_partitions.json`**, **`scrolling-bars_128_compare_partitions.json`**, **`checker_128_compare_partitions.json`**, **`scene-cut_128_compare_partitions.json`**. One **Windows** lab run (**debug** `bench_srsv2`):
+
+| Clip | fixed16×16 bytes | split8×8 bytes | auto-fast bytes | Notes |
+|------|------------------|----------------|-----------------|-------|
+| moving-square | 6772 | 18135 | 12456 | split/auto **raise** bytes vs fixed here but **improve** PSNR-Y (~27.97 vs ~26.06) / SSIM on this synthetic. |
+| scrolling-bars | 26516 | 58779 | 53629 | Higher motion texture; partitions add **MV + header** cost; quality metrics move slightly. |
+| checker | 25732 | 77295 | 71597 | Fine checker pattern; **4×4** transform path can activate under **`auto`** transform mode — bytes grow sharply vs fixed16×16. |
+| scene-cut | 23475 | 73523 | 67763 | Scene-change synthetic; split/auto increase size vs fixed on this clip at these settings. |
+
+This table is **not** proof of codec superiority vs **H.264** or any other encoder — only **repeatable local** SRSV2 engineering snapshots.
 
 ### Example: AQ + motion + skip flags (128×128 moving-square)
 

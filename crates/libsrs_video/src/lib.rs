@@ -31,15 +31,17 @@ pub use srsv2::{
     PixelFormat, PreviousFrameRcStats, QuantBackend, ReferenceFrameBuffer, ResidualEncodeStats,
     ResidualEntropy, SrsElementaryVideoCodecId, SrsV2AdaptiveQuantizationMode, SrsV2AqEncodeStats,
     SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2Error,
-    SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
-    SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
-    SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot, SrsV2SubpelMode,
+    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats,
+    SrsV2MotionSearchMode, SrsV2PartitionEncodeStats, SrsV2RateControlError, SrsV2RateControlMode,
+    SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceKind, SrsV2ReferenceManager,
+    SrsV2ReferenceSlot, SrsV2SubpelMode, SrsV2TransformSize, SrsV2TransformSizeMode,
     SrsVideoCodecId, SrsVideoProfile, Srsv2PayloadKind, TransferFunction, TransformBackend,
     VideoPlane, VideoSequenceHeaderV2, YuvFrame, B_WEIGHTED_PRED_CANDIDATES,
     DEFAULT_DEBLOCK_STRENGTH, FRAME_PAYLOAD_MAGIC_ALT_REF, FRAME_PAYLOAD_MAGIC_B,
     FRAME_PAYLOAD_MAGIC_B_COMPACT, FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY,
     FRAME_PAYLOAD_MAGIC_B_MB_BLEND, FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP,
-    FRAME_PAYLOAD_MAGIC_B_SUBPEL,
+    FRAME_PAYLOAD_MAGIC_B_SUBPEL, FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR,
+    FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
 };
 
 #[cfg(test)]

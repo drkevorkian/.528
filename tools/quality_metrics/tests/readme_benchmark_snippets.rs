@@ -29,4 +29,8 @@ fn readme_uses_current_synthetic_and_bench_flags() {
         s.contains("--residual-entropy"),
         "README should mention residual entropy flag"
     );
+    assert!(
+        s.contains("--compare-partitions"),
+        "README should mention partition comparison flag"
+    );
 }

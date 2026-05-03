@@ -31,7 +31,7 @@ pub fn classify_srsv2_payload(payload: &[u8]) -> Result<Srsv2PayloadKind, SrsV2E
     }
     Ok(match payload[3] {
         1 | 3 | 7 => Srsv2PayloadKind::Intra,
-        2 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 13 | 14 | 15 | 16 | 17 | 18 => {
+        2 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 => {
             Srsv2PayloadKind::Predicted
         }
         12 => Srsv2PayloadKind::AltRef,
@@ -163,6 +163,16 @@ mod classify_tests {
             classify_srsv2_payload(&[b'F', b'R', b'2', 17]).unwrap(),
             Srsv2PayloadKind::Predicted
         );
+    }
+
+    #[test]
+    fn fr2_rev19_through_22_are_predicted_for_mux_policy() {
+        for rev in [19u8, 20, 21, 22] {
+            assert_eq!(
+                classify_srsv2_payload(&[b'F', b'R', b'2', rev]).unwrap(),
+                Srsv2PayloadKind::Predicted
+            );
+        }
     }
 
     #[test]

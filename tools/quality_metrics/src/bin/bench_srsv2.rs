@@ -17,9 +17,10 @@ use libsrs_video::{
     encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
     PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
     SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
-    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager,
-    SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
+    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats,
+    SrsV2MotionSearchMode, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
+    SrsV2ReferenceManager, SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2,
+    YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -186,6 +187,18 @@ struct Args {
     /// Run **`--rdo off`** vs **`--rdo fast`** with other settings unchanged.
     #[arg(long, default_value_t = false)]
     compare_rdo: bool,
+
+    /// Compare **fixed16x16**, **split8x8**, and **auto-fast** inter partitions (uses **`--inter-syntax compact`** for each row).
+    #[arg(long, default_value_t = false)]
+    compare_partitions: bool,
+
+    /// Inter macroblock partition (**default** fixed16x16). Non-default modes require **`--inter-syntax compact`** or **`entropy`**.
+    #[arg(long, default_value = "fixed16x16")]
+    inter_partition: String,
+
+    /// Transform size for partitioned **P** payloads: **`auto`**, **`tx4x4`**, **`tx8x8`**.
+    #[arg(long, default_value = "auto")]
+    transform_size: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -275,6 +288,10 @@ struct Fr2RevisionCounts {
     rev16: u32,
     rev17: u32,
     rev18: u32,
+    rev19: u32,
+    rev20: u32,
+    rev21: u32,
+    rev22: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -357,6 +374,24 @@ struct MotionBenchReport {
     avg_fractional_mv_qpel_per_mb: f64,
     /// Experimental B-frame integer ME mode (`FR2` rev **13** bench).
     b_motion_search_mode: String,
+}
+
+/// Aggregated partition / transform counters from **`SrsV2MotionEncodeStats::partition`** over **P** frames.
+#[derive(Debug, Clone, Serialize, Default)]
+struct PartitionBenchSummary {
+    inter_partition_mode: String,
+    transform_size_mode: String,
+    partition_16x16_count: u64,
+    partition_16x8_count: u64,
+    partition_8x16_count: u64,
+    partition_8x8_count: u64,
+    transform_4x4_count: u64,
+    transform_8x8_count: u64,
+    transform_16x16_count: u64,
+    partition_header_bytes: u64,
+    partition_mv_bytes: u64,
+    partition_residual_bytes: u64,
+    rdo_partition_candidates_tested: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,6 +486,8 @@ struct Srsv2Details {
     bframe_ssim_y: f64,
     /// Displayable packets decoded, in bitstream/decode order (`decode_order_frame_indices.len()`).
     decode_order_count: u32,
+    #[serde(default)]
+    partition: PartitionBenchSummary,
 }
 
 impl Default for Srsv2Details {
@@ -518,6 +555,7 @@ impl Default for Srsv2Details {
             bframe_psnr_y: 0.0,
             bframe_ssim_y: 0.0,
             decode_order_count: 0,
+            partition: PartitionBenchSummary::default(),
         }
     }
 }
@@ -598,6 +636,8 @@ struct BenchReport {
     compare_inter_syntax: Option<Vec<VariantBenchEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_rdo: Option<Vec<VariantBenchEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_partitions: Option<Vec<VariantBenchEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     match_x264_bitrate_note: Option<String>,
     git_commit: Option<String>,
@@ -787,10 +827,14 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.compare_residual_modes && args.sweep {
         bail!("--compare-residual-modes and --sweep are mutually exclusive");
     }
-    if args.compare_inter_syntax as u8 + args.compare_rdo as u8 > 1 {
-        bail!("--compare-inter-syntax and --compare-rdo are mutually exclusive");
+    let compare_pass_count =
+        args.compare_inter_syntax as u8 + args.compare_rdo as u8 + args.compare_partitions as u8;
+    if compare_pass_count > 1 {
+        bail!(
+            "--compare-inter-syntax, --compare-rdo, and --compare-partitions are mutually exclusive"
+        );
     }
-    if (args.compare_inter_syntax || args.compare_rdo)
+    if (args.compare_inter_syntax || args.compare_rdo || args.compare_partitions)
         && (args.sweep || args.compare_residual_modes || args.compare_b_modes)
     {
         bail!("comparison modes cannot be combined with --sweep, --compare-residual-modes, or --compare-b-modes");
@@ -818,8 +862,18 @@ fn validate_args(args: &Args) -> Result<()> {
         bail!("alt-ref benchmark encode is not wired yet.");
     }
     parse_b_motion_search_mode(&args.b_motion_search)?;
-    parse_inter_syntax_mode(&args.inter_syntax)?;
+    let inter_syn = parse_inter_syntax_mode(&args.inter_syntax)?;
     parse_rdo_mode(&args.rdo)?;
+    let inter_partition_mode = parse_inter_partition_mode(&args.inter_partition)?;
+    parse_transform_size_mode(&args.transform_size)?;
+    if inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16
+        && inter_syn == SrsV2InterSyntaxMode::RawLegacy
+    {
+        bail!("non-default --inter-partition requires --inter-syntax compact or entropy (not raw)");
+    }
+    if inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16 && args.bframes > 0 {
+        bail!("non-default --inter-partition requires --bframes 0 in this slice");
+    }
     if args.bframes > 1 {
         bail!(
             "only --bframes 0 or 1 is supported in this experimental slice (got {})",
@@ -897,6 +951,63 @@ fn parse_rdo_mode(s: &str) -> Result<SrsV2RdoMode> {
     }
 }
 
+fn parse_inter_partition_mode(s: &str) -> Result<SrsV2InterPartitionMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "fixed16x16" | "fixed-16x16" => Ok(SrsV2InterPartitionMode::Fixed16x16),
+        "split8x8" | "split-8x8" => Ok(SrsV2InterPartitionMode::Split8x8),
+        "rect16x8" | "rect-16x8" => Ok(SrsV2InterPartitionMode::Rect16x8),
+        "rect8x16" | "rect-8x16" => Ok(SrsV2InterPartitionMode::Rect8x16),
+        "auto-fast" | "autofast" => Ok(SrsV2InterPartitionMode::AutoFast),
+        _ => Err(anyhow!(
+            "--inter-partition must be fixed16x16, split8x8, rect16x8, rect8x16, or auto-fast (got {s})"
+        )),
+    }
+}
+
+fn parse_transform_size_mode(s: &str) -> Result<SrsV2TransformSizeMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "auto" => Ok(SrsV2TransformSizeMode::Auto),
+        "tx4x4" | "4x4" => Ok(SrsV2TransformSizeMode::Force4x4),
+        "tx8x8" | "8x8" => Ok(SrsV2TransformSizeMode::Force8x8),
+        _ => Err(anyhow!(
+            "--transform-size must be auto, tx4x4, or tx8x8 (got {s})"
+        )),
+    }
+}
+
+fn inter_partition_cli_label(m: SrsV2InterPartitionMode) -> &'static str {
+    match m {
+        SrsV2InterPartitionMode::Fixed16x16 => "fixed16x16",
+        SrsV2InterPartitionMode::Split8x8 => "split8x8",
+        SrsV2InterPartitionMode::Rect16x8 => "rect16x8",
+        SrsV2InterPartitionMode::Rect8x16 => "rect8x16",
+        SrsV2InterPartitionMode::AutoFast => "auto-fast",
+    }
+}
+
+fn transform_size_cli_label(m: SrsV2TransformSizeMode) -> &'static str {
+    match m {
+        SrsV2TransformSizeMode::Auto => "auto",
+        SrsV2TransformSizeMode::Force4x4 => "tx4x4",
+        SrsV2TransformSizeMode::Force8x8 => "tx8x8",
+    }
+}
+
+fn motion_agg_add_partition(motion_agg: &mut MotionAgg, motion_frame: &SrsV2MotionEncodeStats) {
+    let p = &motion_frame.partition;
+    motion_agg.partition_16x16_count += p.partition_16x16_count;
+    motion_agg.partition_16x8_count += p.partition_16x8_count;
+    motion_agg.partition_8x16_count += p.partition_8x16_count;
+    motion_agg.partition_8x8_count += p.partition_8x8_count;
+    motion_agg.transform_4x4_count += p.transform_4x4_count;
+    motion_agg.transform_8x8_count += p.transform_8x8_count;
+    motion_agg.transform_16x16_count += p.transform_16x16_count;
+    motion_agg.partition_header_bytes += p.partition_header_bytes;
+    motion_agg.partition_mv_bytes += p.partition_mv_bytes;
+    motion_agg.partition_residual_bytes += p.partition_residual_bytes;
+    motion_agg.rdo_partition_candidates_tested += p.rdo_partition_candidates_tested;
+}
+
 fn parse_block_aq_mode(s: &str) -> Result<SrsV2BlockAqMode> {
     match s.to_ascii_lowercase().replace('_', "-").as_str() {
         "off" => Ok(SrsV2BlockAqMode::Off),
@@ -933,6 +1044,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let b_motion_search_mode = parse_b_motion_search_mode(&args.b_motion_search)?;
     let inter_syntax_mode = parse_inter_syntax_mode(&args.inter_syntax)?;
     let rdo_mode = parse_rdo_mode(&args.rdo)?;
+    let inter_partition_mode = parse_inter_partition_mode(&args.inter_partition)?;
+    let transform_size_mode = parse_transform_size_mode(&args.transform_size)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -962,6 +1075,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         inter_syntax_mode,
         rdo_mode,
         rdo_lambda_scale: args.rdo_lambda_scale,
+        inter_partition_mode,
+        transform_size_mode,
         ..Default::default()
     };
     s.validate_rate_control()
@@ -1000,6 +1115,17 @@ struct MotionAgg {
     rdo_residual_decisions: u64,
     rdo_no_residual_decisions: u64,
     rdo_estimated_bits: u64,
+    partition_16x16_count: u64,
+    partition_16x8_count: u64,
+    partition_8x16_count: u64,
+    partition_8x8_count: u64,
+    transform_4x4_count: u64,
+    transform_8x8_count: u64,
+    transform_16x16_count: u64,
+    partition_header_bytes: u64,
+    partition_mv_bytes: u64,
+    partition_residual_bytes: u64,
+    rdo_partition_candidates_tested: u64,
 }
 
 struct PassNumbers {
@@ -1101,6 +1227,10 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             16 => c.rev16 += 1,
             17 => c.rev17 += 1,
             18 => c.rev18 += 1,
+            19 => c.rev19 += 1,
+            20 => c.rev20 += 1,
+            21 => c.rev21 += 1,
+            22 => c.rev22 += 1,
             _ => {}
         }
     }
@@ -1351,7 +1481,10 @@ fn run_srsv2_numbers_b_gop(
                 )
                 .map_err(|e| anyhow!("SRSV2 encode P {fi}: {e}"))?;
                 anchor_p_payload_bytes.push(pl.len() as u64);
-                let is_p_wire = matches!(pl.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17));
+                let is_p_wire = matches!(
+                    pl.get(3).copied(),
+                    Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20)
+                );
                 if is_p_wire {
                     motion_agg.sad_evaluations += motion_frame.sad_evaluations;
                     motion_agg.skip_subblocks += motion_frame.skip_subblocks;
@@ -1381,6 +1514,7 @@ fn run_srsv2_numbers_b_gop(
                     motion_agg.rdo_residual_decisions += rd.residual_decisions;
                     motion_agg.rdo_no_residual_decisions += rd.no_residual_decisions;
                     motion_agg.rdo_estimated_bits += rd.estimated_bits_used_for_decision;
+                    motion_agg_add_partition(&mut motion_agg, &motion_frame);
                 }
                 pl
             }
@@ -1621,7 +1755,7 @@ fn run_srsv2_numbers(
         aq_last = aq_frame;
         let is_p = matches!(
             payload.get(3).copied(),
-            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17)
+            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20)
         );
         if is_p {
             motion_agg.sad_evaluations += motion_frame.sad_evaluations;
@@ -1650,6 +1784,7 @@ fn run_srsv2_numbers(
             motion_agg.rdo_residual_decisions += rd.residual_decisions;
             motion_agg.rdo_no_residual_decisions += rd.no_residual_decisions;
             motion_agg.rdo_estimated_bits += rd.estimated_bits_used_for_decision;
+            motion_agg_add_partition(&mut motion_agg, &motion_frame);
         }
 
         let is_i = matches!(payload.get(3).copied(), Some(1 | 3 | 7));
@@ -1755,7 +1890,10 @@ fn run_srsv2_numbers(
 
     let mut p_wire_bytes: Vec<u64> = Vec::new();
     for pl in &payloads {
-        if matches!(pl.get(3).copied(), Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17)) {
+        if matches!(
+            pl.get(3).copied(),
+            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20)
+        ) {
             p_wire_bytes.push(pl.len() as u64);
         }
     }
@@ -1892,8 +2030,8 @@ fn pass_to_details(
     for pl in &p.payloads {
         match pl.get(3).copied() {
             Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
-            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17) => p_bytes.push(pl.len() as u64),
-            Some(10 | 11 | 13 | 14 | 16 | 18) => b_bytes.push(pl.len() as u64),
+            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20) => p_bytes.push(pl.len() as u64),
+            Some(10 | 11 | 13 | 14 | 16 | 18 | 21 | 22) => b_bytes.push(pl.len() as u64),
             Some(12) => alt_bytes.push(pl.len() as u64),
             _ => {}
         }
@@ -1969,6 +2107,22 @@ fn pass_to_details(
         bframe_mode_note: p.bframe_mode_note.clone(),
         bframe_psnr_y: p.bframe_psnr_y,
         bframe_ssim_y: p.bframe_ssim_y,
+        partition: PartitionBenchSummary {
+            inter_partition_mode: inter_partition_cli_label(settings.inter_partition_mode)
+                .to_string(),
+            transform_size_mode: transform_size_cli_label(settings.transform_size_mode).to_string(),
+            partition_16x16_count: m.partition_16x16_count,
+            partition_16x8_count: m.partition_16x8_count,
+            partition_8x16_count: m.partition_8x16_count,
+            partition_8x8_count: m.partition_8x8_count,
+            transform_4x4_count: m.transform_4x4_count,
+            transform_8x8_count: m.transform_8x8_count,
+            transform_16x16_count: m.transform_16x16_count,
+            partition_header_bytes: m.partition_header_bytes,
+            partition_mv_bytes: m.partition_mv_bytes,
+            partition_residual_bytes: m.partition_residual_bytes,
+            rdo_partition_candidates_tested: m.rdo_partition_candidates_tested,
+        },
     }
 }
 
@@ -2134,6 +2288,7 @@ fn run_compare_b_modes_report(
         compare_b_modes: Some(rows),
         compare_inter_syntax: None,
         compare_rdo: None,
+        compare_partitions: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2201,6 +2356,7 @@ fn run_single_report(
         compare_b_modes: None,
         compare_inter_syntax: None,
         compare_rdo: None,
+        compare_partitions: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2337,6 +2493,7 @@ fn run_compare_residual_report(
         compare_b_modes: None,
         compare_inter_syntax: None,
         compare_rdo: None,
+        compare_partitions: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2465,6 +2622,7 @@ fn run_compare_inter_syntax_report(
         compare_b_modes: None,
         compare_inter_syntax: Some(entries),
         compare_rdo: None,
+        compare_partitions: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2589,6 +2747,137 @@ fn run_compare_rdo_report(
         compare_b_modes: None,
         compare_inter_syntax: None,
         compare_rdo: Some(entries),
+        compare_partitions: None,
+        match_x264_bitrate_note: None,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
+}
+
+fn run_compare_partitions_report(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    let re = parse_residual_entropy(&args.residual_entropy)?;
+    let modes = [
+        ("SRSV2-part-fixed16x16", "fixed16x16"),
+        ("SRSV2-part-split8x8", "split8x8"),
+        ("SRSV2-part-auto-fast", "auto-fast"),
+    ];
+    let mut entries = Vec::new();
+    let mut table = Vec::new();
+    let mut primary: Option<Srsv2Details> = None;
+
+    for (label, ip_s) in modes {
+        let mut a = args.clone();
+        a.inter_partition = ip_s.to_string();
+        a.inter_syntax = "compact".to_string();
+        let settings = match build_settings(&a, re) {
+            Ok(s) => s,
+            Err(e) => {
+                entries.push(VariantBenchEntry {
+                    label: label.to_string(),
+                    ok: false,
+                    error: Some(format!("settings: {e:#}")),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(format!("settings: {e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        inter_syntax_mode: "compact".to_string(),
+                        residual_entropy: args.residual_entropy.clone(),
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+                continue;
+            }
+        };
+
+        match run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
+            Ok(numbers) => {
+                let row = pass_to_row(&a, label, &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details = pass_to_details(
+                    &a,
+                    seq,
+                    &settings,
+                    &args.residual_entropy,
+                    &numbers,
+                    deblock,
+                );
+                if primary.is_none() {
+                    primary = Some(details.clone());
+                }
+                entries.push(VariantBenchEntry {
+                    label: label.to_string(),
+                    ok: true,
+                    error: None,
+                    row: row.clone(),
+                    details,
+                });
+                table.push(row);
+            }
+            Err(e) => {
+                entries.push(VariantBenchEntry {
+                    label: label.to_string(),
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(format!("{e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        inter_syntax_mode: "compact".to_string(),
+                        residual_entropy: args.residual_entropy.clone(),
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+            }
+        }
+    }
+
+    let srsv2 = primary.unwrap_or_else(|| entries[0].details.clone());
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "`--compare-partitions` runs fixed16x16, split8x8, and auto-fast with `--inter-syntax compact` for comparable MV packing; see each row's `partition` stats.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2,
+        x264: None,
+        table,
+        compare_residual_modes: None,
+        sweep: None,
+        compare_b_modes: None,
+        compare_inter_syntax: None,
+        compare_rdo: None,
+        compare_partitions: Some(entries),
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2829,6 +3118,8 @@ fn main() -> Result<()> {
         run_compare_inter_syntax_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_rdo {
         run_compare_rdo_report(&args, &seq, &raw, expected_frame)?
+    } else if args.compare_partitions {
+        run_compare_partitions_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_residual_modes {
         run_compare_residual_report(&args, &seq, &raw, expected_frame)?
     } else {
@@ -3222,6 +3513,29 @@ fn to_markdown(r: &BenchReport) -> String {
         }
     }
 
+    if let Some(rows) = &r.compare_partitions {
+        out.push_str("\n## Partition comparison (`--compare-partitions`)\n\n");
+        for e in rows {
+            let p = &e.details.partition;
+            out.push_str(&format!(
+                "- **{}**: ok={} bytes={} PSNR-Y={:.2} part={}/{}/{}/{} tx={}/{}/{} rdo_part_cand={} err={:?}\n",
+                e.label,
+                e.ok,
+                e.row.bytes,
+                e.row.psnr_y,
+                p.partition_16x16_count,
+                p.partition_16x8_count,
+                p.partition_8x16_count,
+                p.partition_8x8_count,
+                p.transform_4x4_count,
+                p.transform_8x8_count,
+                p.transform_16x16_count,
+                p.rdo_partition_candidates_tested,
+                e.error
+            ));
+        }
+    }
+
     if let Some(note) = &r.match_x264_bitrate_note {
         out.push_str("\n## Bitrate matching note\n\n");
         out.push_str(note);
@@ -3526,6 +3840,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -3585,6 +3902,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         assert!(validate_args(&a).is_err());
         a.bframes = 0;
@@ -3643,6 +3963,72 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: true,
             compare_rdo: true,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
+        };
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "unexpected validate message: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_compare_partitions_with_compare_inter_syntax() {
+        let a = Args {
+            input: PathBuf::from("nope"),
+            width: 64,
+            height: 64,
+            frames: 1,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+            inter_syntax: "compact".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
+            compare_inter_syntax: true,
+            compare_rdo: false,
+            compare_partitions: true,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -3703,6 +4089,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -3765,6 +4154,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         assert!(validate_args(&a).is_err());
         a.reference_frames = 2;
@@ -3841,6 +4233,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -3908,6 +4303,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -3992,6 +4390,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -4059,6 +4460,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -4131,6 +4535,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         validate_args(&a).unwrap();
         let s = build_settings(&a, ResidualEntropy::Auto).unwrap();
@@ -4237,6 +4644,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
         let seq = build_seq_header(&args, &settings);
@@ -4382,6 +4792,7 @@ mod tests {
                 bframe_psnr_y: 0.0,
                 bframe_ssim_y: 0.0,
                 decode_order_count: 1,
+                partition: PartitionBenchSummary::default(),
             },
             x264: None,
             table: vec![CodecRow {
@@ -4400,6 +4811,7 @@ mod tests {
             compare_b_modes: None,
             compare_inter_syntax: None,
             compare_rdo: None,
+            compare_partitions: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -4491,6 +4903,7 @@ mod tests {
                 bframe_psnr_y: 0.0,
                 bframe_ssim_y: 0.0,
                 decode_order_count: 0,
+                partition: PartitionBenchSummary::default(),
             },
             x264: None,
             table: vec![],
@@ -4572,17 +4985,47 @@ mod tests {
                     bframe_psnr_y: 0.0,
                     bframe_ssim_y: 0.0,
                     decode_order_count: 0,
+                    partition: PartitionBenchSummary::default(),
                 },
             }]),
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
             compare_rdo: None,
+            compare_partitions: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
         };
         let _ = serde_json::to_string(&r).unwrap();
+    }
+
+    #[test]
+    fn compare_partitions_report_serializes() {
+        let r = BenchReport {
+            note: "x",
+            residual_note: "n",
+            command: "cmd".to_string(),
+            raw_bytes: 1,
+            width: 128,
+            height: 128,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            table: vec![],
+            compare_residual_modes: None,
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: Some(vec![]),
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "os".to_string(),
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert!(js.contains("\"compare_partitions\":[]"));
     }
 
     #[test]
@@ -4671,6 +5114,7 @@ mod tests {
                     bframe_psnr_y: 0.0,
                     bframe_ssim_y: 0.0,
                     decode_order_count: 0,
+                    partition: PartitionBenchSummary::default(),
                 },
             }],
             git_commit: None,
@@ -4731,6 +5175,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
@@ -4789,6 +5236,9 @@ mod tests {
             b_weighted_prediction: false,
             compare_inter_syntax: false,
             compare_rdo: false,
+            compare_partitions: false,
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
         };
         assert!(validate_args(&a).is_err());
         a.aq = "off".to_string();

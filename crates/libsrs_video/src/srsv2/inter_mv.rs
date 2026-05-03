@@ -216,6 +216,141 @@ pub fn rans_decode_mv_bytes(
     Ok(syms.into_iter().map(|s| s as u8).collect())
 }
 
+/// `FR2` rev **19**+ macroblock partition types (low **2** bits; upper bits must be **0**).
+pub const P_PART_WIRE_16X16: u8 = 0;
+pub const P_PART_WIRE_16X8: u8 = 1;
+pub const P_PART_WIRE_8X16: u8 = 2;
+pub const P_PART_WIRE_8X8: u8 = 3;
+
+#[inline]
+pub fn pu_count_partition_wire(pt: u8) -> Result<usize, SrsV2Error> {
+    let p = validate_partition_reserved_bits(pt)?;
+    Ok(match p {
+        P_PART_WIRE_16X16 => 1,
+        P_PART_WIRE_16X8 | P_PART_WIRE_8X16 => 2,
+        P_PART_WIRE_8X8 => 4,
+        _ => {
+            return Err(SrsV2Error::syntax("bad P partition wire"));
+        }
+    })
+}
+
+#[inline]
+pub fn validate_partition_reserved_bits(b: u8) -> Result<u8, SrsV2Error> {
+    if b & !3 != 0 {
+        return Err(SrsV2Error::syntax("P partition reserved bits"));
+    }
+    Ok(b & 3)
+}
+
+/// Sum of partition units; rejects if larger than **macroblocks × 4**.
+pub fn total_partition_units_bounded(
+    partition_bytes: &[u8],
+    max_mb: usize,
+) -> Result<usize, SrsV2Error> {
+    let mut t = 0usize;
+    for &b in partition_bytes {
+        let pt = validate_partition_reserved_bits(b)?;
+        t = t
+            .checked_add(pu_count_partition_wire(pt)?)
+            .ok_or_else(|| SrsV2Error::syntax("P partition unit count overflow"))?;
+        if t > max_mb.saturating_mul(4) {
+            return Err(SrsV2Error::syntax("P partition unit cap exceeded"));
+        }
+    }
+    Ok(t)
+}
+
+/// Encode MVs for variable partitions: first PU per MB uses spatial median; further PUs use previous PU MV.
+pub fn encode_mv_stream_partitioned(
+    mb_cols: u32,
+    mb_rows: u32,
+    partition_types: &[u8],
+    pu_mvs: &[(i32, i32)],
+) -> Result<Vec<u8>, SrsV2Error> {
+    let n_mb = (mb_cols * mb_rows) as usize;
+    if partition_types.len() != n_mb {
+        return Err(SrsV2Error::syntax("P partition byte count mismatch"));
+    }
+    let total = total_partition_units_bounded(partition_types, n_mb)?;
+    if pu_mvs.len() != total {
+        return Err(SrsV2Error::syntax("P MV PU count mismatch"));
+    }
+    let mut grid_first = vec![(0_i32, 0_i32); n_mb];
+    let mut out = Vec::new();
+    let mut pu_i = 0usize;
+    for mby in 0..mb_rows {
+        for mbx in 0..mb_cols {
+            let idx = (mby * mb_cols + mbx) as usize;
+            let pt = validate_partition_reserved_bits(partition_types[idx])?;
+            let npu = pu_count_partition_wire(pt)?;
+            for pi in 0..npu {
+                let pred = if pi == 0 {
+                    predict_mv_qpel(mbx, mby, mb_cols, &grid_first)
+                } else {
+                    pu_mvs[pu_i - 1]
+                };
+                let mv = pu_mvs[pu_i];
+                write_signed_varint(&mut out, mv.0 - pred.0);
+                write_signed_varint(&mut out, mv.1 - pred.1);
+                pu_i += 1;
+            }
+            grid_first[idx] = pu_mvs[pu_i - npu];
+        }
+    }
+    Ok(out)
+}
+
+pub fn decode_mv_stream_partitioned<F>(
+    data: &[u8],
+    cur: &mut usize,
+    mb_cols: u32,
+    mb_rows: u32,
+    partition_types: &[u8],
+    validate: &mut F,
+) -> Result<Vec<(i32, i32)>, SrsV2Error>
+where
+    F: FnMut(i32, i32) -> Result<(), SrsV2Error>,
+{
+    let n_mb = (mb_cols * mb_rows) as usize;
+    if partition_types.len() != n_mb {
+        return Err(SrsV2Error::syntax("P partition byte count mismatch"));
+    }
+    let total = total_partition_units_bounded(partition_types, n_mb)?;
+    let mut out = Vec::with_capacity(total);
+    let mut grid_first = vec![(0_i32, 0_i32); n_mb];
+    for mby in 0..mb_rows {
+        for mbx in 0..mb_cols {
+            let idx = (mby * mb_cols + mbx) as usize;
+            let pt = validate_partition_reserved_bits(partition_types[idx])?;
+            let npu = pu_count_partition_wire(pt)?;
+            for pi in 0..npu {
+                let pred = if pi == 0 {
+                    predict_mv_qpel(mbx, mby, mb_cols, &grid_first)
+                } else {
+                    *out.last()
+                        .ok_or_else(|| SrsV2Error::syntax("P MV PU decode underflow"))?
+                };
+                let dx = read_signed_varint(data, cur)?;
+                let dy = read_signed_varint(data, cur)?;
+                let mvx = pred
+                    .0
+                    .checked_add(dx)
+                    .ok_or(SrsV2Error::CorruptedMotionVector)?;
+                let mvy = pred
+                    .1
+                    .checked_add(dy)
+                    .ok_or(SrsV2Error::CorruptedMotionVector)?;
+                validate(mvx, mvy)?;
+                out.push((mvx, mvy));
+            }
+            let start = out.len() - npu;
+            grid_first[idx] = out[start];
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,5 +448,25 @@ mod tests {
         let mut c = 0usize;
         let dec = decode_mv_grid_compact(&enc, &mut c, 3, 1, |_x, _y| Ok(())).unwrap();
         assert_eq!(dec, mvs);
+    }
+
+    #[test]
+    fn partitioned_mv_stream_roundtrips_two_mbs() {
+        let mb_cols = 2u32;
+        let mb_rows = 1u32;
+        let parts = vec![P_PART_WIRE_16X16, P_PART_WIRE_8X8];
+        let mvs = vec![(0, 0), (8, 0), (0, 8), (8, 8), (4, -4)];
+        let enc = encode_mv_stream_partitioned(mb_cols, mb_rows, &parts, &mvs).unwrap();
+        let mut cur = 0usize;
+        let mut val = |_mx: i32, _my: i32| Ok(());
+        let dec = decode_mv_stream_partitioned(&enc, &mut cur, mb_cols, mb_rows, &parts, &mut val)
+            .unwrap();
+        assert_eq!(dec, mvs);
+        assert_eq!(cur, enc.len());
+    }
+
+    #[test]
+    fn partition_reserved_bits_rejected() {
+        assert!(validate_partition_reserved_bits(4).is_err());
     }
 }

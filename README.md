@@ -38,7 +38,7 @@ Further detail: `docs/specs/compatibility_layer.md`, `docs/specs/container_forma
 
 Further playback architecture: `docs/playback_pipeline.md`.
 
-**SRSV2 experimental status (short):** **B-frame** syntax — experimental (rev **10**/integer MV + frame blend, rev **11**/half-pel, rev **13**/per-MB blend + integer MV, rev **14**/per-MB blend + half-pel MV grid + optional weighted candidates). **Compact / entropy inter MV** — experimental **`FR2` rev 15/17 (**P**) and 16/18 (**B**)**: median-predicted MV deltas (zigzag varints), optional **static** rANS over MV bytes; **opt-in** via encoder settings / **`bench_srsv2 --inter-syntax`**; **not** default; **not** CABAC-class. **`bench_srsv2 --bframes 1`** uses rev **13** or **14** depending on **`--b-motion-search`** / **`--b-weighted-prediction`** (unless **`--inter-syntax`** selects **16**/**18**). **`--compare-inter-syntax`** and **`--compare-rdo`** batch measurement rows (see `docs/srsv2_benchmarks.md`). **`--compare-b-modes`** runs **P-only**, **B-int**, **B-half**, and **B-weighted** rows in one report (see `docs/srsv2_benchmarks.md`). **Alt-ref** (rev **12**) — experimental non-display reference; **`bench_srsv2 --alt-ref on`** is rejected (“not wired yet”) so reports stay honest. **Benchmark B-GOP** (`bench_srsv2 --bframes 1`, keyint-aware **I/B/P** placement, decode order may be *I₀→P₂→B₁…*, metrics in display/`frame_index` order; **`--bframes > 1`** unsupported). Optional **`--b-motion-search independent-forward-backward`** enables integer B ME (rev **13**); **`independent-forward-backward-half`** enables half-pel B refinement (rev **14**). Optional **`--b-weighted-prediction`** enables weighted blend candidates (rev **14** wire). **B** RDO and production GOP placement remain future work. No claim that SRSV2 “beats” H.264 or other codecs — see `docs/h264_competition_plan.md` for an honest gap list.
+**SRSV2 experimental status (short):** **B-frame** syntax — experimental (rev **10**/integer MV + frame blend, rev **11**/half-pel, rev **13**/per-MB blend + integer MV, rev **14**/per-MB blend + half-pel MV grid + optional weighted candidates). **Compact / entropy inter MV** — experimental **`FR2` rev 15/17 (**P**) and 16/18 (**B**)**: median-predicted MV deltas (zigzag varints), optional **static** rANS over MV bytes; **opt-in** via encoder settings / **`bench_srsv2 --inter-syntax`**; **not** default; **not** CABAC-class. **Variable P-frame inter partitions** — experimental **`FR2` rev 19/20** (revs **21**/**22** **B** placeholders decode as **`Unsupported`**); default encoding stays **fixed 16×16**; **`bench_srsv2 --inter-partition`**, **`--transform-size`**, **`--compare-partitions`** (see `docs/srsv2_benchmarks.md`). **`bench_srsv2 --bframes 1`** uses rev **13** or **14** depending on **`--b-motion-search`** / **`--b-weighted-prediction`** (unless **`--inter-syntax`** selects **16**/**18**). **`--compare-inter-syntax`**, **`--compare-rdo`**, and **`--compare-partitions`** are mutually exclusive batch modes (see `docs/srsv2_benchmarks.md`). **`--compare-b-modes`** runs **P-only**, **B-int**, **B-half**, and **B-weighted** rows in one report (see `docs/srsv2_benchmarks.md`). **Alt-ref** (rev **12**) — experimental non-display reference; **`bench_srsv2 --alt-ref on`** is rejected (“not wired yet”) so reports stay honest. **Benchmark B-GOP** (`bench_srsv2 --bframes 1`, keyint-aware **I/B/P** placement, decode order may be *I₀→P₂→B₁…*, metrics in display/`frame_index` order; **`--bframes > 1`** unsupported). Optional **`--b-motion-search independent-forward-backward`** enables integer B ME (rev **13**); **`independent-forward-backward-half`** enables half-pel B refinement (rev **14**). Optional **`--b-weighted-prediction`** enables weighted blend candidates (rev **14** wire). **B** RDO and production GOP placement remain future work. No claim that SRSV2 “beats” H.264 or other codecs — see `docs/h264_competition_plan.md` for an honest gap list.
 
 ### Benchmark tooling (optional, engineering measurements)
 
@@ -105,6 +105,16 @@ Further playback architecture: `docs/playback_pipeline.md`.
     --qp 28 --keyint 30 --motion-radius 16 --residual-entropy auto \
     --compare-rdo \
     --report-json var/bench/flat_rdo_cmp.json --report-md var/bench/flat_rdo_cmp.md
+  ```
+
+- **Variable P-frame partitions (experimental rev **19**/**20** wire):** **`--inter-syntax compact`** (or **`entropy`**) required when **`--inter-partition`** is not **`fixed16x16`**. **`--compare-partitions`** batches **fixed16x16**, **split8x8**, **auto-fast**:
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 --residual-entropy explicit \
+    --inter-syntax compact --compare-partitions \
+    --report-json var/bench/flat_part_cmp.json --report-md var/bench/flat_part_cmp.md
   ```
 
 - **Rate control knobs** (encoder-side QP selection for the benchmark loop; see `docs/rate_control.md`):

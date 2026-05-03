@@ -134,6 +134,45 @@ pub enum SrsV2RdoMode {
     Fast,
 }
 
+/// Experimental **inter luma partition** per 16×16 macroblock (`FR2` rev **19**–**22** only).
+///
+/// **`Fixed16x16`** keeps legacy **`FR2` rev 2–17** wiring; other modes require compact/entropy inter syntax and emit **rev 19+**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2InterPartitionMode {
+    /// Legacy single MV + four 8×8 residual slots (`FR2` rev **2**–**17** family).
+    #[default]
+    Fixed16x16,
+    /// Four 8×8 partitions with independent MVs each.
+    Split8x8,
+    /// Two horizontal 16×8 partitions.
+    Rect16x8,
+    /// Two vertical 8×16 partitions.
+    Rect8x16,
+    /// Bounded heuristic: compare 16×16 vs 8×8 first; optionally adds rect partitions when cheap.
+    AutoFast,
+}
+
+/// Residual transform size for **`FR2` rev 19+** partition payloads (per 8×8 luma sub-region unless noted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrsV2TransformSize {
+    /// Four 4×4 DCT blocks inside each 8×8 residual region.
+    Tx4x4,
+    /// Single 8×8 DCT (baseline SRSV2 path).
+    Tx8x8,
+    /// Parser marker only in this slice — encoder must not emit; decoder rejects if signaled.
+    Tx16x16Candidate,
+}
+
+/// Encoder transform selection for partitioned **P**/**B** (`FR2` rev **19**+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2TransformSizeMode {
+    /// Pick **Tx8x8** vs **Tx4x4** per 8×8 region using a deterministic detail heuristic.
+    #[default]
+    Auto,
+    Force4x4,
+    Force8x8,
+}
+
 /// Experimental **B-frame** motion / blend search (`FR2` rev **13** integer MVs, rev **14** half-pel MVs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2BMotionSearchMode {
@@ -197,6 +236,15 @@ pub struct SrsV2EncodeSettings {
     pub rdo_mode: SrsV2RdoMode,
     /// Fixed-point λ scale for [`SrsV2RdoMode::Fast`] (**256 ≈ 1.0**).
     pub rdo_lambda_scale: u16,
+
+    /// Experimental variable inter partitions (**default** [`SrsV2InterPartitionMode::Fixed16x16`]).
+    pub inter_partition_mode: SrsV2InterPartitionMode,
+    /// Reserved partition-tree depth cap (**`0`** = default non-recursive layouts only).
+    pub max_partition_depth: u8,
+    /// Extra λ scale for partition-mode decisions (**256 ≈ 1.0**); multiplied with [`rdo_lambda_effective`].
+    pub partition_rdo_lambda_scale: u16,
+    /// Transform choice for **`FR2` rev 19+** partitioned residuals.
+    pub transform_size_mode: SrsV2TransformSizeMode,
 }
 
 impl Default for SrsV2EncodeSettings {
@@ -237,6 +285,11 @@ impl Default for SrsV2EncodeSettings {
             inter_syntax_mode: SrsV2InterSyntaxMode::RawLegacy,
             rdo_mode: SrsV2RdoMode::Off,
             rdo_lambda_scale: 256,
+
+            inter_partition_mode: SrsV2InterPartitionMode::Fixed16x16,
+            max_partition_depth: 0,
+            partition_rdo_lambda_scale: 256,
+            transform_size_mode: SrsV2TransformSizeMode::Auto,
         }
     }
 }

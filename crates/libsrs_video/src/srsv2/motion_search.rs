@@ -39,6 +39,23 @@ impl Default for SrsV2InterMvBenchStats {
     }
 }
 
+/// Experimental partition counters (`FR2` rev **19**+).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SrsV2PartitionEncodeStats {
+    pub inter_partition_mode_label: &'static str,
+    pub partition_16x16_count: u64,
+    pub partition_16x8_count: u64,
+    pub partition_8x16_count: u64,
+    pub partition_8x8_count: u64,
+    pub transform_4x4_count: u64,
+    pub transform_8x8_count: u64,
+    pub transform_16x16_count: u64,
+    pub partition_header_bytes: u64,
+    pub partition_mv_bytes: u64,
+    pub partition_residual_bytes: u64,
+    pub rdo_partition_candidates_tested: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SrsV2RdoBenchStats {
     pub candidates_tested: u64,
@@ -68,6 +85,7 @@ pub struct SrsV2MotionEncodeStats {
     pub sum_abs_frac_qpel: u64,
     pub inter_mv: SrsV2InterMvBenchStats,
     pub rdo: SrsV2RdoBenchStats,
+    pub partition: SrsV2PartitionEncodeStats,
 }
 
 pub(crate) fn sample_u8_plane(plane: &VideoPlane<u8>, x: i32, y: i32) -> u8 {
@@ -77,6 +95,159 @@ pub(crate) fn sample_u8_plane(plane: &VideoPlane<u8>, x: i32, y: i32) -> u8 {
         return 128;
     }
     plane.samples[y as usize * plane.stride + x as usize]
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sad_rect_integer(
+    cur: &VideoPlane<u8>,
+    refp: &VideoPlane<u8>,
+    org_x: u32,
+    org_y: u32,
+    w: u32,
+    h: u32,
+    mvx: i32,
+    mvy: i32,
+) -> u32 {
+    let mut acc = 0_u32;
+    for row in 0..h {
+        for col in 0..w {
+            let lx = org_x + col;
+            let ly = org_y + row;
+            let cx = cur.samples[ly as usize * cur.stride + lx as usize];
+            let pv = sample_u8_plane(refp, lx as i32 + mvx, ly as i32 + mvy);
+            acc += cx.abs_diff(pv) as u32;
+        }
+    }
+    acc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_rect(
+    cur: &VideoPlane<u8>,
+    refp: &VideoPlane<u8>,
+    org_x: u32,
+    org_y: u32,
+    w: u32,
+    h: u32,
+    mvx: i32,
+    mvy: i32,
+    evals: &mut u64,
+) -> u32 {
+    *evals += 1;
+    sad_rect_integer(cur, refp, org_x, org_y, w, h, mvx, mvy)
+}
+
+/// Integer-pel ME on an arbitrary **luma-aligned** rectangle (`w`,`h` ∈ **{8,16}**).
+#[allow(clippy::too_many_arguments)]
+pub fn pick_mv_rect(
+    mode: SrsV2MotionSearchMode,
+    cur: &VideoPlane<u8>,
+    refp: &VideoPlane<u8>,
+    org_x: u32,
+    org_y: u32,
+    w: u32,
+    h: u32,
+    radius: i16,
+    early_exit_sad_threshold: u32,
+    stats_eval_only: Option<&mut u64>,
+) -> (i16, i16) {
+    let mut scratch = 0_u64;
+    let evals: &mut u64 = match stats_eval_only {
+        Some(r) => r,
+        None => &mut scratch,
+    };
+    let r = (radius as i32).clamp(0, MAX_MOTION_VECTOR_PELS as i32);
+
+    fn rect_exhaustive(
+        cur: &VideoPlane<u8>,
+        refp: &VideoPlane<u8>,
+        org_x: u32,
+        org_y: u32,
+        w: u32,
+        h: u32,
+        r: i32,
+        early: u32,
+        evals: &mut u64,
+    ) -> (i16, i16) {
+        let mut best_mvx = 0_i16;
+        let mut best_mvy = 0_i16;
+        let mut best_sad = u32::MAX;
+        for mvx in -r..=r {
+            for mvy in -r..=r {
+                let s = eval_rect(cur, refp, org_x, org_y, w, h, mvx, mvy, evals);
+                if s < best_sad {
+                    best_sad = s;
+                    best_mvx = mvx as i16;
+                    best_mvy = mvy as i16;
+                }
+                if early > 0 && best_sad <= early {
+                    return (best_mvx, best_mvy);
+                }
+            }
+        }
+        (best_mvx, best_mvy)
+    }
+
+    match mode {
+        SrsV2MotionSearchMode::None => {
+            *evals += 1;
+            sad_rect_integer(cur, refp, org_x, org_y, w, h, 0, 0);
+            (0, 0)
+        }
+        SrsV2MotionSearchMode::ExhaustiveSmall => rect_exhaustive(
+            cur,
+            refp,
+            org_x,
+            org_y,
+            w,
+            h,
+            r,
+            early_exit_sad_threshold,
+            evals,
+        ),
+        SrsV2MotionSearchMode::Diamond => {
+            let mut cx = 0_i32;
+            let mut cy = 0_i32;
+            let mut best_sad = eval_rect(cur, refp, org_x, org_y, w, h, cx, cy, evals);
+            if early_exit_sad_threshold > 0 && best_sad <= early_exit_sad_threshold {
+                return (0, 0);
+            }
+            let dirs = [(1_i32, 0_i32), (-1, 0), (0, 1), (0, -1)];
+            let mut improved = true;
+            while improved {
+                improved = false;
+                for &(dx, dy) in &dirs {
+                    let nx = cx + dx;
+                    let ny = cy + dy;
+                    if nx.abs() > r || ny.abs() > r {
+                        continue;
+                    }
+                    let s = eval_rect(cur, refp, org_x, org_y, w, h, nx, ny, evals);
+                    if s < best_sad {
+                        best_sad = s;
+                        cx = nx;
+                        cy = ny;
+                        improved = true;
+                        if early_exit_sad_threshold > 0 && best_sad <= early_exit_sad_threshold {
+                            return (cx as i16, cy as i16);
+                        }
+                    }
+                }
+            }
+            (cx as i16, cy as i16)
+        }
+        SrsV2MotionSearchMode::Hex | SrsV2MotionSearchMode::Hierarchical => rect_exhaustive(
+            cur,
+            refp,
+            org_x,
+            org_y,
+            w,
+            h,
+            r,
+            early_exit_sad_threshold,
+            evals,
+        ),
+    }
 }
 
 pub(crate) fn sad_16x16(

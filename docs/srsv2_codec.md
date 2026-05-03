@@ -21,7 +21,14 @@
 - **Rev 12 (`FR2\x0C`):** **Non-displayable** alt-ref / hidden reference refresh (`is_displayable == false`); updates **`SrsV2ReferenceManager`** only.
 - **Rev 13 (`FR2\x0D`):** Per-MB blend + **integer** MV (**`bench_srsv2 --bframes 1`** default **B** wire when half-pel **B** and weighted flags are off).
 - **Rev 14 (`FR2\x0E`):** Per-MB blend + **half-pel** MV grid on the quarter lattice (**even qpel only**) + optional **weighted** blend candidates (**`/256`** weights) when enabled (`docs/video_bitstream_v2.md`).
-- **Rev 15 / 17 (`FR2\x0F` / `\x11`) and 16 / 18 (`FR2\x10` / `\x12`):** **experimental**, **encoder-opt-in** compact MV deltas (**median** left/top/top-right predictor + zigzag varints) and optional **static** rANS over MV bytes (**not** default wire; **rev 1–14** remain supported).
+- **FR2 rev15 / `FR2\x0F`:** **P**-frame **compact** inter MV syntax (median-predicted MV deltas + zigzag varints); **experimental**, **opt-in**; **raw legacy inter MV tuples remain default** unless explicitly selected.
+- **FR2 rev16 / `FR2\x10`:** **B**-frame **compact** inter MV grids (**dual** backward/forward compact grids); **experimental**, **opt-in**.
+- **FR2 rev17 / `FR2\x11`:** **P**-frame **entropy** inter MV section (**static** rANS over the same compact MV symbol bytes as rev15); **experimental**, **opt-in**. **Not** CABAC-class; **context-adaptive / trained MV models remain future work**.
+- **FR2 rev18 / `FR2\x12`:** **B**-frame **entropy** inter (**two** rANS MV blobs); **experimental**, **opt-in**. Same caveat: **static** rANS only today.
+- **FR2 rev19 / `FR2\x13`:** **P** variable **inter** partitions + compact MV (**experimental**, **opt-in**); bounded partition types (**16×16**, **16×8**, **8×16**, **8×8**); per–8×8 **transform** (**8×8** vs **4×4**) + residuals (`docs/video_bitstream_v2.md`).
+- **FR2 rev20 / `FR2\x14`:** **P** variable partitions + **entropy** MV section (**experimental**, **opt-in**).
+- **FR2 rev21 / `FR2\x15`:** **B** variable partitions (**compact**) — **reserved**; decoder returns **`Unsupported`** in this slice (honest placeholder).
+- **FR2 rev22 / `FR2\x16`:** **B** variable partitions (**entropy**) — same **`Unsupported`** placeholder rule as rev21.
 - **Bench encoder (`--bframes 1`):** optional **`SrsV2BMotionSearchMode`** (integer vs half-pel **B** ME), optional **`b_weighted_prediction`** — still **heuristic** (SAD, fixed candidate weights), not production **RDO**.
 
 Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future slices**.
@@ -30,15 +37,15 @@ Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future sli
 
 - 64-byte `SRS2` sequence header (little-endian fields + profile/pixel/color metadata), including **`max_ref_frames`** (capped; enables reference pictures for **P** prototype).
 - YUV420p8 intra frame payloads: **`FR2\x01`** (explicit coefficient tuples only); experimental **`FR2\x03`** (adaptive explicit vs static rANS per **8×8** block); experimental **`FR2\x07`** (rev **3** block layout + per-block **`qp_delta`**).
-- Experimental P-frame payloads: **`FR2\x02`** / **`FR2\x04`** (integer **`i16`** MVs); **`FR2\x05`** / **`FR2\x06`** (half-pel grid, **`i32`** quarter-pel MVs); **`FR2\x08`** / **`FR2\x09`** (rev **4**/**6** residuals + per-chunk **`qp_delta`**); **opt-in** **`FR2\x0F`** / **`FR2\x11`** (**compact** / **static-rANS** MV sections before the same residual packing as **rev 8**/**9**).
-- Experimental **B** payloads **`FR2\x0A`**–**`\x0E`** (rev **13** per-MB integer MV; rev **14** half-pel MV + optional weighted), **opt-in** **`FR2\x10`** / **`FR2\x12`** (dual compact MV grids + residuals; entropy wraps each grid), and **alt-ref** **`FR2\x0C`**, parser-safe and bounded by **`max_ref_frames`**.
+- Experimental P-frame payloads: **`FR2\x02`** / **`FR2\x04`** (integer **`i16`** MVs); **`FR2\x05`** / **`FR2\x06`** (half-pel grid, **`i32`** quarter-pel MVs); **`FR2\x08`** / **`FR2\x09`** (rev **4**/**6** residuals + per-chunk **`qp_delta`**); **opt-in** **`FR2\x0F`** / **`FR2\x11`** (**compact** / **static-rANS** MV sections before the same residual packing as **rev 8**/**9**); **opt-in** **`FR2\x13`** / **`FR2\x14`** (**P** variable **inter** partitions + compact or entropy MV — see **`docs/video_bitstream_v2.md`**).
+- Experimental **B** payloads **`FR2\x0A`**–**`\x0E`** (rev **13** per-MB integer MV; rev **14** half-pel MV + optional weighted), **opt-in** **`FR2\x10`** / **`FR2\x12`** (dual compact MV grids + residuals; entropy wraps each grid), **reserved placeholders** **`FR2\x15`** / **`FR2\x16`** (**B** variable partitions — decode **`Unsupported`** today), and **alt-ref** **`FR2\x0C`**, parser-safe and bounded by **`max_ref_frames`**.
 - Elementary `.srsv2` streams (sync + CRC-framed payloads).
 - Container mux/demux with `codec_id == 3` and bounded playback decode for primary video (`decode_yuv420_srsv2_payload_managed`; legacy **`decode_yuv420_srsv2_payload`** remains for **FR2** rev **1**–**9** single-slot callers).
 - CLI: `encode --codec srsv2`, `analyze --dump-codec`, decode of `.srsv2` to raw YUV via app services.
 
 ## Planned / not yet merged
 
-- General **quarter-pel** **luma** motion beyond the current half-pel ring, **full chroma sub-pel**, **context-adaptive / trained MV entropy**, production **B** **RDO**, and production-grade **GOP** / **B** placement beyond the current **`bench_srsv2`** heuristics. See **`docs/h264_competition_plan.md`** for a blunt gap list vs mature AVC-class encoders.
+- General **quarter-pel** **luma** motion beyond the current half-pel ring, **full chroma sub-pel**, **context-adaptive / trained MV entropy**, production **B** **RDO**, **working B-frame variable partitions** (revs **21**/**22** today are honest **`Unsupported`**), **bitrate-matched x264 sweeps**, **tiles / threaded 8K**, and production-grade **GOP** / **B** placement beyond the current **`bench_srsv2`** heuristics. **`SrsV2InterPartitionMode::AutoFast`** is a **deterministic heuristic**, not full **RDO**. **Transform-size** (**4×4** vs **8×8**) selection for rev **19**+ is **early** engineering. See **`docs/h264_competition_plan.md`** for a blunt gap list vs mature AVC-class encoders (**no** claim that SRSV2 beats H.264).
 - Broader entropy coding (per-file trained models, CABAC-class contexts, etc.). Today: **experimental** static rANS **AC residual** tokens; **experimental** **static** rANS over **compact** MV bytes (**rev 17**/**18**) — **not** mature codec-class MV coding.
 - **Loop filter (experimental):** when `disable_loop_filter` is **false**, encoder and decoder apply the same **simple luma deblock** on reconstructed **Y** before refreshing the SRSV2 reference (see **`docs/deblock_filter.md`**). **CDEF**, **restoration**, **film grain**, and chroma loop filtering are **not** implemented.
 - GPU backends (`gpu-wgpu`, `gpu-cuda` feature placeholders).

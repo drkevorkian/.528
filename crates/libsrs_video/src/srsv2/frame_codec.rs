@@ -585,7 +585,7 @@ pub fn decode_yuv420_srsv2_payload_managed(
             }
             d
         }
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 => {
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 => {
             let reference = manager
                 .primary_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -595,7 +595,7 @@ pub fn decode_yuv420_srsv2_payload_managed(
             }
             d
         }
-        10 | 11 | 13 | 14 | 16 | 18 => {
+        10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 => {
             if seq.max_ref_frames < 2 {
                 return Err(SrsV2Error::syntax(
                     "B-frame requires max_ref_frames >= 2 in sequence header",
@@ -625,14 +625,14 @@ pub fn decode_yuv420_srsv2_payload(
     if payload.len() < 4 {
         return Err(SrsV2Error::Truncated);
     }
-    if matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18) {
+    if matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22) {
         return Err(SrsV2Error::Unsupported(
             "multi-reference SRSV2 payloads require decode_yuv420_srsv2_payload_managed",
         ));
     }
     let mut dec = match payload[3] {
         1 | 3 | 7 => decode_yuv420_intra_payload(seq, payload)?,
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 => {
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 => {
             let reference = ref_slot
                 .as_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;

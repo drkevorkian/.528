@@ -1018,6 +1018,13 @@ pub fn encode_yuv420_b_payload_mb_blend(
     if !seq.width.is_multiple_of(16) || !seq.height.is_multiple_of(16) {
         return Err(SrsV2Error::syntax("B-frame requires 16-aligned dimensions"));
     }
+    if settings.inter_partition_mode
+        != crate::srsv2::rate_control::SrsV2InterPartitionMode::Fixed16x16
+    {
+        return Err(SrsV2Error::Unsupported(
+            "variable inter partitions for B frames (FR2 rev21/rev22) are not implemented in this slice",
+        ));
+    }
     let w = seq.width;
     let h = seq.height;
     let qp_i = qp.max(1) as i16;
@@ -1177,10 +1184,15 @@ pub fn decode_yuv420_b_payload(
     if payload.len() < 4 + 4 + 1 + 2 {
         return Err(SrsV2Error::Truncated);
     }
-    if &payload[0..3] != b"FR2" || !matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18) {
+    if &payload[0..3] != b"FR2" || !matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22) {
         return Err(SrsV2Error::BadMagic);
     }
     let rev_byte = payload[3];
+    if matches!(rev_byte, 21 | 22) {
+        return Err(SrsV2Error::Unsupported(
+            "FR2 rev21/rev22 variable B partitions are not implemented in this slice",
+        ));
+    }
     let half_pel_legacy = rev_byte == 11;
     let mb_blend_rev14 = rev_byte == 14;
     let compact_b = matches!(rev_byte, 16 | 18);
@@ -2369,6 +2381,20 @@ mod tests {
         mgr.push_displayable_last(4, ref_a);
         mgr.push_displayable_last(6, ref_b);
         assert!(decode_yuv420_b_payload(&seq, &pay, &mgr).is_err());
+    }
+
+    #[test]
+    fn decode_b_rev21_is_unsupported() {
+        let seq = seq_b(16, 16);
+        let pay: Vec<u8> = vec![
+            b'F', b'R', b'2', 21, 0, 0, 0, 0, 28, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        let r = flat_yuv(16, 16, 100);
+        mgr.push_displayable_last(0, r.clone());
+        mgr.push_displayable_last(2, r);
+        let err = decode_yuv420_b_payload(&seq, &pay, &mgr).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Unsupported(_)));
     }
 
     #[test]
