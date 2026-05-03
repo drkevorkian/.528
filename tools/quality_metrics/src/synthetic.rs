@@ -24,7 +24,7 @@ impl SyntheticPattern {
     pub fn parse_cli(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
             "flat" => Some(Self::Flat),
-            "gray-ramp" | "gray_ramp" => Some(Self::GrayRamp),
+            "gray-ramp" | "gray_ramp" | "gradient" => Some(Self::GrayRamp),
             "moving-square" | "moving_square" => Some(Self::MovingSquare),
             "scrolling-bars" | "scrolling_bars" => Some(Self::ScrollingBars),
             "noise" => Some(Self::Noise),
@@ -95,6 +95,8 @@ pub enum SyntheticError {
     SerdeJson(#[from] serde_json::Error),
     #[error("unknown pattern: {0}")]
     UnknownPattern(String),
+    #[error("--preset-corpus requires --out-dir")]
+    PresetCorpusRequiresOutDir,
 }
 
 fn checked_mul_u64(a: u64, b: u64) -> Result<u64, SyntheticError> {
@@ -357,5 +359,38 @@ mod tests {
         let m = metadata_for_clip(&s).unwrap();
         let j = serde_json::to_string(&m).unwrap();
         assert!(j.contains("\"pix_fmt\""));
+    }
+
+    #[test]
+    fn gradient_cli_alias_is_gray_ramp() {
+        assert_eq!(
+            SyntheticPattern::parse_cli("gradient"),
+            Some(SyntheticPattern::GrayRamp)
+        );
+    }
+
+    #[test]
+    fn preset_tiny_flat_clip_deterministic_seed() {
+        let dir = std::env::temp_dir().join("qm_preset_tiny_flat_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = SyntheticClipSpec {
+            width: 64,
+            height: 64,
+            fps_num: 30,
+            fps_den: 1,
+            frames: 16,
+            pattern: SyntheticPattern::Flat,
+            seed: 528,
+            allow_large: false,
+        };
+        let out = dir.join("tiny_flat_64x64.yuv");
+        let meta = dir.join("tiny_flat_64x64.json");
+        let m1 = write_yuv420p8_clip(&spec, &out, &meta).unwrap();
+        let m2 = write_yuv420p8_clip(&spec, &out, &meta).unwrap();
+        assert_eq!(m1.yuv_bytes, m2.yuv_bytes);
+        let raw = std::fs::read(&out).unwrap();
+        assert_eq!(raw.len() as u64, m1.yuv_bytes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

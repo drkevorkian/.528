@@ -113,7 +113,7 @@ pub enum SrsV2MotionSearchMode {
     Hierarchical,
 }
 
-/// Experimental **B-frame** integer-pel motion / blend search (`FR2` rev **13** bench path).
+/// Experimental **B-frame** motion / blend search (`FR2` rev **13** integer MVs, rev **14** half-pel MVs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2BMotionSearchMode {
     /// Zero MVs; per-MB blend chosen by SAD among forward / backward / average (`FR2` rev **13**).
@@ -123,6 +123,8 @@ pub enum SrsV2BMotionSearchMode {
     ReuseP,
     /// Independent integer search on backward ref **A** and forward ref **B**, then pick blend by SAD.
     IndependentForwardBackward,
+    /// Like [`IndependentForwardBackward`], then half-pel refinement on the quarter-pel grid (`FR2` rev **14**).
+    IndependentForwardBackwardHalfPel,
 }
 
 #[derive(Debug, Clone)]
@@ -150,8 +152,10 @@ pub struct SrsV2EncodeSettings {
     pub max_block_qp_delta: i8,
 
     pub motion_search_mode: SrsV2MotionSearchMode,
-    /// Experimental B-frame integer search (`FR2` rev **13**); does not enable half-pel B MVs.
+    /// Experimental B-frame motion search (`FR2` rev **13**/**14**).
     pub b_motion_search_mode: SrsV2BMotionSearchMode,
+    /// Per-MB weighted prediction candidates (`FR2` rev **14** only on wire); **`false`** preserves rev **13** behavior.
+    pub b_weighted_prediction: bool,
     /// When non-zero, motion search may stop early once best SAD ≤ threshold.
     pub early_exit_sad_threshold: u32,
     pub enable_skip_blocks: bool,
@@ -190,6 +194,7 @@ impl Default for SrsV2EncodeSettings {
 
             motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
             b_motion_search_mode: SrsV2BMotionSearchMode::Off,
+            b_weighted_prediction: false,
             early_exit_sad_threshold: 0,
             enable_skip_blocks: true,
 

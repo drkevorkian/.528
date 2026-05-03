@@ -1,4 +1,5 @@
-//! Experimental **B-frame** payload (`FR2` rev **10** integer MV, **11** half-pel) — parser-safe baseline.
+//! Experimental **B-frame** payload (`FR2` rev **10** integer MV, **11** half-pel, **13** per-MB blend +
+//! integer MV, **14** per-MB blend + half-pel MV grid + optional weighted prediction).
 
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
@@ -10,12 +11,20 @@ use super::rate_control::{SrsV2BMotionSearchMode, SrsV2EncodeSettings};
 use super::reference_manager::SrsV2ReferenceManager;
 use super::residual_entropy::{decode_p_residual_chunk, encode_p_residual_chunk};
 use super::residual_tokens::residual_token_model;
-use super::subpel::{sample_luma_bilinear_qpel, validate_mv_qpel_halfgrid};
+use super::subpel::{
+    refine_half_pel_center, sad_16x16_qpel, sample_luma_bilinear_qpel, validate_mv_qpel_halfgrid,
+};
 
 pub const FRAME_PAYLOAD_MAGIC_B: [u8; 4] = [b'F', b'R', b'2', 10];
 pub const FRAME_PAYLOAD_MAGIC_B_SUBPEL: [u8; 4] = [b'F', b'R', b'2', 11];
 /// Per-macroblock blend selection, integer MV only (`FR2` rev **13**).
 pub const FRAME_PAYLOAD_MAGIC_B_MB_BLEND: [u8; 4] = [b'F', b'R', b'2', 13];
+/// Per-macroblock blend + quarter-pel MVs (half-pel grid only) + optional weighted prediction (`FR2` rev **14**).
+pub const FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP: [u8; 4] = [b'F', b'R', b'2', 14];
+
+/// Fixed weighted-prediction coefficient pairs \(`weight_a`, `weight_b`\); **`sum == 256`** (denominator \(2^8\)).
+pub const B_WEIGHTED_PRED_CANDIDATES: [(u8, u8); 5] =
+    [(64, 192), (95, 161), (128, 128), (161, 95), (192, 64)];
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,21 +32,60 @@ pub enum BBlendModeWire {
     ForwardOnly = 0,
     BackwardOnly = 1,
     Average = 2,
-    WeightedPlaceholder = 3,
+    /// Weighted luma/chroma blend (`FR2` rev **14** only). **`weight_a + weight_b == 256`** on wire.
+    Weighted = 3,
 }
 
 impl BBlendModeWire {
+    /// Frame-level blend byte (`FR2` rev **10**/**11**): weighted is unsupported.
     pub fn from_u8(v: u8) -> Result<Self, SrsV2Error> {
         match v {
             0 => Ok(Self::ForwardOnly),
             1 => Ok(Self::BackwardOnly),
             2 => Ok(Self::Average),
             3 => Err(SrsV2Error::Unsupported(
-                "B-frame weighted blend is not implemented",
+                "B-frame weighted blend is not implemented for legacy FR2 rev10/11",
             )),
             _ => Err(SrsV2Error::syntax("unknown B blend mode")),
         }
     }
+
+    /// Per-MB blend (`FR2` rev **13**/**14**). Rev **13** rejects weighted ([`Self::Weighted`]).
+    pub fn from_u8_per_mb(fr2_rev14: bool, v: u8) -> Result<Self, SrsV2Error> {
+        match v {
+            0 => Ok(Self::ForwardOnly),
+            1 => Ok(Self::BackwardOnly),
+            2 => Ok(Self::Average),
+            3 if fr2_rev14 => Ok(Self::Weighted),
+            3 => Err(SrsV2Error::Unsupported(
+                "B-frame weighted blend requires FR2 rev14 wire",
+            )),
+            _ => Err(SrsV2Error::syntax("unknown B blend mode")),
+        }
+    }
+}
+
+/// Validate **`weight_a + weight_b == 256`** (integer blend denominator \(2^8\)).
+pub fn validate_b_prediction_weights(weight_a: u8, weight_b: u8) -> Result<(), SrsV2Error> {
+    let sum = weight_a as u16 + weight_b as u16;
+    if sum != 256 {
+        return Err(SrsV2Error::syntax(
+            "B weighted prediction weights must sum to 256",
+        ));
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn blend_weighted_pixels(pred_a: i32, pred_b: i32, weight_a: u8, weight_b: u8) -> i32 {
+    (pred_a * weight_a as i32 + pred_b * weight_b as i32 + 128) >> 8
+}
+
+fn uses_fr2_rev14_wire(settings: &SrsV2EncodeSettings) -> bool {
+    matches!(
+        settings.b_motion_search_mode,
+        SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel
+    ) || settings.b_weighted_prediction
 }
 
 fn read_u32(data: &[u8], cur: &mut usize) -> Result<u32, SrsV2Error> {
@@ -209,7 +257,7 @@ pub fn encode_yuv420_b_payload(
                                 };
                                 ((pa + pb + 1) >> 1) as i16
                             }
-                            BBlendModeWire::WeightedPlaceholder => unreachable!(),
+                            BBlendModeWire::Weighted => unreachable!(),
                         };
                         let d = cx - pred;
                         blk[row as usize][col as usize] = d;
@@ -260,6 +308,31 @@ pub struct BFrameEncodeStats {
     pub b_average_macroblocks: u32,
     pub b_weighted_macroblocks: u32,
     pub b_sad_evaluations: u64,
+    pub b_subpel_blocks_tested: u64,
+    pub b_subpel_blocks_selected: u64,
+    pub b_additional_subpel_evaluations: u64,
+    pub b_sum_abs_frac_qpel: u64,
+    pub b_forward_halfpel_blocks: u32,
+    pub b_backward_halfpel_blocks: u32,
+    pub b_weighted_candidates_tested: u64,
+    pub b_weighted_sum_weight_a: u64,
+    pub b_weighted_sum_weight_b: u64,
+}
+
+/// Per-MB encoder decision (integer MVs always kept for chroma approximation / rev13 wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BMbEncodeChoice {
+    pub blend: BBlendModeWire,
+    pub weight_a: u8,
+    pub weight_b: u8,
+    pub mv_ax: i16,
+    pub mv_ay: i16,
+    pub mv_bx: i16,
+    pub mv_by: i16,
+    pub mv_aqx: i32,
+    pub mv_aqy: i32,
+    pub mv_bqx: i32,
+    pub mv_bqy: i32,
 }
 
 fn sad_mb_average_plane(
@@ -288,19 +361,92 @@ fn sad_mb_average_plane(
     acc
 }
 
-fn pick_blend_by_min_sad(sf: u32, sb: u32, sa: u32) -> BBlendModeWire {
-    let min_v = sf.min(sb).min(sa);
-    if sa == min_v {
-        return BBlendModeWire::Average;
+fn sad_mb_average_qpel(
+    cur: &VideoPlane<u8>,
+    ref_a: &VideoPlane<u8>,
+    ref_b: &VideoPlane<u8>,
+    mb_x: u32,
+    mb_y: u32,
+    mva_q: (i32, i32),
+    mvb_q: (i32, i32),
+) -> u32 {
+    let mut acc = 0_u32;
+    for row in 0..16 {
+        for col in 0..16 {
+            let lx = mb_x * 16 + col;
+            let ly = mb_y * 16 + row;
+            let cx = cur.samples[ly as usize * cur.stride + lx as usize] as i32;
+            let pa =
+                sample_luma_bilinear_qpel(ref_a, lx as i32, ly as i32, mva_q.0, mva_q.1) as i32;
+            let pb =
+                sample_luma_bilinear_qpel(ref_b, lx as i32, ly as i32, mvb_q.0, mvb_q.1) as i32;
+            let pred = (pa + pb + 1) >> 1;
+            acc += (cx - pred).unsigned_abs() as u32;
+        }
     }
-    if sf == min_v {
-        return BBlendModeWire::ForwardOnly;
-    }
-    BBlendModeWire::BackwardOnly
+    acc
 }
 
-/// Choose per-MB blend and integer MVs for [`encode_yuv420_b_payload_mb_blend`].
-pub fn choose_b_macroblock_blend_and_mv(
+#[allow(clippy::too_many_arguments)]
+fn sad_mb_weighted_plane(
+    cur: &VideoPlane<u8>,
+    ref_a: &VideoPlane<u8>,
+    ref_b: &VideoPlane<u8>,
+    mb_x: u32,
+    mb_y: u32,
+    mva: (i16, i16),
+    mvb: (i16, i16),
+    weight_a: u8,
+    weight_b: u8,
+) -> u32 {
+    let (rax, ray) = (mva.0 as i32, mva.1 as i32);
+    let (rbx, rby) = (mvb.0 as i32, mvb.1 as i32);
+    let mut acc = 0_u32;
+    for row in 0..16 {
+        for col in 0..16 {
+            let lx = mb_x * 16 + col;
+            let ly = mb_y * 16 + row;
+            let cx = cur.samples[ly as usize * cur.stride + lx as usize] as i32;
+            let pa = sample_u8_plane(ref_a, lx as i32 + rax, ly as i32 + ray) as i32;
+            let pb = sample_u8_plane(ref_b, lx as i32 + rbx, ly as i32 + rby) as i32;
+            let pred = blend_weighted_pixels(pa, pb, weight_a, weight_b);
+            acc += (cx - pred).unsigned_abs() as u32;
+        }
+    }
+    acc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sad_mb_weighted_qpel(
+    cur: &VideoPlane<u8>,
+    ref_a: &VideoPlane<u8>,
+    ref_b: &VideoPlane<u8>,
+    mb_x: u32,
+    mb_y: u32,
+    mva_q: (i32, i32),
+    mvb_q: (i32, i32),
+    weight_a: u8,
+    weight_b: u8,
+) -> u32 {
+    let mut acc = 0_u32;
+    for row in 0..16 {
+        for col in 0..16 {
+            let lx = mb_x * 16 + col;
+            let ly = mb_y * 16 + row;
+            let cx = cur.samples[ly as usize * cur.stride + lx as usize] as i32;
+            let pa =
+                sample_luma_bilinear_qpel(ref_a, lx as i32, ly as i32, mva_q.0, mva_q.1) as i32;
+            let pb =
+                sample_luma_bilinear_qpel(ref_b, lx as i32, ly as i32, mvb_q.0, mvb_q.1) as i32;
+            let pred = blend_weighted_pixels(pa, pb, weight_a, weight_b);
+            acc += (cx - pred).unsigned_abs() as u32;
+        }
+    }
+    acc
+}
+
+/// Choose per-MB blend, optional weights, and MVs for [`encode_yuv420_b_payload_mb_blend`].
+pub fn choose_b_macroblock(
     settings: &SrsV2EncodeSettings,
     cur: &YuvFrame,
     ref_a: &YuvFrame,
@@ -308,7 +454,12 @@ pub fn choose_b_macroblock_blend_and_mv(
     mbx: u32,
     mby: u32,
     stats: &mut BFrameEncodeStats,
-) -> Result<(BBlendModeWire, i16, i16, i16, i16), SrsV2Error> {
+) -> Result<BMbEncodeChoice, SrsV2Error> {
+    let use_halfpel_b = matches!(
+        settings.b_motion_search_mode,
+        SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel
+    );
+    let use_weighted = settings.b_weighted_prediction;
     let radius = settings.clamped_motion_search_radius();
     let mode = settings.motion_search_mode;
     let early = settings.early_exit_sad_threshold;
@@ -317,7 +468,8 @@ pub fn choose_b_macroblock_blend_and_mv(
         SrsV2BMotionSearchMode::Off | SrsV2BMotionSearchMode::ReuseP => {
             ((0_i16, 0_i16), (0_i16, 0_i16))
         }
-        SrsV2BMotionSearchMode::IndependentForwardBackward => {
+        SrsV2BMotionSearchMode::IndependentForwardBackward
+        | SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel => {
             let mut ev_a = 0_u64;
             let mut ev_b = 0_u64;
             let ma = pick_mv(
@@ -345,31 +497,189 @@ pub fn choose_b_macroblock_blend_and_mv(
         }
     };
 
-    let sf = sad_16x16(&cur.y, &ref_a.y, mbx, mby, mv_ax as i32, mv_ay as i32);
-    let sb = sad_16x16(&cur.y, &ref_b.y, mbx, mby, mv_bx as i32, mv_by as i32);
-    let sa = sad_mb_average_plane(
-        &cur.y,
-        &ref_a.y,
-        &ref_b.y,
-        mbx,
-        mby,
-        (mv_ax, mv_ay),
-        (mv_bx, mv_by),
-    );
+    let (mv_aqx, mv_aqy, mv_bqx, mv_bqy) = if use_halfpel_b {
+        let sub_r = settings.clamped_subpel_refinement_radius();
+        let mut ev_a = 0_u64;
+        let mut tested_a = 0_u64;
+        let (aqx, aqy) = refine_half_pel_center(
+            &cur.y,
+            &ref_a.y,
+            mbx,
+            mby,
+            mv_ax,
+            mv_ay,
+            sub_r,
+            &mut ev_a,
+            &mut tested_a,
+        );
+        stats.b_additional_subpel_evaluations += ev_a;
+        stats.b_subpel_blocks_tested += tested_a;
+        let mut ev_b = 0_u64;
+        let mut tested_b = 0_u64;
+        let (bqx, bqy) = refine_half_pel_center(
+            &cur.y,
+            &ref_b.y,
+            mbx,
+            mby,
+            mv_bx,
+            mv_by,
+            sub_r,
+            &mut ev_b,
+            &mut tested_b,
+        );
+        stats.b_additional_subpel_evaluations += ev_b;
+        stats.b_subpel_blocks_tested += tested_b;
+        validate_mv_qpel_halfgrid(aqx, aqy)?;
+        validate_mv_qpel_halfgrid(bqx, bqy)?;
+        if aqx != mv_ax as i32 * 4 || aqy != mv_ay as i32 * 4 {
+            stats.b_forward_halfpel_blocks += 1;
+        }
+        if bqx != mv_bx as i32 * 4 || bqy != mv_by as i32 * 4 {
+            stats.b_backward_halfpel_blocks += 1;
+        }
+        if aqx != mv_ax as i32 * 4
+            || aqy != mv_ay as i32 * 4
+            || bqx != mv_bx as i32 * 4
+            || bqy != mv_by as i32 * 4
+        {
+            stats.b_subpel_blocks_selected += 1;
+        }
+        let fx_a = aqx.rem_euclid(4) as u32;
+        let fy_a = aqy.rem_euclid(4) as u32;
+        let fx_b = bqx.rem_euclid(4) as u32;
+        let fy_b = bqy.rem_euclid(4) as u32;
+        stats.b_sum_abs_frac_qpel += (fx_a + fy_a + fx_b + fy_b) as u64;
+        (aqx, aqy, bqx, bqy)
+    } else {
+        (
+            mv_ax as i32 * 4,
+            mv_ay as i32 * 4,
+            mv_bx as i32 * 4,
+            mv_by as i32 * 4,
+        )
+    };
+
+    let (sf, sb, sa) = if use_halfpel_b {
+        let sf = sad_16x16_qpel(&cur.y, &ref_a.y, mbx, mby, mv_aqx, mv_aqy);
+        let sb = sad_16x16_qpel(&cur.y, &ref_b.y, mbx, mby, mv_bqx, mv_bqy);
+        let sa = sad_mb_average_qpel(
+            &cur.y,
+            &ref_a.y,
+            &ref_b.y,
+            mbx,
+            mby,
+            (mv_aqx, mv_aqy),
+            (mv_bqx, mv_bqy),
+        );
+        (sf, sb, sa)
+    } else {
+        let sf = sad_16x16(&cur.y, &ref_a.y, mbx, mby, mv_ax as i32, mv_ay as i32);
+        let sb = sad_16x16(&cur.y, &ref_b.y, mbx, mby, mv_bx as i32, mv_by as i32);
+        let sa = sad_mb_average_plane(
+            &cur.y,
+            &ref_a.y,
+            &ref_b.y,
+            mbx,
+            mby,
+            (mv_ax, mv_ay),
+            (mv_bx, mv_by),
+        );
+        (sf, sb, sa)
+    };
     stats.b_sad_evaluations += 3;
 
-    let blend = pick_blend_by_min_sad(sf, sb, sa);
+    let mut min_v = sf.min(sb).min(sa);
+    let mut best_w: Option<(u8, u8)> = None;
+    if use_weighted {
+        for &(wa, wb) in &B_WEIGHTED_PRED_CANDIDATES {
+            stats.b_weighted_candidates_tested += 1;
+            let sw = if use_halfpel_b {
+                sad_mb_weighted_qpel(
+                    &cur.y,
+                    &ref_a.y,
+                    &ref_b.y,
+                    mbx,
+                    mby,
+                    (mv_aqx, mv_aqy),
+                    (mv_bqx, mv_bqy),
+                    wa,
+                    wb,
+                )
+            } else {
+                sad_mb_weighted_plane(
+                    &cur.y,
+                    &ref_a.y,
+                    &ref_b.y,
+                    mbx,
+                    mby,
+                    (mv_ax, mv_ay),
+                    (mv_bx, mv_by),
+                    wa,
+                    wb,
+                )
+            };
+            stats.b_sad_evaluations += 1;
+            if sw < min_v {
+                min_v = sw;
+                best_w = Some((wa, wb));
+            }
+        }
+    }
+
+    let (blend, weight_a, weight_b) = if sa == min_v {
+        (BBlendModeWire::Average, 0_u8, 0_u8)
+    } else if sf == min_v {
+        (BBlendModeWire::ForwardOnly, 0_u8, 0_u8)
+    } else if sb == min_v {
+        (BBlendModeWire::BackwardOnly, 0_u8, 0_u8)
+    } else {
+        let (wa, wb) = best_w.ok_or_else(|| {
+            SrsV2Error::syntax("internal: weighted B blend missing after candidate search")
+        })?;
+        (BBlendModeWire::Weighted, wa, wb)
+    };
+
     match blend {
         BBlendModeWire::ForwardOnly => stats.b_forward_macroblocks += 1,
         BBlendModeWire::BackwardOnly => stats.b_backward_macroblocks += 1,
         BBlendModeWire::Average => stats.b_average_macroblocks += 1,
-        BBlendModeWire::WeightedPlaceholder => {}
+        BBlendModeWire::Weighted => {
+            stats.b_weighted_macroblocks += 1;
+            stats.b_weighted_sum_weight_a += weight_a as u64;
+            stats.b_weighted_sum_weight_b += weight_b as u64;
+        }
     }
 
-    Ok((blend, mv_ax, mv_ay, mv_bx, mv_by))
+    Ok(BMbEncodeChoice {
+        blend,
+        weight_a,
+        weight_b,
+        mv_ax,
+        mv_ay,
+        mv_bx,
+        mv_by,
+        mv_aqx,
+        mv_aqy,
+        mv_bqx,
+        mv_bqy,
+    })
 }
 
-/// Encode experimental **B** picture (`FR2` rev **13**): per-MB blend + integer MVs.
+/// Choose per-MB blend and integer MVs for [`encode_yuv420_b_payload_mb_blend`] (compat shim).
+pub fn choose_b_macroblock_blend_and_mv(
+    settings: &SrsV2EncodeSettings,
+    cur: &YuvFrame,
+    ref_a: &YuvFrame,
+    ref_b: &YuvFrame,
+    mbx: u32,
+    mby: u32,
+    stats: &mut BFrameEncodeStats,
+) -> Result<(BBlendModeWire, i16, i16, i16, i16), SrsV2Error> {
+    let c = choose_b_macroblock(settings, cur, ref_a, ref_b, mbx, mby, stats)?;
+    Ok((c.blend, c.mv_ax, c.mv_ay, c.mv_bx, c.mv_by))
+}
+
+/// Encode experimental **B** picture (`FR2` rev **13** or **14**): per-MB blend (+ optional weights) and MVs.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_yuv420_b_payload_mb_blend(
     seq: &VideoSequenceHeaderV2,
@@ -398,8 +708,13 @@ pub fn encode_yuv420_b_payload_mb_blend(
     let mb_cols = w / 16;
     let mb_rows = h / 16;
     let model = residual_token_model();
+    let wire_rev14 = uses_fr2_rev14_wire(settings);
     let mut out = Vec::new();
-    out.extend_from_slice(&FRAME_PAYLOAD_MAGIC_B_MB_BLEND);
+    out.extend_from_slice(if wire_rev14 {
+        &FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP
+    } else {
+        &FRAME_PAYLOAD_MAGIC_B_MB_BLEND
+    });
     out.extend_from_slice(&frame_index.to_le_bytes());
     out.push(qp);
     out.push(slot_a);
@@ -409,15 +724,28 @@ pub fn encode_yuv420_b_payload_mb_blend(
 
     for mby in 0..mb_rows {
         for mbx in 0..mb_cols {
-            let (blend, mv_ax, mv_ay, mv_bx, mv_by) =
-                choose_b_macroblock_blend_and_mv(settings, cur, ref_a, ref_b, mbx, mby, stats_out)?;
-            out.push(blend as u8);
-            validate_mv_i16(mv_ax, mv_ay)?;
-            validate_mv_i16(mv_bx, mv_by)?;
-            out.extend_from_slice(&mv_ax.to_le_bytes());
-            out.extend_from_slice(&mv_ay.to_le_bytes());
-            out.extend_from_slice(&mv_bx.to_le_bytes());
-            out.extend_from_slice(&mv_by.to_le_bytes());
+            let ch = choose_b_macroblock(settings, cur, ref_a, ref_b, mbx, mby, stats_out)?;
+            out.push(ch.blend as u8);
+            if wire_rev14 {
+                if ch.blend == BBlendModeWire::Weighted {
+                    validate_b_prediction_weights(ch.weight_a, ch.weight_b)?;
+                    out.push(ch.weight_a);
+                    out.push(ch.weight_b);
+                }
+                validate_mv_qpel_halfgrid(ch.mv_aqx, ch.mv_aqy)?;
+                validate_mv_qpel_halfgrid(ch.mv_bqx, ch.mv_bqy)?;
+                out.extend_from_slice(&ch.mv_aqx.to_le_bytes());
+                out.extend_from_slice(&ch.mv_aqy.to_le_bytes());
+                out.extend_from_slice(&ch.mv_bqx.to_le_bytes());
+                out.extend_from_slice(&ch.mv_bqy.to_le_bytes());
+            } else {
+                validate_mv_i16(ch.mv_ax, ch.mv_ay)?;
+                validate_mv_i16(ch.mv_bx, ch.mv_by)?;
+                out.extend_from_slice(&ch.mv_ax.to_le_bytes());
+                out.extend_from_slice(&ch.mv_ay.to_le_bytes());
+                out.extend_from_slice(&ch.mv_bx.to_le_bytes());
+                out.extend_from_slice(&ch.mv_by.to_le_bytes());
+            }
 
             let mut pattern = 0_u8;
             let mut chunks: Vec<Vec<u8>> = Vec::new();
@@ -430,31 +758,60 @@ pub fn encode_yuv420_b_payload_mb_blend(
                         let lx = mbx * 16 + dx + col;
                         let ly = mby * 16 + dy + row;
                         let cx = cur.y.samples[ly as usize * cur.y.stride + lx as usize] as i16;
-                        let pred = match blend {
+                        let pred = match ch.blend {
                             BBlendModeWire::ForwardOnly => {
-                                let rx = lx as i32 + mv_ax as i32;
-                                let ry = ly as i32 + mv_ay as i32;
-                                sample_u8_plane(&ref_a.y, rx, ry) as i16
+                                if wire_rev14 {
+                                    sample_luma_bilinear_qpel(
+                                        &ref_a.y, lx as i32, ly as i32, ch.mv_aqx, ch.mv_aqy,
+                                    ) as i16
+                                } else {
+                                    let rx = lx as i32 + ch.mv_ax as i32;
+                                    let ry = ly as i32 + ch.mv_ay as i32;
+                                    sample_u8_plane(&ref_a.y, rx, ry) as i16
+                                }
                             }
                             BBlendModeWire::BackwardOnly => {
-                                let rx = lx as i32 + mv_bx as i32;
-                                let ry = ly as i32 + mv_by as i32;
-                                sample_u8_plane(&ref_b.y, rx, ry) as i16
+                                if wire_rev14 {
+                                    sample_luma_bilinear_qpel(
+                                        &ref_b.y, lx as i32, ly as i32, ch.mv_bqx, ch.mv_bqy,
+                                    ) as i16
+                                } else {
+                                    let rx = lx as i32 + ch.mv_bx as i32;
+                                    let ry = ly as i32 + ch.mv_by as i32;
+                                    sample_u8_plane(&ref_b.y, rx, ry) as i16
+                                }
                             }
                             BBlendModeWire::Average => {
-                                let pa = {
-                                    let rx = lx as i32 + mv_ax as i32;
-                                    let ry = ly as i32 + mv_ay as i32;
+                                let pa = if wire_rev14 {
+                                    sample_luma_bilinear_qpel(
+                                        &ref_a.y, lx as i32, ly as i32, ch.mv_aqx, ch.mv_aqy,
+                                    ) as i32
+                                } else {
+                                    let rx = lx as i32 + ch.mv_ax as i32;
+                                    let ry = ly as i32 + ch.mv_ay as i32;
                                     sample_u8_plane(&ref_a.y, rx, ry) as i32
                                 };
-                                let pb = {
-                                    let rx = lx as i32 + mv_bx as i32;
-                                    let ry = ly as i32 + mv_by as i32;
+                                let pb = if wire_rev14 {
+                                    sample_luma_bilinear_qpel(
+                                        &ref_b.y, lx as i32, ly as i32, ch.mv_bqx, ch.mv_bqy,
+                                    ) as i32
+                                } else {
+                                    let rx = lx as i32 + ch.mv_bx as i32;
+                                    let ry = ly as i32 + ch.mv_by as i32;
                                     sample_u8_plane(&ref_b.y, rx, ry) as i32
                                 };
                                 ((pa + pb + 1) >> 1) as i16
                             }
-                            BBlendModeWire::WeightedPlaceholder => unreachable!(),
+                            BBlendModeWire::Weighted => {
+                                let pa = sample_luma_bilinear_qpel(
+                                    &ref_a.y, lx as i32, ly as i32, ch.mv_aqx, ch.mv_aqy,
+                                ) as i32;
+                                let pb = sample_luma_bilinear_qpel(
+                                    &ref_b.y, lx as i32, ly as i32, ch.mv_bqx, ch.mv_bqy,
+                                ) as i32;
+                                blend_weighted_pixels(pa, pb, ch.weight_a, ch.weight_b)
+                                    .clamp(0, 255) as i16
+                            }
                         };
                         let d = cx - pred;
                         blk[row as usize][col as usize] = d;
@@ -512,11 +869,13 @@ pub fn decode_yuv420_b_payload(
     if payload.len() < 4 + 4 + 1 + 2 {
         return Err(SrsV2Error::Truncated);
     }
-    if &payload[0..3] != b"FR2" || !matches!(payload[3], 10 | 11 | 13) {
+    if &payload[0..3] != b"FR2" || !matches!(payload[3], 10 | 11 | 13 | 14) {
         return Err(SrsV2Error::BadMagic);
     }
     let rev_byte = payload[3];
-    let half_pel = rev_byte == 11;
+    let half_pel_legacy = rev_byte == 11;
+    let mb_blend_rev14 = rev_byte == 14;
+    let chroma_qpel = half_pel_legacy || mb_blend_rev14;
     let mut cur = 4usize;
     let frame_index = read_u32(payload, &mut cur)?;
     let qp = read_u8(payload, &mut cur)?;
@@ -571,9 +930,23 @@ pub fn decode_yuv420_b_payload(
             let blend = if let Some(b) = frame_blend {
                 b
             } else {
-                BBlendModeWire::from_u8(read_u8(payload, &mut cur)?)?
+                let tag = read_u8(payload, &mut cur)?;
+                BBlendModeWire::from_u8_per_mb(mb_blend_rev14, tag)?
             };
-            let (mv_aqx, mv_aqy, mv_bqx, mv_bqy, mv_ax, mv_ay, mv_bx, mv_by) = if half_pel {
+            let (weight_a, weight_b) = if mb_blend_rev14 {
+                if blend == BBlendModeWire::Weighted {
+                    let wa = read_u8(payload, &mut cur)?;
+                    let wb = read_u8(payload, &mut cur)?;
+                    validate_b_prediction_weights(wa, wb)?;
+                    (wa, wb)
+                } else {
+                    (0_u8, 0_u8)
+                }
+            } else {
+                (0_u8, 0_u8)
+            };
+            let use_qpel_luma = half_pel_legacy || mb_blend_rev14;
+            let (mv_aqx, mv_aqy, mv_bqx, mv_bqy, mv_ax, mv_ay, mv_bx, mv_by) = if half_pel_legacy {
                 let ax = read_i32(payload, &mut cur)?;
                 let ay = read_i32(payload, &mut cur)?;
                 let bx = read_i32(payload, &mut cur)?;
@@ -581,6 +954,23 @@ pub fn decode_yuv420_b_payload(
                 validate_mv_qpel_halfgrid(ax, ay)?;
                 validate_mv_qpel_halfgrid(bx, by)?;
                 (ax, ay, bx, by, 0_i16, 0_i16, 0_i16, 0_i16)
+            } else if mb_blend_rev14 {
+                let ax = read_i32(payload, &mut cur)?;
+                let ay = read_i32(payload, &mut cur)?;
+                let bx = read_i32(payload, &mut cur)?;
+                let by = read_i32(payload, &mut cur)?;
+                validate_mv_qpel_halfgrid(ax, ay)?;
+                validate_mv_qpel_halfgrid(bx, by)?;
+                (
+                    ax,
+                    ay,
+                    bx,
+                    by,
+                    ax.div_euclid(4) as i16,
+                    ay.div_euclid(4) as i16,
+                    bx.div_euclid(4) as i16,
+                    by.div_euclid(4) as i16,
+                )
             } else {
                 let ax = read_i16(payload, &mut cur)?;
                 let ay = read_i16(payload, &mut cur)?;
@@ -588,7 +978,16 @@ pub fn decode_yuv420_b_payload(
                 let by = read_i16(payload, &mut cur)?;
                 validate_mv_i16(ax, ay)?;
                 validate_mv_i16(bx, by)?;
-                (0_i32, 0_i32, 0_i32, 0_i32, ax, ay, bx, by)
+                (
+                    ax as i32 * 4,
+                    ay as i32 * 4,
+                    bx as i32 * 4,
+                    by as i32 * 4,
+                    ax,
+                    ay,
+                    bx,
+                    by,
+                )
             };
 
             let pattern = read_u8(payload, &mut cur)?;
@@ -602,7 +1001,7 @@ pub fn decode_yuv420_b_payload(
                             let ly = mby * 16 + dy + row;
                             let pv = match blend {
                                 BBlendModeWire::ForwardOnly => {
-                                    if half_pel {
+                                    if use_qpel_luma {
                                         sample_luma_bilinear_qpel(
                                             &ref_a.y, lx as i32, ly as i32, mv_aqx, mv_aqy,
                                         )
@@ -613,7 +1012,7 @@ pub fn decode_yuv420_b_payload(
                                     }
                                 }
                                 BBlendModeWire::BackwardOnly => {
-                                    if half_pel {
+                                    if use_qpel_luma {
                                         sample_luma_bilinear_qpel(
                                             &ref_b.y, lx as i32, ly as i32, mv_bqx, mv_bqy,
                                         )
@@ -624,7 +1023,7 @@ pub fn decode_yuv420_b_payload(
                                     }
                                 }
                                 BBlendModeWire::Average => {
-                                    let pa = if half_pel {
+                                    let pa = if use_qpel_luma {
                                         sample_luma_bilinear_qpel(
                                             &ref_a.y, lx as i32, ly as i32, mv_aqx, mv_aqy,
                                         ) as i32
@@ -633,7 +1032,7 @@ pub fn decode_yuv420_b_payload(
                                         let ry = ly as i32 + mv_ay as i32;
                                         sample_u8_plane(&ref_a.y, rx, ry) as i32
                                     };
-                                    let pb = if half_pel {
+                                    let pb = if use_qpel_luma {
                                         sample_luma_bilinear_qpel(
                                             &ref_b.y, lx as i32, ly as i32, mv_bqx, mv_bqy,
                                         ) as i32
@@ -644,7 +1043,16 @@ pub fn decode_yuv420_b_payload(
                                     };
                                     ((pa + pb + 1) >> 1) as u8
                                 }
-                                BBlendModeWire::WeightedPlaceholder => unreachable!(),
+                                BBlendModeWire::Weighted => {
+                                    let pa = sample_luma_bilinear_qpel(
+                                        &ref_a.y, lx as i32, ly as i32, mv_aqx, mv_aqy,
+                                    ) as i32;
+                                    let pb = sample_luma_bilinear_qpel(
+                                        &ref_b.y, lx as i32, ly as i32, mv_bqx, mv_bqy,
+                                    ) as i32;
+                                    blend_weighted_pixels(pa, pb, weight_a, weight_b).clamp(0, 255)
+                                        as u8
+                                }
                             };
                             y_plane.samples[ly as usize * y_plane.stride + lx as usize] = pv;
                         }
@@ -666,7 +1074,7 @@ pub fn decode_yuv420_b_payload(
                             let ly = mby * 16 + dy + row;
                             let pred = match blend {
                                 BBlendModeWire::ForwardOnly => {
-                                    if half_pel {
+                                    if use_qpel_luma {
                                         sample_luma_bilinear_qpel(
                                             &ref_a.y, lx as i32, ly as i32, mv_aqx, mv_aqy,
                                         ) as i32
@@ -677,7 +1085,7 @@ pub fn decode_yuv420_b_payload(
                                     }
                                 }
                                 BBlendModeWire::BackwardOnly => {
-                                    if half_pel {
+                                    if use_qpel_luma {
                                         sample_luma_bilinear_qpel(
                                             &ref_b.y, lx as i32, ly as i32, mv_bqx, mv_bqy,
                                         ) as i32
@@ -688,7 +1096,7 @@ pub fn decode_yuv420_b_payload(
                                     }
                                 }
                                 BBlendModeWire::Average => {
-                                    let pa = if half_pel {
+                                    let pa = if use_qpel_luma {
                                         sample_luma_bilinear_qpel(
                                             &ref_a.y, lx as i32, ly as i32, mv_aqx, mv_aqy,
                                         ) as i32
@@ -697,7 +1105,7 @@ pub fn decode_yuv420_b_payload(
                                         let ry = ly as i32 + mv_ay as i32;
                                         sample_u8_plane(&ref_a.y, rx, ry) as i32
                                     };
-                                    let pb = if half_pel {
+                                    let pb = if use_qpel_luma {
                                         sample_luma_bilinear_qpel(
                                             &ref_b.y, lx as i32, ly as i32, mv_bqx, mv_bqy,
                                         ) as i32
@@ -708,7 +1116,15 @@ pub fn decode_yuv420_b_payload(
                                     };
                                     (pa + pb + 1) >> 1
                                 }
-                                BBlendModeWire::WeightedPlaceholder => unreachable!(),
+                                BBlendModeWire::Weighted => {
+                                    let pa = sample_luma_bilinear_qpel(
+                                        &ref_a.y, lx as i32, ly as i32, mv_aqx, mv_aqy,
+                                    ) as i32;
+                                    let pb = sample_luma_bilinear_qpel(
+                                        &ref_b.y, lx as i32, ly as i32, mv_bqx, mv_bqy,
+                                    ) as i32;
+                                    blend_weighted_pixels(pa, pb, weight_a, weight_b)
+                                }
                             };
                             let pv = (pred + res[row as usize][col as usize] as i32).clamp(0, 255);
                             y_plane.samples[ly as usize * y_plane.stride + lx as usize] = pv as u8;
@@ -719,7 +1135,7 @@ pub fn decode_yuv420_b_payload(
 
             match blend {
                 BBlendModeWire::ForwardOnly => {
-                    if half_pel {
+                    if chroma_qpel {
                         copy_chroma_mb8_qpel(&ref_a.u, &mut u_plane, mbx, mby, mv_aqx, mv_aqy);
                         copy_chroma_mb8_qpel(&ref_a.v, &mut v_plane, mbx, mby, mv_aqx, mv_aqy);
                     } else {
@@ -728,7 +1144,7 @@ pub fn decode_yuv420_b_payload(
                     }
                 }
                 BBlendModeWire::BackwardOnly => {
-                    if half_pel {
+                    if chroma_qpel {
                         copy_chroma_mb8_qpel(&ref_b.u, &mut u_plane, mbx, mby, mv_bqx, mv_bqy);
                         copy_chroma_mb8_qpel(&ref_b.v, &mut v_plane, mbx, mby, mv_bqx, mv_bqy);
                     } else {
@@ -746,7 +1162,7 @@ pub fn decode_yuv420_b_payload(
                             }
                             let base_x = (mbx * 8) as i32 + rx as i32;
                             let base_y = (mby * 8) as i32 + ry as i32;
-                            let ua = if half_pel {
+                            let ua = if chroma_qpel {
                                 sample_u8_plane(&ref_a.u, base_x + mv_aqx / 8, base_y + mv_aqy / 8)
                                     as i32
                             } else {
@@ -756,7 +1172,7 @@ pub fn decode_yuv420_b_payload(
                                     base_y + (mv_ay as i32) / 2,
                                 ) as i32
                             };
-                            let ub = if half_pel {
+                            let ub = if chroma_qpel {
                                 sample_u8_plane(&ref_b.u, base_x + mv_bqx / 8, base_y + mv_bqy / 8)
                                     as i32
                             } else {
@@ -767,7 +1183,7 @@ pub fn decode_yuv420_b_payload(
                                 ) as i32
                             };
                             u_plane.samples[oy * u_plane.stride + ox] = ((ua + ub + 1) >> 1) as u8;
-                            let va = if half_pel {
+                            let va = if chroma_qpel {
                                 sample_u8_plane(&ref_a.v, base_x + mv_aqx / 8, base_y + mv_aqy / 8)
                                     as i32
                             } else {
@@ -777,7 +1193,7 @@ pub fn decode_yuv420_b_payload(
                                     base_y + (mv_ay as i32) / 2,
                                 ) as i32
                             };
-                            let vb = if half_pel {
+                            let vb = if chroma_qpel {
                                 sample_u8_plane(&ref_b.v, base_x + mv_bqx / 8, base_y + mv_bqy / 8)
                                     as i32
                             } else {
@@ -791,7 +1207,65 @@ pub fn decode_yuv420_b_payload(
                         }
                     }
                 }
-                BBlendModeWire::WeightedPlaceholder => unreachable!(),
+                BBlendModeWire::Weighted => {
+                    for ry in 0..8u32 {
+                        for rx in 0..8u32 {
+                            let ox = (mbx * 8 + rx) as usize;
+                            let oy = (mby * 8 + ry) as usize;
+                            if ox >= u_plane.width as usize || oy >= u_plane.height as usize {
+                                continue;
+                            }
+                            let base_x = (mbx * 8) as i32 + rx as i32;
+                            let base_y = (mby * 8) as i32 + ry as i32;
+                            let ua = if chroma_qpel {
+                                sample_u8_plane(&ref_a.u, base_x + mv_aqx / 8, base_y + mv_aqy / 8)
+                                    as i32
+                            } else {
+                                sample_u8_plane(
+                                    &ref_a.u,
+                                    base_x + (mv_ax as i32) / 2,
+                                    base_y + (mv_ay as i32) / 2,
+                                ) as i32
+                            };
+                            let ub = if chroma_qpel {
+                                sample_u8_plane(&ref_b.u, base_x + mv_bqx / 8, base_y + mv_bqy / 8)
+                                    as i32
+                            } else {
+                                sample_u8_plane(
+                                    &ref_b.u,
+                                    base_x + (mv_bx as i32) / 2,
+                                    base_y + (mv_by as i32) / 2,
+                                ) as i32
+                            };
+                            let pu = blend_weighted_pixels(ua, ub, weight_a, weight_b).clamp(0, 255)
+                                as u8;
+                            u_plane.samples[oy * u_plane.stride + ox] = pu;
+                            let va = if chroma_qpel {
+                                sample_u8_plane(&ref_a.v, base_x + mv_aqx / 8, base_y + mv_aqy / 8)
+                                    as i32
+                            } else {
+                                sample_u8_plane(
+                                    &ref_a.v,
+                                    base_x + (mv_ax as i32) / 2,
+                                    base_y + (mv_ay as i32) / 2,
+                                ) as i32
+                            };
+                            let vb = if chroma_qpel {
+                                sample_u8_plane(&ref_b.v, base_x + mv_bqx / 8, base_y + mv_bqy / 8)
+                                    as i32
+                            } else {
+                                sample_u8_plane(
+                                    &ref_b.v,
+                                    base_x + (mv_bx as i32) / 2,
+                                    base_y + (mv_by as i32) / 2,
+                                ) as i32
+                            };
+                            let pv = blend_weighted_pixels(va, vb, weight_a, weight_b).clamp(0, 255)
+                                as u8;
+                            v_plane.samples[oy * v_plane.stride + ox] = pv;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1102,7 +1576,7 @@ mod tests {
         )
         .unwrap();
         // Header ends at index 10 (0-based): magic4 + fi4 + qp + slot_a + slot_b → next is first MB blend.
-        pay[11] = BBlendModeWire::WeightedPlaceholder as u8;
+        pay[11] = BBlendModeWire::Weighted as u8;
         let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
         mgr.push_displayable_last(4, ref_a);
         mgr.push_displayable_last(6, ref_b);
@@ -1213,6 +1687,94 @@ mod tests {
         )
         .unwrap();
         assert!(st_ind.b_sad_evaluations > st_off.b_sad_evaluations);
+    }
+
+    #[test]
+    fn weighted_prediction_blend_math_deterministic() {
+        assert_eq!(blend_weighted_pixels(100, 200, 128, 128), 150);
+        assert_eq!(blend_weighted_pixels(100, 200, 64, 192), 175);
+        assert_eq!(blend_weighted_pixels(40, 80, 192, 64), 50);
+    }
+
+    #[test]
+    fn validate_b_prediction_weights_rejects_bad_sum() {
+        assert!(validate_b_prediction_weights(100, 100).is_err());
+        assert!(validate_b_prediction_weights(1, 254).is_err());
+        assert!(validate_b_prediction_weights(128, 128).is_ok());
+    }
+
+    #[test]
+    fn b_rev13_magic_with_independent_integer_me() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 100);
+        let ref_a = flat_yuv(16, 16, 80);
+        let ref_b = flat_yuv(16, 16, 120);
+        let mut st = BFrameEncodeStats::default();
+        let settings = SrsV2EncodeSettings {
+            b_motion_search_mode: SrsV2BMotionSearchMode::IndependentForwardBackward,
+            motion_search_mode: SrsV2MotionSearchMode::Diamond,
+            motion_search_radius: 4,
+            ..Default::default()
+        };
+        let pay = encode_yuv420_b_payload_mb_blend(
+            &seq, &cur, &ref_a, &ref_b, 5, 28, 1, 0, &settings, &mut st,
+        )
+        .unwrap();
+        assert_eq!(pay[3], 13);
+    }
+
+    #[test]
+    fn b_rev14_magic_with_half_pel_b_motion_mode() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 100);
+        let ref_a = flat_yuv(16, 16, 80);
+        let ref_b = flat_yuv(16, 16, 120);
+        let mut st = BFrameEncodeStats::default();
+        let settings = SrsV2EncodeSettings {
+            b_motion_search_mode: SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel,
+            motion_search_mode: SrsV2MotionSearchMode::Diamond,
+            motion_search_radius: 4,
+            ..Default::default()
+        };
+        let pay = encode_yuv420_b_payload_mb_blend(
+            &seq, &cur, &ref_a, &ref_b, 5, 28, 1, 0, &settings, &mut st,
+        )
+        .unwrap();
+        assert_eq!(pay[3], 14);
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        let dec = decode_yuv420_b_payload(&seq, &pay, &mgr).unwrap();
+        assert_eq!(dec.frame_index, 5);
+    }
+
+    #[test]
+    fn decode_b_rev14_odd_qpel_mv_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 100);
+        let ref_a = flat_yuv(16, 16, 80);
+        let ref_b = flat_yuv(16, 16, 120);
+        let mut st = BFrameEncodeStats::default();
+        let settings = SrsV2EncodeSettings {
+            b_motion_search_mode: SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel,
+            motion_search_mode: SrsV2MotionSearchMode::Diamond,
+            motion_search_radius: 4,
+            ..Default::default()
+        };
+        let mut pay = encode_yuv420_b_payload_mb_blend(
+            &seq, &cur, &ref_a, &ref_b, 5, 28, 1, 0, &settings, &mut st,
+        )
+        .unwrap();
+        assert_eq!(pay[3], 14);
+        // First MB: blend @ 11, then four i32 MVs @ 12..28
+        pay[12] = 1;
+        pay[13] = 0;
+        pay[14] = 0;
+        pay[15] = 0;
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        assert!(decode_yuv420_b_payload(&seq, &pay, &mgr).is_err());
     }
 
     #[test]

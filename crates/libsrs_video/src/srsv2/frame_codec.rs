@@ -565,9 +565,9 @@ pub fn encode_yuv420_alt_ref_payload(
     Ok(out)
 }
 
-/// Multi-reference decode entry point for mux / playback (`FR2` rev **1**–**12**).
+/// Multi-reference decode entry point for mux / playback (`FR2` rev **1**–**14** for paths wired here).
 ///
-/// Updates `manager` for intra, **P**, and **alt-ref**; **B** frames (**10**/**11**) do not advance the last-displayed slot.
+/// Updates `manager` for intra, **P**, and **alt-ref**; **B** frames (**10**/**11**/**13**/**14**) do not advance the last-displayed slot.
 pub fn decode_yuv420_srsv2_payload_managed(
     seq: &VideoSequenceHeaderV2,
     payload: &[u8],
@@ -595,7 +595,7 @@ pub fn decode_yuv420_srsv2_payload_managed(
             }
             d
         }
-        10 | 11 | 13 => {
+        10 | 11 | 13 | 14 => {
             if seq.max_ref_frames < 2 {
                 return Err(SrsV2Error::syntax(
                     "B-frame requires max_ref_frames >= 2 in sequence header",
@@ -616,7 +616,7 @@ pub fn decode_yuv420_srsv2_payload_managed(
 
 /// Decode intra or P SRSV2 payload; updates `ref_slot` when `max_ref_frames > 0` after a successful decode.
 ///
-/// **`FR2` revision 10–13** (`B` / **alt-ref**) require [`decode_yuv420_srsv2_payload_managed`].
+/// **`FR2` revision 10–14** (`B` / **alt-ref**) require [`decode_yuv420_srsv2_payload_managed`].
 pub fn decode_yuv420_srsv2_payload(
     seq: &VideoSequenceHeaderV2,
     payload: &[u8],
@@ -625,7 +625,7 @@ pub fn decode_yuv420_srsv2_payload(
     if payload.len() < 4 {
         return Err(SrsV2Error::Truncated);
     }
-    if matches!(payload[3], 10..=13) {
+    if matches!(payload[3], 10..=14) {
         return Err(SrsV2Error::Unsupported(
             "multi-reference SRSV2 payloads require decode_yuv420_srsv2_payload_managed",
         ));

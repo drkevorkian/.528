@@ -12,14 +12,16 @@
 
 **Adaptive quantization (experimental):** optional **frame-level** QP derivation from per-MB activity (`docs/adaptive_quantization.md`). Optional **block-level** **`qp_delta`** syntax is **versioned** (**`FR2\x07`–`\x09`**) and **off by default** (`SrsV2BlockAqMode`). Frame-level AQ still picks the **`base_qp`** byte before per-block deltas apply. **Intra rev 7** carries **`qp_delta` on Y/U/V 8×8 blocks**; **P rev 8/9** carries **`qp_delta` on luma residuals only** (chroma has no residual syntax in this prototype).
 
-**Motion search (experimental):** integer-pel modes, optional **half-pel** refinement (`docs/motion_search.md`). **Experimental B** (`FR2\x0A`/`\x0B`) and **alt-ref** (`FR2\x0C`) decode through **`decode_yuv420_srsv2_payload_managed`** / **`SrsV2ReferenceManager`** (parser-safe baseline). **Playback** accepts **B** when **`max_ref_frames ≥ 2`** and packet order matches decode needs (often *I₀ → P₂ → B₁*); **`max_ref_frames < 2`** → **`PlaybackError::Unsupported`**. **`classify_srsv2_payload`** treats rev **10**/**11** like other **non-keyframe** **predicted** kinds for mux/index policy. Quality and tooling are **not** production-grade. Finer **GPU** motion remains roadmap.
+**Motion search (experimental):** integer-pel modes, optional **half-pel** refinement for **P** (`docs/motion_search.md`). **Experimental B** (**`FR2\x0A`**–**`\x0E`**) and **alt-ref** (`FR2\x0C`) decode through **`decode_yuv420_srsv2_payload_managed`** / **`SrsV2ReferenceManager`**. **Playback** accepts **B** when **`max_ref_frames ≥ 2`** and packet order matches decode needs (often *I₀ → P₂ → B₁*); **`max_ref_frames < 2`** → **`PlaybackError::Unsupported`**. **`classify_srsv2_payload`** treats rev **10**/**11**/**13**/**14** like other **non-keyframe** **predicted** kinds for mux/index policy (alongside older **B** revisions). Quality and tooling are **not** production-grade. Finer **GPU** motion remains roadmap.
 
 ### Experimental B frames and alt-ref (baseline semantics)
 
 - **Rev 10 (`FR2\x0A`):** B-frame syntax with **integer** MV grid (parser-safe / minimal baseline).
 - **Rev 11 (`FR2\x0B`):** B-frame syntax with **half-pel** MV grid (same experimental tier).
 - **Rev 12 (`FR2\x0C`):** **Non-displayable** alt-ref / hidden reference refresh (`is_displayable == false`); updates **`SrsV2ReferenceManager`** only.
-- **Current B encoder (when enabled)** is intentionally minimal: **average** blend (`BBlendModeWire::Average`), **zero MV** baseline unless improved later; residual entropy follows the same experimental paths as **P**. **B-frame compression optimization** (bidirectional motion search, weighted prediction, joint RDO B/P/I decisions, tuned benchmark encode presets) remains **future work** — not “B syntax unavailable,” but **not** mature compression yet.
+- **Rev 13 (`FR2\x0D`):** Per-MB blend + **integer** MV (**`bench_srsv2 --bframes 1`** default **B** wire when half-pel **B** and weighted flags are off).
+- **Rev 14 (`FR2\x0E`):** Per-MB blend + **half-pel** MV grid on the quarter lattice (**even qpel only**) + optional **weighted** blend candidates (**`/256`** weights) when enabled (`docs/video_bitstream_v2.md`).
+- **Bench encoder (`--bframes 1`):** optional **`SrsV2BMotionSearchMode`** (integer vs half-pel **B** ME), optional **`b_weighted_prediction`** — still **heuristic** (SAD, fixed candidate weights), not production **RDO**.
 
 Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future slices**.
 
@@ -28,14 +30,14 @@ Richer closed-loop RC, GPU codecs, and OS audio/video output remain **future sli
 - 64-byte `SRS2` sequence header (little-endian fields + profile/pixel/color metadata), including **`max_ref_frames`** (capped; enables reference pictures for **P** prototype).
 - YUV420p8 intra frame payloads: **`FR2\x01`** (explicit coefficient tuples only); experimental **`FR2\x03`** (adaptive explicit vs static rANS per **8×8** block); experimental **`FR2\x07`** (rev **3** block layout + per-block **`qp_delta`**).
 - Experimental P-frame payloads: **`FR2\x02`** / **`FR2\x04`** (integer **`i16`** MVs); **`FR2\x05`** / **`FR2\x06`** (half-pel grid, **`i32`** quarter-pel MVs); **`FR2\x08`** / **`FR2\x09`** (rev **4**/**6** residuals + per-chunk **`qp_delta`**).
-- Experimental **B** payloads **`FR2\x0A`** (integer MV) / **`FR2\x0B`** (half-pel MV) and **alt-ref** **`FR2\x0C`** (non-display reference refresh), parser-safe and bounded by **`max_ref_frames`**.
+- Experimental **B** payloads **`FR2\x0A`**–**`\x0E`** (rev **13** per-MB integer MV; rev **14** half-pel MV + optional weighted) and **alt-ref** **`FR2\x0C`**, parser-safe and bounded by **`max_ref_frames`**.
 - Elementary `.srsv2` streams (sync + CRC-framed payloads).
 - Container mux/demux with `codec_id == 3` and bounded playback decode for primary video (`decode_yuv420_srsv2_payload_managed`; legacy **`decode_yuv420_srsv2_payload`** remains for **FR2** rev **1**–**9** single-slot callers).
 - CLI: `encode --codec srsv2`, `analyze --dump-codec`, decode of `.srsv2` to raw YUV via app services.
 
 ## Planned / not yet merged
 
-- General **quarter-pel** motion beyond the current half-pel grid, **B** half-pel ME, **weighted B** prediction, **B** RDO, and production-grade **GOP** / **B** placement (beyond **`FR2` rev 13** bench measurements and **`bench_srsv2 --bframes 1`** keyint-aware lab GOPs).
+- General **quarter-pel** **luma** motion beyond the current half-pel ring, **full chroma sub-pel**, **MV entropy coding**, **B** **RDO**, and production-grade **GOP** / **B** placement beyond the current **`bench_srsv2`** heuristics. See **`docs/h264_competition_plan.md`** for a blunt gap list vs mature AVC-class encoders.
 - Broader entropy coding (per-file trained models, MV syntax, etc.). Today: **experimental** static rANS **AC residual** tokens only; motion and headers remain structured bytes with bounds checks.
 - **Loop filter (experimental):** when `disable_loop_filter` is **false**, encoder and decoder apply the same **simple luma deblock** on reconstructed **Y** before refreshing the SRSV2 reference (see **`docs/deblock_filter.md`**). **CDEF**, **restoration**, **film grain**, and chroma loop filtering are **not** implemented.
 - GPU backends (`gpu-wgpu`, `gpu-cuda` feature placeholders).

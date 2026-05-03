@@ -32,9 +32,11 @@ pub use adaptive_quant::{
     SrsV2AqEncodeStats, SrsV2BlockAqWireStats,
 };
 pub use b_frame_codec::{
-    choose_b_macroblock_blend_and_mv, decode_yuv420_b_payload, encode_yuv420_b_payload,
-    encode_yuv420_b_payload_mb_blend, BBlendModeWire, BFrameEncodeStats, FRAME_PAYLOAD_MAGIC_B,
-    FRAME_PAYLOAD_MAGIC_B_MB_BLEND, FRAME_PAYLOAD_MAGIC_B_SUBPEL,
+    blend_weighted_pixels, choose_b_macroblock, choose_b_macroblock_blend_and_mv,
+    decode_yuv420_b_payload, encode_yuv420_b_payload, encode_yuv420_b_payload_mb_blend,
+    validate_b_prediction_weights, BBlendModeWire, BFrameEncodeStats, BMbEncodeChoice,
+    B_WEIGHTED_PRED_CANDIDATES, FRAME_PAYLOAD_MAGIC_B, FRAME_PAYLOAD_MAGIC_B_MB_BLEND,
+    FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP, FRAME_PAYLOAD_MAGIC_B_SUBPEL,
 };
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,

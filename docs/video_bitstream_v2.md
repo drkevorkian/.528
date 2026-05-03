@@ -62,13 +62,24 @@ Same as revision **10** but MVs are **`i32` LE** quarter-pel (even grid), matchi
 
 ### Revision 13 — experimental B-frame, per-MB blend + integer MV (`FR2\x0D`)
 
-Integer MV only (`i16` LE per reference, four components per macroblock: backward MV then forward MV). After `frame_index`, `qp`, `slot_a`, `slot_b` there is **no** frame-level blend byte: each macroblock begins with **`blend`** (`u8`, same semantics as rev **10**: forward **0**, backward **1**, average **2**, weighted **3** reserved / rejected), then the four MV components, then the usual **P**-style **8×8** skip pattern and adaptive residual chunks. Encoder chooses **`blend`** per MB (benchmark uses min-SAD among forward / backward / average predictions). **`Weighted`** remains unsupported on decode.
+Integer MV only (`i16` LE per reference, four components per macroblock: backward MV then forward MV). After `frame_index`, `qp`, `slot_a`, `slot_b` there is **no** frame-level blend byte: each macroblock begins with **`blend`** (`u8`, same semantics as rev **10**: forward **0**, backward **1**, average **2**, weighted **3** reserved / rejected), then the four MV components, then the usual **P**-style **8×8** skip pattern and adaptive residual chunks. Encoder chooses **`blend`** per MB by min-SAD among forward / backward / average predictions. **`Weighted`** (**3**) remains **rejected** on decode for rev **13** (use rev **14**).
+
+### Revision 14 — experimental B-frame, per-MB blend + half-pel MV grid + optional weighted blend (`FR2\x0E`)
+
+Same macroblock coverage and slot rules as rev **13**, but motion uses **`i32` LE** quarter-pel components (**backward** then **forward**, four values per MB). Only **even** quarter-pel steps are legal (**half-pel** grid); **odd** quarter values are malformed. MV magnitude is bounded to the same radius family as **P** half-pel revisions (decoder rejects out-of-range vectors).
+
+Per macroblock, after **`blend`**:
+
+- **`blend` ∈ {0,1,2}`**: four **`i32`** MV components, then skip pattern + residuals (same style as rev **13**).
+- **`blend == 3` (weighted):** **`weight_a`**, **`weight_b`** (`u8` each). Valid pairs satisfy **`weight_a + weight_b == 256`** with both non-zero; prediction uses integer **`(a * weight_a + b * weight_b + 128) / 256`** with **`clamp(0, 255)`**. Then four **`i32`** MV components, skip pattern, residuals.
+
+**Chroma** MC remains the same **integer approximation** as other SRSV2 inter paths (**`mv_q / 8`** rounding); only **luma** uses the bilinear half-pel sampler.
 
 ### Revision 12 — experimental alt-ref / hidden reference (`FR2\x0C`)
 
 Non-displayable intra-coded planes (same entropy style as **rev 3** in this slice): `frame_index`, `qp`, **`target_slot`**, **`reserved`** (must be **0**). Picture updates **`SrsV2ReferenceManager`** at **`target_slot`** with **`is_displayable == false`**; playback must **not** treat it as a presented frame.
 
-**Compatibility:** Revisions **1**–**9** remain the stable interchange baseline. **10**–**13** are **experimental**; the legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**13** — use **`decode_yuv420_srsv2_payload_managed`**.
+**Compatibility:** Revisions **1**–**9** remain the stable interchange baseline. **10**–**14** are **experimental**; the legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**14** — use **`decode_yuv420_srsv2_payload_managed`**.
 
 ## Elementary `.srsv2` file
 

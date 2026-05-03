@@ -48,6 +48,14 @@ struct Args {
     report_md: PathBuf,
     #[arg(long, default_value_t = false)]
     compare_x264: bool,
+    /// Reserved: target-bitrate matching vs x264 (not implemented; report-only placeholder).
+    #[arg(long, default_value_t = false)]
+    match_x264_bitrate: bool,
+    #[arg(long, default_value_t = false)]
+    compare_b_modes: bool,
+    /// Experimental weighted B prediction (`FR2` rev **14** wire when combined with motion that selects weighted MBs).
+    #[arg(long, default_value_t = false)]
+    b_weighted_prediction: bool,
     #[arg(long, default_value_t = 23)]
     x264_crf: u8,
     #[arg(long, default_value = "medium")]
@@ -241,6 +249,7 @@ struct Fr2RevisionCounts {
     rev11: u32,
     rev12: u32,
     rev13: u32,
+    rev14: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -250,6 +259,28 @@ struct BBlendBenchReport {
     b_average_macroblocks: u64,
     b_weighted_macroblocks: u64,
     b_sad_evaluations: u64,
+    b_subpel_blocks_tested: u64,
+    b_subpel_blocks_selected: u64,
+    b_additional_subpel_evaluations: u64,
+    b_avg_fractional_mv_qpel: f64,
+    b_forward_halfpel_blocks: u64,
+    b_backward_halfpel_blocks: u64,
+    b_weighted_candidates_tested: u64,
+    b_weighted_avg_weight_a: f64,
+    b_weighted_avg_weight_b: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CompareBModesEntry {
+    mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    row: CodecRow,
+    fr2_revision_counts: Fr2RevisionCounts,
+    b_blend: BBlendBenchReport,
+    keyframes: u32,
+    pframes: u32,
+    bframe_packets: u32,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -409,6 +440,16 @@ struct X264Details {
     decode_seconds: Option<f64>,
     psnr_y: Option<f64>,
     ssim_y: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ffmpeg_command: Option<String>,
+    x264_preset: String,
+    x264_crf: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    achieved_bitrate_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    srsv2_bitrate_bps: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_x264_bitrate_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -451,6 +492,10 @@ struct BenchReport {
     compare_residual_modes: Option<Vec<ResidualCompareEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sweep: Option<Vec<SweepRunReport>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_b_modes: Option<Vec<CompareBModesEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    match_x264_bitrate_note: Option<String>,
     git_commit: Option<String>,
     os: String,
 }
@@ -635,6 +680,20 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.compare_residual_modes && args.sweep {
         bail!("--compare-residual-modes and --sweep are mutually exclusive");
     }
+    if args.compare_b_modes && (args.sweep || args.compare_residual_modes) {
+        bail!("--compare-b-modes cannot be combined with --sweep or --compare-residual-modes");
+    }
+    if args.compare_b_modes {
+        if args.reference_frames < 2 {
+            bail!("--compare-b-modes requires --reference-frames >= 2");
+        }
+        if args.frames < 3 {
+            bail!("--compare-b-modes requires --frames >= 3");
+        }
+        if !args.width.is_multiple_of(16) || !args.height.is_multiple_of(16) {
+            bail!("--compare-b-modes requires width and height divisible by 16");
+        }
+    }
     parse_aq_mode(&args.aq)?;
     parse_motion_search_mode(&args.motion_search)?;
     parse_loop_filter(&args.loop_filter)?;
@@ -682,8 +741,11 @@ fn parse_b_motion_search_mode(s: &str) -> Result<SrsV2BMotionSearchMode> {
         "independent-forward-backward" | "independent" => {
             Ok(SrsV2BMotionSearchMode::IndependentForwardBackward)
         }
+        "independent-forward-backward-half" | "independent-forward-backward-half-pel" => Ok(
+            SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel,
+        ),
         _ => Err(anyhow!(
-            "--b-motion-search must be off, reuse-p, or independent-forward-backward (got {s})"
+            "--b-motion-search must be off, reuse-p, independent-forward-backward, or independent-forward-backward-half (got {s})"
         )),
     }
 }
@@ -693,6 +755,9 @@ fn b_motion_mode_cli_label(m: SrsV2BMotionSearchMode) -> &'static str {
         SrsV2BMotionSearchMode::Off => "off",
         SrsV2BMotionSearchMode::ReuseP => "reuse-p",
         SrsV2BMotionSearchMode::IndependentForwardBackward => "independent-forward-backward",
+        SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel => {
+            "independent-forward-backward-half"
+        }
     }
 }
 
@@ -755,6 +820,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         loop_filter_mode,
         deblock_strength: args.deblock_strength,
         b_motion_search_mode,
+        b_weighted_prediction: args.b_weighted_prediction,
         ..Default::default()
     };
     s.validate_rate_control()
@@ -806,6 +872,16 @@ struct PassNumbers {
     b_blend_average_macroblocks: u64,
     b_blend_weighted_macroblocks: u64,
     b_blend_sad_evaluations: u64,
+    b_blend_subpel_blocks_tested: u64,
+    b_blend_subpel_blocks_selected: u64,
+    b_blend_additional_subpel_evaluations: u64,
+    b_blend_sum_abs_frac_qpel: u64,
+    b_blend_forward_halfpel_blocks: u64,
+    b_blend_backward_halfpel_blocks: u64,
+    b_blend_weighted_candidates_tested: u64,
+    b_blend_weighted_sum_weight_a: u64,
+    b_blend_weighted_sum_weight_b: u64,
+    b_blend_macroblocks_total: u64,
     bframe_psnr_y: f64,
     bframe_ssim_y: f64,
     unsupported_bframe_reason: Option<String>,
@@ -861,10 +937,40 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             11 => c.rev11 += 1,
             12 => c.rev12 += 1,
             13 => c.rev13 += 1,
+            14 => c.rev14 += 1,
             _ => {}
         }
     }
     c
+}
+
+fn b_blend_report_from_pass(p: &PassNumbers) -> BBlendBenchReport {
+    let denom = p.b_blend_macroblocks_total.max(1);
+    let avg_frac = p.b_blend_sum_abs_frac_qpel as f64 / denom as f64;
+    let (w_avg_a, w_avg_b) = if p.b_blend_weighted_macroblocks > 0 {
+        (
+            p.b_blend_weighted_sum_weight_a as f64 / p.b_blend_weighted_macroblocks as f64,
+            p.b_blend_weighted_sum_weight_b as f64 / p.b_blend_weighted_macroblocks as f64,
+        )
+    } else {
+        (0.0, 0.0)
+    };
+    BBlendBenchReport {
+        b_forward_macroblocks: p.b_blend_forward_macroblocks,
+        b_backward_macroblocks: p.b_blend_backward_macroblocks,
+        b_average_macroblocks: p.b_blend_average_macroblocks,
+        b_weighted_macroblocks: p.b_blend_weighted_macroblocks,
+        b_sad_evaluations: p.b_blend_sad_evaluations,
+        b_subpel_blocks_tested: p.b_blend_subpel_blocks_tested,
+        b_subpel_blocks_selected: p.b_blend_subpel_blocks_selected,
+        b_additional_subpel_evaluations: p.b_blend_additional_subpel_evaluations,
+        b_avg_fractional_mv_qpel: avg_frac,
+        b_forward_halfpel_blocks: p.b_blend_forward_halfpel_blocks,
+        b_backward_halfpel_blocks: p.b_blend_backward_halfpel_blocks,
+        b_weighted_candidates_tested: p.b_blend_weighted_candidates_tested,
+        b_weighted_avg_weight_a: w_avg_a,
+        b_weighted_avg_weight_b: w_avg_b,
+    }
 }
 
 fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> MotionBenchReport {
@@ -1025,6 +1131,16 @@ fn run_srsv2_numbers_b_gop(
     let mut b_avg_mb = 0_u64;
     let mut b_wgt_mb = 0_u64;
     let mut b_sad_ev = 0_u64;
+    let mut b_subpel_tested = 0_u64;
+    let mut b_subpel_sel = 0_u64;
+    let mut b_subpel_extra_ev = 0_u64;
+    let mut b_sum_frac = 0_u64;
+    let mut b_fwd_hp = 0_u64;
+    let mut b_bwd_hp = 0_u64;
+    let mut b_wgt_cand = 0_u64;
+    let mut b_wgt_sa = 0_u64;
+    let mut b_wgt_sb = 0_u64;
+    let mut b_mb_total = 0_u64;
 
     let mut rc =
         SrsV2RateController::new(settings, args.fps.max(1), 1).map_err(|e| anyhow!("{e}"))?;
@@ -1107,6 +1223,16 @@ fn run_srsv2_numbers_b_gop(
                 b_avg_mb += st.b_average_macroblocks as u64;
                 b_wgt_mb += st.b_weighted_macroblocks as u64;
                 b_sad_ev += st.b_sad_evaluations;
+                b_subpel_tested += st.b_subpel_blocks_tested;
+                b_subpel_sel += st.b_subpel_blocks_selected;
+                b_subpel_extra_ev += st.b_additional_subpel_evaluations;
+                b_sum_frac += st.b_sum_abs_frac_qpel;
+                b_fwd_hp += st.b_forward_halfpel_blocks as u64;
+                b_bwd_hp += st.b_backward_halfpel_blocks as u64;
+                b_wgt_cand += st.b_weighted_candidates_tested;
+                b_wgt_sa += st.b_weighted_sum_weight_a;
+                b_wgt_sb += st.b_weighted_sum_weight_b;
+                b_mb_total += (seq.width / 16) as u64 * (seq.height / 16) as u64;
                 pl
             }
         };
@@ -1239,10 +1365,20 @@ fn run_srsv2_numbers_b_gop(
         b_blend_average_macroblocks: b_avg_mb,
         b_blend_weighted_macroblocks: b_wgt_mb,
         b_blend_sad_evaluations: b_sad_ev,
+        b_blend_subpel_blocks_tested: b_subpel_tested,
+        b_blend_subpel_blocks_selected: b_subpel_sel,
+        b_blend_additional_subpel_evaluations: b_subpel_extra_ev,
+        b_blend_sum_abs_frac_qpel: b_sum_frac,
+        b_blend_forward_halfpel_blocks: b_fwd_hp,
+        b_blend_backward_halfpel_blocks: b_bwd_hp,
+        b_blend_weighted_candidates_tested: b_wgt_cand,
+        b_blend_weighted_sum_weight_a: b_wgt_sa,
+        b_blend_weighted_sum_weight_b: b_wgt_sb,
+        b_blend_macroblocks_total: b_mb_total,
         bframe_psnr_y,
         bframe_ssim_y,
         unsupported_bframe_reason: None,
-        bframe_mode_note: "experimental --bframes 1: keyint-aware I/B/P placement; encode order is decode order (anchors before sandwiched B); FR2 rev13 per-MB blend/SAD (+ optional integer B ME); metrics computed in display order".to_string(),
+        bframe_mode_note: "experimental --bframes 1: keyint-aware I/B/P placement; encode order is decode order (anchors before sandwiched B); FR2 rev13/14 per-MB blend/SAD + optional B ME (integer or half-pel) and optional weighted prediction; metrics computed in display order".to_string(),
     })
 }
 
@@ -1438,6 +1574,16 @@ fn run_srsv2_numbers(
         b_blend_average_macroblocks: 0,
         b_blend_weighted_macroblocks: 0,
         b_blend_sad_evaluations: 0,
+        b_blend_subpel_blocks_tested: 0,
+        b_blend_subpel_blocks_selected: 0,
+        b_blend_additional_subpel_evaluations: 0,
+        b_blend_sum_abs_frac_qpel: 0,
+        b_blend_forward_halfpel_blocks: 0,
+        b_blend_backward_halfpel_blocks: 0,
+        b_blend_weighted_candidates_tested: 0,
+        b_blend_weighted_sum_weight_a: 0,
+        b_blend_weighted_sum_weight_b: 0,
+        b_blend_macroblocks_total: 0,
         bframe_psnr_y: 0.0,
         bframe_ssim_y: 0.0,
         unsupported_bframe_reason: None,
@@ -1534,13 +1680,13 @@ fn pass_to_details(
         match pl.get(3).copied() {
             Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
             Some(2 | 4 | 5 | 6 | 8 | 9) => p_bytes.push(pl.len() as u64),
-            Some(10 | 11 | 13) => b_bytes.push(pl.len() as u64),
+            Some(10 | 11 | 13 | 14) => b_bytes.push(pl.len() as u64),
             Some(12) => alt_bytes.push(pl.len() as u64),
             _ => {}
         }
     }
     let fr2 = fr2_revision_counts(&p.payloads);
-    let bframe_count = fr2.rev10 + fr2.rev11 + fr2.rev13;
+    let bframe_count = fr2.rev10 + fr2.rev11 + fr2.rev13 + fr2.rev14;
     let alt_ref_count = fr2.rev12;
     let enc_bytes: u64 = p.byte_hist.iter().sum();
     let raw_bytes = raw_len_for_bitrate(args);
@@ -1580,13 +1726,7 @@ fn pass_to_details(
         decode_order_count: p.decode_order_count,
         p_anchor_count: p.p_anchor_count,
         avg_p_anchor_bytes: p.avg_p_anchor_bytes,
-        b_blend: BBlendBenchReport {
-            b_forward_macroblocks: p.b_blend_forward_macroblocks,
-            b_backward_macroblocks: p.b_blend_backward_macroblocks,
-            b_average_macroblocks: p.b_blend_average_macroblocks,
-            b_weighted_macroblocks: p.b_blend_weighted_macroblocks,
-            b_sad_evaluations: p.b_blend_sad_evaluations,
-        },
+        b_blend: b_blend_report_from_pass(p),
         unsupported_bframe_reason: p.unsupported_bframe_reason.clone(),
         bframe_mode_note: p.bframe_mode_note.clone(),
         bframe_psnr_y: p.bframe_psnr_y,
@@ -1610,6 +1750,158 @@ fn pass_to_row(args: &Args, codec: &str, p: &PassNumbers) -> CodecRow {
         enc_fps: args.frames as f64 / p.enc_secs.max(1e-9),
         dec_fps: args.frames as f64 / p.dec_secs.max(1e-9),
     }
+}
+
+fn compare_b_modes_err_row(label: &str, err: &str) -> CompareBModesEntry {
+    CompareBModesEntry {
+        mode: label.to_string(),
+        error: Some(err.to_string()),
+        row: CodecRow {
+            codec: label.to_string(),
+            error: Some(err.to_string()),
+            bytes: 0,
+            ratio: 0.0,
+            bitrate_bps: 0.0,
+            psnr_y: 0.0,
+            ssim_y: 0.0,
+            enc_fps: 0.0,
+            dec_fps: 0.0,
+        },
+        fr2_revision_counts: Fr2RevisionCounts::default(),
+        b_blend: BBlendBenchReport::default(),
+        keyframes: 0,
+        pframes: 0,
+        bframe_packets: 0,
+    }
+}
+
+fn compare_b_modes_try_entry(
+    ef: usize,
+    raw: &[u8],
+    label: &str,
+    row_args: Args,
+) -> CompareBModesEntry {
+    let re = match parse_residual_entropy(&row_args.residual_entropy) {
+        Ok(r) => r,
+        Err(e) => return compare_b_modes_err_row(label, &format!("{e:#}")),
+    };
+    let settings = match build_settings(&row_args, re) {
+        Ok(s) => s,
+        Err(e) => return compare_b_modes_err_row(label, &format!("{e:#}")),
+    };
+    let seq_r = build_seq_header(&row_args, &settings);
+    let numbers = match run_srsv2_pass(&row_args, &seq_r, raw, &settings, ef) {
+        Ok(n) => n,
+        Err(e) => return compare_b_modes_err_row(label, &format!("{e:#}")),
+    };
+    let details = pass_to_details(
+        &row_args,
+        &seq_r,
+        &settings,
+        &row_args.residual_entropy,
+        &numbers,
+        DeblockBenchReport::default(),
+    );
+    let fr2 = fr2_revision_counts(&numbers.payloads);
+    let b_pkts = fr2.rev10 + fr2.rev11 + fr2.rev13 + fr2.rev14;
+    CompareBModesEntry {
+        mode: label.to_string(),
+        error: None,
+        row: pass_to_row(&row_args, label, &numbers),
+        fr2_revision_counts: fr2,
+        b_blend: details.b_blend.clone(),
+        keyframes: details.keyframes,
+        pframes: details.pframes,
+        bframe_packets: b_pkts,
+    }
+}
+
+fn run_compare_b_modes_report(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    ef: usize,
+) -> Result<BenchReport> {
+    let re = parse_residual_entropy(&args.residual_entropy)?;
+    let settings = build_settings(args, re)?;
+    let numbers = run_srsv2_pass(args, seq, raw, &settings, ef)?;
+    let deblock = build_deblock_bench_report(args, seq, &settings, raw, ef, &numbers)?;
+    let details = pass_to_details(
+        args,
+        seq,
+        &settings,
+        &args.residual_entropy,
+        &numbers,
+        deblock,
+    );
+    let srsv2_row = pass_to_row(args, "SRSV2", &numbers);
+    let src_luma = flatten_src_luma(raw, ef, args)?;
+
+    let mut rows: Vec<CompareBModesEntry> = Vec::new();
+
+    let mut a = args.clone();
+    a.bframes = 0;
+    a.b_motion_search = "off".to_string();
+    a.b_weighted_prediction = false;
+    a.reference_frames = a.reference_frames.max(1);
+    rows.push(compare_b_modes_try_entry(ef, raw, "SRSV2-P-only", a));
+
+    let mut a = args.clone();
+    a.bframes = 1;
+    a.reference_frames = a.reference_frames.max(2);
+    a.b_motion_search = "independent-forward-backward".to_string();
+    a.b_weighted_prediction = false;
+    rows.push(compare_b_modes_try_entry(ef, raw, "SRSV2-B-int", a));
+
+    let mut a = args.clone();
+    a.bframes = 1;
+    a.reference_frames = a.reference_frames.max(2);
+    a.b_motion_search = "independent-forward-backward-half".to_string();
+    a.b_weighted_prediction = false;
+    rows.push(compare_b_modes_try_entry(ef, raw, "SRSV2-B-half", a));
+
+    let mut a = args.clone();
+    a.bframes = 1;
+    a.reference_frames = a.reference_frames.max(2);
+    a.b_motion_search = "independent-forward-backward".to_string();
+    a.b_weighted_prediction = true;
+    rows.push(compare_b_modes_try_entry(ef, raw, "SRSV2-B-weighted", a));
+
+    let mut table: Vec<CodecRow> = rows.iter().map(|r| r.row.clone()).collect();
+
+    let x264 = if args.compare_x264 {
+        let (row, det) = run_x264_compare(args, raw, ef, &src_luma, Some(srsv2_row.bitrate_bps))?;
+        if let Some(r) = row {
+            table.push(r);
+        }
+        Some(det)
+    } else {
+        None
+    };
+
+    let match_x264_bitrate_note = args
+        .match_x264_bitrate
+        .then(|| "Bitrate matching vs x264 is not implemented (placeholder only).".to_string());
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "Residual entropy (FR2 rev 3 intra / rev 4 P; rev 7–9 add optional block qp_delta with adaptive residuals) is experimental; auto mode never chooses a larger representation than explicit tuples per block.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2: details,
+        x264,
+        table,
+        compare_residual_modes: None,
+        sweep: None,
+        compare_b_modes: Some(rows),
+        match_x264_bitrate_note,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
 }
 
 fn raw_len_for_bitrate(args: &Args) -> u64 {
@@ -1640,8 +1932,18 @@ fn run_single_report(
 
     let src_luma = flatten_src_luma(raw, expected_frame, args)?;
 
+    let match_x264_bitrate_note = args
+        .match_x264_bitrate
+        .then(|| "Bitrate matching vs x264 is not implemented (placeholder only).".to_string());
+
     let x264 = if args.compare_x264 {
-        let (row, details_x264) = run_x264_compare(args, raw, expected_frame, &src_luma)?;
+        let (row, details_x264) = run_x264_compare(
+            args,
+            raw,
+            expected_frame,
+            &src_luma,
+            Some(srsv2_row.bitrate_bps),
+        )?;
         if let Some(r) = row {
             table.push(r);
         }
@@ -1664,6 +1966,8 @@ fn run_single_report(
         table,
         compare_residual_modes: None,
         sweep: None,
+        compare_b_modes: None,
+        match_x264_bitrate_note,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
@@ -1796,6 +2100,10 @@ fn run_compare_residual_report(
         table,
         compare_residual_modes: Some(entries),
         sweep: None,
+        compare_b_modes: None,
+        match_x264_bitrate_note: args.match_x264_bitrate.then(|| {
+            "Bitrate matching vs x264 is not implemented (placeholder only).".to_string()
+        }),
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
@@ -2029,7 +2337,9 @@ fn main() -> Result<()> {
         return run_sweep_file(&args, &seq, &raw, expected_frame);
     }
 
-    let report = if args.compare_residual_modes {
+    let report = if args.compare_b_modes {
+        run_compare_b_modes_report(&args, &seq, &raw, expected_frame)?
+    } else if args.compare_residual_modes {
         run_compare_residual_report(&args, &seq, &raw, expected_frame)?
     } else {
         run_single_report(&args, &seq, &raw, expected_frame)?
@@ -2139,7 +2449,23 @@ fn run_x264_compare(
     raw: &[u8],
     frame_bytes: usize,
     src_luma: &[u8],
+    srsv2_bitrate_bps: Option<f64>,
 ) -> Result<(Option<CodecRow>, X264Details)> {
+    let match_x264_bitrate_note = args
+        .match_x264_bitrate
+        .then(|| "Bitrate matching vs x264 is not implemented (placeholder only).".to_string());
+    let crf = args.x264_crf;
+    let ffmpeg_command = format!(
+        "ffmpeg -y -f rawvideo -pix_fmt yuv420p -s {w}x{h} -r {fps} -i \"{inp}\" -frames:v {frames} -c:v libx264 -preset {preset} -crf {crf} -an <output.mp4>",
+        w = args.width,
+        h = args.height,
+        fps = args.fps.max(1),
+        inp = args.input.display(),
+        frames = args.frames,
+        preset = args.x264_preset,
+        crf = crf,
+    );
+
     if !ffmpeg_available() {
         return Ok((
             None,
@@ -2150,6 +2476,12 @@ fn run_x264_compare(
                 decode_seconds: None,
                 psnr_y: None,
                 ssim_y: None,
+                ffmpeg_command: Some(ffmpeg_command),
+                x264_preset: args.x264_preset.clone(),
+                x264_crf: crf,
+                achieved_bitrate_bps: None,
+                srsv2_bitrate_bps,
+                match_x264_bitrate_note,
             },
         ));
     }
@@ -2193,6 +2525,12 @@ fn run_x264_compare(
                 decode_seconds: None,
                 psnr_y: None,
                 ssim_y: None,
+                ffmpeg_command: Some(ffmpeg_command.clone()),
+                x264_preset: args.x264_preset.clone(),
+                x264_crf: crf,
+                achieved_bitrate_bps: None,
+                srsv2_bitrate_bps,
+                match_x264_bitrate_note,
             },
         ));
     }
@@ -2277,6 +2615,12 @@ fn run_x264_compare(
             decode_seconds: Some(dec_secs),
             psnr_y,
             ssim_y,
+            ffmpeg_command: Some(ffmpeg_command),
+            x264_preset: args.x264_preset.clone(),
+            x264_crf: crf,
+            achieved_bitrate_bps: Some(bitrate_bps),
+            srsv2_bitrate_bps,
+            match_x264_bitrate_note,
         },
     ))
 }
@@ -2323,6 +2667,42 @@ fn to_markdown(r: &BenchReport) -> String {
                 e.label, e.ok, e.error
             ));
         }
+    }
+
+    if let Some(rows) = &r.compare_b_modes {
+        out.push_str("\n## B-mode comparison (`--compare-b-modes`)\n\n");
+        out.push_str("| Mode | Bytes | Bitrate (bps) | PSNR-Y | SSIM-Y | I | P | B pkts | B blend (f/b/avg/w) |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        for e in rows {
+            let err = e
+                .error
+                .as_ref()
+                .map(|s| format!(" **skipped:** {s}"))
+                .unwrap_or_default();
+            let bb = &e.b_blend;
+            out.push_str(&format!(
+                "| {}{} | {} | {:.0} | {:.2} | {:.4} | {} | {} | {} | {}/{}/{}/{} |\n",
+                e.mode,
+                err,
+                e.row.bytes,
+                e.row.bitrate_bps,
+                e.row.psnr_y,
+                e.row.ssim_y,
+                e.keyframes,
+                e.pframes,
+                e.bframe_packets,
+                bb.b_forward_macroblocks,
+                bb.b_backward_macroblocks,
+                bb.b_average_macroblocks,
+                bb.b_weighted_macroblocks,
+            ));
+        }
+    }
+
+    if let Some(note) = &r.match_x264_bitrate_note {
+        out.push_str("\n## Bitrate matching note\n\n");
+        out.push_str(note);
+        out.push_str("\n\n");
     }
 
     out.push_str("\n## SRSV2 details\n\n");
@@ -2469,7 +2849,7 @@ fn to_markdown(r: &BenchReport) -> String {
             m.avg_fractional_mv_qpel_per_mb
         ));
         out.push_str(&format!(
-            "- B-frame motion search (experimental, FR2 rev13 path): {}\n",
+            "- B-frame motion search (experimental, FR2 rev13/14 path): {}\n",
             m.b_motion_search_mode
         ));
     }
@@ -2498,8 +2878,37 @@ fn to_markdown(r: &BenchReport) -> String {
         }
     }
     if let Some(x) = &r.x264 {
-        out.push_str("\n## x264 details\n\n");
-        out.push_str(&format!("- status: {}\n", x.status));
+        out.push_str("\n## x264 / FFmpeg comparison (`--compare-x264`)\n\n");
+        out.push_str("_Fair comparison requires **achieved bitrate** and quality metrics for **both** encoders (CRF-only labels are not sufficient by themselves)._\n\n");
+        out.push_str(&format!(
+            "- status: {}\n- preset: `{}`\n- CRF: {}\n",
+            x.status, x.x264_preset, x.x264_crf
+        ));
+        if let Some(b) = x.achieved_bitrate_bps {
+            out.push_str(&format!("- x264 achieved bitrate (bps): {:.2}\n", b));
+        } else {
+            out.push_str("- x264 achieved bitrate (bps): *(unavailable)*\n");
+        }
+        if let Some(b) = x.srsv2_bitrate_bps {
+            out.push_str(&format!(
+                "- SRSV2 achieved bitrate (bps) at compare time: {:.2}\n",
+                b
+            ));
+        }
+        if let Some(py) = x.psnr_y {
+            out.push_str(&format!("- x264 PSNR-Y (vs source): {:.2}\n", py));
+        }
+        if let Some(sy) = x.ssim_y {
+            out.push_str(&format!("- x264 SSIM-Y (vs source): {:.4}\n", sy));
+        }
+        if let Some(cmd) = &x.ffmpeg_command {
+            out.push_str(&format!(
+                "- documented FFmpeg template / command string:\n\n```text\n{cmd}\n```\n"
+            ));
+        }
+        if let Some(n) = &x.match_x264_bitrate_note {
+            out.push_str(&format!("- match-bitrate placeholder: {n}\n"));
+        }
     }
     out
 }
@@ -2554,6 +2963,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -2605,6 +3017,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         assert!(validate_args(&a).is_err());
         a.bframes = 0;
@@ -2655,6 +3070,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         assert!(validate_args(&a).is_err());
         a.reference_frames = 2;
@@ -2723,6 +3141,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 2,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -2782,6 +3203,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 2,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -2858,6 +3282,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 2,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -2866,6 +3293,164 @@ mod tests {
         assert_eq!(numbers.display_order_frame_indices.len(), frames as usize);
         assert_eq!(numbers.decode_order_frame_indices, vec![0, 2, 1]);
         assert!(numbers.payloads.iter().any(|p| p.get(3) == Some(&13)));
+    }
+
+    #[test]
+    fn compare_b_modes_report_runs_four_rows_without_errors_and_serializes() {
+        let w = 64u32;
+        let h = 64u32;
+        let frames = 3u32;
+        let fb = yuv420_frame_bytes(w, h).unwrap();
+        let raw: Vec<u8> = vec![120u8; fb * frames as usize];
+        let args = Args {
+            input: PathBuf::from("nope"),
+            width: w,
+            height: h,
+            frames,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "diamond".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 1,
+            alt_ref: "off".to_string(),
+            b_motion_search: "independent-forward-backward".to_string(),
+            gop: 0,
+            reference_frames: 2,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
+        };
+        validate_args(&args).unwrap();
+        let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
+        let seq = build_seq_header(&args, &settings);
+        let rep = run_compare_b_modes_report(&args, &seq, &raw, fb).unwrap();
+        let rows = rep.compare_b_modes.as_ref().unwrap();
+        assert_eq!(rows.len(), 4);
+        for e in rows {
+            assert!(e.error.is_none(), "mode {} failed: {:?}", e.mode, e.error);
+        }
+        assert_eq!(rep.srsv2.display_frame_count, frames);
+        assert_eq!(rep.frames, frames);
+        let js = serde_json::to_string(&rep).unwrap();
+        assert!(js.contains("SRSV2-P-only"));
+        assert!(js.contains("SRSV2-B-int"));
+        assert!(js.contains("SRSV2-B-half"));
+        assert!(js.contains("SRSV2-B-weighted"));
+        assert!(js.contains("\"compare_b_modes\""));
+    }
+
+    #[test]
+    fn b_motion_half_pel_cli_maps_in_build_settings() {
+        let mut a = Args {
+            input: PathBuf::from("nope"),
+            width: 64,
+            height: 64,
+            frames: 3,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 8,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "diamond".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 1,
+            alt_ref: "off".to_string(),
+            b_motion_search: "independent-forward-backward-half".to_string(),
+            gop: 0,
+            reference_frames: 2,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
+        };
+        validate_args(&a).unwrap();
+        let s = build_settings(&a, ResidualEntropy::Auto).unwrap();
+        assert_eq!(
+            s.b_motion_search_mode,
+            SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel
+        );
+        a.b_motion_search = "independent_forward_backward_half".to_string();
+        let s2 = build_settings(&a, ResidualEntropy::Auto).unwrap();
+        assert_eq!(
+            s2.b_motion_search_mode,
+            SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel
+        );
+    }
+
+    #[test]
+    fn x264_compare_details_always_include_documented_ffmpeg_command_string() {
+        let x = X264Details {
+            status: "ffmpeg unavailable".to_string(),
+            bytes: None,
+            encode_seconds: None,
+            decode_seconds: None,
+            psnr_y: None,
+            ssim_y: None,
+            ffmpeg_command: Some("ffmpeg -y -f rawvideo ...".to_string()),
+            x264_preset: "medium".to_string(),
+            x264_crf: 23,
+            achieved_bitrate_bps: None,
+            srsv2_bitrate_bps: Some(123_456.0),
+            match_x264_bitrate_note: Some("placeholder".to_string()),
+        };
+        let j = serde_json::to_string(&x).unwrap();
+        assert!(j.contains("ffmpeg_command"));
+        assert!(j.contains("ffmpeg -y -f rawvideo"));
+        assert!(j.contains("\"x264_preset\":\"medium\""));
+        assert!(j.contains("\"x264_crf\":23"));
+        assert!(j.contains("srsv2_bitrate_bps"));
     }
 
     #[test]
@@ -2917,6 +3502,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
         let seq = build_seq_header(&args, &settings);
@@ -3055,6 +3643,8 @@ mod tests {
             }],
             compare_residual_modes: None,
             sweep: None,
+            compare_b_modes: None,
+            match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
         };
@@ -3185,6 +3775,8 @@ mod tests {
                 },
             }]),
             sweep: None,
+            compare_b_modes: None,
+            match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
         };
@@ -3307,6 +3899,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
@@ -3357,6 +3952,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
         };
         assert!(validate_args(&a).is_err());
         a.aq = "off".to_string();

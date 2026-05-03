@@ -10,7 +10,11 @@ Legacy predicted payloads **`FR2` revision 2 / 4** carry **`i16`** motion vector
 
 When **`SrsV2EncodeSettings::subpel_mode == HalfPel`**, the encoder keeps the same integer search, then optionally refines each macroblock on an **eight-offset half-pel ring** in **quarter-pel units** (`±2` == half-pel on the ¼ grid). Wire format: **`FR2\x05`** (tuple residuals, same layout as rev **2** after MV width) or **`FR2\x06`** (adaptive residuals like rev **4**). MVs are stored as **`i32` LE** in **quarter-pel** luma units; decoders reject **odd** quarter values (not on the half-pel grid).
 
-**`SrsV2EncodeSettings::subpel_refinement_radius`** is clamped ( **`0`** skips refinement; **`1`** runs the default eight probes). **Quarter-pel** motion beyond the current half-pel grid is not implemented. **Experimental B** syntax (`FR2\x0A`/`\x0B`) decodes in **`libsrs_video`** and **`PlaybackSession`** when **`max_ref_frames ≥ 2`** (typically **decode-order** *I₀→P₂→B₁*). **`bench_srsv2`** supports **`--bframes 1`** as an **experimental** encode/decode GOP benchmark (zero-MV **B**, average blend); **`--bframes > 1`** is rejected in the current slice. **GPU** motion search is not implemented.
+**`SrsV2EncodeSettings::subpel_refinement_radius`** is clamped ( **`0`** skips refinement; **`1`** runs the default eight probes). **Quarter-pel** motion beyond the current half-pel grid is not implemented for **P** or **B**.
+
+**Experimental B** syntax (**`FR2\x0A`** … **`FR2\x0E`**) decodes in **`libsrs_video`** and **`PlaybackSession`** when **`max_ref_frames ≥ 2`** (typically **decode-order** *I₀→P₂→B₁*). **`bench_srsv2`** supports **`--bframes 1`** as an **experimental** GOP benchmark. **`SrsV2BMotionSearchMode::IndependentForwardBackward`** drives **`FR2` rev 13** (integer MV per MB). **`IndependentForwardBackwardHalfPel`** runs integer ME first, then half-pel probes on the quarter grid (**even qpel only**) around the best forward/backward candidates and emits **`FR2` rev 14** when selected.
+
+**GPU** motion search is not implemented.
 
 **Chroma** still uses an **integer** copy with **`mv_q / 8`** (approximation); full chroma sub-pel is future work — benchmark before claiming chroma-aware gains.
 
