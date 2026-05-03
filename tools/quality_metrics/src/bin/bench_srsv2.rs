@@ -2436,6 +2436,22 @@ fn git_short_hash() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// When MSE is zero, [`psnr_u8`] returns positive infinity. `serde_json` serializes non-finite `f64`
+/// as JSON `null`, which broke `--compare-x264` reports for near-lossless encodes. Use this finite
+/// sentinel in JSON/table output only; it means “indistinguishable from source on luma for this clip.”
+const PSNR_Y_JSON_SAFE_IDENTICAL_DB: f64 = 100.0;
+
+fn psnr_y_json_safe_from_buffers(reference: &[u8], measured: &[u8]) -> Result<f64> {
+    let p = psnr_u8(reference, measured, 255.0).map_err(|e| anyhow!("psnr: {e}"))?;
+    if p.is_finite() {
+        Ok(p)
+    } else if p == f64::INFINITY {
+        Ok(PSNR_Y_JSON_SAFE_IDENTICAL_DB)
+    } else {
+        Err(anyhow!("psnr non-finite (NaN)"))
+    }
+}
+
 fn ffmpeg_available() -> bool {
     Command::new("ffmpeg")
         .arg("-version")
@@ -2568,7 +2584,7 @@ fn run_x264_compare(
     }
 
     let psnr_y = if dec_luma.len() == src_luma.len() {
-        Some(psnr_u8(src_luma, &dec_luma, 255.0)?)
+        Some(psnr_y_json_safe_from_buffers(src_luma, &dec_luma)?)
     } else {
         None
     };
@@ -2897,6 +2913,9 @@ fn to_markdown(r: &BenchReport) -> String {
         }
         if let Some(py) = x.psnr_y {
             out.push_str(&format!("- x264 PSNR-Y (vs source): {:.2}\n", py));
+            if (py - PSNR_Y_JSON_SAFE_IDENTICAL_DB).abs() <= 1e-6 {
+                out.push_str("  - Identical luma → raw PSNR is ∞; **100.0 dB** here is a JSON-safe sentinel, not a codec ceiling.\n");
+            }
         }
         if let Some(sy) = x.ssim_y {
             out.push_str(&format!("- x264 SSIM-Y (vs source): {:.4}\n", sy));
@@ -3427,6 +3446,16 @@ mod tests {
             s2.b_motion_search_mode,
             SrsV2BMotionSearchMode::IndependentForwardBackwardHalfPel
         );
+    }
+
+    #[test]
+    fn psnr_json_safe_maps_perfect_luma_match_to_finite_db() {
+        let b = vec![42_u8; 256];
+        let raw = psnr_u8(&b, &b, 255.0).unwrap();
+        assert!(raw.is_infinite(), "expected +inf for identical buffers");
+        let safe = psnr_y_json_safe_from_buffers(&b, &b).unwrap();
+        assert_eq!(safe, PSNR_Y_JSON_SAFE_IDENTICAL_DB);
+        assert!(safe.is_finite());
     }
 
     #[test]
