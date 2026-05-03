@@ -173,6 +173,28 @@ pub enum SrsV2TransformSizeMode {
     Force8x8,
 }
 
+/// How **`AutoFast`** weighs **SAD** vs estimated side-information (`FR2` rev **19**+).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2PartitionCostModel {
+    /// Legacy **AutoFast**: **SAD** plus fixed integer penalties — identical to pre–cost-model behavior.
+    #[default]
+    SadOnly,
+    /// **SAD + λ ×** isolated compact **MV** bytes + configurable PU / split penalties (no residual re-encode).
+    HeaderAware,
+    /// **SAD + λ ×** (**MV** + isolated residual body bytes) per macroblock (**bounded** buffers).
+    RdoFast,
+}
+
+/// **`FR2` rev19** partition map encoding on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2PartitionMapEncoding {
+    /// One byte per macroblock (original layout).
+    #[default]
+    LegacyPerMb,
+    /// Run-length map using **`P_INTER_FLAG_PACKED_PART_MAP`** (flags bit **3**).
+    RleRuns,
+}
+
 /// Experimental **B-frame** motion / blend search (`FR2` rev **13** integer MVs, rev **14** half-pel MVs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2BMotionSearchMode {
@@ -245,6 +267,19 @@ pub struct SrsV2EncodeSettings {
     pub partition_rdo_lambda_scale: u16,
     /// Transform choice for **`FR2` rev 19+** partitioned residuals.
     pub transform_size_mode: SrsV2TransformSizeMode,
+
+    /// **`AutoFast`** cost model (**default** [`SrsV2PartitionCostModel::SadOnly`] — legacy behavior).
+    pub partition_cost_model: SrsV2PartitionCostModel,
+    /// Fixed-point scale (**256 ≈ 1.0**) — extra disincentive for **split8×8** vs **16×16** in [`SrsV2PartitionCostModel::HeaderAware`].
+    pub partition_split_penalty: u16,
+    /// Fixed-point weight (**256 ≈ 1.0**) on isolated **MV** compact bytes in [`SrsV2PartitionCostModel::HeaderAware`].
+    pub partition_mv_penalty: u16,
+    /// Fixed-point weight on extra partition-units (beyond one) in [`SrsV2PartitionCostModel::HeaderAware`].
+    pub partition_header_penalty: u16,
+    /// Fixed-point scale on (**MV + residual**) byte term in [`SrsV2PartitionCostModel::RdoFast`].
+    pub partition_quality_bias: u16,
+    /// **`FR2` rev19** partition map packing (**default** legacy one-byte-per-MB).
+    pub partition_map_encoding: SrsV2PartitionMapEncoding,
 }
 
 impl Default for SrsV2EncodeSettings {
@@ -290,6 +325,13 @@ impl Default for SrsV2EncodeSettings {
             max_partition_depth: 0,
             partition_rdo_lambda_scale: 256,
             transform_size_mode: SrsV2TransformSizeMode::Auto,
+
+            partition_cost_model: SrsV2PartitionCostModel::SadOnly,
+            partition_split_penalty: 3072,
+            partition_mv_penalty: 256,
+            partition_header_penalty: 512,
+            partition_quality_bias: 256,
+            partition_map_encoding: SrsV2PartitionMapEncoding::LegacyPerMb,
         }
     }
 }

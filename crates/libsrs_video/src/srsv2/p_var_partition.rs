@@ -26,7 +26,8 @@ use super::motion_search::{
 };
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings,
-    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2SubpelMode, SrsV2TransformSizeMode,
+    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2PartitionCostModel,
+    SrsV2PartitionMapEncoding, SrsV2SubpelMode, SrsV2TransformSizeMode,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, decode_p_residual_chunk_4x4, encode_p_residual_chunk,
@@ -69,6 +70,10 @@ fn copy_chroma_mb8_qpel_local(
 const P_INTER_FLAG_SUBPEL: u8 = 1;
 const P_INTER_FLAG_BLOCK_AQ: u8 = 2;
 const P_INTER_FLAG_ENTROPY_RESIDUAL: u8 = 4;
+/// Run-length partition map (`FR2` rev **19**/**20**): **flags** bit **3**.
+const P_INTER_FLAG_PACKED_PART_MAP: u8 = 8;
+
+const MAX_MB_RESIDUAL_RD_BYTES: usize = 65_536;
 
 const CTRL_SKIP: u8 = 1;
 const TX_SHIFT: u8 = 1;
@@ -95,6 +100,84 @@ fn read_u8(data: &[u8], cur: &mut usize) -> Result<u8, SrsV2Error> {
     let v = data[*cur];
     *cur += 1;
     Ok(v)
+}
+
+fn read_u16_le(data: &[u8], cur: &mut usize) -> Result<u16, SrsV2Error> {
+    if data.len().saturating_sub(*cur) < 2 {
+        return Err(SrsV2Error::Truncated);
+    }
+    let v = u16::from_le_bytes([data[*cur], data[*cur + 1]]);
+    *cur += 2;
+    Ok(v)
+}
+
+/// Run-length partition map: **`n_runs`** (**u16** LE), then **`(partition_byte, run_len_u16)`** pairs.
+fn rle_partition_payload(partitions: &[u8]) -> Result<Vec<u8>, SrsV2Error> {
+    if partitions.is_empty() {
+        return Err(SrsV2Error::syntax("empty partition map"));
+    }
+    for &b in partitions {
+        validate_partition_reserved_bits(b)?;
+    }
+    let mut runs: Vec<(u8, u16)> = Vec::new();
+    let mut cur_b = partitions[0];
+    let mut cnt: u16 = 1;
+    for &b in &partitions[1..] {
+        if b == cur_b && cnt < u16::MAX {
+            cnt += 1;
+        } else {
+            runs.push((cur_b, cnt));
+            cur_b = b;
+            cnt = 1;
+        }
+    }
+    runs.push((cur_b, cnt));
+    let n_runs =
+        u16::try_from(runs.len()).map_err(|_| SrsV2Error::Overflow("partition rle run count"))?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&n_runs.to_le_bytes());
+    for (w, c) in runs {
+        out.push(w);
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    Ok(out)
+}
+
+fn decode_rle_partition_map(
+    data: &[u8],
+    cur: &mut usize,
+    n_mb: usize,
+) -> Result<Vec<u8>, SrsV2Error> {
+    if n_mb == 0 {
+        return Ok(Vec::new());
+    }
+    let n_runs = read_u16_le(data, cur)? as usize;
+    if n_runs == 0 || n_runs > n_mb {
+        return Err(SrsV2Error::syntax("partition rle run count out of range"));
+    }
+    let mut out = Vec::with_capacity(n_mb);
+    let mut total = 0usize;
+    for _ in 0..n_runs {
+        let w = read_u8(data, cur)?;
+        validate_partition_reserved_bits(w)?;
+        let c = read_u16_le(data, cur)? as usize;
+        if c == 0 {
+            return Err(SrsV2Error::syntax("partition rle zero-length run"));
+        }
+        total = total
+            .checked_add(c)
+            .ok_or(SrsV2Error::Overflow("partition rle expand"))?;
+        if total > n_mb {
+            return Err(SrsV2Error::syntax(
+                "partition rle overflow macroblock count",
+            ));
+        }
+        out.extend(std::iter::repeat_n(w, c));
+    }
+    if total != n_mb {
+        return Err(SrsV2Error::syntax("partition rle length mismatch"));
+    }
+    Ok(out)
 }
 
 fn validate_mv_int(mvx: i16, mvy: i16) -> Result<(), SrsV2Error> {
@@ -124,12 +207,21 @@ struct PartitionMbCtx<'a> {
     search: super::rate_control::SrsV2MotionSearchMode,
 }
 
-fn partition_choice_for_mb(
-    mode: SrsV2InterPartitionMode,
-    ctx: PartitionMbCtx<'_>,
+#[inline]
+fn partition_cost_model_label(m: SrsV2PartitionCostModel) -> &'static str {
+    match m {
+        SrsV2PartitionCostModel::SadOnly => "sad-only",
+        SrsV2PartitionCostModel::HeaderAware => "header-aware",
+        SrsV2PartitionCostModel::RdoFast => "rdo-fast",
+    }
+}
+
+/// **SAD** sum and **wire-order** MVs for one macroblock and partition type (`pt`).
+fn candidate_sad_and_mvs(
+    ctx: &PartitionMbCtx<'_>,
+    pt: u8,
     ms: &mut SrsV2MotionEncodeStats,
-    lam_p: i64,
-) -> u8 {
+) -> Result<(u32, Vec<(i32, i32)>), SrsV2Error> {
     let PartitionMbCtx {
         cur,
         refp,
@@ -141,45 +233,104 @@ fn partition_choice_for_mb(
     } = ctx;
     let ox = mbx * 16;
     let oy = mby * 16;
-    match mode {
-        SrsV2InterPartitionMode::Fixed16x16 => P_PART_WIRE_16X16,
-        SrsV2InterPartitionMode::Split8x8 => P_PART_WIRE_8X8,
-        SrsV2InterPartitionMode::Rect16x8 => P_PART_WIRE_16X8,
-        SrsV2InterPartitionMode::Rect8x16 => P_PART_WIRE_8X16,
-        SrsV2InterPartitionMode::AutoFast => {
-            ms.partition.rdo_partition_candidates_tested += 2;
+    let mut out = Vec::new();
+    let mut sad_acc = 0_u32;
+    match pt {
+        P_PART_WIRE_16X16 => {
             let mut ev = 0_u64;
-            let (mv16x, mv16y) = pick_mv_rect(
-                search,
+            let (vx, vy) = pick_mv_rect(
+                *search,
                 cur,
                 refp,
                 ox,
                 oy,
                 16,
                 16,
-                radius,
-                early,
+                *radius,
+                *early,
                 Some(&mut ev),
             );
             ms.sad_evaluations += ev;
-            let sad16 = sad_rect_integer(cur, refp, ox, oy, 16, 16, mv16x as i32, mv16y as i32);
-            let mut sad8 = 0_u32;
-            for (dx, dy) in [(0u32, 0u32), (8, 0), (0, 8), (8, 8)] {
-                let mut e2 = 0_u64;
+            sad_acc = sad_acc.saturating_add(sad_rect_integer(
+                cur, refp, ox, oy, 16, 16, vx as i32, vy as i32,
+            ));
+            out.push((vx as i32 * 4, vy as i32 * 4));
+        }
+        P_PART_WIRE_16X8 => {
+            for dy in [0u32, 8u32] {
+                let mut ev = 0_u64;
                 let (vx, vy) = pick_mv_rect(
-                    search,
+                    *search,
+                    cur,
+                    refp,
+                    ox,
+                    oy + dy,
+                    16,
+                    8,
+                    *radius,
+                    *early,
+                    Some(&mut ev),
+                );
+                ms.sad_evaluations += ev;
+                sad_acc = sad_acc.saturating_add(sad_rect_integer(
+                    cur,
+                    refp,
+                    ox,
+                    oy + dy,
+                    16,
+                    8,
+                    vx as i32,
+                    vy as i32,
+                ));
+                out.push((vx as i32 * 4, vy as i32 * 4));
+            }
+        }
+        P_PART_WIRE_8X16 => {
+            for (dx, wt) in [(0u32, 8u32), (8, 8)] {
+                let mut ev = 0_u64;
+                let (vx, vy) = pick_mv_rect(
+                    *search,
+                    cur,
+                    refp,
+                    ox + dx,
+                    oy,
+                    wt,
+                    16,
+                    *radius,
+                    *early,
+                    Some(&mut ev),
+                );
+                ms.sad_evaluations += ev;
+                sad_acc = sad_acc.saturating_add(sad_rect_integer(
+                    cur,
+                    refp,
+                    ox + dx,
+                    oy,
+                    wt,
+                    16,
+                    vx as i32,
+                    vy as i32,
+                ));
+                out.push((vx as i32 * 4, vy as i32 * 4));
+            }
+        }
+        P_PART_WIRE_8X8 => {
+            for (dx, dy) in [(0u32, 0u32), (8, 0), (0, 8), (8, 8)] {
+                let mut ev = 0_u64;
+                let (vx, vy) = pick_mv_rect(
+                    *search,
                     cur,
                     refp,
                     ox + dx,
                     oy + dy,
                     8,
                     8,
-                    radius,
-                    early,
-                    Some(&mut e2),
+                    *radius,
+                    *early,
+                    Some(&mut ev),
                 );
-                ms.sad_evaluations += e2;
-                sad8 = sad8.saturating_add(sad_rect_integer(
+                ms.sad_evaluations += ev;
+                sad_acc = sad_acc.saturating_add(sad_rect_integer(
                     cur,
                     refp,
                     ox + dx,
@@ -189,54 +340,310 @@ fn partition_choice_for_mb(
                     vx as i32,
                     vy as i32,
                 ));
+                out.push((vx as i32 * 4, vy as i32 * 4));
             }
-            ms.partition.rdo_partition_candidates_tested += 1;
-            let mut e3 = 0_u64;
-            let (mvt_x, mvt_y) = pick_mv_rect(
-                search,
-                cur,
-                refp,
-                ox,
-                oy,
-                16,
-                8,
-                radius,
-                early,
-                Some(&mut e3),
-            );
-            ms.sad_evaluations += e3;
-            let sad16x8_top =
-                sad_rect_integer(cur, refp, ox, oy, 16, 8, mvt_x as i32, mvt_y as i32);
-            let mut e4 = 0_u64;
-            let (mvb_x, mvb_y) = pick_mv_rect(
-                search,
-                cur,
-                refp,
-                ox,
-                oy + 8,
-                16,
-                8,
-                radius,
-                early,
-                Some(&mut e4),
-            );
-            ms.sad_evaluations += e4;
-            let sad16x8_bot =
-                sad_rect_integer(cur, refp, ox, oy + 8, 16, 8, mvb_x as i32, mvb_y as i32);
-            let sad16x8 = sad16x8_top.saturating_add(sad16x8_bot);
+        }
+        _ => return Err(SrsV2Error::syntax("bad candidate partition")),
+    }
+    Ok((sad_acc, out))
+}
 
-            let split_penalty = (12_i64 * lam_p) / 256;
-            let rect_penalty = (8_i64 * lam_p) / 256;
-            let s16 = sad16 as i128;
-            let s8 = sad8 as i128 + split_penalty as i128;
-            let sr = sad16x8 as i128 + rect_penalty as i128;
-            if s8 + 4 < s16 && s8 <= sr {
-                P_PART_WIRE_8X8
-            } else if sr + 4 < s16 {
-                P_PART_WIRE_16X8
-            } else {
-                P_PART_WIRE_16X16
+/// Legacy **SAD**-only **AutoFast** winner (**no** [`SrsV2PartitionEncodeStats::rdo_partition_candidates_tested`] bump).
+fn autofast_compute_sad_only_choice(
+    ctx: &PartitionMbCtx<'_>,
+    ms: &mut SrsV2MotionEncodeStats,
+    lam_p: i64,
+) -> u8 {
+    let ox = ctx.mbx * 16;
+    let oy = ctx.mby * 16;
+    let mut ev = 0_u64;
+    let (mv16x, mv16y) = pick_mv_rect(
+        ctx.search,
+        ctx.cur,
+        ctx.refp,
+        ox,
+        oy,
+        16,
+        16,
+        ctx.radius,
+        ctx.early,
+        Some(&mut ev),
+    );
+    ms.sad_evaluations += ev;
+    let sad16 = sad_rect_integer(
+        ctx.cur,
+        ctx.refp,
+        ox,
+        oy,
+        16,
+        16,
+        mv16x as i32,
+        mv16y as i32,
+    );
+    let mut sad8 = 0_u32;
+    for (dx, dy) in [(0u32, 0u32), (8, 0), (0, 8), (8, 8)] {
+        let mut e2 = 0_u64;
+        let (vx, vy) = pick_mv_rect(
+            ctx.search,
+            ctx.cur,
+            ctx.refp,
+            ox + dx,
+            oy + dy,
+            8,
+            8,
+            ctx.radius,
+            ctx.early,
+            Some(&mut e2),
+        );
+        ms.sad_evaluations += e2;
+        sad8 = sad8.saturating_add(sad_rect_integer(
+            ctx.cur,
+            ctx.refp,
+            ox + dx,
+            oy + dy,
+            8,
+            8,
+            vx as i32,
+            vy as i32,
+        ));
+    }
+    let mut e3 = 0_u64;
+    let (mvt_x, mvt_y) = pick_mv_rect(
+        ctx.search,
+        ctx.cur,
+        ctx.refp,
+        ox,
+        oy,
+        16,
+        8,
+        ctx.radius,
+        ctx.early,
+        Some(&mut e3),
+    );
+    ms.sad_evaluations += e3;
+    let sad16x8_top =
+        sad_rect_integer(ctx.cur, ctx.refp, ox, oy, 16, 8, mvt_x as i32, mvt_y as i32);
+    let mut e4 = 0_u64;
+    let (mvb_x, mvb_y) = pick_mv_rect(
+        ctx.search,
+        ctx.cur,
+        ctx.refp,
+        ox,
+        oy + 8,
+        16,
+        8,
+        ctx.radius,
+        ctx.early,
+        Some(&mut e4),
+    );
+    ms.sad_evaluations += e4;
+    let sad16x8_bot = sad_rect_integer(
+        ctx.cur,
+        ctx.refp,
+        ox,
+        oy + 8,
+        16,
+        8,
+        mvb_x as i32,
+        mvb_y as i32,
+    );
+    let sad16x8 = sad16x8_top.saturating_add(sad16x8_bot);
+
+    let split_penalty = (12_i64 * lam_p) / 256;
+    let rect_penalty = (8_i64 * lam_p) / 256;
+    let s16 = sad16 as i128;
+    let s8 = sad8 as i128 + split_penalty as i128;
+    let sr = sad16x8 as i128 + rect_penalty as i128;
+    if s8 + 4 < s16 && s8 <= sr {
+        P_PART_WIRE_8X8
+    } else if sr + 4 < s16 {
+        P_PART_WIRE_16X8
+    } else {
+        P_PART_WIRE_16X16
+    }
+}
+
+fn autofast_pick_sad_only_legacy(
+    ctx: &PartitionMbCtx<'_>,
+    ms: &mut SrsV2MotionEncodeStats,
+    lam_p: i64,
+) -> u8 {
+    ms.partition.rdo_partition_candidates_tested += 3;
+    autofast_compute_sad_only_choice(ctx, ms, lam_p)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_one_mb_residual_body_len(
+    cur: &YuvFrame,
+    reference: &YuvFrame,
+    mbx: u32,
+    mby: u32,
+    mb_cols: u32,
+    pt: u8,
+    pu_mvs: &[(i32, i32)],
+    qp: u8,
+    block_aq_wire: bool,
+    sub_vars: &[u32],
+    median_var: u64,
+    settings: &SrsV2EncodeSettings,
+    rans_model: &RansModel,
+) -> Result<usize, SrsV2Error> {
+    let use_subpel = matches!(settings.subpel_mode, SrsV2SubpelMode::HalfPel);
+    let mut buf = Vec::new();
+    let mut dry_residual_stats: Option<&mut ResidualEncodeStats> = None;
+    let mut dry_ms = SrsV2MotionEncodeStats::default();
+    let mut dry_block: Option<&mut SrsV2BlockAqWireStats> = None;
+    let npu = pu_index_layout(pt);
+    if pu_mvs.len() != npu {
+        return Err(SrsV2Error::syntax("PU MV len mismatch residual RD"));
+    }
+    for (pu_idx, mv) in pu_mvs.iter().copied().enumerate() {
+        encode_residual_subblocks_for_pu(
+            &mut buf,
+            cur,
+            reference,
+            mbx,
+            mby,
+            mb_cols,
+            mv.0,
+            mv.1,
+            use_subpel,
+            pt,
+            pu_idx,
+            qp,
+            block_aq_wire,
+            sub_vars,
+            median_var,
+            settings,
+            rans_model,
+            &mut dry_residual_stats,
+            &mut dry_ms,
+            &mut dry_block,
+        )?;
+        if buf.len() > MAX_MB_RESIDUAL_RD_BYTES {
+            return Err(SrsV2Error::AllocationLimit {
+                context: "var-partition mb residual RD estimate",
+            });
+        }
+    }
+    Ok(buf.len())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn partition_choice_for_mb(
+    mode: SrsV2InterPartitionMode,
+    settings: &SrsV2EncodeSettings,
+    qp: u8,
+    ctx: &PartitionMbCtx<'_>,
+    ms: &mut SrsV2MotionEncodeStats,
+    lam_p: i64,
+    cur_frame: &YuvFrame,
+    reference: &YuvFrame,
+    mb_cols: u32,
+    block_aq_wire: bool,
+    sub_vars: &[u32],
+    median_var: u64,
+    rans_model: &RansModel,
+) -> Result<u8, SrsV2Error> {
+    match mode {
+        SrsV2InterPartitionMode::Fixed16x16 => Ok(P_PART_WIRE_16X16),
+        SrsV2InterPartitionMode::Split8x8 => Ok(P_PART_WIRE_8X8),
+        SrsV2InterPartitionMode::Rect16x8 => Ok(P_PART_WIRE_16X8),
+        SrsV2InterPartitionMode::Rect8x16 => Ok(P_PART_WIRE_8X16),
+        SrsV2InterPartitionMode::AutoFast => {
+            let cm = settings.partition_cost_model;
+            if matches!(cm, SrsV2PartitionCostModel::SadOnly) {
+                return Ok(autofast_pick_sad_only_legacy(ctx, ms, lam_p));
             }
+
+            let cands = [
+                P_PART_WIRE_16X16,
+                P_PART_WIRE_8X8,
+                P_PART_WIRE_16X8,
+                P_PART_WIRE_8X16,
+            ];
+            let sad_only_choice = autofast_compute_sad_only_choice(ctx, ms, lam_p);
+            ms.partition.rdo_partition_candidates_tested += cands.len() as u64;
+
+            let mut best_pt = P_PART_WIRE_16X16;
+            let mut best_score = i128::MAX;
+            let mut sad_by_pt = [(P_PART_WIRE_16X16, 0u32); 4];
+
+            for (i, &pt) in cands.iter().enumerate() {
+                let (sad, mvs) = candidate_sad_and_mvs(ctx, pt, ms)?;
+                sad_by_pt[i] = (pt, sad);
+                let mv_b = encode_mv_stream_partitioned(1, 1, &[pt], &mvs)?.len();
+                let extra_pu = pu_index_layout(pt).saturating_sub(1);
+                let score = match cm {
+                    SrsV2PartitionCostModel::SadOnly => unreachable!(),
+                    SrsV2PartitionCostModel::HeaderAware => {
+                        let spl = if pt == P_PART_WIRE_8X8 {
+                            i128::from(settings.partition_split_penalty)
+                        } else {
+                            0
+                        };
+                        sad as i128
+                            + (lam_p as i128
+                                * i128::from(settings.partition_mv_penalty)
+                                * mv_b as i128)
+                                / (256 * 256)
+                            + (lam_p as i128
+                                * i128::from(settings.partition_header_penalty)
+                                * extra_pu as i128)
+                                / (256 * 256)
+                            + (lam_p as i128 * spl) / (256 * 256)
+                    }
+                    SrsV2PartitionCostModel::RdoFast => {
+                        let res_b = encode_one_mb_residual_body_len(
+                            cur_frame,
+                            reference,
+                            ctx.mbx,
+                            ctx.mby,
+                            mb_cols,
+                            pt,
+                            &mvs,
+                            qp,
+                            block_aq_wire,
+                            sub_vars,
+                            median_var,
+                            settings,
+                            rans_model,
+                        )?;
+                        let qb = i128::from(settings.partition_quality_bias);
+                        sad as i128 + (lam_p as i128 * qb * (mv_b + res_b) as i128) / (256 * 256)
+                    }
+                };
+                if score < best_score {
+                    best_score = score;
+                    best_pt = pt;
+                }
+            }
+
+            if sad_only_choice != best_pt {
+                match cm {
+                    SrsV2PartitionCostModel::HeaderAware => {
+                        ms.partition.partition_rejected_by_header_cost += 1;
+                    }
+                    SrsV2PartitionCostModel::RdoFast => {
+                        ms.partition.partition_rejected_by_rdo += 1;
+                    }
+                    _ => {}
+                }
+                let sad_so = sad_by_pt
+                    .iter()
+                    .find(|(p, _)| *p == sad_only_choice)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(0);
+                let sad_best = sad_by_pt
+                    .iter()
+                    .find(|(p, _)| *p == best_pt)
+                    .map(|(_, s)| *s)
+                    .unwrap_or(0);
+                ms.partition.partition_sad_override_events += 1;
+                ms.partition.partition_sad_override_accum += sad_so.saturating_sub(sad_best) as u64;
+            }
+
+            Ok(best_pt)
         }
     }
 }
@@ -618,51 +1025,20 @@ pub fn encode_yuv420_p_payload_var_partition(
             SrsV2InterPartitionMode::Rect8x16 => "rect8x16",
             SrsV2InterPartitionMode::AutoFast => "auto-fast",
         },
+        partition_cost_model_label: if matches!(
+            settings.inter_partition_mode,
+            SrsV2InterPartitionMode::AutoFast
+        ) {
+            partition_cost_model_label(settings.partition_cost_model)
+        } else {
+            ""
+        },
         ..Default::default()
     };
 
     let lam_p = rdo_lambda_effective(settings, qp)
         .saturating_mul(i64::from(settings.partition_rdo_lambda_scale))
         / 256;
-
-    let mut partitions = Vec::with_capacity(n_mb);
-    for mby in 0..mb_rows {
-        for mbx in 0..mb_cols {
-            let choice = partition_choice_for_mb(
-                settings.inter_partition_mode,
-                PartitionMbCtx {
-                    cur: &cur.y,
-                    refp: &reference.y,
-                    mbx,
-                    mby,
-                    radius: settings.clamped_motion_search_radius(),
-                    early: settings.early_exit_sad_threshold,
-                    search: settings.motion_search_mode,
-                },
-                ms,
-                lam_p,
-            );
-            partitions.push(choice);
-            match choice {
-                P_PART_WIRE_16X16 => ms.partition.partition_16x16_count += 1,
-                P_PART_WIRE_16X8 => ms.partition.partition_16x8_count += 1,
-                P_PART_WIRE_8X16 => ms.partition.partition_8x16_count += 1,
-                P_PART_WIRE_8X8 => ms.partition.partition_8x8_count += 1,
-                _ => {}
-            }
-        }
-    }
-
-    let pu_mvs = collect_pu_mvs(
-        &partitions,
-        mb_cols,
-        mb_rows,
-        &cur.y,
-        &reference.y,
-        settings,
-        ms,
-    )?;
-    let mv_compact = encode_mv_stream_partitioned(mb_cols, mb_rows, &partitions, &pu_mvs)?;
 
     let sub_vars = if block_aq_wire {
         collect_p_subblock_variances(&cur.y, mb_cols, mb_rows)
@@ -685,6 +1061,55 @@ pub fn encode_yuv420_p_payload_var_partition(
     };
 
     let rans_model = residual_token_model();
+
+    let mut partitions = Vec::with_capacity(n_mb);
+    for mby in 0..mb_rows {
+        for mbx in 0..mb_cols {
+            let mb_ctx = PartitionMbCtx {
+                cur: &cur.y,
+                refp: &reference.y,
+                mbx,
+                mby,
+                radius: settings.clamped_motion_search_radius(),
+                early: settings.early_exit_sad_threshold,
+                search: settings.motion_search_mode,
+            };
+            let choice = partition_choice_for_mb(
+                settings.inter_partition_mode,
+                settings,
+                qp,
+                &mb_ctx,
+                ms,
+                lam_p,
+                cur,
+                reference,
+                mb_cols,
+                block_aq_wire,
+                &sub_vars,
+                median_var,
+                &rans_model,
+            )?;
+            partitions.push(choice);
+            match choice {
+                P_PART_WIRE_16X16 => ms.partition.partition_16x16_count += 1,
+                P_PART_WIRE_16X8 => ms.partition.partition_16x8_count += 1,
+                P_PART_WIRE_8X16 => ms.partition.partition_8x16_count += 1,
+                P_PART_WIRE_8X8 => ms.partition.partition_8x8_count += 1,
+                _ => {}
+            }
+        }
+    }
+
+    let pu_mvs = collect_pu_mvs(
+        &partitions,
+        mb_cols,
+        mb_rows,
+        &cur.y,
+        &reference.y,
+        settings,
+        ms,
+    )?;
+    let mv_compact = encode_mv_stream_partitioned(mb_cols, mb_rows, &partitions, &pu_mvs)?;
     let use_subpel = matches!(settings.subpel_mode, SrsV2SubpelMode::HalfPel);
 
     let entropy_residual = matches!(
@@ -740,6 +1165,20 @@ pub fn encode_yuv420_p_payload_var_partition(
     out.extend_from_slice(&magic);
     out.extend_from_slice(&frame_index.to_le_bytes());
     out.push(qp);
+
+    let rle_blob = if matches!(
+        settings.partition_map_encoding,
+        SrsV2PartitionMapEncoding::RleRuns
+    ) {
+        Some(rle_partition_payload(&partitions)?)
+    } else {
+        None
+    };
+    let use_packed_part_map = rle_blob
+        .as_ref()
+        .map(|r| r.len() < partitions.len())
+        .unwrap_or(false);
+
     let mut flags = 0_u8;
     if use_subpel {
         flags |= P_INTER_FLAG_SUBPEL;
@@ -750,14 +1189,29 @@ pub fn encode_yuv420_p_payload_var_partition(
     if entropy_residual {
         flags |= P_INTER_FLAG_ENTROPY_RESIDUAL;
     }
+    if use_packed_part_map {
+        flags |= P_INTER_FLAG_PACKED_PART_MAP;
+    }
     out.push(flags);
     if block_aq_wire {
         validate_qp_clip_range(settings.min_qp, settings.max_qp)?;
         out.push(settings.min_qp);
         out.push(settings.max_qp);
     }
-    out.extend_from_slice(&partitions);
-    ms.partition.partition_header_bytes = partitions.len() as u64;
+    if use_packed_part_map {
+        let r = rle_blob
+            .as_ref()
+            .ok_or_else(|| SrsV2Error::syntax("missing partition RLE payload"))?;
+        out.extend_from_slice(r);
+        let map_len = r.len() as u64;
+        ms.partition.partition_map_bytes = map_len;
+        ms.partition.partition_header_bytes = map_len;
+    } else {
+        out.extend_from_slice(&partitions);
+        let map_len = partitions.len() as u64;
+        ms.partition.partition_map_bytes = map_len;
+        ms.partition.partition_header_bytes = map_len;
+    }
 
     if inter_entropy_mv {
         let mv_blob = rans_encode_mv_bytes(&mv_compact)?;
@@ -852,12 +1306,13 @@ pub fn decode_yuv420_p_payload_var_partition(
     let frame_index = read_u32(payload, &mut cur)?;
     let qp = read_u8(payload, &mut cur)?;
     let flags = read_u8(payload, &mut cur)?;
-    if flags & !7 != 0 {
+    if flags & !0x0F != 0 {
         return Err(SrsV2Error::syntax("unknown P var-partition flags"));
     }
     let use_qpel = flags & P_INTER_FLAG_SUBPEL != 0;
     let block_aq_wire = flags & P_INTER_FLAG_BLOCK_AQ != 0;
     let entropy_chunks = flags & P_INTER_FLAG_ENTROPY_RESIDUAL != 0;
+    let packed_part_map = flags & P_INTER_FLAG_PACKED_PART_MAP != 0;
     let _ = entropy_chunks;
 
     let (clip_min, clip_max) = if block_aq_wire {
@@ -869,14 +1324,20 @@ pub fn decode_yuv420_p_payload_var_partition(
         (1_u8, 51_u8)
     };
 
-    if payload.len() < cur + n_mb {
-        return Err(SrsV2Error::Truncated);
-    }
-    let partitions = &payload[cur..cur + n_mb];
-    cur += n_mb;
-    for &b in partitions {
-        validate_partition_reserved_bits(b)?;
-    }
+    let partitions_owned = if packed_part_map {
+        decode_rle_partition_map(payload, &mut cur, n_mb)?
+    } else {
+        if payload.len() < cur + n_mb {
+            return Err(SrsV2Error::Truncated);
+        }
+        let sl = payload[cur..cur + n_mb].to_vec();
+        cur += n_mb;
+        for &b in &sl {
+            validate_partition_reserved_bits(b)?;
+        }
+        sl
+    };
+    let partitions = partitions_owned.as_slice();
     let inter_entropy_mv = rev_byte == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR[3];
 
     let pu_mvs = if inter_entropy_mv {
@@ -1170,5 +1631,34 @@ mod tests {
             SrsV2Error::Syntax(s) => assert!(s.contains("bad P var-partition transform wire")),
             e => panic!("expected Syntax bad transform wire: {e:?}"),
         }
+    }
+
+    #[test]
+    fn partition_map_rle_roundtrip_all_same() {
+        let p = vec![P_PART_WIRE_16X16; 64];
+        let r = rle_partition_payload(&p).unwrap();
+        assert!(r.len() < p.len(), "RLE should beat raw for uniform map");
+        let mut c = 0usize;
+        let out = decode_rle_partition_map(&r, &mut c, 64).unwrap();
+        assert_eq!(out, p);
+        assert_eq!(c, r.len());
+    }
+
+    #[test]
+    fn partition_map_rle_rejects_run_overflow_vs_mb_count() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u16.to_le_bytes());
+        blob.push(P_PART_WIRE_16X16);
+        blob.extend_from_slice(&100u16.to_le_bytes());
+        let mut c = 0usize;
+        let err = decode_rle_partition_map(&blob, &mut c, 64).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_)));
+    }
+
+    #[test]
+    fn partition_map_rle_rejects_truncated_header() {
+        let blob = 1u16.to_le_bytes();
+        let mut c = 0usize;
+        assert!(decode_rle_partition_map(&blob, &mut c, 64).is_err());
     }
 }

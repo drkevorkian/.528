@@ -72,9 +72,9 @@ pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2RateControlError,
-    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformSize,
-    SrsV2TransformSizeMode,
+    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
+    SrsV2PartitionMapEncoding, SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController,
+    SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformSize, SrsV2TransformSizeMode,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};

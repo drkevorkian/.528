@@ -18,9 +18,9 @@ use libsrs_video::{
     PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
     SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
     SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats,
-    SrsV2MotionSearchMode, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
-    SrsV2ReferenceManager, SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2,
-    YuvFrame,
+    SrsV2MotionSearchMode, SrsV2PartitionCostModel, SrsV2PartitionMapEncoding,
+    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager,
+    SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -191,6 +191,18 @@ struct Args {
     /// Compare **fixed16x16**, **split8x8**, and **auto-fast** inter partitions (uses **`--inter-syntax compact`** for each row).
     #[arg(long, default_value_t = false)]
     compare_partitions: bool,
+
+    /// Compare partition cost models: **fixed16x16**, **split8x8**, **auto-fast** × (**sad-only**, **header-aware**, **rdo-fast**).
+    #[arg(long, default_value_t = false)]
+    compare_partition_costs: bool,
+
+    /// AutoFast partition RD: **`sad-only`** (legacy default), **`header-aware`**, **`rdo-fast`**.
+    #[arg(long, default_value = "sad-only")]
+    partition_cost_model: String,
+
+    /// Partition map on wire: **`legacy`** (one byte/MB) or **`rle`** when smaller.
+    #[arg(long, default_value = "legacy")]
+    partition_map_encoding: String,
 
     /// Inter macroblock partition (**default** fixed16x16). Non-default modes require **`--inter-syntax compact`** or **`entropy`**.
     #[arg(long, default_value = "fixed16x16")]
@@ -381,6 +393,9 @@ struct MotionBenchReport {
 struct PartitionBenchSummary {
     inter_partition_mode: String,
     transform_size_mode: String,
+    /// [`SrsV2PartitionCostModel`] CLI label when relevant (**AutoFast**); empty otherwise.
+    #[serde(default)]
+    partition_cost_model: String,
     partition_16x16_count: u64,
     partition_16x8_count: u64,
     partition_8x16_count: u64,
@@ -388,10 +403,28 @@ struct PartitionBenchSummary {
     transform_4x4_count: u64,
     transform_8x8_count: u64,
     transform_16x16_count: u64,
+    /// Same as **`transform_4x4_count`** (explicit telemetry label).
+    #[serde(default)]
+    transform_decision_tx4x4: u64,
+    /// Same as **`transform_8x8_count`**.
+    #[serde(default)]
+    transform_decision_tx8x8: u64,
     partition_header_bytes: u64,
+    #[serde(default)]
+    partition_map_bytes: u64,
     partition_mv_bytes: u64,
     partition_residual_bytes: u64,
+    /// Sum of **`rdo_partition_candidates_tested`** over **P** frames (same as candidates tested).
     rdo_partition_candidates_tested: u64,
+    #[serde(default)]
+    partition_rejected_by_header_cost: u64,
+    #[serde(default)]
+    partition_rejected_by_rdo: u64,
+    #[serde(default)]
+    avg_partition_sad_gain: f64,
+    /// Reserved until byte deltas are tracked end-to-end per MB.
+    #[serde(default)]
+    avg_partition_byte_delta: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -639,6 +672,8 @@ struct BenchReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_partitions: Option<Vec<VariantBenchEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    compare_partition_costs: Option<Vec<VariantBenchEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     match_x264_bitrate_note: Option<String>,
     git_commit: Option<String>,
     os: String,
@@ -827,14 +862,19 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.compare_residual_modes && args.sweep {
         bail!("--compare-residual-modes and --sweep are mutually exclusive");
     }
-    let compare_pass_count =
-        args.compare_inter_syntax as u8 + args.compare_rdo as u8 + args.compare_partitions as u8;
+    let compare_pass_count = args.compare_inter_syntax as u8
+        + args.compare_rdo as u8
+        + args.compare_partitions as u8
+        + args.compare_partition_costs as u8;
     if compare_pass_count > 1 {
         bail!(
-            "--compare-inter-syntax, --compare-rdo, and --compare-partitions are mutually exclusive"
+            "--compare-inter-syntax, --compare-rdo, --compare-partitions, and --compare-partition-costs are mutually exclusive"
         );
     }
-    if (args.compare_inter_syntax || args.compare_rdo || args.compare_partitions)
+    if (args.compare_inter_syntax
+        || args.compare_rdo
+        || args.compare_partitions
+        || args.compare_partition_costs)
         && (args.sweep || args.compare_residual_modes || args.compare_b_modes)
     {
         bail!("comparison modes cannot be combined with --sweep, --compare-residual-modes, or --compare-b-modes");
@@ -894,6 +934,8 @@ fn validate_args(args: &Args) -> Result<()> {
             bail!("--bframes 1 cannot be combined with --sweep or --compare-residual-modes");
         }
     }
+    parse_partition_cost_model(&args.partition_cost_model)?;
+    parse_partition_map_encoding(&args.partition_map_encoding)?;
     Ok(())
 }
 
@@ -975,6 +1017,35 @@ fn parse_transform_size_mode(s: &str) -> Result<SrsV2TransformSizeMode> {
     }
 }
 
+fn parse_partition_cost_model(s: &str) -> Result<SrsV2PartitionCostModel> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "sad-only" | "sadonly" => Ok(SrsV2PartitionCostModel::SadOnly),
+        "header-aware" | "headeraware" => Ok(SrsV2PartitionCostModel::HeaderAware),
+        "rdo-fast" | "rdofast" => Ok(SrsV2PartitionCostModel::RdoFast),
+        _ => Err(anyhow!(
+            "--partition-cost-model must be sad-only, header-aware, or rdo-fast (got {s})"
+        )),
+    }
+}
+
+fn parse_partition_map_encoding(s: &str) -> Result<SrsV2PartitionMapEncoding> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "legacy" | "per-mb" | "legacy-per-mb" => Ok(SrsV2PartitionMapEncoding::LegacyPerMb),
+        "rle" | "rle-runs" => Ok(SrsV2PartitionMapEncoding::RleRuns),
+        _ => Err(anyhow!(
+            "--partition-map-encoding must be legacy or rle (got {s})"
+        )),
+    }
+}
+
+fn partition_cost_model_cli_label(m: SrsV2PartitionCostModel) -> &'static str {
+    match m {
+        SrsV2PartitionCostModel::SadOnly => "sad-only",
+        SrsV2PartitionCostModel::HeaderAware => "header-aware",
+        SrsV2PartitionCostModel::RdoFast => "rdo-fast",
+    }
+}
+
 fn inter_partition_cli_label(m: SrsV2InterPartitionMode) -> &'static str {
     match m {
         SrsV2InterPartitionMode::Fixed16x16 => "fixed16x16",
@@ -1003,9 +1074,14 @@ fn motion_agg_add_partition(motion_agg: &mut MotionAgg, motion_frame: &SrsV2Moti
     motion_agg.transform_8x8_count += p.transform_8x8_count;
     motion_agg.transform_16x16_count += p.transform_16x16_count;
     motion_agg.partition_header_bytes += p.partition_header_bytes;
+    motion_agg.partition_map_bytes += p.partition_map_bytes;
     motion_agg.partition_mv_bytes += p.partition_mv_bytes;
     motion_agg.partition_residual_bytes += p.partition_residual_bytes;
     motion_agg.rdo_partition_candidates_tested += p.rdo_partition_candidates_tested;
+    motion_agg.partition_rejected_by_header_cost += p.partition_rejected_by_header_cost;
+    motion_agg.partition_rejected_by_rdo += p.partition_rejected_by_rdo;
+    motion_agg.partition_sad_override_accum += p.partition_sad_override_accum;
+    motion_agg.partition_sad_override_events += p.partition_sad_override_events;
 }
 
 fn parse_block_aq_mode(s: &str) -> Result<SrsV2BlockAqMode> {
@@ -1046,6 +1122,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let rdo_mode = parse_rdo_mode(&args.rdo)?;
     let inter_partition_mode = parse_inter_partition_mode(&args.inter_partition)?;
     let transform_size_mode = parse_transform_size_mode(&args.transform_size)?;
+    let partition_cost_model = parse_partition_cost_model(&args.partition_cost_model)?;
+    let partition_map_encoding = parse_partition_map_encoding(&args.partition_map_encoding)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -1077,6 +1155,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         rdo_lambda_scale: args.rdo_lambda_scale,
         inter_partition_mode,
         transform_size_mode,
+        partition_cost_model,
+        partition_map_encoding,
         ..Default::default()
     };
     s.validate_rate_control()
@@ -1126,6 +1206,11 @@ struct MotionAgg {
     partition_mv_bytes: u64,
     partition_residual_bytes: u64,
     rdo_partition_candidates_tested: u64,
+    partition_rejected_by_header_cost: u64,
+    partition_rejected_by_rdo: u64,
+    partition_sad_override_accum: u64,
+    partition_sad_override_events: u64,
+    partition_map_bytes: u64,
 }
 
 struct PassNumbers {
@@ -2107,21 +2192,45 @@ fn pass_to_details(
         bframe_mode_note: p.bframe_mode_note.clone(),
         bframe_psnr_y: p.bframe_psnr_y,
         bframe_ssim_y: p.bframe_ssim_y,
-        partition: PartitionBenchSummary {
-            inter_partition_mode: inter_partition_cli_label(settings.inter_partition_mode)
-                .to_string(),
-            transform_size_mode: transform_size_cli_label(settings.transform_size_mode).to_string(),
-            partition_16x16_count: m.partition_16x16_count,
-            partition_16x8_count: m.partition_16x8_count,
-            partition_8x16_count: m.partition_8x16_count,
-            partition_8x8_count: m.partition_8x8_count,
-            transform_4x4_count: m.transform_4x4_count,
-            transform_8x8_count: m.transform_8x8_count,
-            transform_16x16_count: m.transform_16x16_count,
-            partition_header_bytes: m.partition_header_bytes,
-            partition_mv_bytes: m.partition_mv_bytes,
-            partition_residual_bytes: m.partition_residual_bytes,
-            rdo_partition_candidates_tested: m.rdo_partition_candidates_tested,
+        partition: {
+            let pcm = if matches!(
+                settings.inter_partition_mode,
+                SrsV2InterPartitionMode::AutoFast
+            ) {
+                partition_cost_model_cli_label(settings.partition_cost_model).to_string()
+            } else {
+                String::new()
+            };
+            let avg_sad_gain = if m.partition_sad_override_events > 0 {
+                m.partition_sad_override_accum as f64 / m.partition_sad_override_events as f64
+            } else {
+                0.0
+            };
+            PartitionBenchSummary {
+                inter_partition_mode: inter_partition_cli_label(settings.inter_partition_mode)
+                    .to_string(),
+                transform_size_mode: transform_size_cli_label(settings.transform_size_mode)
+                    .to_string(),
+                partition_cost_model: pcm,
+                partition_16x16_count: m.partition_16x16_count,
+                partition_16x8_count: m.partition_16x8_count,
+                partition_8x16_count: m.partition_8x16_count,
+                partition_8x8_count: m.partition_8x8_count,
+                transform_4x4_count: m.transform_4x4_count,
+                transform_8x8_count: m.transform_8x8_count,
+                transform_16x16_count: m.transform_16x16_count,
+                transform_decision_tx4x4: m.transform_4x4_count,
+                transform_decision_tx8x8: m.transform_8x8_count,
+                partition_header_bytes: m.partition_header_bytes,
+                partition_map_bytes: m.partition_map_bytes,
+                partition_mv_bytes: m.partition_mv_bytes,
+                partition_residual_bytes: m.partition_residual_bytes,
+                rdo_partition_candidates_tested: m.rdo_partition_candidates_tested,
+                partition_rejected_by_header_cost: m.partition_rejected_by_header_cost,
+                partition_rejected_by_rdo: m.partition_rejected_by_rdo,
+                avg_partition_sad_gain: avg_sad_gain,
+                avg_partition_byte_delta: 0.0,
+            }
         },
     }
 }
@@ -2289,6 +2398,7 @@ fn run_compare_b_modes_report(
         compare_inter_syntax: None,
         compare_rdo: None,
         compare_partitions: None,
+        compare_partition_costs: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2357,6 +2467,7 @@ fn run_single_report(
         compare_inter_syntax: None,
         compare_rdo: None,
         compare_partitions: None,
+        compare_partition_costs: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2494,6 +2605,7 @@ fn run_compare_residual_report(
         compare_inter_syntax: None,
         compare_rdo: None,
         compare_partitions: None,
+        compare_partition_costs: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2623,6 +2735,7 @@ fn run_compare_inter_syntax_report(
         compare_inter_syntax: Some(entries),
         compare_rdo: None,
         compare_partitions: None,
+        compare_partition_costs: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2748,6 +2861,7 @@ fn run_compare_rdo_report(
         compare_inter_syntax: None,
         compare_rdo: Some(entries),
         compare_partitions: None,
+        compare_partition_costs: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2878,6 +2992,161 @@ fn run_compare_partitions_report(
         compare_inter_syntax: None,
         compare_rdo: None,
         compare_partitions: Some(entries),
+        compare_partition_costs: None,
+        match_x264_bitrate_note: None,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
+}
+
+fn run_compare_partition_costs_report(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    let re = parse_residual_entropy(&args.residual_entropy)?;
+    let modes = [
+        (
+            "SRSV2-pc-fixed16x16",
+            "fixed16x16",
+            SrsV2PartitionCostModel::SadOnly,
+        ),
+        (
+            "SRSV2-pc-split8x8",
+            "split8x8",
+            SrsV2PartitionCostModel::SadOnly,
+        ),
+        (
+            "SRSV2-pc-auto-fast-sad",
+            "auto-fast",
+            SrsV2PartitionCostModel::SadOnly,
+        ),
+        (
+            "SRSV2-pc-auto-fast-header-aware",
+            "auto-fast",
+            SrsV2PartitionCostModel::HeaderAware,
+        ),
+        (
+            "SRSV2-pc-auto-fast-rdo",
+            "auto-fast",
+            SrsV2PartitionCostModel::RdoFast,
+        ),
+    ];
+    let mut entries = Vec::new();
+    let mut table = Vec::new();
+    let mut primary: Option<Srsv2Details> = None;
+
+    for (label, ip_s, pcm) in modes {
+        let mut a = args.clone();
+        a.inter_partition = ip_s.to_string();
+        a.inter_syntax = "compact".to_string();
+        a.partition_cost_model = partition_cost_model_cli_label(pcm).to_string();
+        let settings = match build_settings(&a, re) {
+            Ok(s) => s,
+            Err(e) => {
+                entries.push(VariantBenchEntry {
+                    label: label.to_string(),
+                    ok: false,
+                    error: Some(format!("settings: {e:#}")),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(format!("settings: {e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        inter_syntax_mode: "compact".to_string(),
+                        residual_entropy: args.residual_entropy.clone(),
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+                continue;
+            }
+        };
+
+        match run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
+            Ok(numbers) => {
+                let row = pass_to_row(&a, label, &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details = pass_to_details(
+                    &a,
+                    seq,
+                    &settings,
+                    &args.residual_entropy,
+                    &numbers,
+                    deblock,
+                );
+                if primary.is_none() {
+                    primary = Some(details.clone());
+                }
+                entries.push(VariantBenchEntry {
+                    label: label.to_string(),
+                    ok: true,
+                    error: None,
+                    row: row.clone(),
+                    details,
+                });
+                table.push(row);
+            }
+            Err(e) => {
+                entries.push(VariantBenchEntry {
+                    label: label.to_string(),
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(format!("{e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        inter_syntax_mode: "compact".to_string(),
+                        residual_entropy: args.residual_entropy.clone(),
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+            }
+        }
+    }
+
+    let srsv2 = primary.unwrap_or_else(|| entries[0].details.clone());
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "`--compare-partition-costs` runs fixed16x16, split8x8, and three AutoFast cost models (`sad-only`, `header-aware`, `rdo-fast`) with `--inter-syntax compact`.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2,
+        x264: None,
+        table,
+        compare_residual_modes: None,
+        sweep: None,
+        compare_b_modes: None,
+        compare_inter_syntax: None,
+        compare_rdo: None,
+        compare_partitions: None,
+        compare_partition_costs: Some(entries),
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3120,6 +3389,8 @@ fn main() -> Result<()> {
         run_compare_rdo_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_partitions {
         run_compare_partitions_report(&args, &seq, &raw, expected_frame)?
+    } else if args.compare_partition_costs {
+        run_compare_partition_costs_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_residual_modes {
         run_compare_residual_report(&args, &seq, &raw, expected_frame)?
     } else {
@@ -3536,6 +3807,29 @@ fn to_markdown(r: &BenchReport) -> String {
         }
     }
 
+    if let Some(rows) = &r.compare_partition_costs {
+        out.push_str("\n## Partition cost comparison (`--compare-partition-costs`)\n\n");
+        for e in rows {
+            let p = &e.details.partition;
+            out.push_str(&format!(
+                "- **{}**: ok={} bytes={} PSNR-Y={:.2} cost_model={} part={}/{}/{}/{} map_bytes={} mv_bytes={} res_bytes={} err={:?}\n",
+                e.label,
+                e.ok,
+                e.row.bytes,
+                e.row.psnr_y,
+                p.partition_cost_model,
+                p.partition_16x16_count,
+                p.partition_16x8_count,
+                p.partition_8x16_count,
+                p.partition_8x8_count,
+                p.partition_map_bytes,
+                p.partition_mv_bytes,
+                p.partition_residual_bytes,
+                e.error
+            ));
+        }
+    }
+
     if let Some(note) = &r.match_x264_bitrate_note {
         out.push_str("\n## Bitrate matching note\n\n");
         out.push_str(note);
@@ -3580,6 +3874,68 @@ fn to_markdown(r: &BenchReport) -> String {
     }
     if !sv.bframe_mode_note.is_empty() {
         out.push_str(&format!("- bframe_mode_note: {}\n", sv.bframe_mode_note));
+    }
+    {
+        let pt = &sv.partition;
+        out.push_str("\n## Partition decision telemetry\n\n");
+        out.push_str("| Metric | Value |\n|---|---:|\n");
+        out.push_str(&format!(
+            "| Partition cost model (AutoFast) | {} |\n",
+            if pt.partition_cost_model.is_empty() {
+                "(n/a)"
+            } else {
+                pt.partition_cost_model.as_str()
+            }
+        ));
+        out.push_str(&format!(
+            "| Candidates tested | {} |\n",
+            pt.rdo_partition_candidates_tested
+        ));
+        out.push_str(&format!(
+            "| Header-cost rejections | {} |\n",
+            pt.partition_rejected_by_header_cost
+        ));
+        out.push_str(&format!(
+            "| RDO rejections | {} |\n",
+            pt.partition_rejected_by_rdo
+        ));
+        out.push_str(&format!(
+            "| 16×16 chosen | {} |\n",
+            pt.partition_16x16_count
+        ));
+        out.push_str(&format!(
+            "| Split 8×8 chosen | {} |\n",
+            pt.partition_8x8_count
+        ));
+        out.push_str(&format!(
+            "| Rect 16×8 chosen | {} |\n",
+            pt.partition_16x8_count
+        ));
+        out.push_str(&format!(
+            "| Rect 8×16 chosen | {} |\n",
+            pt.partition_8x16_count
+        ));
+        out.push_str(&format!(
+            "| Avg SAD gain (override events) | {:.4} |\n",
+            pt.avg_partition_sad_gain
+        ));
+        out.push_str(&format!(
+            "| Partition map bytes | {} |\n",
+            pt.partition_map_bytes
+        ));
+        out.push_str(&format!("| MV bytes | {} |\n", pt.partition_mv_bytes));
+        out.push_str(&format!(
+            "| Residual bytes | {} |\n",
+            pt.partition_residual_bytes
+        ));
+        out.push_str(&format!(
+            "| Transform decisions Tx4×4 | {} |\n",
+            pt.transform_decision_tx4x4
+        ));
+        out.push_str(&format!(
+            "| Transform decisions Tx8×8 | {} |\n",
+            pt.transform_decision_tx8x8
+        ));
     }
     out.push_str("\n## Frame-kind payloads\n\n");
     out.push_str("| Kind | Count | Avg bytes |\n");
@@ -3841,6 +4197,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -3903,6 +4262,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -3964,6 +4326,9 @@ mod tests {
             compare_inter_syntax: true,
             compare_rdo: true,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4027,6 +4392,9 @@ mod tests {
             compare_inter_syntax: true,
             compare_rdo: false,
             compare_partitions: true,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4090,6 +4458,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4155,6 +4526,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4234,6 +4608,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4304,6 +4681,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4391,6 +4771,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4461,6 +4844,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4536,6 +4922,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4645,6 +5034,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -4812,6 +5204,7 @@ mod tests {
             compare_inter_syntax: None,
             compare_rdo: None,
             compare_partitions: None,
+            compare_partition_costs: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -4993,6 +5386,7 @@ mod tests {
             compare_inter_syntax: None,
             compare_rdo: None,
             compare_partitions: None,
+            compare_partition_costs: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -5020,12 +5414,42 @@ mod tests {
             compare_inter_syntax: None,
             compare_rdo: None,
             compare_partitions: Some(vec![]),
+            compare_partition_costs: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
         };
         let js = serde_json::to_string(&r).unwrap();
         assert!(js.contains("\"compare_partitions\":[]"));
+    }
+
+    #[test]
+    fn compare_partition_costs_report_serializes() {
+        let r = BenchReport {
+            note: "x",
+            residual_note: "n",
+            command: "cmd".to_string(),
+            raw_bytes: 1,
+            width: 128,
+            height: 128,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            table: vec![],
+            compare_residual_modes: None,
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: Some(vec![]),
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "os".to_string(),
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert!(js.contains("\"compare_partition_costs\":[]"));
     }
 
     #[test]
@@ -5176,6 +5600,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };
@@ -5237,6 +5664,9 @@ mod tests {
             compare_inter_syntax: false,
             compare_rdo: false,
             compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
         };

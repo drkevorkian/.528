@@ -43,6 +43,8 @@ impl Default for SrsV2InterMvBenchStats {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SrsV2PartitionEncodeStats {
     pub inter_partition_mode_label: &'static str,
+    /// [`crate::srsv2::rate_control::SrsV2PartitionCostModel`] string for **AutoFast** (empty if N/A).
+    pub partition_cost_model_label: &'static str,
     pub partition_16x16_count: u64,
     pub partition_16x8_count: u64,
     pub partition_8x16_count: u64,
@@ -50,10 +52,20 @@ pub struct SrsV2PartitionEncodeStats {
     pub transform_4x4_count: u64,
     pub transform_8x8_count: u64,
     pub transform_16x16_count: u64,
+    /// On-wire partition map bytes (legacy one-per-MB or **RLE**).
     pub partition_header_bytes: u64,
+    /// Best-effort: run-length **map** bytes only (excludes other header fields).
+    pub partition_map_bytes: u64,
     pub partition_mv_bytes: u64,
     pub partition_residual_bytes: u64,
     pub rdo_partition_candidates_tested: u64,
+    /// **AutoFast** would have picked a smaller split on **SAD** only, but cost model kept **16×16** (or larger partition).
+    pub partition_rejected_by_header_cost: u64,
+    /// **AutoFast** `RdoFast` overrode the **SAD**-only winner.
+    pub partition_rejected_by_rdo: u64,
+    /// Sum of absolute **SAD** deltas when cost model overrides pure-SAD pick (**informational**).
+    pub partition_sad_override_accum: u64,
+    pub partition_sad_override_events: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
