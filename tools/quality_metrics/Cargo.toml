@@ -15,6 +15,10 @@ path = "src/bin/gen_synthetic_yuv.rs"
 name = "bench_srsv2"
 path = "src/bin/bench_srsv2.rs"
 
+[[bin]]
+name = "srsv2_h264_progress"
+path = "src/bin/srsv2_h264_progress.rs"
+
 [dependencies]
 anyhow.workspace = true
 serde = { workspace = true }

@@ -33,6 +33,7 @@ use super::rate_control::{
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2PartitionCostModel,
     SrsV2PartitionMapEncoding, SrsV2SubpelMode, SrsV2TransformSizeMode,
 };
+use super::rdo::{choose_min_partition_by_precomputed_scores, partition_header_aware_score, partition_rdo_fast_score};
 use super::residual_entropy::{
     decode_p_residual_chunk, decode_p_residual_chunk_4x4, encode_p_residual_chunk,
     encode_p_residual_chunk_4x4, BlockResidualCoding, PResidualChunkKind,
@@ -571,9 +572,8 @@ fn partition_choice_for_mb(
             let sad_only_choice = autofast_compute_sad_only_choice(ctx, ms, lam_p);
             ms.partition.rdo_partition_candidates_tested += cands.len() as u64;
 
-            let mut best_pt = P_PART_WIRE_16X16;
-            let mut best_score = i128::MAX;
             let mut sad_by_pt = [(P_PART_WIRE_16X16, 0u32); 4];
+            let mut scored: [(u8, i128); 4] = [(P_PART_WIRE_16X16, i128::MAX); 4];
 
             for (i, &pt) in cands.iter().enumerate() {
                 let (sad, mvs) = candidate_sad_and_mvs(ctx, pt, ms)?;
@@ -588,16 +588,15 @@ fn partition_choice_for_mb(
                         } else {
                             0
                         };
-                        sad as i128
-                            + (lam_p as i128
-                                * i128::from(settings.partition_mv_penalty)
-                                * mv_b as i128)
-                                / (256 * 256)
-                            + (lam_p as i128
-                                * i128::from(settings.partition_header_penalty)
-                                * extra_pu as i128)
-                                / (256 * 256)
-                            + (lam_p as i128 * spl) / (256 * 256)
+                        partition_header_aware_score(
+                            sad,
+                            lam_p,
+                            spl,
+                            mv_b,
+                            settings.partition_mv_penalty,
+                            extra_pu as u32,
+                            settings.partition_header_penalty,
+                        )
                     }
                     SrsV2PartitionCostModel::RdoFast => {
                         let res_b = encode_one_mb_residual_body_len(
@@ -615,15 +614,19 @@ fn partition_choice_for_mb(
                             settings,
                             rans_model,
                         )?;
-                        let qb = i128::from(settings.partition_quality_bias);
-                        sad as i128 + (lam_p as i128 * qb * (mv_b + res_b) as i128) / (256 * 256)
+                        partition_rdo_fast_score(
+                            sad,
+                            lam_p,
+                            settings.partition_quality_bias,
+                            mv_b,
+                            res_b,
+                        )
                     }
                 };
-                if score < best_score {
-                    best_score = score;
-                    best_pt = pt;
-                }
+                scored[i] = (pt, score);
             }
+
+            let best_pt = choose_min_partition_by_precomputed_scores(&scored[..cands.len()])?.chosen_id;
 
             if sad_only_choice != best_pt {
                 match cm {
@@ -1237,6 +1240,12 @@ pub fn encode_yuv420_p_payload_var_partition(
         out.extend_from_slice(&mv_blob);
         ms.partition.partition_mv_bytes = 8 + mv_blob.len() as u64;
         ms.inter_mv.mv_entropy_section_bytes = ms.partition.partition_mv_bytes;
+        let sym = mv_compact.len() as u64;
+        ms.inter_mv.entropy_symbol_count = sym;
+        ms.inter_mv.entropy_context_count = match settings.entropy_model_mode {
+            SrsV2EntropyModelMode::StaticV1 => 0,
+            SrsV2EntropyModelMode::ContextV1 => sym,
+        };
     } else {
         out.extend_from_slice(&mv_compact);
         ms.partition.partition_mv_bytes = mv_compact.len() as u64;

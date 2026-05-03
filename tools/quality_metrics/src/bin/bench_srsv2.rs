@@ -17,7 +17,8 @@ use libsrs_video::{
     encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
     PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
     SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats,
+    SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode,
+    SrsV2MotionEncodeStats,
     SrsV2MotionSearchMode, SrsV2PartitionCostModel, SrsV2PartitionMapEncoding,
     SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager,
     SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
@@ -71,6 +72,18 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     sweep: bool,
+
+    /// Full SRSV2 quality/bitrate matrix (QP × inter × entropy × partition cost × partition mode); writes `--report-json` and `--report-md` (in-process encoder only).
+    #[arg(long, default_value_t = false)]
+    sweep_quality_bitrate: bool,
+
+    /// SSIM-Y threshold in (0, 1] for Pareto “smallest bytes with SSIM ≥ threshold”.
+    #[arg(long, default_value = "0.95")]
+    sweep_ssim_threshold: f64,
+
+    /// Total compressed-byte budget for Pareto “best SSIM / PSNR under budget”.
+    #[arg(long, default_value = "10000000")]
+    sweep_byte_budget: u64,
 
     /// Rate control: `fixed-qp`, `quality`, `target-bitrate`.
     #[arg(long, default_value = "fixed-qp")]
@@ -211,6 +224,14 @@ struct Args {
     /// Transform size for partitioned **P** payloads: **`auto`**, **`tx4x4`**, **`tx8x8`**.
     #[arg(long, default_value = "auto")]
     transform_size: String,
+
+    /// MV rANS entropy model when **`--inter-syntax entropy`**: **`static`** (**StaticV1**, default) or **`context`** (**ContextV1**).
+    #[arg(long, default_value = "static")]
+    entropy_model: String,
+
+    /// Run **StaticV1** then **ContextV1** MV entropy (**requires** **`--inter-syntax entropy`**). A failed **ContextV1** pass keeps an error row; **StaticV1** is still reported.
+    #[arg(long, default_value_t = false)]
+    compare_entropy_models: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,6 +325,10 @@ struct Fr2RevisionCounts {
     rev20: u32,
     rev21: u32,
     rev22: u32,
+    rev23: u32,
+    rev24: u32,
+    rev25: u32,
+    rev26: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -521,6 +546,24 @@ struct Srsv2Details {
     decode_order_count: u32,
     #[serde(default)]
     partition: PartitionBenchSummary,
+    /// CLI / settings mirror: **`static`** or **`context`** when inter entropy is used; else **`static`**.
+    #[serde(default)]
+    entropy_model_mode: String,
+    /// Aggregated on-wire MV entropy section bytes (**sym_count + blob_len + blob**) for **P**/**B** when **`StaticV1`** + **`EntropyV1`**; else **0**.
+    #[serde(default)]
+    static_mv_bytes: u64,
+    /// Same metric when **`ContextV1`** + **`EntropyV1`**; else **0**.
+    #[serde(default)]
+    context_mv_bytes: u64,
+    /// Sum of per-frame **`SrsV2InterMvBenchStats::entropy_context_count`** (ContextV1: one label per MV byte).
+    #[serde(default)]
+    entropy_context_count: u64,
+    /// Sum of per-frame **`SrsV2InterMvBenchStats::entropy_symbol_count`** (MV compact bytes under **EntropyV1**).
+    #[serde(default)]
+    entropy_symbol_count: u64,
+    /// Populated when a benchmark pass fails before **`Srsv2Details`** is complete (reserved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entropy_failure_reason: Option<String>,
 }
 
 impl Default for Srsv2Details {
@@ -589,8 +632,34 @@ impl Default for Srsv2Details {
             bframe_ssim_y: 0.0,
             decode_order_count: 0,
             partition: PartitionBenchSummary::default(),
+            entropy_model_mode: "static".to_string(),
+            static_mv_bytes: 0,
+            context_mv_bytes: 0,
+            entropy_context_count: 0,
+            entropy_symbol_count: 0,
+            entropy_failure_reason: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EntropyModelCompareEntry {
+    entropy_model_mode: String,
+    context_mv_bytes: u64,
+    static_mv_bytes: u64,
+    mv_delta_zero_count: u64,
+    mv_delta_nonzero_count: u64,
+    mv_delta_avg_abs: f64,
+    entropy_context_count: u64,
+    entropy_symbol_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entropy_failure_reason: Option<String>,
+    fr2_revision_counts: Fr2RevisionCounts,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    row: CodecRow,
+    details: Srsv2Details,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -673,6 +742,8 @@ struct BenchReport {
     compare_partitions: Option<Vec<VariantBenchEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_partition_costs: Option<Vec<VariantBenchEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_entropy_models: Option<Vec<EntropyModelCompareEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     match_x264_bitrate_note: Option<String>,
     git_commit: Option<String>,
@@ -859,28 +930,36 @@ fn validate_args(args: &Args) -> Result<()> {
     if args.min_qp > args.max_qp {
         bail!("--min-qp must be <= --max-qp");
     }
-    if args.compare_residual_modes && args.sweep {
-        bail!("--compare-residual-modes and --sweep are mutually exclusive");
+    if args.compare_residual_modes && (args.sweep || args.sweep_quality_bitrate) {
+        bail!("--compare-residual-modes cannot be combined with --sweep or --sweep-quality-bitrate");
+    }
+    if args.sweep && args.sweep_quality_bitrate {
+        bail!("--sweep and --sweep-quality-bitrate are mutually exclusive");
     }
     let compare_pass_count = args.compare_inter_syntax as u8
         + args.compare_rdo as u8
         + args.compare_partitions as u8
-        + args.compare_partition_costs as u8;
+        + args.compare_partition_costs as u8
+        + args.compare_entropy_models as u8;
     if compare_pass_count > 1 {
         bail!(
-            "--compare-inter-syntax, --compare-rdo, --compare-partitions, and --compare-partition-costs are mutually exclusive"
+            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, and --compare-entropy-models are mutually exclusive"
         );
     }
     if (args.compare_inter_syntax
         || args.compare_rdo
         || args.compare_partitions
-        || args.compare_partition_costs)
-        && (args.sweep || args.compare_residual_modes || args.compare_b_modes)
+        || args.compare_partition_costs
+        || args.compare_entropy_models)
+        && (args.sweep
+            || args.sweep_quality_bitrate
+            || args.compare_residual_modes
+            || args.compare_b_modes)
     {
-        bail!("comparison modes cannot be combined with --sweep, --compare-residual-modes, or --compare-b-modes");
+        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, or --compare-b-modes");
     }
-    if args.compare_b_modes && (args.sweep || args.compare_residual_modes) {
-        bail!("--compare-b-modes cannot be combined with --sweep or --compare-residual-modes");
+    if args.compare_b_modes && (args.sweep || args.compare_residual_modes || args.sweep_quality_bitrate) {
+        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, or --compare-residual-modes");
     }
     if args.compare_b_modes {
         if args.reference_frames < 2 {
@@ -903,6 +982,21 @@ fn validate_args(args: &Args) -> Result<()> {
     }
     parse_b_motion_search_mode(&args.b_motion_search)?;
     let inter_syn = parse_inter_syntax_mode(&args.inter_syntax)?;
+    let entropy_model = parse_entropy_model(&args.entropy_model)?;
+    if entropy_model == SrsV2EntropyModelMode::ContextV1
+        && inter_syn != SrsV2InterSyntaxMode::EntropyV1
+    {
+        bail!(
+            "--entropy-model context requires --inter-syntax entropy (MV rANS on compact median-predicted deltas); got `--inter-syntax {}`",
+            args.inter_syntax
+        );
+    }
+    if args.compare_entropy_models && inter_syn != SrsV2InterSyntaxMode::EntropyV1 {
+        bail!(
+            "--compare-entropy-models requires --inter-syntax entropy (runs StaticV1 then ContextV1 on MV rANS paths); got `--inter-syntax {}`",
+            args.inter_syntax
+        );
+    }
     parse_rdo_mode(&args.rdo)?;
     let inter_partition_mode = parse_inter_partition_mode(&args.inter_partition)?;
     parse_transform_size_mode(&args.transform_size)?;
@@ -930,9 +1024,16 @@ fn validate_args(args: &Args) -> Result<()> {
         if !args.width.is_multiple_of(16) || !args.height.is_multiple_of(16) {
             bail!("--bframes 1 requires width and height divisible by 16");
         }
-        if args.sweep || args.compare_residual_modes {
-            bail!("--bframes 1 cannot be combined with --sweep or --compare-residual-modes");
+        if args.sweep || args.compare_residual_modes || args.sweep_quality_bitrate {
+            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, or --compare-residual-modes");
         }
+    }
+    if args.sweep_quality_bitrate {
+        quality_metrics::srsv2_sweep::validate_sweep_pareto(
+            args.sweep_ssim_threshold,
+            args.sweep_byte_budget,
+        )
+        .map_err(|e| anyhow!("{e}"))?;
     }
     parse_partition_cost_model(&args.partition_cost_model)?;
     parse_partition_map_encoding(&args.partition_map_encoding)?;
@@ -982,6 +1083,23 @@ fn parse_inter_syntax_mode(s: &str) -> Result<SrsV2InterSyntaxMode> {
         _ => Err(anyhow!(
             "--inter-syntax must be raw, compact, or entropy (got {s})"
         )),
+    }
+}
+
+fn parse_entropy_model(s: &str) -> Result<SrsV2EntropyModelMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "static" | "static-v1" | "staticv1" => Ok(SrsV2EntropyModelMode::StaticV1),
+        "context" | "context-v1" | "contextv1" => Ok(SrsV2EntropyModelMode::ContextV1),
+        _ => Err(anyhow!(
+            "--entropy-model must be static or context (got {s})"
+        )),
+    }
+}
+
+fn entropy_model_cli_label(m: SrsV2EntropyModelMode) -> &'static str {
+    match m {
+        SrsV2EntropyModelMode::StaticV1 => "static",
+        SrsV2EntropyModelMode::ContextV1 => "context",
     }
 }
 
@@ -1124,6 +1242,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let transform_size_mode = parse_transform_size_mode(&args.transform_size)?;
     let partition_cost_model = parse_partition_cost_model(&args.partition_cost_model)?;
     let partition_map_encoding = parse_partition_map_encoding(&args.partition_map_encoding)?;
+    let entropy_model_mode = parse_entropy_model(&args.entropy_model)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -1157,11 +1276,14 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         transform_size_mode,
         partition_cost_model,
         partition_map_encoding,
+        entropy_model_mode,
         ..Default::default()
     };
     s.validate_rate_control()
         .map_err(|e| anyhow!("rate-control settings: {e}"))?;
     validate_adaptive_quant_settings(&s).map_err(|e| anyhow!("adaptive quant settings: {e}"))?;
+    s.validate_entropy_model_inter()
+        .map_err(|e| anyhow!("MV entropy configuration: {e}"))?;
     Ok(s)
 }
 
@@ -1180,6 +1302,8 @@ struct MotionAgg {
     mv_raw_bytes_estimate: u64,
     mv_compact_bytes: u64,
     mv_entropy_section_bytes: u64,
+    entropy_context_count: u64,
+    entropy_symbol_count: u64,
     mv_delta_zero_varints: u64,
     mv_delta_nonzero_varints: u64,
     mv_delta_sum_abs_components: u64,
@@ -1316,6 +1440,10 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             20 => c.rev20 += 1,
             21 => c.rev21 += 1,
             22 => c.rev22 += 1,
+            23 => c.rev23 += 1,
+            24 => c.rev24 += 1,
+            25 => c.rev25 += 1,
+            26 => c.rev26 += 1,
             _ => {}
         }
     }
@@ -1568,7 +1696,7 @@ fn run_srsv2_numbers_b_gop(
                 anchor_p_payload_bytes.push(pl.len() as u64);
                 let is_p_wire = matches!(
                     pl.get(3).copied(),
-                    Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20)
+                    Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25)
                 );
                 if is_p_wire {
                     motion_agg.sad_evaluations += motion_frame.sad_evaluations;
@@ -1588,6 +1716,8 @@ fn run_srsv2_numbers_b_gop(
                     motion_agg.mv_raw_bytes_estimate += im.mv_raw_bytes_estimate;
                     motion_agg.mv_compact_bytes += im.mv_compact_bytes;
                     motion_agg.mv_entropy_section_bytes += im.mv_entropy_section_bytes;
+                    motion_agg.entropy_context_count += im.entropy_context_count;
+                    motion_agg.entropy_symbol_count += im.entropy_symbol_count;
                     motion_agg.mv_delta_zero_varints += im.mv_delta_zero_varints;
                     motion_agg.mv_delta_nonzero_varints += im.mv_delta_nonzero_varints;
                     motion_agg.mv_delta_sum_abs_components += im.mv_delta_sum_abs_components;
@@ -1642,6 +1772,8 @@ fn run_srsv2_numbers_b_gop(
                 motion_agg.mv_raw_bytes_estimate += im.mv_raw_bytes_estimate;
                 motion_agg.mv_compact_bytes += im.mv_compact_bytes;
                 motion_agg.mv_entropy_section_bytes += im.mv_entropy_section_bytes;
+                motion_agg.entropy_context_count += im.entropy_context_count;
+                motion_agg.entropy_symbol_count += im.entropy_symbol_count;
                 motion_agg.mv_delta_zero_varints += im.mv_delta_zero_varints;
                 motion_agg.mv_delta_nonzero_varints += im.mv_delta_nonzero_varints;
                 motion_agg.mv_delta_sum_abs_components += im.mv_delta_sum_abs_components;
@@ -1840,7 +1972,7 @@ fn run_srsv2_numbers(
         aq_last = aq_frame;
         let is_p = matches!(
             payload.get(3).copied(),
-            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20)
+            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25)
         );
         if is_p {
             motion_agg.sad_evaluations += motion_frame.sad_evaluations;
@@ -1858,6 +1990,8 @@ fn run_srsv2_numbers(
             motion_agg.mv_raw_bytes_estimate += im.mv_raw_bytes_estimate;
             motion_agg.mv_compact_bytes += im.mv_compact_bytes;
             motion_agg.mv_entropy_section_bytes += im.mv_entropy_section_bytes;
+            motion_agg.entropy_context_count += im.entropy_context_count;
+            motion_agg.entropy_symbol_count += im.entropy_symbol_count;
             motion_agg.mv_delta_zero_varints += im.mv_delta_zero_varints;
             motion_agg.mv_delta_nonzero_varints += im.mv_delta_nonzero_varints;
             motion_agg.mv_delta_sum_abs_components += im.mv_delta_sum_abs_components;
@@ -2115,20 +2249,35 @@ fn pass_to_details(
     for pl in &p.payloads {
         match pl.get(3).copied() {
             Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
-            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20) => p_bytes.push(pl.len() as u64),
-            Some(10 | 11 | 13 | 14 | 16 | 18 | 21 | 22) => b_bytes.push(pl.len() as u64),
+            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25) => p_bytes.push(pl.len() as u64),
+            Some(10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26) => b_bytes.push(pl.len() as u64),
             Some(12) => alt_bytes.push(pl.len() as u64),
             _ => {}
         }
     }
     let fr2 = fr2_revision_counts(&p.payloads);
-    let bframe_count = fr2.rev10 + fr2.rev11 + fr2.rev13 + fr2.rev14 + fr2.rev16 + fr2.rev18;
+    let bframe_count = fr2.rev10
+        + fr2.rev11
+        + fr2.rev13
+        + fr2.rev14
+        + fr2.rev16
+        + fr2.rev18
+        + fr2.rev24;
     let alt_ref_count = fr2.rev12;
     let enc_bytes: u64 = p.byte_hist.iter().sum();
     let raw_bytes = raw_len_for_bitrate(args);
     let m = &p.motion_agg;
     let mv_denom = (m.mv_delta_zero_varints + m.mv_delta_nonzero_varints).max(1);
     let mv_delta_avg_abs = m.mv_delta_sum_abs_components as f64 / mv_denom as f64;
+    let (static_mv_b, context_mv_b) =
+        if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1) {
+            match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => (m.mv_entropy_section_bytes, 0),
+                SrsV2EntropyModelMode::ContextV1 => (0, m.mv_entropy_section_bytes),
+            }
+        } else {
+            (0, 0)
+        };
     Srsv2Details {
         frames: args.frames,
         keyframes: i_bytes.len() as u32,
@@ -2192,6 +2341,12 @@ fn pass_to_details(
         bframe_mode_note: p.bframe_mode_note.clone(),
         bframe_psnr_y: p.bframe_psnr_y,
         bframe_ssim_y: p.bframe_ssim_y,
+        entropy_model_mode: entropy_model_cli_label(settings.entropy_model_mode).to_string(),
+        static_mv_bytes: static_mv_b,
+        context_mv_bytes: context_mv_b,
+        entropy_context_count: m.entropy_context_count,
+        entropy_symbol_count: m.entropy_symbol_count,
+        entropy_failure_reason: None,
         partition: {
             let pcm = if matches!(
                 settings.inter_partition_mode,
@@ -2399,6 +2554,7 @@ fn run_compare_b_modes_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_entropy_models: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2468,6 +2624,7 @@ fn run_single_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_entropy_models: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2606,6 +2763,7 @@ fn run_compare_residual_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_entropy_models: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2736,6 +2894,7 @@ fn run_compare_inter_syntax_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_entropy_models: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2862,6 +3021,7 @@ fn run_compare_rdo_report(
         compare_rdo: Some(entries),
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_entropy_models: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2993,6 +3153,7 @@ fn run_compare_partitions_report(
         compare_rdo: None,
         compare_partitions: Some(entries),
         compare_partition_costs: None,
+        compare_entropy_models: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3147,6 +3308,205 @@ fn run_compare_partition_costs_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: Some(entries),
+        compare_entropy_models: None,
+        match_x264_bitrate_note: None,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
+}
+
+fn entropy_model_compare_row(
+    label: &str,
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    settings: &SrsV2EncodeSettings,
+    p: &PassNumbers,
+    deblock: DeblockBenchReport,
+) -> EntropyModelCompareEntry {
+    let m = &p.motion_agg;
+    let mv_denom = (m.mv_delta_zero_varints + m.mv_delta_nonzero_varints).max(1);
+    let mv_delta_avg_abs = m.mv_delta_sum_abs_components as f64 / mv_denom as f64;
+    let (static_mv, ctx_mv) =
+        if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1) {
+            match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => (m.mv_entropy_section_bytes, 0),
+                SrsV2EntropyModelMode::ContextV1 => (0, m.mv_entropy_section_bytes),
+            }
+        } else {
+            (0, 0)
+        };
+    EntropyModelCompareEntry {
+        entropy_model_mode: entropy_model_cli_label(settings.entropy_model_mode).to_string(),
+        context_mv_bytes: ctx_mv,
+        static_mv_bytes: static_mv,
+        mv_delta_zero_count: m.mv_delta_zero_varints,
+        mv_delta_nonzero_count: m.mv_delta_nonzero_varints,
+        mv_delta_avg_abs,
+        entropy_context_count: m.entropy_context_count,
+        entropy_symbol_count: m.entropy_symbol_count,
+        entropy_failure_reason: None,
+        fr2_revision_counts: fr2_revision_counts(&p.payloads),
+        ok: true,
+        error: None,
+        row: pass_to_row(args, label, p),
+        details: pass_to_details(
+            args,
+            seq,
+            settings,
+            &args.residual_entropy,
+            p,
+            deblock,
+        ),
+    }
+}
+
+fn run_compare_entropy_models_report(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    let re = parse_residual_entropy(&args.residual_entropy)?;
+    let modes = [
+        (
+            "SRSV2-entropy-StaticV1",
+            SrsV2EntropyModelMode::StaticV1,
+            "static",
+        ),
+        (
+            "SRSV2-entropy-ContextV1",
+            SrsV2EntropyModelMode::ContextV1,
+            "context",
+        ),
+    ];
+    let mut entries = Vec::new();
+    let mut table = Vec::new();
+    let mut primary: Option<Srsv2Details> = None;
+
+    for (label, mode, entropy_cli) in modes {
+        let mut a = args.clone();
+        a.inter_syntax = "entropy".to_string();
+        a.entropy_model = entropy_cli.to_string();
+        let settings = match build_settings(&a, re) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = format!("settings: {e:#}");
+                entries.push(EntropyModelCompareEntry {
+                    entropy_model_mode: entropy_cli.to_string(),
+                    context_mv_bytes: 0,
+                    static_mv_bytes: 0,
+                    mv_delta_zero_count: 0,
+                    mv_delta_nonzero_count: 0,
+                    mv_delta_avg_abs: 0.0,
+                    entropy_context_count: 0,
+                    entropy_symbol_count: 0,
+                    entropy_failure_reason: Some(err.clone()),
+                    fr2_revision_counts: Fr2RevisionCounts::default(),
+                    ok: false,
+                    error: Some(err.clone()),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(err),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        inter_syntax_mode: "entropy".to_string(),
+                        residual_entropy: args.residual_entropy.clone(),
+                        entropy_model_mode: entropy_cli.to_string(),
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+                continue;
+            }
+        };
+        debug_assert_eq!(settings.entropy_model_mode, mode);
+        debug_assert_eq!(
+            settings.inter_syntax_mode,
+            SrsV2InterSyntaxMode::EntropyV1
+        );
+
+        match run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
+            Ok(numbers) => {
+                let deblock =
+                    build_deblock_bench_report(&a, seq, &settings, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let row_entry =
+                    entropy_model_compare_row(label, &a, seq, &settings, &numbers, deblock);
+                if primary.is_none() {
+                    primary = Some(row_entry.details.clone());
+                }
+                table.push(row_entry.row.clone());
+                entries.push(row_entry);
+            }
+            Err(e) => {
+                let err = format!("{e:#}");
+                entries.push(EntropyModelCompareEntry {
+                    entropy_model_mode: entropy_cli.to_string(),
+                    context_mv_bytes: 0,
+                    static_mv_bytes: 0,
+                    mv_delta_zero_count: 0,
+                    mv_delta_nonzero_count: 0,
+                    mv_delta_avg_abs: 0.0,
+                    entropy_context_count: 0,
+                    entropy_symbol_count: 0,
+                    entropy_failure_reason: Some(err.clone()),
+                    fr2_revision_counts: Fr2RevisionCounts::default(),
+                    ok: false,
+                    error: Some(err.clone()),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(err),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        inter_syntax_mode: "entropy".to_string(),
+                        residual_entropy: args.residual_entropy.clone(),
+                        entropy_model_mode: entropy_cli.to_string(),
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+            }
+        }
+    }
+
+    let srsv2 = primary.unwrap_or_else(|| entries[0].details.clone());
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "`--compare-entropy-models` runs **StaticV1** then **ContextV1** with `--inter-syntax entropy`; a failed **ContextV1** pass keeps an error row without discarding **StaticV1**.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2,
+        x264: None,
+        table,
+        compare_residual_modes: None,
+        sweep: None,
+        compare_b_modes: None,
+        compare_inter_syntax: None,
+        compare_rdo: None,
+        compare_partitions: None,
+        compare_partition_costs: None,
+        compare_entropy_models: Some(entries),
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3373,6 +3733,36 @@ fn main() -> Result<()> {
         ));
     }
 
+    if args.sweep_quality_bitrate {
+        let sweep_cfg = quality_metrics::srsv2_sweep::SweepConfig {
+            width: args.width,
+            height: args.height,
+            frames: args.frames,
+            fps: args.fps,
+            keyint: args.keyint,
+            motion_radius: args.motion_radius,
+            reference_frames: args.reference_frames,
+            residual_entropy: args.residual_entropy.clone(),
+            pareto_ssim_threshold: args.sweep_ssim_threshold,
+            pareto_byte_budget: args.sweep_byte_budget,
+            max_rows: None,
+        };
+        let report = quality_metrics::srsv2_sweep::run_quality_bitrate_sweep(&sweep_cfg, &raw)
+            .map_err(|e| anyhow!("quality/bitrate sweep: {e}"))?;
+        if let Some(p) = args.report_json.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        if let Some(p) = args.report_md.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        quality_metrics::srsv2_sweep::write_sweep_json(&args.report_json, &report)
+            .map_err(|e| anyhow!("write sweep json: {e}"))?;
+        quality_metrics::srsv2_sweep::write_sweep_markdown(&args.report_md, &report)
+            .map_err(|e| anyhow!("write sweep markdown: {e}"))?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
     let re = parse_residual_entropy(&args.residual_entropy)?;
     let settings = build_settings(&args, re)?;
     let seq = build_seq_header(&args, &settings);
@@ -3391,6 +3781,8 @@ fn main() -> Result<()> {
         run_compare_partitions_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_partition_costs {
         run_compare_partition_costs_report(&args, &seq, &raw, expected_frame)?
+    } else if args.compare_entropy_models {
+        run_compare_entropy_models_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_residual_modes {
         run_compare_residual_report(&args, &seq, &raw, expected_frame)?
     } else {
@@ -3830,6 +4222,39 @@ fn to_markdown(r: &BenchReport) -> String {
         }
     }
 
+    if let Some(rows) = &r.compare_entropy_models {
+        out.push_str("\n## MV entropy model comparison (`--compare-entropy-models`)\n\n");
+        out.push_str("| Entropy model | Bytes | MV bytes | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS | Status |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|---:|---|\n");
+        for e in rows {
+            let mv_wire = e.static_mv_bytes.saturating_add(e.context_mv_bytes);
+            let status = if e.ok {
+                "ok".to_string()
+            } else {
+                e.error
+                    .as_ref()
+                    .map(|s| {
+                        let one_line = s.replace('\n', " ");
+                        let short: String = one_line.chars().take(72).collect();
+                        format!("failed ({short})")
+                    })
+                    .unwrap_or_else(|| "failed".to_string())
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {:.2} | {:.4} | {:.2} | {:.2} | {} |\n",
+                e.entropy_model_mode,
+                e.row.bytes,
+                mv_wire,
+                e.row.psnr_y,
+                e.row.ssim_y,
+                e.row.enc_fps,
+                e.row.dec_fps,
+                status
+            ));
+        }
+        out.push_str("\n_JSON rows include `entropy_model_mode`, `static_mv_bytes`, `context_mv_bytes`, `mv_delta_*`, `entropy_context_count`, `entropy_symbol_count`, `entropy_failure_reason`, `fr2_revision_counts`, and nested `details`._\n");
+    }
+
     if let Some(note) = &r.match_x264_bitrate_note {
         out.push_str("\n## Bitrate matching note\n\n");
         out.push_str(note);
@@ -3979,6 +4404,14 @@ fn to_markdown(r: &BenchReport) -> String {
         sv.mv_delta_avg_abs,
         sv.inter_header_bytes,
         sv.inter_residual_bytes,
+    ));
+    out.push_str(&format!(
+        "- MV entropy telemetry: entropy_model_mode={} static_mv_bytes={} context_mv_bytes={} entropy_context_count={} entropy_symbol_count={}\n",
+        sv.entropy_model_mode,
+        sv.static_mv_bytes,
+        sv.context_mv_bytes,
+        sv.entropy_context_count,
+        sv.entropy_symbol_count,
     ));
     out.push_str(&format!(
         "- RDO aggregate: candidates_tested={} skip={} forward={} backward={} average={} weighted={} halfpel={} residual={} no_residual={} estimated_bits_used_for_decision={}\n",
@@ -4163,6 +4596,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4202,6 +4638,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -4228,6 +4666,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4267,6 +4708,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         assert!(validate_args(&a).is_err());
         a.bframes = 0;
@@ -4292,6 +4735,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4331,6 +4777,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -4358,6 +4806,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4397,6 +4848,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -4424,6 +4877,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4463,6 +4919,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -4492,6 +4950,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4531,6 +4992,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         assert!(validate_args(&a).is_err());
         a.reference_frames = 2;
@@ -4574,6 +5037,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4613,6 +5079,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -4647,6 +5115,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4686,6 +5157,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -4737,6 +5210,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4776,6 +5252,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -4810,6 +5288,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4849,6 +5330,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -4888,6 +5371,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -4927,6 +5413,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         validate_args(&a).unwrap();
         let s = build_settings(&a, ResidualEntropy::Auto).unwrap();
@@ -5000,6 +5488,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -5039,6 +5530,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
         let seq = build_seq_header(&args, &settings);
@@ -5185,6 +5678,12 @@ mod tests {
                 bframe_ssim_y: 0.0,
                 decode_order_count: 1,
                 partition: PartitionBenchSummary::default(),
+                entropy_model_mode: "static".to_string(),
+                static_mv_bytes: 0,
+                context_mv_bytes: 0,
+                entropy_context_count: 0,
+                entropy_symbol_count: 0,
+                entropy_failure_reason: None,
             },
             x264: None,
             table: vec![CodecRow {
@@ -5205,6 +5704,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: None,
             compare_partition_costs: None,
+            compare_entropy_models: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -5297,6 +5797,12 @@ mod tests {
                 bframe_ssim_y: 0.0,
                 decode_order_count: 0,
                 partition: PartitionBenchSummary::default(),
+                entropy_model_mode: "static".to_string(),
+                static_mv_bytes: 0,
+                context_mv_bytes: 0,
+                entropy_context_count: 0,
+                entropy_symbol_count: 0,
+                entropy_failure_reason: None,
             },
             x264: None,
             table: vec![],
@@ -5379,6 +5885,12 @@ mod tests {
                     bframe_ssim_y: 0.0,
                     decode_order_count: 0,
                     partition: PartitionBenchSummary::default(),
+                    entropy_model_mode: "static".to_string(),
+                    static_mv_bytes: 0,
+                    context_mv_bytes: 0,
+                    entropy_context_count: 0,
+                    entropy_symbol_count: 0,
+                    entropy_failure_reason: None,
                 },
             }]),
             sweep: None,
@@ -5387,6 +5899,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: None,
             compare_partition_costs: None,
+            compare_entropy_models: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -5415,6 +5928,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: Some(vec![]),
             compare_partition_costs: None,
+            compare_entropy_models: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -5444,6 +5958,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: None,
             compare_partition_costs: Some(vec![]),
+            compare_entropy_models: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -5539,12 +6054,317 @@ mod tests {
                     bframe_ssim_y: 0.0,
                     decode_order_count: 0,
                     partition: PartitionBenchSummary::default(),
+                    entropy_model_mode: "static".to_string(),
+                    static_mv_bytes: 0,
+                    context_mv_bytes: 0,
+                    entropy_context_count: 0,
+                    entropy_symbol_count: 0,
+                    entropy_failure_reason: None,
                 },
             }],
             git_commit: None,
             os: "os".to_string(),
         };
         let _ = serde_json::to_string(&s).unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_entropy_model_context_without_entropy_inter_syntax() {
+        let a = Args {
+            input: PathBuf::from("nope"),
+            width: 64,
+            height: 64,
+            frames: 1,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+            inter_syntax: "compact".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
+            compare_inter_syntax: false,
+            compare_rdo: false,
+            compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
+            entropy_model: "context".to_string(),
+            compare_entropy_models: false,
+        };
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(err.contains("entropy-model context"), "{err}");
+        assert!(err.contains("inter-syntax entropy"), "{err}");
+    }
+
+    #[test]
+    fn build_settings_entropy_model_static_and_context_with_entropy_inter_ok() {
+        let mut base = Args {
+            input: PathBuf::from("nope"),
+            width: 64,
+            height: 64,
+            frames: 1,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "explicit".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+            inter_syntax: "entropy".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
+            compare_inter_syntax: false,
+            compare_rdo: false,
+            compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
+        };
+        let s = build_settings(&base, ResidualEntropy::Explicit).unwrap();
+        assert_eq!(s.entropy_model_mode, SrsV2EntropyModelMode::StaticV1);
+        base.entropy_model = "context".to_string();
+        let s2 = build_settings(&base, ResidualEntropy::Explicit).unwrap();
+        assert_eq!(s2.entropy_model_mode, SrsV2EntropyModelMode::ContextV1);
+    }
+
+    #[test]
+    fn validate_rejects_compare_entropy_models_with_compare_rdo() {
+        let a = Args {
+            input: PathBuf::from("nope"),
+            width: 64,
+            height: 64,
+            frames: 3,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+            inter_syntax: "entropy".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
+            compare_inter_syntax: false,
+            compare_rdo: true,
+            compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: true,
+        };
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn compare_entropy_models_serializes_two_rows() {
+        let rows = vec![
+            EntropyModelCompareEntry {
+                entropy_model_mode: "static".to_string(),
+                context_mv_bytes: 0,
+                static_mv_bytes: 120,
+                mv_delta_zero_count: 1,
+                mv_delta_nonzero_count: 2,
+                mv_delta_avg_abs: 0.5,
+                entropy_context_count: 0,
+                entropy_symbol_count: 10,
+                entropy_failure_reason: None,
+                fr2_revision_counts: Fr2RevisionCounts::default(),
+                ok: true,
+                error: None,
+                row: CodecRow {
+                    codec: "SRSV2-entropy-StaticV1".to_string(),
+                    error: None,
+                    bytes: 1000,
+                    ratio: 0.1,
+                    bitrate_bps: 1.0,
+                    psnr_y: 30.0,
+                    ssim_y: 0.9,
+                    enc_fps: 10.0,
+                    dec_fps: 10.0,
+                },
+                details: Srsv2Details::default(),
+            },
+            EntropyModelCompareEntry {
+                entropy_model_mode: "context".to_string(),
+                context_mv_bytes: 0,
+                static_mv_bytes: 0,
+                mv_delta_zero_count: 0,
+                mv_delta_nonzero_count: 0,
+                mv_delta_avg_abs: 0.0,
+                entropy_context_count: 0,
+                entropy_symbol_count: 0,
+                entropy_failure_reason: Some("simulated".into()),
+                fr2_revision_counts: Fr2RevisionCounts::default(),
+                ok: false,
+                error: Some("simulated".into()),
+                row: CodecRow {
+                    codec: "SRSV2-entropy-ContextV1".to_string(),
+                    error: Some("simulated".into()),
+                    bytes: 0,
+                    ratio: 0.0,
+                    bitrate_bps: 0.0,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    enc_fps: 0.0,
+                    dec_fps: 0.0,
+                },
+                details: Srsv2Details::default(),
+            },
+        ];
+        let r = BenchReport {
+            note: "n",
+            residual_note: "n",
+            command: "bench".into(),
+            raw_bytes: 1,
+            width: 16,
+            height: 16,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            table: vec![],
+            compare_residual_modes: None,
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: None,
+            compare_entropy_models: Some(rows),
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "x".into(),
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert!(js.contains("\"entropy_model_mode\":\"static\""), "{js}");
+        assert!(js.contains("\"entropy_model_mode\":\"context\""), "{js}");
+        assert!(js.contains("compare_entropy_models"));
+        assert!(js.contains("entropy_failure_reason"));
+        assert!(js.contains("fr2_revision_counts"));
+        let md = to_markdown(&r);
+        assert!(md.contains("MV entropy model comparison"));
+        assert!(md.contains("| static |"));
     }
 
     #[test]
@@ -5566,6 +6386,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "quality".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -5605,6 +6428,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
@@ -5630,6 +6455,9 @@ mod tests {
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
             rc: "fixed-qp".to_string(),
             quality: None,
             target_bitrate_kbps: None,
@@ -5669,6 +6497,8 @@ mod tests {
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
             transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
         };
         assert!(validate_args(&a).is_err());
         a.aq = "off".to_string();

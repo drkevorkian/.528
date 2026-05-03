@@ -7,7 +7,7 @@ use super::error::SrsV2Error;
 pub enum Srsv2PayloadKind {
     /// `FR2\\x01` — intra / refresh picture (should be indexed as a keyframe).
     Intra,
-    /// `FR2\\x02` … `FR2\\x09` — forward/inter predicted; **`FR2\\x0A` / `FR2\\x0B`** are experimental **B** syntax but classified here as predicted for mux/policy (not keyframes).
+    /// `FR2\\x02` … `FR2\\x09` — forward/inter predicted; experimental **B** / extended inter revisions (**10**–**11**, **13**–**26** except **12**) are classified here as **predicted** for mux/index policy (not keyframes) even when logical frame type is **B** — see `docs/video_bitstream_v2.md` for decode support per revision.
     Predicted,
     /// `FR2\\x0C` — experimental non-displayable alt-ref (`FR2` rev **12**).
     AltRef,
@@ -18,7 +18,7 @@ pub enum Srsv2PayloadKind {
 /// Classify a mux/elementary SRSV2 frame payload by its `FR2` revision.
 ///
 /// - `FR2\\x01` / `FR2\\x03` / `FR2\\x07` → [`Srsv2PayloadKind::Intra`] (rev 3/7 use entropy residuals; rev 7 adds block `qp_delta`)
-/// - Forward/inter and experimental **B** revisions (**2**, **4**–**11**, **13**–**18**) → [`Srsv2PayloadKind::Predicted`] for mux policy (**16**/**18** = experimental **B** compact/entropy MV grids)
+/// - Forward/inter and experimental **B** revisions (**2**, **4**–**11**, **13**–**26**) → [`Srsv2PayloadKind::Predicted`] for mux/index policy (includes **P** rev **19**/**20**/**23**/**25**, **B** rev **16**/**18**/**24**, and reserved **B** rev **21**/**22**/**26** — **decode** may still return `Unsupported` for some of these; see `docs/video_bitstream_v2.md`)
 /// - `FR2\\x0C` → [`Srsv2PayloadKind::AltRef`]
 /// - Other `FR2\\x??` → [`Srsv2PayloadKind::Unknown`]
 /// - Too short or bad magic → [`SrsV2Error`]
@@ -167,6 +167,16 @@ mod classify_tests {
     #[test]
     fn fr2_rev19_through_22_are_predicted_for_mux_policy() {
         for rev in [19u8, 20, 21, 22] {
+            assert_eq!(
+                classify_srsv2_payload(&[b'F', b'R', b'2', rev]).unwrap(),
+                Srsv2PayloadKind::Predicted
+            );
+        }
+    }
+
+    #[test]
+    fn fr2_rev23_through_26_are_predicted_for_mux_policy() {
+        for rev in [23u8, 24, 25, 26] {
             assert_eq!(
                 classify_srsv2_payload(&[b'F', b'R', b'2', rev]).unwrap(),
                 Srsv2PayloadKind::Predicted

@@ -13,6 +13,10 @@ pub struct SrsV2InterMvBenchStats {
     pub mv_compact_bytes: u64,
     /// On-wire MV entropy section length (**sym_count + blob_len fields + rANS blob**) when rev **17**/ **18**; else **0**.
     pub mv_entropy_section_bytes: u64,
+    /// **`EntropyV1` + ContextV1:** one context label per compact MV byte (same length as compact). **`StaticV1` / non-entropy:** **0**.
+    pub entropy_context_count: u64,
+    /// **`EntropyV1`:** count of MV bytes fed to rANS (**compact** symbol count). Else **0**.
+    pub entropy_symbol_count: u64,
     pub mv_delta_zero_varints: u64,
     pub mv_delta_nonzero_varints: u64,
     pub mv_delta_sum_abs_components: u64,
@@ -29,6 +33,8 @@ impl Default for SrsV2InterMvBenchStats {
             mv_raw_bytes_estimate: 0,
             mv_compact_bytes: 0,
             mv_entropy_section_bytes: 0,
+            entropy_context_count: 0,
+            entropy_symbol_count: 0,
             mv_delta_zero_varints: 0,
             mv_delta_nonzero_varints: 0,
             mv_delta_sum_abs_components: 0,

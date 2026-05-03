@@ -7,10 +7,7 @@ use libsrs_bitio::{
 use super::error::SrsV2Error;
 use super::inter_mv::{read_signed_varint, validate_partition_reserved_bits};
 
-pub const SRS_ENTROPY_MODEL_STATIC_V1: u8 = 0;
-pub const SRS_ENTROPY_MODEL_CONTEXT_V1: u8 = 1;
-
-pub const MV_CONTEXT_COUNT: usize = 16;
+const MV_CONTEXT_COUNT: usize = 16;
 
 #[inline]
 fn delta_mag_bucket_qpel(d: i32) -> u8 {
@@ -24,7 +21,7 @@ fn delta_mag_bucket_qpel(d: i32) -> u8 {
 }
 
 #[inline]
-pub fn mv_context_id_from_prev_residual_deltas(prev_dx: i32, prev_dy: i32) -> u8 {
+fn mv_context_id_from_prev_residual_deltas(prev_dx: i32, prev_dy: i32) -> u8 {
     let bx = delta_mag_bucket_qpel(prev_dx);
     let by = delta_mag_bucket_qpel(prev_dy);
     (bx << 2) | by
@@ -113,7 +110,7 @@ fn model_for_ctx(ctx: usize) -> Result<RansModel, SrsV2Error> {
     RansModel::try_from_freqs(freqs).map_err(|_| SrsV2Error::syntax("MV context rANS model"))
 }
 
-pub fn inter_mv_context_models_v1() -> Result<[RansModel; MV_CONTEXT_COUNT], SrsV2Error> {
+fn inter_mv_context_models_v1() -> Result<[RansModel; MV_CONTEXT_COUNT], SrsV2Error> {
     let v: Vec<RansModel> = (0..MV_CONTEXT_COUNT)
         .map(model_for_ctx)
         .collect::<Result<_, _>>()?;
@@ -347,9 +344,52 @@ pub fn rans_decode_mv_bytes_context_v1_partitioned(
 mod tests {
     use super::*;
     use crate::srsv2::inter_mv::{
-        encode_mv_grid_compact, encode_mv_stream_partitioned, P_PART_WIRE_8X8,
+        encode_mv_grid_compact, encode_mv_stream_partitioned, rans_decode_mv_bytes,
+        rans_encode_mv_bytes, P_PART_WIRE_8X8,
     };
+    use crate::srsv2::SrsV2Error;
     use libsrs_bitio::{rans_decode_symbols_multi_context, rans_encode_symbols_multi_context};
+
+    #[test]
+    fn static_v1_mv_rans_roundtrip_unchanged() {
+        let mb_cols = 1u32;
+        let mb_rows = 1u32;
+        let mvs = vec![(8_i32, -4)];
+        let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
+        let blob = rans_encode_mv_bytes(&compact).unwrap();
+        let dec = rans_decode_mv_bytes(&blob, compact.len(), 512_000).unwrap();
+        assert_eq!(dec, compact);
+    }
+
+    #[test]
+    fn context_encode_rejects_invalid_context_id() {
+        let compact = vec![0_u8, 1_u8];
+        let bad_ctx = vec![16_u8, 0_u8];
+        let err = rans_encode_mv_bytes_context_v1(&compact, &bad_ctx).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_)));
+    }
+
+    #[test]
+    fn context_decode_truncated_rans_fails() {
+        let blob = [0_u8; 4];
+        let err = rans_decode_mv_bytes_context_v1_fixed(&blob, 4, 1, 1, 10_000).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_) | SrsV2Error::Truncated));
+    }
+
+    #[test]
+    fn context_decode_trailing_garbage_fails() {
+        let mb_cols = 1u32;
+        let mb_rows = 1u32;
+        let mvs = vec![(4_i32, 0)];
+        let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
+        let ctx = mv_fixed_grid_compact_contexts(&compact, mb_cols, mb_rows).unwrap();
+        let mut blob = rans_encode_mv_bytes_context_v1(&compact, &ctx).unwrap();
+        blob.push(0xAB);
+        let err =
+            rans_decode_mv_bytes_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000)
+                .unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_)));
+    }
 
     #[test]
     fn fixed_grid_context_roundtrip_rans() {

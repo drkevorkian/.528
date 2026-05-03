@@ -18,6 +18,7 @@ use super::motion_search::{
     pick_mv, sad_16x16, sample_u8_plane, SrsV2InterMvBenchStats, SrsV2RdoBenchStats,
 };
 use super::p_frame_codec::{copy_chroma_mb8, copy_chroma_mb8_qpel};
+use super::rdo::b_blend_rdo_score;
 use super::rate_control::{
     rdo_lambda_effective, ResidualEntropy, SrsV2BMotionSearchMode, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterSyntaxMode, SrsV2RdoMode,
@@ -831,9 +832,9 @@ pub fn choose_b_macroblock(
         let base_bytes = 8i128;
         let weighted_extra = 72i128;
         let mut cands: Vec<(i128, BBlendModeWire, u8, u8)> = Vec::with_capacity(8);
-        let sf_s = sf as i128 + lam * (base_bytes + hp_pen_bytes) / 256;
-        let sb_s = sb as i128 + lam * (base_bytes + hp_pen_bytes) / 256;
-        let sa_s = sa as i128 + lam * (base_bytes + hp_pen_bytes) / 256;
+        let sf_s = b_blend_rdo_score(sf, lam as i64, base_bytes, 0, hp_pen_bytes);
+        let sb_s = b_blend_rdo_score(sb, lam as i64, base_bytes, 0, hp_pen_bytes);
+        let sa_s = b_blend_rdo_score(sa, lam as i64, base_bytes, 0, hp_pen_bytes);
         cands.push((sf_s, BBlendModeWire::ForwardOnly, 0, 0));
         cands.push((sb_s, BBlendModeWire::BackwardOnly, 0, 0));
         cands.push((sa_s, BBlendModeWire::Average, 0, 0));
@@ -867,7 +868,7 @@ pub fn choose_b_macroblock(
                     )
                 };
                 stats.b_sad_evaluations += 1;
-                let sw_s = sw as i128 + lam * (base_bytes + weighted_extra + hp_pen_bytes) / 256;
+                let sw_s = b_blend_rdo_score(sw, lam as i64, base_bytes, weighted_extra, hp_pen_bytes);
                 stats.rdo.candidates_tested += 1;
                 cands.push((sw_s, BBlendModeWire::Weighted, wa, wb));
             }
@@ -1167,6 +1168,18 @@ pub fn encode_yuv420_b_payload_mb_blend(
     let inter_header_bytes = inter_prefix_end as u64;
     let residual_payload_bytes = out.len() as u64 - inter_header_bytes;
 
+    let (ent_ctx, ent_sym) = entropy_blobs
+        .as_ref()
+        .map(|_| {
+            let sym = (ca.len() + cb.len()) as u64;
+            let ctx = match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => 0,
+                SrsV2EntropyModelMode::ContextV1 => sym,
+            };
+            (ctx, sym)
+        })
+        .unwrap_or((0, 0));
+
     stats_out.inter_mv = SrsV2InterMvBenchStats {
         mv_prediction_mode: MV_PREDICTION_MODE_LABEL,
         mv_raw_bytes_estimate: n_mb_u64.saturating_mul(2).saturating_mul(if wire_rev14 {
@@ -1176,6 +1189,8 @@ pub fn encode_yuv420_b_payload_mb_blend(
         }),
         mv_compact_bytes: (ca.len() + cb.len()) as u64,
         mv_entropy_section_bytes,
+        entropy_context_count: ent_ctx,
+        entropy_symbol_count: ent_sym,
         mv_delta_zero_varints: zero_c,
         mv_delta_nonzero_varints: nonzero_c,
         mv_delta_sum_abs_components: sum_abs_c,

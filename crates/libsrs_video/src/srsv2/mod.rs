@@ -23,6 +23,7 @@ pub mod motion_search;
 pub mod p_frame_codec;
 pub mod p_var_partition;
 pub mod payload_kind;
+pub mod rdo;
 pub mod rate_control;
 pub mod reference;
 pub mod reference_manager;
@@ -45,11 +46,6 @@ pub use b_frame_codec::{
 };
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
-};
-pub use context_inter_entropy::{
-    mv_fixed_grid_compact_contexts, mv_partitioned_compact_contexts,
-    rans_decode_mv_bytes_context_v1_fixed, rans_decode_mv_bytes_context_v1_partitioned,
-    rans_encode_mv_bytes_context_v1, SRS_ENTROPY_MODEL_CONTEXT_V1, SRS_ENTROPY_MODEL_STATIC_V1,
 };
 pub use deblock::{
     apply_loop_filter_y, apply_simple_mb_boundary_deblock_y, resolve_deblock_strength,
@@ -78,6 +74,13 @@ pub use p_var_partition::{
     FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
 };
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
+pub use rdo::{
+    b_blend_rdo_score, choose_best_inter_mode_candidate, choose_min_partition_by_precomputed_scores,
+    estimate_mv_delta_wire_bytes, estimate_partition_candidate_bytes, partition_header_aware_score,
+    partition_rdo_fast_score, p_subblock_skip_residual_is_rdo_cheaper, rdo_fast_enabled, rdo_score,
+    score_candidate, choose_best_partition_candidate, RdoCandidate, RdoCost, RdoDecision, RdoStats,
+    MAX_RDO_CANDIDATES,
+};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,

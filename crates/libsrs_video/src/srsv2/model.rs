@@ -114,9 +114,9 @@ pub enum ColorRange {
 #[repr(u8)]
 pub enum FrameTypeV2 {
     Intra = 0,
-    /// Forward/inter predicted (`FR2` rev **2**/**4**/**5**/**6**/**8**/**9**/**15**/**17**/**19**/**20**).
+    /// Forward/inter predicted (`FR2` rev **2**/**4**/**5**/**6**/**8**/**9**/**15**/**17**/**19**/**20**/**23**/**25** — see `docs/video_bitstream_v2.md`).
     PredictedP = 1,
-    /// Experimental bidirectional (`FR2` rev **10**/**11**/**13**/**14**/**16**/**18**/**21**/**22**).
+    /// Experimental bidirectional (`FR2` rev **10**/**11**/**13**/**14**/**16**/**18**/**21**/**22**/**24**/**26** — rev **26** decode is `Unsupported` today).
     BidirectionalB = 2,
     /// Experimental non-displayable reference (`FR2` rev **12**).
     AltRef = 3,
@@ -499,7 +499,7 @@ mod frame_type_revision_tests {
     use super::{frame_type_from_srsv2_revision, FrameTypeV2};
 
     #[test]
-    fn frame_type_maps_rev1_through_12() {
+    fn frame_type_maps_intra_predicted_p_bidirectional_b_and_alt_ref() {
         for rev in [1u8, 3, 7] {
             assert_eq!(
                 frame_type_from_srsv2_revision(rev).unwrap(),

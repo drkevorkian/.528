@@ -18,17 +18,21 @@ use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::inter_mv::{
     decode_mv_grid_compact, encode_mv_grid_compact, mv_compact_grid_delta_statistics,
-    predict_mv_qpel, rans_decode_mv_bytes, rans_encode_mv_bytes, signed_varint_wire_bytes,
+    rans_decode_mv_bytes, rans_encode_mv_bytes,
     MV_PREDICTION_MODE_LABEL,
 };
 use super::intra_codec::{decode_residual_block_8x8, encode_residual_block_8x8, quantize};
 use super::limits::{MAX_FRAME_PAYLOAD_BYTES, MAX_MOTION_VECTOR_PELS};
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
 use super::motion_search::{pick_mv, sad_16x16, sample_u8_plane, SrsV2MotionEncodeStats};
+use super::rdo::{
+    choose_best_inter_mode_candidate, estimate_mv_delta_wire_bytes, p_subblock_skip_residual_is_rdo_cheaper,
+    rdo_fast_enabled,
+};
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode,
     SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode,
-    SrsV2RdoMode, SrsV2SubpelMode,
+    SrsV2SubpelMode,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
@@ -80,12 +84,6 @@ const P_INTER_FLAG_SUBPEL: u8 = 1;
 const P_INTER_FLAG_BLOCK_AQ: u8 = 2;
 const P_INTER_FLAG_ENTROPY_RESIDUAL: u8 = 4;
 
-/// λ·bits score helper: `distortion + lam * wire_bytes`.
-#[inline]
-fn rdo_score_p_mb(sad: u32, lam: i64, wire_bytes: i64) -> i128 {
-    sad as i128 + (lam as i128 * wire_bytes.max(0) as i128) / 256
-}
-
 fn mb_luma_sad_with_mv_q(
     cur: &VideoPlane<u8>,
     refp: &VideoPlane<u8>,
@@ -99,32 +97,6 @@ fn mb_luma_sad_with_mv_q(
         sad_16x16_qpel(cur, refp, mb_x, mb_y, mvx_q, mvy_q)
     } else {
         sad_16x16(cur, refp, mb_x, mb_y, mvx_q / 4, mvy_q / 4)
-    }
-}
-
-fn mv_wire_cost_bytes_estimate(
-    mode: SrsV2InterSyntaxMode,
-    use_subpel: bool,
-    mbx: u32,
-    mby: u32,
-    mb_cols: u32,
-    grid_so_far: &[(i32, i32)],
-    mv: (i32, i32),
-) -> i64 {
-    match mode {
-        SrsV2InterSyntaxMode::RawLegacy => {
-            if use_subpel {
-                8
-            } else {
-                4
-            }
-        }
-        SrsV2InterSyntaxMode::CompactV1 | SrsV2InterSyntaxMode::EntropyV1 => {
-            let (px, py) = predict_mv_qpel(mbx, mby, mb_cols, grid_so_far);
-            let dx = mv.0 - px;
-            let dy = mv.1 - py;
-            (signed_varint_wire_bytes(dx) + signed_varint_wire_bytes(dy)) as i64
-        }
     }
 }
 
@@ -306,7 +278,7 @@ fn encode_p_macroblock(
         let eff_i = eff_qp_u8.max(1) as i16;
 
         if allow_skip && max_abs <= SKIP_ABS_THRESH {
-            if matches!(settings.rdo_mode, SrsV2RdoMode::Fast) {
+            if rdo_fast_enabled(settings.rdo_mode) {
                 let (chunk, kind) =
                     if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
                         let mut c = Vec::new();
@@ -332,9 +304,7 @@ fn encode_p_macroblock(
                     .rdo
                     .estimated_bits_used_for_decision
                     .saturating_add(wire_res.max(0) as u64);
-                let lhs = i128::from(max_abs as i32) * 256;
-                let rhs = i128::from(lam) * i128::from(wire_res.max(1));
-                if lhs <= rhs {
+                if p_subblock_skip_residual_is_rdo_cheaper(max_abs, lam, wire_res) {
                     pattern |= 1 << si;
                     ms.skip_subblocks += 1;
                     ms.rdo.skip_decisions += 1;
@@ -641,7 +611,7 @@ pub fn encode_yuv420_p_payload(
         }
     }
 
-    let lam_mv = if matches!(settings.rdo_mode, SrsV2RdoMode::Fast) {
+    let lam_mv = if rdo_fast_enabled(settings.rdo_mode) {
         rdo_lambda_effective(settings, qp)
     } else {
         0
@@ -652,7 +622,7 @@ pub fn encode_yuv420_p_payload(
         for mbx in 0..mb_cols {
             let idx = (mby * mb_cols + mbx) as usize;
             let mv_me = me_mvs[idx];
-            let mv_use = if matches!(settings.rdo_mode, SrsV2RdoMode::Fast) {
+            let mv_use = if rdo_fast_enabled(settings.rdo_mode) {
                 let sad_me = mb_luma_sad_with_mv_q(
                     &cur.y,
                     &reference.y,
@@ -663,7 +633,7 @@ pub fn encode_yuv420_p_payload(
                     use_subpel,
                 );
                 let sad_z = mb_luma_sad_with_mv_q(&cur.y, &reference.y, mbx, mby, 0, 0, use_subpel);
-                let cost_me = mv_wire_cost_bytes_estimate(
+                let cost_me = estimate_mv_delta_wire_bytes(
                     settings.inter_syntax_mode,
                     use_subpel,
                     mbx,
@@ -672,7 +642,7 @@ pub fn encode_yuv420_p_payload(
                     &grid_pred,
                     mv_me,
                 );
-                let cost_z = mv_wire_cost_bytes_estimate(
+                let cost_z = estimate_mv_delta_wire_bytes(
                     settings.inter_syntax_mode,
                     use_subpel,
                     mbx,
@@ -681,6 +651,8 @@ pub fn encode_yuv420_p_payload(
                     &grid_pred,
                     (0, 0),
                 );
+                let dec = choose_best_inter_mode_candidate(lam_mv, &[(sad_z, cost_z), (sad_me, cost_me)], None)
+                    .expect("two MV RDO candidates");
                 ms.rdo.candidates_tested += 2;
                 ms.rdo.estimated_bits_used_for_decision = ms
                     .rdo
@@ -690,9 +662,7 @@ pub fn encode_yuv420_p_payload(
                     .rdo
                     .estimated_bits_used_for_decision
                     .saturating_add(cost_z.max(0) as u64);
-                let score_me = rdo_score_p_mb(sad_me, lam_mv, cost_me);
-                let score_z = rdo_score_p_mb(sad_z, lam_mv, cost_z);
-                if score_z <= score_me {
+                if dec.chosen_index == 0 {
                     (0, 0)
                 } else {
                     mv_me
@@ -869,10 +839,23 @@ pub fn encode_yuv420_p_payload(
         } else {
             0
         };
+    let (ent_ctx, ent_sym) =
+        if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1) {
+            let sym = compact_tmp.len() as u64;
+            let ctx = match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => 0,
+                SrsV2EntropyModelMode::ContextV1 => sym,
+            };
+            (ctx, sym)
+        } else {
+            (0, 0)
+        };
     ms.inter_mv.mv_prediction_mode = MV_PREDICTION_MODE_LABEL;
     ms.inter_mv.mv_raw_bytes_estimate = n_mb as u64 * if use_subpel { 8 } else { 4 };
     ms.inter_mv.mv_compact_bytes = compact_tmp.len() as u64;
     ms.inter_mv.mv_entropy_section_bytes = mv_entropy_section;
+    ms.inter_mv.entropy_context_count = ent_ctx;
+    ms.inter_mv.entropy_symbol_count = ent_sym;
     ms.inter_mv.mv_delta_zero_varints = z0;
     ms.inter_mv.mv_delta_nonzero_varints = zn;
     ms.inter_mv.mv_delta_sum_abs_components = sum_abs;
@@ -1148,7 +1131,7 @@ mod tests {
         ChromaSiting, ColorPrimaries, ColorRange, MatrixCoefficients, SrsVideoProfile,
         TransferFunction,
     };
-    use crate::srsv2::rate_control::SrsV2SubpelMode;
+    use crate::srsv2::rate_control::{SrsV2RdoMode, SrsV2SubpelMode};
 
     fn seq_inter(w: u32, h: u32) -> VideoSequenceHeaderV2 {
         VideoSequenceHeaderV2 {
@@ -1165,6 +1148,30 @@ mod tests {
             deblock_strength: 0,
             max_ref_frames: 1,
         }
+    }
+
+    #[test]
+    fn p_payload_rdo_off_matches_default_encode_settings() {
+        let w = 64u32;
+        let h = 64u32;
+        let seq = seq_inter(w, h);
+        let rgb = vec![128_u8; (w * h * 3) as usize];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, w, h, ColorRange::Limited).unwrap();
+        let mut s_off = SrsV2EncodeSettings {
+            keyframe_interval: 30,
+            motion_search_radius: 16,
+            ..Default::default()
+        };
+        s_off.rdo_mode = SrsV2RdoMode::Off;
+        let s_def = SrsV2EncodeSettings {
+            keyframe_interval: 30,
+            motion_search_radius: 16,
+            ..Default::default()
+        };
+        assert_eq!(s_def.rdo_mode, SrsV2RdoMode::Off);
+        let p0 = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &s_off, None, None, None).unwrap();
+        let p1 = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &s_def, None, None, None).unwrap();
+        assert_eq!(p0, p1, "RDO off path must be bit-identical to default (RDO off)");
     }
 
     #[test]

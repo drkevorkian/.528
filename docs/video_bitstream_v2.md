@@ -52,13 +52,36 @@ Same macroblock grid and motion syntax as revision **4**, with the same **`clip_
 
 Same as revision **8** for **`qp_delta`** placement, clipping header, and **luma-only** residual deltas (chroma MV-copy only), with motion syntax matching revision **6** (**`i32` LE** quarter-pel MVs, even quarter-pel grid).
 
+### Inter MV and entropy — **FR2 revision map** (compact vs StaticV1 vs ContextV1)
+
+This table is the **authoritative** mapping between **on-wire `FR2` byte 4** (the revision byte after `F` `R` `2`), **picture kind**, and **encoder settings** in `libsrs_video::srsv2::rate_control`. Future agents should treat **revision numbers as part of the frozen wire contract** for each row: **do not** reuse a revision byte for a different layout, and **do not** decode a higher revision with a lower revision’s MV entropy code path.
+
+| `FR2` rev (decimal) | Fourth byte (hex) | Inter MV family | Picture | Wire summary | Encoder selection (today) |
+|--------------------:|-------------------:|-----------------|---------|--------------|---------------------------|
+| **15** | `0x0F` | **Compact** (no MV rANS) | **P** | Median-predicted MV **varints** + same residual packing as rev **8**/**9** | `SrsV2InterSyntaxMode::CompactV1` |
+| **16** | `0x10` | **Compact** | **B** | Dual compact MV grids + per-MB blend / residuals | `SrsV2InterSyntaxMode::CompactV1` |
+| **17** | `0x11` | **StaticV1** MV rANS | **P** | Same MV bytes as rev **15**, one **static** rANS blob (`sym_count`, `blob_len`, blob) | `SrsV2InterSyntaxMode::EntropyV1` + **`SrsV2EntropyModelMode::StaticV1`** (default) |
+| **18** | `0x12` | **StaticV1** MV rANS | **B** | Two static rANS MV blobs (backward grid, then forward) | `EntropyV1` + **`StaticV1`** (default) |
+| **20** | `0x14` | **StaticV1** MV rANS | **P** (variable partition) | Rev **19** layout, MV bytes wrapped with **static** rANS | `EntropyV1` + **`StaticV1`** on variable-partition **P** path |
+| **23** | `0x17` | **ContextV1** MV rANS | **P** (fixed **16×16** MB grid) | Same header and **`sym_count` / `blob_len`** framing as rev **17**, MV blob uses **16** deterministic **context-conditioned static** rANS models over MV bytes (**not** CABAC; **not** trained adaptive arithmetic) | `EntropyV1` + **`SrsV2EntropyModelMode::ContextV1`** |
+| **24** | `0x18` | **ContextV1** MV rANS | **B** (fixed MB grid) | Same dual-blob layout as rev **18**, each blob uses ContextV1 multi-model rANS | `EntropyV1` + **`ContextV1`** |
+| **25** | `0x19` | **ContextV1** MV rANS | **P** (variable partition) | Rev **19**/**20** partition map + flags; MV blob uses ContextV1 rANS aligned to partitioned MV scan | `EntropyV1` + **`ContextV1`** on variable-partition **P** path |
+| **26** | `0x1A` | *Reserved* | **B** (variable partition + ContextV1) | **Not implemented:** mux may see this revision for policy tests, but **`decode_yuv420_b_payload` returns `Unsupported`** — **no** working bitstream layout in this repository slice | — |
+
+**Policy statements (non-normative but required for project honesty):**
+
+- **`SrsV2EntropyModelMode::StaticV1`** remains the **default**; **`ContextV1`** is **experimental** and must be **measured** (bytes + quality at matched settings) before any discussion of making it default.
+- **ContextV1 is not CABAC-class** and does not implement H.264-style adaptive binary arithmetic coding; it uses **fixed, bounded** per-context frequency tables and **bounded** rANS decode steps.
+- **No superiority claim vs H.264** is stated or implied by these revisions; they exist for **native** SRSV2 experimentation only.
+- Payloads **`FR2` rev 1–22** remain **supported** decoders paths alongside **23–25** where implemented; rev **26** is **explicitly unsupported** decode today (fail-fast).
+
 ### Revision 15 — experimental **P** compact inter MV (`FR2\x0F`) — **opt-in**
 
 **Experimental:** median-predicted MV deltas as **zigzag signed varints** (left / top / top-right median per quarter-pel component stream), then the same **rev 8**/**rev 9**-style residual bodies (skip pattern + adaptive chunks + optional block AQ). **Default encoder output remains raw legacy rev 2/4/5/6/8/9** unless settings explicitly select compact inter syntax.
 
-### Revision 17 — experimental **P** entropy-coded inter MV (`FR2\x11`) — **opt-in**
+### Revision 17 — experimental **P** StaticV1 entropy-coded inter MV (`FR2\x11`) — **opt-in**
 
-Same compact MV **symbol bytes** as rev **15**, plus a **bounded** static **rANS** blob over those bytes (**sym_count**, **blob_len**, blob) before residuals. **Not** CABAC-class; **not** context adaptive.
+Same compact MV **symbol bytes** as rev **15**, plus a **bounded** static **rANS** blob over those bytes (**`sym_count` `u32` LE**, **`blob_len` `u32` LE**, blob) before residuals. This is **`SrsV2EntropyModelMode::StaticV1`** (single static frequency table over MV bytes). **`decode_yuv420_p_payload`** accepts **`FR2` rev 17** on this path; **rev 23** uses the same header and framing but **ContextV1** MV entropy (see below). **Not** CABAC-class; **not** H.264-style context adaptive binary arithmetic coding.
 
 ### Revision 10 — experimental B-frame, integer MV (`FR2\x0A`)
 
@@ -87,17 +110,17 @@ Per macroblock, after **`blend`**:
 
 After `frame_index`, `qp`, `slot_a`, `slot_b`, **`flags`** (`u8`: bit **0** half-pel MV grid, bit **1** weighted blend allowed): **two** back-to-back compact MV grids (**backward** then **forward**, same median+varint syntax as **P** rev **15**), then per-MB blend / weights / residuals using the same compact residual packing as legacy **B** rev **13**/ **14** (without embedding raw MV tuples per MB).
 
-### Revision 18 — experimental **B** entropy inter (`FR2\x12`) — **opt-in**
+### Revision 18 — experimental **B** StaticV1 entropy inter (`FR2\x12`) — **opt-in**
 
-Same header and dual grids as rev **16**, but each grid’s compact byte sequence is wrapped as **sym_count**, **blob_len**, **rANS blob** (two sections), then per-MB residuals. **Static** rANS model only; bounded decode.
+Same header and dual grids as rev **16**, but each grid’s compact byte sequence is wrapped as **`sym_count`**, **`blob_len`**, **rANS blob** (two sections), then per-MB residuals. **`SrsV2EntropyModelMode::StaticV1`**: one **static** rANS model per grid; bounded decode. **Not** CABAC-class.
 
 ### Revision 19 — experimental **P** variable partition + compact MV (`FR2\x13`) — **opt-in**
 
 After `frame_index`, `qp`, **`flags`** (same low three bits as **P** rev **15**: subpel, block AQ, entropy residuals), optional **`clip_min`/`clip_max`**, **`n_mb`** partition-type bytes (**2** bits **MB type**: **0** = 16×16, **1** = 16×8, **2** = 8×16, **3** = 8×8; reserved high bits rejected), compact partitioned MV byte stream (median prediction), then per **8×8** luma region **ctrl** (**skip**, **transform**: **8×8** vs **4×4** vs reserved **16×16** marker) and length-prefixed residual chunks compatible with **`decode_p_residual_chunk`** / **`decode_p_residual_chunk_4x4`**. **Maximum partition units per frame** = **`macroblocks × 4`** (decoder-enforced). Chroma follows **first PU MV** per macroblock (same approximation family as other **P** revisions).
 
-### Revision 20 — experimental **P** variable partition + entropy MV (`FR2\x14`) — **opt-in**
+### Revision 20 — experimental **P** variable partition + StaticV1 entropy MV (`FR2\x14`) — **opt-in**
 
-Same as rev **19**, but the compact MV bytes are wrapped **`sym_count`**, **`blob_len`**, static **rANS** blob (bounded).
+Same as rev **19**, but the compact MV bytes are wrapped **`sym_count`**, **`blob_len`**, **static** **rANS** blob (bounded). Emitted when **`SrsV2EntropyModelMode::StaticV1`** (default) is selected together with variable-partition **P** and **`SrsV2InterSyntaxMode::EntropyV1`**.
 
 ### Revision 21 — experimental **B** variable partition + compact inter (`FR2\x15`) — **parser placeholder**
 
@@ -107,11 +130,27 @@ Magic is reserved and classified as **bidirectional** for mux policy; **decode r
 
 Same honesty rule as rev **21**.
 
+### Revision 23 — experimental **P** fixed grid + ContextV1 entropy MV (`FR2\x17`) — **opt-in**
+
+**Implemented** in `libsrs_video` (`FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1`): same overall **rev 15/17** header (flags, optional AQ clip), **`sym_count`**, **`blob_len`**, and MV **symbol byte** alphabet as rev **17**, but the MV blob is encoded/decoded with **ContextV1** multi-model rANS (**16** contexts; deterministic static tables; **bounded** decode step budget). **Decoders must not** treat this payload as rev **17** StaticV1 — the revision byte is the only selector for the MV entropy path.
+
+### Revision 24 — experimental **B** fixed grid + ContextV1 entropy MV (`FR2\x18`) — **opt-in**
+
+**Implemented** (`FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY_CTX_V1`): same structure as rev **18** (dual **`sym_count` / `blob_len` / blob`** sections), but each MV blob uses **ContextV1** rANS. **Not** CABAC-class.
+
+### Revision 25 — experimental **P** variable partition + ContextV1 entropy MV (`FR2\x19`) — **opt-in**
+
+**Implemented** (`FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1`): same partition map, flags, and residual layout as rev **19**/**20**, with MV **`sym_count` / `blob_len` / blob`** using **ContextV1** rANS over the **partitioned** compact MV byte stream.
+
+### Revision 26 — experimental **B** variable partition + ContextV1 (`FR2\x1A`) — **reserved / unsupported**
+
+The revision byte **`26`** is recognized by **`FrameTypeV2`** / mux classifiers for **bidirectional** policy, but **`decode_yuv420_b_payload` returns structured `Unsupported`** — there is **no** end-to-end encoder or decoder payload specification wired in this repository slice. **Do not** describe rev **26** as “done”.
+
 ### Revision 12 — experimental alt-ref / hidden reference (`FR2\x0C`)
 
 Non-displayable intra-coded planes (same entropy style as **rev 3** in this slice): `frame_index`, `qp`, **`target_slot`**, **`reserved`** (must be **0**). Picture updates **`SrsV2ReferenceManager`** at **`target_slot`** with **`is_displayable == false`**; playback must **not** treat it as a presented frame.
 
-**Compatibility:** Revisions **1**–**14** remain readable; **15**–**22** extend **opt-in** inter experiments (**15**–**18**: fixed-MB compact/entropy MV; **19**–**20**: **P** variable partitions; **21**–**22**: **B** variable partitions — **not implemented**, honest **`Unsupported`**). The legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**18** and **B**-class **21**/**22** — use **`decode_yuv420_srsv2_payload_managed`** for **B** and managed reference paths.
+**Compatibility:** Revisions **1**–**14** remain readable. **15**–**22** extend **opt-in** inter experiments (**15**–**18**: fixed-MB compact / StaticV1 entropy MV; **19**–**20**: **P** variable partitions + compact or StaticV1 entropy MV; **21**–**22**: **B** variable partitions — **not implemented**, honest **`Unsupported`**). **23**–**25** are **implemented** ContextV1 MV rANS payloads (see per-revision sections above); **26** is **reserved** (mux may classify the revision; **decode returns `Unsupported`**). The legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**18** and **B**-class **21**/**22** — use **`decode_yuv420_srsv2_payload_managed`** for **B**, **alt-ref**, and reference-rich timelines (unchanged rule).
 
 ## Elementary `.srsv2` file
 
