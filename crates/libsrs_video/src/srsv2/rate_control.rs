@@ -113,6 +113,27 @@ pub enum SrsV2MotionSearchMode {
     Hierarchical,
 }
 
+/// Experimental **inter macroblock header** packing (`FR2` rev **15**/**17** P, **16**/**18** B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2InterSyntaxMode {
+    /// Legacy fixed-width MV tuples (`FR2` rev **2**/**4**/**5**/**6**/**8**/**9**).
+    #[default]
+    RawLegacy,
+    /// Varint MV deltas after median prediction (`FR2` rev **15** P / **16** B).
+    CompactV1,
+    /// Compact MV bytes wrapped with static rANS (`FR2` rev **17** P / **18** B).
+    EntropyV1,
+}
+
+/// Experimental **rate–distortion** mode pick (bounded candidates; not production RDO).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2RdoMode {
+    #[default]
+    Off,
+    /// Compare a tiny candidate set per MB (e.g. ME MV vs zero MV) using λ·estimated bits + distortion proxy.
+    Fast,
+}
+
 /// Experimental **B-frame** motion / blend search (`FR2` rev **13** integer MVs, rev **14** half-pel MVs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2BMotionSearchMode {
@@ -169,6 +190,13 @@ pub struct SrsV2EncodeSettings {
     pub loop_filter_mode: SrsV2LoopFilterMode,
     /// Written to the sequence header when [`SrsV2LoopFilterMode::SimpleDeblock`] is selected; **`0`** uses codec default strength.
     pub deblock_strength: u8,
+
+    /// Experimental compact / entropy inter MV syntax (**default** [`SrsV2InterSyntaxMode::RawLegacy`]).
+    pub inter_syntax_mode: SrsV2InterSyntaxMode,
+    /// Experimental fast RDO (**default** [`SrsV2RdoMode::Off`]).
+    pub rdo_mode: SrsV2RdoMode,
+    /// Fixed-point λ scale for [`SrsV2RdoMode::Fast`] (**256 ≈ 1.0**).
+    pub rdo_lambda_scale: u16,
 }
 
 impl Default for SrsV2EncodeSettings {
@@ -205,8 +233,25 @@ impl Default for SrsV2EncodeSettings {
 
             loop_filter_mode: SrsV2LoopFilterMode::Off,
             deblock_strength: 0,
+
+            inter_syntax_mode: SrsV2InterSyntaxMode::RawLegacy,
+            rdo_mode: SrsV2RdoMode::Off,
+            rdo_lambda_scale: 256,
         }
     }
+}
+
+/// Integer λ≈ `0.85 * 2^((qp-12)/3)` scaled by **256** (clamped).
+pub fn rdo_lambda_fp_from_qp(qp: u8) -> i64 {
+    let q = i64::from(qp);
+    let exp = ((q - 12) / 3).clamp(-8, 16);
+    let mut pow = 256i64;
+    if exp >= 0 {
+        pow <<= exp.min(16);
+    } else {
+        pow >>= (-exp).min(8);
+    }
+    (217 * pow) / 256
 }
 
 impl SrsV2EncodeSettings {

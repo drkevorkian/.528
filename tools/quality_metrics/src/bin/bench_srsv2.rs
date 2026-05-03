@@ -17,8 +17,10 @@ use libsrs_video::{
     encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
     PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
     SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2RateControlMode,
-    SrsV2RateController, SrsV2ReferenceManager, SrsV2SubpelMode, VideoSequenceHeaderV2, YuvFrame,
+    SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
+    SrsV2RateControlMode,
+    SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager, SrsV2SubpelMode,
+    VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -48,7 +50,7 @@ struct Args {
     report_md: PathBuf,
     #[arg(long, default_value_t = false)]
     compare_x264: bool,
-    /// Reserved: target-bitrate matching vs x264 (not implemented; report-only placeholder).
+    /// Target-bitrate matching vs x264 (**not implemented** — benchmark exits with an error when set).
     #[arg(long, default_value_t = false)]
     match_x264_bitrate: bool,
     #[arg(long, default_value_t = false)]
@@ -165,6 +167,18 @@ struct Args {
     /// SRSV2 sequence `max_ref_frames` (**default `1`** — unchanged vs historical bench).
     #[arg(long, default_value_t = 1)]
     reference_frames: u8,
+
+    /// Experimental inter MV/header syntax for **P** (`FR2` 15/17) and **B** mb-blend (`FR2` 16/18): `raw`, `compact`, `entropy`.
+    #[arg(long, default_value = "raw")]
+    inter_syntax: String,
+
+    /// Experimental fast RDO (**encoder hook reserved**; `off` preserves legacy decisions): `off` or `fast`.
+    #[arg(long, default_value = "off")]
+    rdo: String,
+
+    /// Fixed-point λ scale for `--rdo fast` (**256 ≈ 1.0**).
+    #[arg(long, default_value_t = 256)]
+    rdo_lambda_scale: u16,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -250,6 +264,10 @@ struct Fr2RevisionCounts {
     rev12: u32,
     rev13: u32,
     rev14: u32,
+    rev15: u32,
+    rev16: u32,
+    rev17: u32,
+    rev18: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -360,6 +378,11 @@ struct Srsv2Details {
     p_explicit_chunks: u64,
     p_rans_chunks: u64,
     fr2_revision_counts: Fr2RevisionCounts,
+    /// CLI / settings mirror (`raw` / `compact` / `entropy`).
+    inter_syntax_mode: String,
+    /// CLI / settings mirror (`off` / `fast`).
+    rdo_mode: String,
+    rdo_lambda_scale: u16,
     legacy_explicit_total_payload_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rc: Option<RcBenchReport>,
@@ -411,6 +434,9 @@ impl Default for Srsv2Details {
             p_explicit_chunks: 0,
             p_rans_chunks: 0,
             fr2_revision_counts: Fr2RevisionCounts::default(),
+            inter_syntax_mode: "raw".to_string(),
+            rdo_mode: "off".to_string(),
+            rdo_lambda_scale: 256,
             legacy_explicit_total_payload_bytes: None,
             rc: None,
             aq: None,
@@ -651,6 +677,9 @@ fn summarize_frame_bytes_hist(v: &[u64]) -> String {
 }
 
 fn validate_args(args: &Args) -> Result<()> {
+    if args.match_x264_bitrate {
+        bail!("bitrate matching not implemented; use sweeps/target bitrate.");
+    }
     if args.frames == 0 {
         bail!("--frames must be > 0");
     }
@@ -703,6 +732,8 @@ fn validate_args(args: &Args) -> Result<()> {
         bail!("alt-ref benchmark encode is not wired yet.");
     }
     parse_b_motion_search_mode(&args.b_motion_search)?;
+    parse_inter_syntax_mode(&args.inter_syntax)?;
+    parse_rdo_mode(&args.rdo)?;
     if args.bframes > 1 {
         bail!(
             "only --bframes 0 or 1 is supported in this experimental slice (got {})",
@@ -761,6 +792,25 @@ fn b_motion_mode_cli_label(m: SrsV2BMotionSearchMode) -> &'static str {
     }
 }
 
+fn parse_inter_syntax_mode(s: &str) -> Result<SrsV2InterSyntaxMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "raw" | "legacy" => Ok(SrsV2InterSyntaxMode::RawLegacy),
+        "compact" => Ok(SrsV2InterSyntaxMode::CompactV1),
+        "entropy" => Ok(SrsV2InterSyntaxMode::EntropyV1),
+        _ => Err(anyhow!(
+            "--inter-syntax must be raw, compact, or entropy (got {s})"
+        )),
+    }
+}
+
+fn parse_rdo_mode(s: &str) -> Result<SrsV2RdoMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "off" => Ok(SrsV2RdoMode::Off),
+        "fast" => Ok(SrsV2RdoMode::Fast),
+        _ => Err(anyhow!("--rdo must be off or fast (got {s})")),
+    }
+}
+
 fn parse_block_aq_mode(s: &str) -> Result<SrsV2BlockAqMode> {
     match s.to_ascii_lowercase().replace('_', "-").as_str() {
         "off" => Ok(SrsV2BlockAqMode::Off),
@@ -795,6 +845,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let subpel_mode = parse_subpel_mode(&args.subpel)?;
     let block_aq_mode = parse_block_aq_mode(&args.block_aq)?;
     let b_motion_search_mode = parse_b_motion_search_mode(&args.b_motion_search)?;
+    let inter_syntax_mode = parse_inter_syntax_mode(&args.inter_syntax)?;
+    let rdo_mode = parse_rdo_mode(&args.rdo)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -821,6 +873,9 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         deblock_strength: args.deblock_strength,
         b_motion_search_mode,
         b_weighted_prediction: args.b_weighted_prediction,
+        inter_syntax_mode,
+        rdo_mode,
+        rdo_lambda_scale: args.rdo_lambda_scale,
         ..Default::default()
     };
     s.validate_rate_control()
@@ -938,6 +993,10 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             12 => c.rev12 += 1,
             13 => c.rev13 += 1,
             14 => c.rev14 += 1,
+            15 => c.rev15 += 1,
+            16 => c.rev16 += 1,
+            17 => c.rev17 += 1,
+            18 => c.rev18 += 1,
             _ => {}
         }
     }
@@ -1679,14 +1738,14 @@ fn pass_to_details(
     for pl in &p.payloads {
         match pl.get(3).copied() {
             Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
-            Some(2 | 4 | 5 | 6 | 8 | 9) => p_bytes.push(pl.len() as u64),
-            Some(10 | 11 | 13 | 14) => b_bytes.push(pl.len() as u64),
+            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17) => p_bytes.push(pl.len() as u64),
+            Some(10 | 11 | 13 | 14 | 16 | 18) => b_bytes.push(pl.len() as u64),
             Some(12) => alt_bytes.push(pl.len() as u64),
             _ => {}
         }
     }
     let fr2 = fr2_revision_counts(&p.payloads);
-    let bframe_count = fr2.rev10 + fr2.rev11 + fr2.rev13 + fr2.rev14;
+    let bframe_count = fr2.rev10 + fr2.rev11 + fr2.rev13 + fr2.rev14 + fr2.rev16 + fr2.rev18;
     let alt_ref_count = fr2.rev12;
     let enc_bytes: u64 = p.byte_hist.iter().sum();
     let raw_bytes = raw_len_for_bitrate(args);
@@ -1714,6 +1773,9 @@ fn pass_to_details(
         p_explicit_chunks: p.enc_stats.p_explicit_chunks,
         p_rans_chunks: p.enc_stats.p_rans_chunks,
         fr2_revision_counts: fr2,
+        inter_syntax_mode: args.inter_syntax.clone(),
+        rdo_mode: args.rdo.clone(),
+        rdo_lambda_scale: args.rdo_lambda_scale,
         legacy_explicit_total_payload_bytes: p.legacy_explicit_total_payload_bytes,
         rc: Some(rc_report_from_pass(args, settings, p)),
         aq: Some(aq_report_from_pass(settings, &p.aq_last)),
@@ -1803,7 +1865,7 @@ fn compare_b_modes_try_entry(
         DeblockBenchReport::default(),
     );
     let fr2 = fr2_revision_counts(&numbers.payloads);
-    let b_pkts = fr2.rev10 + fr2.rev11 + fr2.rev13 + fr2.rev14;
+    let b_pkts = fr2.rev10 + fr2.rev11 + fr2.rev13 + fr2.rev14 + fr2.rev16 + fr2.rev18;
     CompareBModesEntry {
         mode: label.to_string(),
         error: None,
@@ -1879,10 +1941,6 @@ fn run_compare_b_modes_report(
         None
     };
 
-    let match_x264_bitrate_note = args
-        .match_x264_bitrate
-        .then(|| "Bitrate matching vs x264 is not implemented (placeholder only).".to_string());
-
     Ok(BenchReport {
         note: "Engineering measurement only; not a marketing claim.",
         residual_note: "Residual entropy (FR2 rev 3 intra / rev 4 P; rev 7–9 add optional block qp_delta with adaptive residuals) is experimental; auto mode never chooses a larger representation than explicit tuples per block.",
@@ -1898,7 +1956,7 @@ fn run_compare_b_modes_report(
         compare_residual_modes: None,
         sweep: None,
         compare_b_modes: Some(rows),
-        match_x264_bitrate_note,
+        match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
@@ -1932,10 +1990,6 @@ fn run_single_report(
 
     let src_luma = flatten_src_luma(raw, expected_frame, args)?;
 
-    let match_x264_bitrate_note = args
-        .match_x264_bitrate
-        .then(|| "Bitrate matching vs x264 is not implemented (placeholder only).".to_string());
-
     let x264 = if args.compare_x264 {
         let (row, details_x264) = run_x264_compare(
             args,
@@ -1967,7 +2021,7 @@ fn run_single_report(
         compare_residual_modes: None,
         sweep: None,
         compare_b_modes: None,
-        match_x264_bitrate_note,
+        match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
@@ -2101,9 +2155,7 @@ fn run_compare_residual_report(
         compare_residual_modes: Some(entries),
         sweep: None,
         compare_b_modes: None,
-        match_x264_bitrate_note: args.match_x264_bitrate.then(|| {
-            "Bitrate matching vs x264 is not implemented (placeholder only).".to_string()
-        }),
+        match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
@@ -2467,9 +2519,6 @@ fn run_x264_compare(
     src_luma: &[u8],
     srsv2_bitrate_bps: Option<f64>,
 ) -> Result<(Option<CodecRow>, X264Details)> {
-    let match_x264_bitrate_note = args
-        .match_x264_bitrate
-        .then(|| "Bitrate matching vs x264 is not implemented (placeholder only).".to_string());
     let crf = args.x264_crf;
     let ffmpeg_command = format!(
         "ffmpeg -y -f rawvideo -pix_fmt yuv420p -s {w}x{h} -r {fps} -i \"{inp}\" -frames:v {frames} -c:v libx264 -preset {preset} -crf {crf} -an <output.mp4>",
@@ -2497,7 +2546,7 @@ fn run_x264_compare(
                 x264_crf: crf,
                 achieved_bitrate_bps: None,
                 srsv2_bitrate_bps,
-                match_x264_bitrate_note,
+                match_x264_bitrate_note: None,
             },
         ));
     }
@@ -2546,7 +2595,7 @@ fn run_x264_compare(
                 x264_crf: crf,
                 achieved_bitrate_bps: None,
                 srsv2_bitrate_bps,
-                match_x264_bitrate_note,
+                match_x264_bitrate_note: None,
             },
         ));
     }
@@ -2636,7 +2685,7 @@ fn run_x264_compare(
             x264_crf: crf,
             achieved_bitrate_bps: Some(bitrate_bps),
             srsv2_bitrate_bps,
-            match_x264_bitrate_note,
+            match_x264_bitrate_note: None,
         },
     ))
 }
@@ -2982,6 +3031,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3036,6 +3088,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3089,6 +3144,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3160,6 +3218,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 2,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3222,6 +3283,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 2,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3301,6 +3365,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 2,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3363,6 +3430,9 @@ mod tests {
             b_motion_search: "independent-forward-backward".to_string(),
             gop: 0,
             reference_frames: 2,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3430,6 +3500,9 @@ mod tests {
             b_motion_search: "independent-forward-backward-half".to_string(),
             gop: 0,
             reference_frames: 2,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3472,7 +3545,7 @@ mod tests {
             x264_crf: 23,
             achieved_bitrate_bps: None,
             srsv2_bitrate_bps: Some(123_456.0),
-            match_x264_bitrate_note: Some("placeholder".to_string()),
+            match_x264_bitrate_note: None,
         };
         let j = serde_json::to_string(&x).unwrap();
         assert!(j.contains("ffmpeg_command"));
@@ -3531,6 +3604,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3584,6 +3660,9 @@ mod tests {
                 p_explicit_chunks: 0,
                 p_rans_chunks: 0,
                 fr2_revision_counts: Fr2RevisionCounts::default(),
+                inter_syntax_mode: "raw".to_string(),
+                rdo_mode: "off".to_string(),
+                rdo_lambda_scale: 256,
                 legacy_explicit_total_payload_bytes: None,
                 rc: Some(RcBenchReport {
                     mode: "fixed-qp".to_string(),
@@ -3725,6 +3804,9 @@ mod tests {
                 p_explicit_chunks: 0,
                 p_rans_chunks: 0,
                 fr2_revision_counts: Fr2RevisionCounts::default(),
+                inter_syntax_mode: "raw".to_string(),
+                rdo_mode: "off".to_string(),
+                rdo_lambda_scale: 256,
                 legacy_explicit_total_payload_bytes: None,
                 rc: None,
                 aq: None,
@@ -3784,6 +3866,9 @@ mod tests {
                     p_explicit_chunks: 0,
                     p_rans_chunks: 0,
                     fr2_revision_counts: Fr2RevisionCounts::default(),
+                    inter_syntax_mode: "raw".to_string(),
+                    rdo_mode: "off".to_string(),
+                    rdo_lambda_scale: 256,
                     legacy_explicit_total_payload_bytes: None,
                     rc: None,
                     aq: None,
@@ -3859,6 +3944,9 @@ mod tests {
                     p_explicit_chunks: 0,
                     p_rans_chunks: 0,
                     fr2_revision_counts: Fr2RevisionCounts::default(),
+                    inter_syntax_mode: "raw".to_string(),
+                    rdo_mode: "off".to_string(),
+                    rdo_lambda_scale: 256,
                     legacy_explicit_total_payload_bytes: None,
                     rc: None,
                     aq: None,
@@ -3928,6 +4016,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,
@@ -3981,6 +4072,9 @@ mod tests {
             b_motion_search: "off".to_string(),
             gop: 0,
             reference_frames: 1,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
             match_x264_bitrate: false,
             compare_b_modes: false,
             b_weighted_prediction: false,

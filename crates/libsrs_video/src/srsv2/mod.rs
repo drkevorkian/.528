@@ -14,6 +14,7 @@ pub mod error;
 pub mod frame;
 pub mod frame_codec;
 pub mod gpu_traits;
+pub mod inter_mv;
 pub mod intra_codec;
 pub mod limits;
 pub mod model;
@@ -35,7 +36,8 @@ pub use b_frame_codec::{
     blend_weighted_pixels, choose_b_macroblock, choose_b_macroblock_blend_and_mv,
     decode_yuv420_b_payload, encode_yuv420_b_payload, encode_yuv420_b_payload_mb_blend,
     validate_b_prediction_weights, BBlendModeWire, BFrameEncodeStats, BMbEncodeChoice,
-    B_WEIGHTED_PRED_CANDIDATES, FRAME_PAYLOAD_MAGIC_B, FRAME_PAYLOAD_MAGIC_B_MB_BLEND,
+    B_WEIGHTED_PRED_CANDIDATES, FRAME_PAYLOAD_MAGIC_B, FRAME_PAYLOAD_MAGIC_B_COMPACT,
+    FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY, FRAME_PAYLOAD_MAGIC_B_MB_BLEND,
     FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP, FRAME_PAYLOAD_MAGIC_B_SUBPEL,
 };
 pub use color::{
@@ -64,8 +66,8 @@ pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2MotionSearchMode, SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController,
-    SrsV2SubpelMode,
+    SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2RateControlError, SrsV2RateControlMode,
+    SrsV2RateController, SrsV2RdoMode, SrsV2SubpelMode,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};
