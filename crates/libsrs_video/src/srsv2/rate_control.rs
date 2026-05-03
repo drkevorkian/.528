@@ -241,6 +241,12 @@ impl Default for SrsV2EncodeSettings {
     }
 }
 
+/// Effective λ for [`SrsV2RdoMode::Fast`] combining QP-derived scale and [`SrsV2EncodeSettings::rdo_lambda_scale`].
+#[inline]
+pub fn rdo_lambda_effective(settings: &SrsV2EncodeSettings, qp: u8) -> i64 {
+    rdo_lambda_fp_from_qp(qp).saturating_mul(i64::from(settings.rdo_lambda_scale)) / 256
+}
+
 /// Integer λ≈ `0.85 * 2^((qp-12)/3)` scaled by **256** (clamped).
 pub fn rdo_lambda_fp_from_qp(qp: u8) -> i64 {
     let q = i64::from(qp);

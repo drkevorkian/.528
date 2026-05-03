@@ -5,14 +5,18 @@
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::inter_mv::{
-    decode_mv_grid_compact, encode_mv_grid_compact, rans_decode_mv_bytes, rans_encode_mv_bytes,
+    decode_mv_grid_compact, encode_mv_grid_compact, mv_compact_grid_delta_statistics,
+    rans_decode_mv_bytes, rans_encode_mv_bytes, MV_PREDICTION_MODE_LABEL,
 };
 use super::limits::{MAX_FRAME_PAYLOAD_BYTES, MAX_MOTION_VECTOR_PELS};
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
-use super::motion_search::{pick_mv, sad_16x16, sample_u8_plane};
+use super::motion_search::{
+    pick_mv, sad_16x16, sample_u8_plane, SrsV2InterMvBenchStats, SrsV2RdoBenchStats,
+};
 use super::p_frame_codec::{copy_chroma_mb8, copy_chroma_mb8_qpel};
 use super::rate_control::{
-    ResidualEntropy, SrsV2BMotionSearchMode, SrsV2EncodeSettings, SrsV2InterSyntaxMode,
+    rdo_lambda_effective, ResidualEntropy, SrsV2BMotionSearchMode, SrsV2EncodeSettings,
+    SrsV2InterSyntaxMode, SrsV2RdoMode,
 };
 use super::reference_manager::SrsV2ReferenceManager;
 use super::residual_entropy::{decode_p_residual_chunk, encode_p_residual_chunk};
@@ -514,12 +518,14 @@ pub fn encode_yuv420_b_payload(
 }
 
 /// Aggregate stats from [`encode_yuv420_b_payload_mb_blend`] (one encoded B picture).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct BFrameEncodeStats {
     pub b_forward_macroblocks: u32,
     pub b_backward_macroblocks: u32,
     pub b_average_macroblocks: u32,
     pub b_weighted_macroblocks: u32,
+    pub inter_mv: SrsV2InterMvBenchStats,
+    pub rdo: SrsV2RdoBenchStats,
     pub b_sad_evaluations: u64,
     pub b_subpel_blocks_tested: u64,
     pub b_subpel_blocks_selected: u64,
@@ -659,6 +665,7 @@ fn sad_mb_weighted_qpel(
 }
 
 /// Choose per-MB blend, optional weights, and MVs for [`encode_yuv420_b_payload_mb_blend`].
+#[allow(clippy::too_many_arguments)]
 pub fn choose_b_macroblock(
     settings: &SrsV2EncodeSettings,
     cur: &YuvFrame,
@@ -666,6 +673,7 @@ pub fn choose_b_macroblock(
     ref_b: &YuvFrame,
     mbx: u32,
     mby: u32,
+    frame_qp: u8,
     stats: &mut BFrameEncodeStats,
 ) -> Result<BMbEncodeChoice, SrsV2Error> {
     let use_halfpel_b = matches!(
@@ -801,65 +809,158 @@ pub fn choose_b_macroblock(
     };
     stats.b_sad_evaluations += 3;
 
-    let mut min_v = sf.min(sb).min(sa);
-    let mut best_w: Option<(u8, u8)> = None;
-    if use_weighted {
-        for &(wa, wb) in &B_WEIGHTED_PRED_CANDIDATES {
-            stats.b_weighted_candidates_tested += 1;
-            let sw = if use_halfpel_b {
-                sad_mb_weighted_qpel(
-                    &cur.y,
-                    &ref_a.y,
-                    &ref_b.y,
-                    mbx,
-                    mby,
-                    (mv_aqx, mv_aqy),
-                    (mv_bqx, mv_bqy),
-                    wa,
-                    wb,
-                )
-            } else {
-                sad_mb_weighted_plane(
-                    &cur.y,
-                    &ref_a.y,
-                    &ref_b.y,
-                    mbx,
-                    mby,
-                    (mv_ax, mv_ay),
-                    (mv_bx, mv_by),
-                    wa,
-                    wb,
-                )
-            };
-            stats.b_sad_evaluations += 1;
-            if sw < min_v {
-                min_v = sw;
-                best_w = Some((wa, wb));
+    let hp_pen_bytes = if use_halfpel_b
+        && (mv_aqx != mv_ax as i32 * 4
+            || mv_aqy != mv_ay as i32 * 4
+            || mv_bqx != mv_bx as i32 * 4
+            || mv_bqy != mv_by as i32 * 4)
+    {
+        40i128
+    } else {
+        0
+    };
+
+    let (blend, weight_a, weight_b) = if matches!(settings.rdo_mode, SrsV2RdoMode::Fast) {
+        let lam = rdo_lambda_effective(settings, frame_qp) as i128;
+        let base_bytes = 8i128;
+        let weighted_extra = 72i128;
+        let mut cands: Vec<(i128, BBlendModeWire, u8, u8)> = Vec::with_capacity(8);
+        let sf_s = sf as i128 + lam * (base_bytes + hp_pen_bytes) / 256;
+        let sb_s = sb as i128 + lam * (base_bytes + hp_pen_bytes) / 256;
+        let sa_s = sa as i128 + lam * (base_bytes + hp_pen_bytes) / 256;
+        cands.push((sf_s, BBlendModeWire::ForwardOnly, 0, 0));
+        cands.push((sb_s, BBlendModeWire::BackwardOnly, 0, 0));
+        cands.push((sa_s, BBlendModeWire::Average, 0, 0));
+        stats.rdo.candidates_tested += 3;
+        if use_weighted {
+            for &(wa, wb) in &B_WEIGHTED_PRED_CANDIDATES {
+                stats.b_weighted_candidates_tested += 1;
+                let sw = if use_halfpel_b {
+                    sad_mb_weighted_qpel(
+                        &cur.y,
+                        &ref_a.y,
+                        &ref_b.y,
+                        mbx,
+                        mby,
+                        (mv_aqx, mv_aqy),
+                        (mv_bqx, mv_bqy),
+                        wa,
+                        wb,
+                    )
+                } else {
+                    sad_mb_weighted_plane(
+                        &cur.y,
+                        &ref_a.y,
+                        &ref_b.y,
+                        mbx,
+                        mby,
+                        (mv_ax, mv_ay),
+                        (mv_bx, mv_by),
+                        wa,
+                        wb,
+                    )
+                };
+                stats.b_sad_evaluations += 1;
+                let sw_s = sw as i128 + lam * (base_bytes + weighted_extra + hp_pen_bytes) / 256;
+                stats.rdo.candidates_tested += 1;
+                cands.push((sw_s, BBlendModeWire::Weighted, wa, wb));
             }
         }
-    }
-
-    let (blend, weight_a, weight_b) = if sa == min_v {
-        (BBlendModeWire::Average, 0_u8, 0_u8)
-    } else if sf == min_v {
-        (BBlendModeWire::ForwardOnly, 0_u8, 0_u8)
-    } else if sb == min_v {
-        (BBlendModeWire::BackwardOnly, 0_u8, 0_u8)
+        fn blend_pri(b: BBlendModeWire) -> u8 {
+            match b {
+                BBlendModeWire::ForwardOnly => 0,
+                BBlendModeWire::BackwardOnly => 1,
+                BBlendModeWire::Average => 2,
+                BBlendModeWire::Weighted => 3,
+            }
+        }
+        cands.sort_by(|a, b| a.0.cmp(&b.0).then(blend_pri(a.1).cmp(&blend_pri(b.1))));
+        let (_, bl, wa, wb) = cands[0];
+        stats.rdo.estimated_bits_used_for_decision = stats
+            .rdo
+            .estimated_bits_used_for_decision
+            .saturating_add(base_bytes.max(0) as u64);
+        if matches!(bl, BBlendModeWire::Weighted) {
+            stats.rdo.estimated_bits_used_for_decision = stats
+                .rdo
+                .estimated_bits_used_for_decision
+                .saturating_add(weighted_extra.max(0) as u64);
+        }
+        if hp_pen_bytes > 0 {
+            stats.rdo.halfpel_decisions += 1;
+        }
+        (bl, wa, wb)
     } else {
-        let (wa, wb) = best_w.ok_or_else(|| {
-            SrsV2Error::syntax("internal: weighted B blend missing after candidate search")
-        })?;
-        (BBlendModeWire::Weighted, wa, wb)
+        let mut min_v = sf.min(sb).min(sa);
+        let mut best_w: Option<(u8, u8)> = None;
+        if use_weighted {
+            for &(wa, wb) in &B_WEIGHTED_PRED_CANDIDATES {
+                stats.b_weighted_candidates_tested += 1;
+                let sw = if use_halfpel_b {
+                    sad_mb_weighted_qpel(
+                        &cur.y,
+                        &ref_a.y,
+                        &ref_b.y,
+                        mbx,
+                        mby,
+                        (mv_aqx, mv_aqy),
+                        (mv_bqx, mv_bqy),
+                        wa,
+                        wb,
+                    )
+                } else {
+                    sad_mb_weighted_plane(
+                        &cur.y,
+                        &ref_a.y,
+                        &ref_b.y,
+                        mbx,
+                        mby,
+                        (mv_ax, mv_ay),
+                        (mv_bx, mv_by),
+                        wa,
+                        wb,
+                    )
+                };
+                stats.b_sad_evaluations += 1;
+                if sw < min_v {
+                    min_v = sw;
+                    best_w = Some((wa, wb));
+                }
+            }
+        }
+
+        if sa == min_v {
+            (BBlendModeWire::Average, 0_u8, 0_u8)
+        } else if sf == min_v {
+            (BBlendModeWire::ForwardOnly, 0_u8, 0_u8)
+        } else if sb == min_v {
+            (BBlendModeWire::BackwardOnly, 0_u8, 0_u8)
+        } else {
+            let (wa, wb) = best_w.ok_or_else(|| {
+                SrsV2Error::syntax("internal: weighted B blend missing after candidate search")
+            })?;
+            (BBlendModeWire::Weighted, wa, wb)
+        }
     };
 
     match blend {
-        BBlendModeWire::ForwardOnly => stats.b_forward_macroblocks += 1,
-        BBlendModeWire::BackwardOnly => stats.b_backward_macroblocks += 1,
-        BBlendModeWire::Average => stats.b_average_macroblocks += 1,
+        BBlendModeWire::ForwardOnly => {
+            stats.b_forward_macroblocks += 1;
+            stats.rdo.forward_decisions += 1;
+        }
+        BBlendModeWire::BackwardOnly => {
+            stats.b_backward_macroblocks += 1;
+            stats.rdo.backward_decisions += 1;
+        }
+        BBlendModeWire::Average => {
+            stats.b_average_macroblocks += 1;
+            stats.rdo.average_decisions += 1;
+        }
         BBlendModeWire::Weighted => {
             stats.b_weighted_macroblocks += 1;
             stats.b_weighted_sum_weight_a += weight_a as u64;
             stats.b_weighted_sum_weight_b += weight_b as u64;
+            stats.rdo.weighted_decisions += 1;
         }
     }
 
@@ -879,6 +980,7 @@ pub fn choose_b_macroblock(
 }
 
 /// Choose per-MB blend and integer MVs for [`encode_yuv420_b_payload_mb_blend`] (compat shim).
+#[allow(clippy::too_many_arguments)]
 pub fn choose_b_macroblock_blend_and_mv(
     settings: &SrsV2EncodeSettings,
     cur: &YuvFrame,
@@ -886,9 +988,10 @@ pub fn choose_b_macroblock_blend_and_mv(
     ref_b: &YuvFrame,
     mbx: u32,
     mby: u32,
+    frame_qp: u8,
     stats: &mut BFrameEncodeStats,
 ) -> Result<(BBlendModeWire, i16, i16, i16, i16), SrsV2Error> {
-    let c = choose_b_macroblock(settings, cur, ref_a, ref_b, mbx, mby, stats)?;
+    let c = choose_b_macroblock(settings, cur, ref_a, ref_b, mbx, mby, frame_qp, stats)?;
     Ok((c.blend, c.mv_ax, c.mv_ay, c.mv_bx, c.mv_by))
 }
 
@@ -927,7 +1030,7 @@ pub fn encode_yuv420_b_payload_mb_blend(
         Vec::with_capacity((mb_cols as usize).saturating_mul(mb_rows as usize));
     for mby in 0..mb_rows {
         for mbx in 0..mb_cols {
-            let ch = choose_b_macroblock(settings, cur, ref_a, ref_b, mbx, mby, stats_out)?;
+            let ch = choose_b_macroblock(settings, cur, ref_a, ref_b, mbx, mby, qp, stats_out)?;
             let mb = build_b_macroblock_encoded(
                 &ch, wire_rev14, cur, ref_a, ref_b, mbx, mby, qp_i, &model,
             )?;
@@ -943,7 +1046,21 @@ pub fn encode_yuv420_b_payload_mb_blend(
         flags_compact |= B_INTER_FLAG_WEIGHTED_OK;
     }
 
+    let mva: Vec<(i32, i32)> = mbs.iter().map(|m| (m.mv_aqx, m.mv_aqy)).collect();
+    let mvb: Vec<(i32, i32)> = mbs.iter().map(|m| (m.mv_bqx, m.mv_bqy)).collect();
+    let ca = encode_mv_grid_compact(&mva, mb_cols, mb_rows);
+    let cb = encode_mv_grid_compact(&mvb, mb_cols, mb_rows);
+
+    let entropy_blobs: Option<(Vec<u8>, Vec<u8>)> =
+        if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1) {
+            Some((rans_encode_mv_bytes(&ca)?, rans_encode_mv_bytes(&cb)?))
+        } else {
+            None
+        };
+
+    let weighted_allowed = settings.b_weighted_prediction;
     let mut out = Vec::new();
+    let inter_prefix_end: usize;
     match settings.inter_syntax_mode {
         SrsV2InterSyntaxMode::RawLegacy => {
             out.extend_from_slice(if wire_rev14 {
@@ -955,6 +1072,7 @@ pub fn encode_yuv420_b_payload_mb_blend(
             out.push(qp);
             out.push(slot_a);
             out.push(slot_b);
+            inter_prefix_end = out.len();
             for mb in &mbs {
                 append_b_mb_legacy_wire(&mut out, mb, wire_rev14)?;
             }
@@ -966,46 +1084,75 @@ pub fn encode_yuv420_b_payload_mb_blend(
             out.push(slot_a);
             out.push(slot_b);
             out.push(flags_compact);
-            let mva: Vec<(i32, i32)> = mbs.iter().map(|m| (m.mv_aqx, m.mv_aqy)).collect();
-            let mvb: Vec<(i32, i32)> = mbs.iter().map(|m| (m.mv_bqx, m.mv_bqy)).collect();
-            let ca = encode_mv_grid_compact(&mva, mb_cols, mb_rows);
-            let cb = encode_mv_grid_compact(&mvb, mb_cols, mb_rows);
             out.extend_from_slice(&ca);
             out.extend_from_slice(&cb);
-            let weighted_allowed = settings.b_weighted_prediction;
+            inter_prefix_end = out.len();
             for mb in &mbs {
                 append_b_mb_compact_residual_wire(&mut out, mb, weighted_allowed)?;
             }
         }
         SrsV2InterSyntaxMode::EntropyV1 => {
+            let (ba, bb) = entropy_blobs
+                .as_ref()
+                .ok_or_else(|| SrsV2Error::syntax("internal: B entropy inter blobs missing"))?;
             out.extend_from_slice(&FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY);
             out.extend_from_slice(&frame_index.to_le_bytes());
             out.push(qp);
             out.push(slot_a);
             out.push(slot_b);
             out.push(flags_compact);
-            let mva: Vec<(i32, i32)> = mbs.iter().map(|m| (m.mv_aqx, m.mv_aqy)).collect();
-            let mvb: Vec<(i32, i32)> = mbs.iter().map(|m| (m.mv_bqx, m.mv_bqy)).collect();
-            let ca = encode_mv_grid_compact(&mva, mb_cols, mb_rows);
-            let cb = encode_mv_grid_compact(&mvb, mb_cols, mb_rows);
-            let ba = rans_encode_mv_bytes(&ca)?;
-            let bb = rans_encode_mv_bytes(&cb)?;
             let sa = u32::try_from(ca.len()).map_err(|_| SrsV2Error::Overflow("b mv a sym"))?;
             let la = u32::try_from(ba.len()).map_err(|_| SrsV2Error::Overflow("b mv a blob"))?;
             let sb = u32::try_from(cb.len()).map_err(|_| SrsV2Error::Overflow("b mv b sym"))?;
             let lb = u32::try_from(bb.len()).map_err(|_| SrsV2Error::Overflow("b mv b blob"))?;
             out.extend_from_slice(&sa.to_le_bytes());
             out.extend_from_slice(&la.to_le_bytes());
-            out.extend_from_slice(&ba);
+            out.extend_from_slice(ba);
             out.extend_from_slice(&sb.to_le_bytes());
             out.extend_from_slice(&lb.to_le_bytes());
-            out.extend_from_slice(&bb);
-            let weighted_allowed = settings.b_weighted_prediction;
+            out.extend_from_slice(bb);
+            inter_prefix_end = out.len();
             for mb in &mbs {
                 append_b_mb_compact_residual_wire(&mut out, mb, weighted_allowed)?;
             }
         }
     }
+
+    let n_mb_u64 = (mb_cols as u64).saturating_mul(mb_rows as u64);
+    let (z0a, zna, sum_a, _) = mv_compact_grid_delta_statistics(&mva, mb_cols, mb_rows);
+    let (z0b, znb, sum_b, _) = mv_compact_grid_delta_statistics(&mvb, mb_cols, mb_rows);
+    let zero_c = z0a + z0b;
+    let nonzero_c = zna + znb;
+    let sum_abs_c = sum_a + sum_b;
+    let denom_c = (zero_c + nonzero_c).max(1);
+    let mv_entropy_section_bytes = entropy_blobs
+        .as_ref()
+        .map(|(a, b)| {
+            16_u64
+                .saturating_add(a.len() as u64)
+                .saturating_add(b.len() as u64)
+        })
+        .unwrap_or(0);
+
+    let inter_header_bytes = inter_prefix_end as u64;
+    let residual_payload_bytes = out.len() as u64 - inter_header_bytes;
+
+    stats_out.inter_mv = SrsV2InterMvBenchStats {
+        mv_prediction_mode: MV_PREDICTION_MODE_LABEL,
+        mv_raw_bytes_estimate: n_mb_u64.saturating_mul(2).saturating_mul(if wire_rev14 {
+            8
+        } else {
+            4
+        }),
+        mv_compact_bytes: (ca.len() + cb.len()) as u64,
+        mv_entropy_section_bytes,
+        mv_delta_zero_varints: zero_c,
+        mv_delta_nonzero_varints: nonzero_c,
+        mv_delta_sum_abs_components: sum_abs_c,
+        mv_delta_avg_abs: sum_abs_c as f64 / denom_c as f64,
+        inter_header_bytes,
+        residual_payload_bytes,
+    };
 
     if out.len() > MAX_FRAME_PAYLOAD_BYTES {
         return Err(SrsV2Error::AllocationLimit {
@@ -1121,13 +1268,9 @@ pub fn decode_yuv420_b_payload(
                     return Err(SrsV2Error::syntax("B MV rANS output length mismatch"));
                 }
                 let mut cc = 0usize;
-                let g = decode_mv_grid_compact(
-                    &compact,
-                    &mut cc,
-                    mb_cols,
-                    mb_rows,
-                    |mx, my| validate_b_compact_mv_unit(compact_subpel, mx, my),
-                )?;
+                let g = decode_mv_grid_compact(&compact, &mut cc, mb_cols, mb_rows, |mx, my| {
+                    validate_b_compact_mv_unit(compact_subpel, mx, my)
+                })?;
                 if cc != compact.len() {
                     return Err(SrsV2Error::syntax("B MV compact trailing bytes"));
                 }
@@ -1138,20 +1281,12 @@ pub fn decode_yuv420_b_payload(
             (ga, gb)
         } else {
             let mut cc = cur;
-            let ga = decode_mv_grid_compact(
-                payload,
-                &mut cc,
-                mb_cols,
-                mb_rows,
-                |mx, my| validate_b_compact_mv_unit(compact_subpel, mx, my),
-            )?;
-            let gb = decode_mv_grid_compact(
-                payload,
-                &mut cc,
-                mb_cols,
-                mb_rows,
-                |mx, my| validate_b_compact_mv_unit(compact_subpel, mx, my),
-            )?;
+            let ga = decode_mv_grid_compact(payload, &mut cc, mb_cols, mb_rows, |mx, my| {
+                validate_b_compact_mv_unit(compact_subpel, mx, my)
+            })?;
+            let gb = decode_mv_grid_compact(payload, &mut cc, mb_cols, mb_rows, |mx, my| {
+                validate_b_compact_mv_unit(compact_subpel, mx, my)
+            })?;
             cur = cc;
             (ga, gb)
         };
@@ -1193,15 +1328,48 @@ pub fn decode_yuv420_b_payload(
             } else {
                 (0_u8, 0_u8)
             };
-            let (mv_aqx, mv_aqy, mv_bqx, mv_bqy, mv_ax, mv_ay, mv_bx, mv_by) = if let Some(
-                (ref ga, ref gb),
-            ) =
-                mv_grids.as_ref()
-            {
-                let idx = (mby * mb_cols + mbx) as usize;
-                let (ax, ay) = ga[idx];
-                let (bx, by) = gb[idx];
-                if compact_subpel {
+            let (mv_aqx, mv_aqy, mv_bqx, mv_bqy, mv_ax, mv_ay, mv_bx, mv_by) =
+                if let Some((ref ga, ref gb)) = mv_grids.as_ref() {
+                    let idx = (mby * mb_cols + mbx) as usize;
+                    let (ax, ay) = ga[idx];
+                    let (bx, by) = gb[idx];
+                    if compact_subpel {
+                        validate_mv_qpel_halfgrid(ax, ay)?;
+                        validate_mv_qpel_halfgrid(bx, by)?;
+                        (
+                            ax,
+                            ay,
+                            bx,
+                            by,
+                            ax.div_euclid(4) as i16,
+                            ay.div_euclid(4) as i16,
+                            bx.div_euclid(4) as i16,
+                            by.div_euclid(4) as i16,
+                        )
+                    } else if ax % 4 != 0 || ay % 4 != 0 || bx % 4 != 0 || by % 4 != 0 {
+                        return Err(SrsV2Error::syntax("B MV not on integer pel grid"));
+                    } else {
+                        let iax = ax.div_euclid(4) as i16;
+                        let iay = ay.div_euclid(4) as i16;
+                        let ibx = bx.div_euclid(4) as i16;
+                        let iby = by.div_euclid(4) as i16;
+                        validate_mv_i16(iax, iay)?;
+                        validate_mv_i16(ibx, iby)?;
+                        (ax, ay, bx, by, iax, iay, ibx, iby)
+                    }
+                } else if half_pel_legacy {
+                    let ax = read_i32(payload, &mut cur)?;
+                    let ay = read_i32(payload, &mut cur)?;
+                    let bx = read_i32(payload, &mut cur)?;
+                    let by = read_i32(payload, &mut cur)?;
+                    validate_mv_qpel_halfgrid(ax, ay)?;
+                    validate_mv_qpel_halfgrid(bx, by)?;
+                    (ax, ay, bx, by, 0_i16, 0_i16, 0_i16, 0_i16)
+                } else if mb_blend_rev14 {
+                    let ax = read_i32(payload, &mut cur)?;
+                    let ay = read_i32(payload, &mut cur)?;
+                    let bx = read_i32(payload, &mut cur)?;
+                    let by = read_i32(payload, &mut cur)?;
                     validate_mv_qpel_halfgrid(ax, ay)?;
                     validate_mv_qpel_halfgrid(bx, by)?;
                     (
@@ -1214,60 +1382,24 @@ pub fn decode_yuv420_b_payload(
                         bx.div_euclid(4) as i16,
                         by.div_euclid(4) as i16,
                     )
-                } else if ax % 4 != 0 || ay % 4 != 0 || bx % 4 != 0 || by % 4 != 0 {
-                    return Err(SrsV2Error::syntax("B MV not on integer pel grid"));
                 } else {
-                    let iax = ax.div_euclid(4) as i16;
-                    let iay = ay.div_euclid(4) as i16;
-                    let ibx = bx.div_euclid(4) as i16;
-                    let iby = by.div_euclid(4) as i16;
-                    validate_mv_i16(iax, iay)?;
-                    validate_mv_i16(ibx, iby)?;
-                    (ax, ay, bx, by, iax, iay, ibx, iby)
-                }
-            } else if half_pel_legacy {
-                let ax = read_i32(payload, &mut cur)?;
-                let ay = read_i32(payload, &mut cur)?;
-                let bx = read_i32(payload, &mut cur)?;
-                let by = read_i32(payload, &mut cur)?;
-                validate_mv_qpel_halfgrid(ax, ay)?;
-                validate_mv_qpel_halfgrid(bx, by)?;
-                (ax, ay, bx, by, 0_i16, 0_i16, 0_i16, 0_i16)
-            } else if mb_blend_rev14 {
-                let ax = read_i32(payload, &mut cur)?;
-                let ay = read_i32(payload, &mut cur)?;
-                let bx = read_i32(payload, &mut cur)?;
-                let by = read_i32(payload, &mut cur)?;
-                validate_mv_qpel_halfgrid(ax, ay)?;
-                validate_mv_qpel_halfgrid(bx, by)?;
-                (
-                    ax,
-                    ay,
-                    bx,
-                    by,
-                    ax.div_euclid(4) as i16,
-                    ay.div_euclid(4) as i16,
-                    bx.div_euclid(4) as i16,
-                    by.div_euclid(4) as i16,
-                )
-            } else {
-                let ax = read_i16(payload, &mut cur)?;
-                let ay = read_i16(payload, &mut cur)?;
-                let bx = read_i16(payload, &mut cur)?;
-                let by = read_i16(payload, &mut cur)?;
-                validate_mv_i16(ax, ay)?;
-                validate_mv_i16(bx, by)?;
-                (
-                    ax as i32 * 4,
-                    ay as i32 * 4,
-                    bx as i32 * 4,
-                    by as i32 * 4,
-                    ax,
-                    ay,
-                    bx,
-                    by,
-                )
-            };
+                    let ax = read_i16(payload, &mut cur)?;
+                    let ay = read_i16(payload, &mut cur)?;
+                    let bx = read_i16(payload, &mut cur)?;
+                    let by = read_i16(payload, &mut cur)?;
+                    validate_mv_i16(ax, ay)?;
+                    validate_mv_i16(bx, by)?;
+                    (
+                        ax as i32 * 4,
+                        ay as i32 * 4,
+                        bx as i32 * 4,
+                        by as i32 * 4,
+                        ax,
+                        ay,
+                        bx,
+                        by,
+                    )
+                };
 
             let pattern = read_u8(payload, &mut cur)?;
 
@@ -1948,6 +2080,81 @@ mod tests {
         let d_co = decode_yuv420_b_payload(&seq, &pay_co, &mgr).unwrap();
         let d_en = decode_yuv420_b_payload(&seq, &pay_en, &mgr).unwrap();
         assert_eq!(d_co.yuv.y.samples, d_en.yuv.y.samples);
+    }
+
+    #[test]
+    fn b_compact_rev16_truncated_mv_grid_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 100);
+        let ref_a = flat_yuv(16, 16, 80);
+        let ref_b = flat_yuv(16, 16, 120);
+        let settings = SrsV2EncodeSettings {
+            b_motion_search_mode: SrsV2BMotionSearchMode::Off,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            ..Default::default()
+        };
+        let mut st = BFrameEncodeStats::default();
+        let mut pay = encode_yuv420_b_payload_mb_blend(
+            &seq, &cur, &ref_a, &ref_b, 5, 28, 1, 0, &settings, &mut st,
+        )
+        .unwrap();
+        assert_eq!(pay[3], 16);
+        pay.truncate(12);
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        let err = decode_yuv420_b_payload(&seq, &pay, &mgr).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Truncated));
+    }
+
+    #[test]
+    fn b_compact_rev16_mv_varint_truncated_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 100);
+        let ref_a = flat_yuv(16, 16, 80);
+        let ref_b = flat_yuv(16, 16, 120);
+        let settings = SrsV2EncodeSettings {
+            b_motion_search_mode: SrsV2BMotionSearchMode::Off,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            ..Default::default()
+        };
+        let mut st = BFrameEncodeStats::default();
+        let mut pay = encode_yuv420_b_payload_mb_blend(
+            &seq, &cur, &ref_a, &ref_b, 5, 28, 1, 0, &settings, &mut st,
+        )
+        .unwrap();
+        pay.truncate(13);
+        pay.push(0x80);
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        let err = decode_yuv420_b_payload(&seq, &pay, &mgr).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Truncated));
+    }
+
+    #[test]
+    fn b_entropy_rev18_first_mv_sym_count_out_of_range_fails() {
+        let seq = seq_b(16, 16);
+        let cur = flat_yuv(16, 16, 100);
+        let ref_a = flat_yuv(16, 16, 80);
+        let ref_b = flat_yuv(16, 16, 120);
+        let settings = SrsV2EncodeSettings {
+            b_motion_search_mode: SrsV2BMotionSearchMode::Off,
+            inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+            ..Default::default()
+        };
+        let mut st = BFrameEncodeStats::default();
+        let mut pay = encode_yuv420_b_payload_mb_blend(
+            &seq, &cur, &ref_a, &ref_b, 5, 28, 1, 0, &settings, &mut st,
+        )
+        .unwrap();
+        assert_eq!(pay[3], 18);
+        pay[12..16].copy_from_slice(&99999u32.to_le_bytes());
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        mgr.push_displayable_last(4, ref_a);
+        mgr.push_displayable_last(6, ref_b);
+        let err = decode_yuv420_b_payload(&seq, &pay, &mgr).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_)));
     }
 
     #[test]

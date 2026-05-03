@@ -6,6 +6,8 @@
 
 Legacy predicted payloads **`FR2` revision 2 / 4** carry **`i16`** motion vectors in **full-pixel** units only.
 
+**Compact inter syntax (`FR2` rev **15**/**16**, optional entropy **17**/**18`):** MVs are still chosen by the same ME path; on wire, **quarter-pel** MV components are written as **median-predicted deltas** (left / top / top-right neighbors in raster order) using **zigzag signed varints**, reducing redundant MV bits on smooth motion vs raw tuples. **`bench_srsv2`** JSON exposes aggregates (**`mv_compact_bytes`**, **`mv_entropy_bytes`**, **`mv_delta_*`**) for A/B measurement.
+
 ## Half-pel (experimental, opt-in)
 
 When **`SrsV2EncodeSettings::subpel_mode == HalfPel`**, the encoder keeps the same integer search, then optionally refines each macroblock on an **eight-offset half-pel ring** in **quarter-pel units** (`±2` == half-pel on the ¼ grid). Wire format: **`FR2\x05`** (tuple residuals, same layout as rev **2** after MV width) or **`FR2\x06`** (adaptive residuals like rev **4**). MVs are stored as **`i32` LE** in **quarter-pel** luma units; decoders reject **odd** quarter values (not on the half-pel grid).

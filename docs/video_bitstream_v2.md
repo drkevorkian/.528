@@ -52,6 +52,14 @@ Same macroblock grid and motion syntax as revision **4**, with the same **`clip_
 
 Same as revision **8** for **`qp_delta`** placement, clipping header, and **luma-only** residual deltas (chroma MV-copy only), with motion syntax matching revision **6** (**`i32` LE** quarter-pel MVs, even quarter-pel grid).
 
+### Revision 15 — experimental **P** compact inter MV (`FR2\x0F`) — **opt-in**
+
+**Experimental:** median-predicted MV deltas as **zigzag signed varints** (left / top / top-right median per quarter-pel component stream), then the same **rev 8**/**rev 9**-style residual bodies (skip pattern + adaptive chunks + optional block AQ). **Default encoder output remains raw legacy rev 2/4/5/6/8/9** unless settings explicitly select compact inter syntax.
+
+### Revision 17 — experimental **P** entropy-coded inter MV (`FR2\x11`) — **opt-in**
+
+Same compact MV **symbol bytes** as rev **15**, plus a **bounded** static **rANS** blob over those bytes (**sym_count**, **blob_len**, blob) before residuals. **Not** CABAC-class; **not** context adaptive.
+
 ### Revision 10 — experimental B-frame, integer MV (`FR2\x0A`)
 
 B-frame **macroblock** syntax (16-aligned canvas; mux/policy may still classify **`FR2\x0A`/`\x0B`** as generic **predicted** / non-keyframe): `frame_index`, `qp`, **`slot_a`**, **`slot_b`**, blend mode, per-MB MV pair(s) (`i16` when rev **10**), adaptive residual packing akin to **P** rev **4**. Requires **`max_ref_frames ≥ 2`**, valid populated slots, backward reference strictly **before** the current picture in `frame_index` order and forward reference strictly **after**, and a supported blend (**weighted** on wire value **3** is reserved / rejected). Parser rejects malformed residuals, bad MVs, and oversize payloads.
@@ -75,11 +83,19 @@ Per macroblock, after **`blend`**:
 
 **Chroma** MC remains the same **integer approximation** as other SRSV2 inter paths (**`mv_q / 8`** rounding); only **luma** uses the bilinear half-pel sampler.
 
+### Revision 16 — experimental **B** compact inter (`FR2\x10`) — **opt-in**
+
+After `frame_index`, `qp`, `slot_a`, `slot_b`, **`flags`** (`u8`: bit **0** half-pel MV grid, bit **1** weighted blend allowed): **two** back-to-back compact MV grids (**backward** then **forward**, same median+varint syntax as **P** rev **15**), then per-MB blend / weights / residuals using the same compact residual packing as legacy **B** rev **13**/ **14** (without embedding raw MV tuples per MB).
+
+### Revision 18 — experimental **B** entropy inter (`FR2\x12`) — **opt-in**
+
+Same header and dual grids as rev **16**, but each grid’s compact byte sequence is wrapped as **sym_count**, **blob_len**, **rANS blob** (two sections), then per-MB residuals. **Static** rANS model only; bounded decode.
+
 ### Revision 12 — experimental alt-ref / hidden reference (`FR2\x0C`)
 
 Non-displayable intra-coded planes (same entropy style as **rev 3** in this slice): `frame_index`, `qp`, **`target_slot`**, **`reserved`** (must be **0**). Picture updates **`SrsV2ReferenceManager`** at **`target_slot`** with **`is_displayable == false`**; playback must **not** treat it as a presented frame.
 
-**Compatibility:** Revisions **1**–**9** remain the stable interchange baseline. **10**–**14** are **experimental**; the legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**14** — use **`decode_yuv420_srsv2_payload_managed`**.
+**Compatibility:** Revisions **1**–**14** remain readable; **15**–**18** add **opt-in** compact/entropy inter MV/header packing (**experimental**). The legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**18** — use **`decode_yuv420_srsv2_payload_managed`** for **B** and newer inter revisions.
 
 ## Elementary `.srsv2` file
 

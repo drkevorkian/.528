@@ -4,6 +4,55 @@ use super::frame::VideoPlane;
 use super::limits::MAX_MOTION_VECTOR_PELS;
 use super::rate_control::SrsV2MotionSearchMode;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SrsV2InterMvBenchStats {
+    pub mv_prediction_mode: &'static str,
+    /// Hypothetical legacy MV tuple bytes for the grid (`i16`×2 or `i32`×2 per macroblock).
+    pub mv_raw_bytes_estimate: u64,
+    /// Compact median+delta varint bytes for the **encoded** MV grid (informational for every syntax mode).
+    pub mv_compact_bytes: u64,
+    /// On-wire MV entropy section length (**sym_count + blob_len fields + rANS blob**) when rev **17**/ **18**; else **0**.
+    pub mv_entropy_section_bytes: u64,
+    pub mv_delta_zero_varints: u64,
+    pub mv_delta_nonzero_varints: u64,
+    pub mv_delta_sum_abs_components: u64,
+    pub mv_delta_avg_abs: f64,
+    /// Non-residual prefix bytes through start of first residual body (best-effort).
+    pub inter_header_bytes: u64,
+    pub residual_payload_bytes: u64,
+}
+
+impl Default for SrsV2InterMvBenchStats {
+    fn default() -> Self {
+        Self {
+            mv_prediction_mode: "",
+            mv_raw_bytes_estimate: 0,
+            mv_compact_bytes: 0,
+            mv_entropy_section_bytes: 0,
+            mv_delta_zero_varints: 0,
+            mv_delta_nonzero_varints: 0,
+            mv_delta_sum_abs_components: 0,
+            mv_delta_avg_abs: 0.0,
+            inter_header_bytes: 0,
+            residual_payload_bytes: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SrsV2RdoBenchStats {
+    pub candidates_tested: u64,
+    pub skip_decisions: u64,
+    pub forward_decisions: u64,
+    pub backward_decisions: u64,
+    pub average_decisions: u64,
+    pub weighted_decisions: u64,
+    pub halfpel_decisions: u64,
+    pub residual_decisions: u64,
+    pub no_residual_decisions: u64,
+    pub estimated_bits_used_for_decision: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SrsV2MotionEncodeStats {
     pub motion_search_mode: SrsV2MotionSearchMode,
@@ -17,6 +66,8 @@ pub struct SrsV2MotionEncodeStats {
     pub additional_subpel_evaluations: u64,
     /// Sum of `|mvx_q.rem_euclid(4)| + |mvy_q.rem_euclid(4)|` over macroblocks (for averages).
     pub sum_abs_frac_qpel: u64,
+    pub inter_mv: SrsV2InterMvBenchStats,
+    pub rdo: SrsV2RdoBenchStats,
 }
 
 pub(crate) fn sample_u8_plane(plane: &VideoPlane<u8>, x: i32, y: i32) -> u8 {

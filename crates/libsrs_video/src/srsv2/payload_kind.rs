@@ -31,7 +31,9 @@ pub fn classify_srsv2_payload(payload: &[u8]) -> Result<Srsv2PayloadKind, SrsV2E
     }
     Ok(match payload[3] {
         1 | 3 | 7 => Srsv2PayloadKind::Intra,
-        2 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 13 | 14 | 15 | 16 | 17 | 18 => Srsv2PayloadKind::Predicted,
+        2 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 13 | 14 | 15 | 16 | 17 | 18 => {
+            Srsv2PayloadKind::Predicted
+        }
         12 => Srsv2PayloadKind::AltRef,
         _ => Srsv2PayloadKind::Unknown,
     })

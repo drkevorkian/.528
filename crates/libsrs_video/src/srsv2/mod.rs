@@ -61,7 +61,7 @@ pub use model::{
     PixelFormat, SrsElementaryVideoCodecId, SrsVideoCodecId, SrsVideoProfile, TileHeaderV2,
     TransferFunction, VideoSequenceHeaderV2, SEQUENCE_HEADER_BYTES,
 };
-pub use motion_search::SrsV2MotionEncodeStats;
+pub use motion_search::{SrsV2InterMvBenchStats, SrsV2MotionEncodeStats, SrsV2RdoBenchStats};
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,

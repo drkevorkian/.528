@@ -13,21 +13,25 @@ use super::dct::fdct_8x8;
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::inter_mv::{
-    decode_mv_grid_compact, encode_mv_grid_compact, rans_decode_mv_bytes, rans_encode_mv_bytes,
+    decode_mv_grid_compact, encode_mv_grid_compact, mv_compact_grid_delta_statistics,
+    predict_mv_qpel, rans_decode_mv_bytes, rans_encode_mv_bytes, signed_varint_wire_bytes,
+    MV_PREDICTION_MODE_LABEL,
 };
 use super::intra_codec::{decode_residual_block_8x8, encode_residual_block_8x8, quantize};
 use super::limits::{MAX_FRAME_PAYLOAD_BYTES, MAX_MOTION_VECTOR_PELS};
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
-use super::motion_search::{pick_mv, sample_u8_plane, SrsV2MotionEncodeStats};
+use super::motion_search::{pick_mv, sad_16x16, sample_u8_plane, SrsV2MotionEncodeStats};
 use super::rate_control::{
-    ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2InterSyntaxMode, SrsV2SubpelMode,
+    rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode,
+    SrsV2EncodeSettings, SrsV2InterSyntaxMode, SrsV2RdoMode, SrsV2SubpelMode,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
 };
 use super::residual_tokens::residual_token_model;
-use super::subpel::{refine_half_pel_center, sample_luma_bilinear_qpel, validate_mv_qpel_halfgrid};
+use super::subpel::{
+    refine_half_pel_center, sad_16x16_qpel, sample_luma_bilinear_qpel, validate_mv_qpel_halfgrid,
+};
 use libsrs_bitio::RansModel;
 
 pub const FRAME_PAYLOAD_MAGIC_P: [u8; 4] = [b'F', b'R', b'2', 2];
@@ -68,6 +72,65 @@ const SKIP_ABS_THRESH: i16 = 6;
 const P_INTER_FLAG_SUBPEL: u8 = 1;
 const P_INTER_FLAG_BLOCK_AQ: u8 = 2;
 const P_INTER_FLAG_ENTROPY_RESIDUAL: u8 = 4;
+
+/// λ·bits score helper: `distortion + lam * wire_bytes`.
+#[inline]
+fn rdo_score_p_mb(sad: u32, lam: i64, wire_bytes: i64) -> i128 {
+    sad as i128 + (lam as i128 * wire_bytes.max(0) as i128) / 256
+}
+
+fn mb_luma_sad_with_mv_q(
+    cur: &VideoPlane<u8>,
+    refp: &VideoPlane<u8>,
+    mb_x: u32,
+    mb_y: u32,
+    mvx_q: i32,
+    mvy_q: i32,
+    use_subpel: bool,
+) -> u32 {
+    if use_subpel {
+        sad_16x16_qpel(cur, refp, mb_x, mb_y, mvx_q, mvy_q)
+    } else {
+        sad_16x16(cur, refp, mb_x, mb_y, mvx_q / 4, mvy_q / 4)
+    }
+}
+
+fn mv_wire_cost_bytes_estimate(
+    mode: SrsV2InterSyntaxMode,
+    use_subpel: bool,
+    mbx: u32,
+    mby: u32,
+    mb_cols: u32,
+    grid_so_far: &[(i32, i32)],
+    mv: (i32, i32),
+) -> i64 {
+    match mode {
+        SrsV2InterSyntaxMode::RawLegacy => {
+            if use_subpel {
+                8
+            } else {
+                4
+            }
+        }
+        SrsV2InterSyntaxMode::CompactV1 | SrsV2InterSyntaxMode::EntropyV1 => {
+            let (px, py) = predict_mv_qpel(mbx, mby, mb_cols, grid_so_far);
+            let dx = mv.0 - px;
+            let dy = mv.1 - py;
+            (signed_varint_wire_bytes(dx) + signed_varint_wire_bytes(dy)) as i64
+        }
+    }
+}
+
+fn p_mb_residual_wire_bytes(mb: &PMacroblockEncoded, block_aq_wire: bool) -> u64 {
+    let mut n = 1_u64;
+    for (_qp_delta, chunk) in &mb.residual_entries {
+        if block_aq_wire {
+            n += 1;
+        }
+        n += 4 + chunk.len() as u64;
+    }
+    n
+}
 
 fn validate_mv(mvx: i16, mvy: i16) -> Result<(), SrsV2Error> {
     if mvx.abs() > MAX_MOTION_VECTOR_PELS || mvy.abs() > MAX_MOTION_VECTOR_PELS {
@@ -212,84 +275,159 @@ fn encode_p_macroblock(
                 max_abs = max_abs.max(d.abs());
             }
         }
+        let idx = ((mby * mb_cols + mbx) * 4 + si as u32) as usize;
+        let qp_delta = if block_aq_wire {
+            let bv = sub_vars[idx];
+            choose_block_qp_delta(
+                bv,
+                median_var,
+                settings.aq_strength,
+                settings.min_block_qp_delta,
+                settings.max_block_qp_delta,
+            )
+        } else {
+            0_i8
+        };
+        if block_aq_wire {
+            validate_wire_qp_delta(qp_delta)?;
+        }
+        let eff_qp_u8 = if block_aq_wire {
+            apply_qp_delta_clamped(qp, qp_delta, settings.min_qp, settings.max_qp)
+        } else {
+            qp
+        };
+        let eff_i = eff_qp_u8.max(1) as i16;
+
         if allow_skip && max_abs <= SKIP_ABS_THRESH {
+            if matches!(settings.rdo_mode, SrsV2RdoMode::Fast) {
+                let (chunk, kind) =
+                    if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
+                        let mut c = Vec::new();
+                        encode_residual_block_8x8(&blk, eff_i, &mut c)?;
+                        (c, None)
+                    } else {
+                        let mut linear = [0_i16; 64];
+                        for r in 0..8 {
+                            for c in 0..8 {
+                                linear[r * 8 + c] = blk[r][c];
+                            }
+                        }
+                        let f = fdct_8x8(&linear);
+                        let qf = quantize(&f, eff_i);
+                        let (c, k) =
+                            encode_p_residual_chunk(&qf, settings.residual_entropy, rans_model)?;
+                        (c, Some(k))
+                    };
+                let wire_res = (4 + chunk.len()) as i64 + if block_aq_wire { 1 } else { 0 };
+                let lam = rdo_lambda_effective(settings, qp);
+                ms.rdo.candidates_tested += 2;
+                ms.rdo.estimated_bits_used_for_decision = ms
+                    .rdo
+                    .estimated_bits_used_for_decision
+                    .saturating_add(wire_res.max(0) as u64);
+                let lhs = i128::from(max_abs as i32) * 256;
+                let rhs = i128::from(lam) * i128::from(wire_res.max(1));
+                if lhs <= rhs {
+                    pattern |= 1 << si;
+                    ms.skip_subblocks += 1;
+                    ms.rdo.skip_decisions += 1;
+                    ms.rdo.no_residual_decisions += 1;
+                    continue;
+                }
+                ms.rdo.residual_decisions += 1;
+                if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
+                    if let Some(s) = stats.as_mut() {
+                        s.p_explicit_chunks += 1;
+                    }
+                } else if let Some(k) = kind {
+                    if let Some(s) = stats.as_mut() {
+                        match k {
+                            PResidualChunkKind::LegacyTuple => s.p_explicit_chunks += 1,
+                            PResidualChunkKind::Adaptive(BlockResidualCoding::ExplicitTuples) => {
+                                s.p_explicit_chunks += 1;
+                            }
+                            PResidualChunkKind::Adaptive(BlockResidualCoding::RansV1) => {
+                                s.p_rans_chunks += 1;
+                            }
+                        }
+                    }
+                }
+                if block_aq_wire {
+                    if let Some(acc) = block_wire_acc.as_mut() {
+                        let pos = u32::from(qp_delta > 0);
+                        let neg = u32::from(qp_delta < 0);
+                        let zero = u32::from(qp_delta == 0);
+                        accumulate_block_aq_wire_plane(
+                            acc,
+                            1,
+                            u64::from(eff_qp_u8),
+                            eff_qp_u8,
+                            eff_qp_u8,
+                            pos,
+                            neg,
+                            zero,
+                        );
+                    }
+                    residual_entries.push((qp_delta, chunk));
+                } else {
+                    residual_entries.push((0, chunk));
+                }
+                continue;
+            }
             pattern |= 1 << si;
             ms.skip_subblocks += 1;
-        } else {
-            let idx = ((mby * mb_cols + mbx) * 4 + si as u32) as usize;
-            let qp_delta = if block_aq_wire {
-                let bv = sub_vars[idx];
-                choose_block_qp_delta(
-                    bv,
-                    median_var,
-                    settings.aq_strength,
-                    settings.min_block_qp_delta,
-                    settings.max_block_qp_delta,
-                )
-            } else {
-                0_i8
-            };
-            if block_aq_wire {
-                validate_wire_qp_delta(qp_delta)?;
-            }
-            let eff_qp_u8 = if block_aq_wire {
-                apply_qp_delta_clamped(qp, qp_delta, settings.min_qp, settings.max_qp)
-            } else {
-                qp
-            };
-            let eff_i = eff_qp_u8.max(1) as i16;
+            continue;
+        }
 
-            let chunk = if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
-                let mut c = Vec::new();
-                encode_residual_block_8x8(&blk, eff_i, &mut c)?;
-                if let Some(s) = stats.as_mut() {
-                    s.p_explicit_chunks += 1;
-                }
-                c
-            } else {
-                let mut linear = [0_i16; 64];
-                for r in 0..8 {
-                    for c in 0..8 {
-                        linear[r * 8 + c] = blk[r][c];
-                    }
-                }
-                let f = fdct_8x8(&linear);
-                let qf = quantize(&f, eff_i);
-                let (c, kind) =
-                    encode_p_residual_chunk(&qf, settings.residual_entropy, rans_model)?;
-                if let Some(s) = stats.as_mut() {
-                    match kind {
-                        PResidualChunkKind::LegacyTuple => s.p_explicit_chunks += 1,
-                        PResidualChunkKind::Adaptive(BlockResidualCoding::ExplicitTuples) => {
-                            s.p_explicit_chunks += 1;
-                        }
-                        PResidualChunkKind::Adaptive(BlockResidualCoding::RansV1) => {
-                            s.p_rans_chunks += 1;
-                        }
-                    }
-                }
-                c
-            };
-            if block_aq_wire {
-                if let Some(acc) = block_wire_acc.as_mut() {
-                    let pos = u32::from(qp_delta > 0);
-                    let neg = u32::from(qp_delta < 0);
-                    let zero = u32::from(qp_delta == 0);
-                    accumulate_block_aq_wire_plane(
-                        acc,
-                        1,
-                        u64::from(eff_qp_u8),
-                        eff_qp_u8,
-                        eff_qp_u8,
-                        pos,
-                        neg,
-                        zero,
-                    );
-                }
-                residual_entries.push((qp_delta, chunk));
-            } else {
-                residual_entries.push((0, chunk));
+        let chunk = if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
+            let mut c = Vec::new();
+            encode_residual_block_8x8(&blk, eff_i, &mut c)?;
+            if let Some(s) = stats.as_mut() {
+                s.p_explicit_chunks += 1;
             }
+            c
+        } else {
+            let mut linear = [0_i16; 64];
+            for r in 0..8 {
+                for c in 0..8 {
+                    linear[r * 8 + c] = blk[r][c];
+                }
+            }
+            let f = fdct_8x8(&linear);
+            let qf = quantize(&f, eff_i);
+            let (c, kind) = encode_p_residual_chunk(&qf, settings.residual_entropy, rans_model)?;
+            if let Some(s) = stats.as_mut() {
+                match kind {
+                    PResidualChunkKind::LegacyTuple => s.p_explicit_chunks += 1,
+                    PResidualChunkKind::Adaptive(BlockResidualCoding::ExplicitTuples) => {
+                        s.p_explicit_chunks += 1;
+                    }
+                    PResidualChunkKind::Adaptive(BlockResidualCoding::RansV1) => {
+                        s.p_rans_chunks += 1;
+                    }
+                }
+            }
+            c
+        };
+        if block_aq_wire {
+            if let Some(acc) = block_wire_acc.as_mut() {
+                let pos = u32::from(qp_delta > 0);
+                let neg = u32::from(qp_delta < 0);
+                let zero = u32::from(qp_delta == 0);
+                accumulate_block_aq_wire_plane(
+                    acc,
+                    1,
+                    u64::from(eff_qp_u8),
+                    eff_qp_u8,
+                    eff_qp_u8,
+                    pos,
+                    neg,
+                    zero,
+                );
+            }
+            residual_entries.push((qp_delta, chunk));
+        } else {
+            residual_entries.push((0, chunk));
         }
     }
 
@@ -381,6 +519,8 @@ pub fn encode_yuv420_p_payload(
     ms.skip_subblocks = 0;
     ms.nonzero_motion_macroblocks = 0;
     ms.sum_mv_l1 = 0;
+    ms.inter_mv = Default::default();
+    ms.rdo = Default::default();
     let use_subpel = matches!(settings.subpel_mode, SrsV2SubpelMode::HalfPel);
     ms.subpel_enabled = use_subpel;
     ms.subpel_blocks_tested = 0;
@@ -410,12 +550,12 @@ pub fn encode_yuv420_p_payload(
 
     let rans_model = residual_token_model();
 
-    let mut mbs: Vec<PMacroblockEncoded> =
-        Vec::with_capacity((mb_cols as usize).saturating_mul(mb_rows as usize));
+    let n_mb = (mb_cols as usize).saturating_mul(mb_rows as usize);
+    let mut me_mvs: Vec<(i32, i32)> = Vec::with_capacity(n_mb);
     for mby in 0..mb_rows {
         for mbx in 0..mb_cols {
             let mut mb_evals = 0_u64;
-            let (mvx_q, mvy_q) = if use_subpel {
+            let mv_me = if use_subpel {
                 let (ix, iy) = pick_mv(
                     settings.motion_search_mode,
                     &cur.y,
@@ -450,10 +590,6 @@ pub fn encode_yuv420_p_payload(
                 let fx = qx.rem_euclid(4) as u32;
                 let fy = qy.rem_euclid(4) as u32;
                 ms.sum_abs_frac_qpel += (fx + fy) as u64;
-                if qx != 0 || qy != 0 {
-                    ms.nonzero_motion_macroblocks += 1;
-                }
-                ms.sum_mv_l1 += ((qx.unsigned_abs() + qy.unsigned_abs()) / 4) as u64;
                 (qx, qy)
             } else {
                 let (mvx, mvy) = pick_mv(
@@ -467,12 +603,72 @@ pub fn encode_yuv420_p_payload(
                     Some(&mut mb_evals),
                 );
                 ms.sad_evaluations += mb_evals;
-                if mvx != 0 || mvy != 0 {
-                    ms.nonzero_motion_macroblocks += 1;
-                }
-                ms.sum_mv_l1 += mvx.unsigned_abs() as u64 + mvy.unsigned_abs() as u64;
                 (mvx as i32 * 4, mvy as i32 * 4)
             };
+            me_mvs.push(mv_me);
+        }
+    }
+
+    let lam_mv = if matches!(settings.rdo_mode, SrsV2RdoMode::Fast) {
+        rdo_lambda_effective(settings, qp)
+    } else {
+        0
+    };
+    let mut grid_pred: Vec<(i32, i32)> = vec![(0, 0); n_mb];
+    let mut mbs: Vec<PMacroblockEncoded> = Vec::with_capacity(n_mb);
+    for mby in 0..mb_rows {
+        for mbx in 0..mb_cols {
+            let idx = (mby * mb_cols + mbx) as usize;
+            let mv_me = me_mvs[idx];
+            let mv_use = if matches!(settings.rdo_mode, SrsV2RdoMode::Fast) {
+                let sad_me = mb_luma_sad_with_mv_q(
+                    &cur.y,
+                    &reference.y,
+                    mbx,
+                    mby,
+                    mv_me.0,
+                    mv_me.1,
+                    use_subpel,
+                );
+                let sad_z = mb_luma_sad_with_mv_q(&cur.y, &reference.y, mbx, mby, 0, 0, use_subpel);
+                let cost_me = mv_wire_cost_bytes_estimate(
+                    settings.inter_syntax_mode,
+                    use_subpel,
+                    mbx,
+                    mby,
+                    mb_cols,
+                    &grid_pred,
+                    mv_me,
+                );
+                let cost_z = mv_wire_cost_bytes_estimate(
+                    settings.inter_syntax_mode,
+                    use_subpel,
+                    mbx,
+                    mby,
+                    mb_cols,
+                    &grid_pred,
+                    (0, 0),
+                );
+                ms.rdo.candidates_tested += 2;
+                ms.rdo.estimated_bits_used_for_decision = ms
+                    .rdo
+                    .estimated_bits_used_for_decision
+                    .saturating_add(cost_me.max(0) as u64);
+                ms.rdo.estimated_bits_used_for_decision = ms
+                    .rdo
+                    .estimated_bits_used_for_decision
+                    .saturating_add(cost_z.max(0) as u64);
+                let score_me = rdo_score_p_mb(sad_me, lam_mv, cost_me);
+                let score_z = rdo_score_p_mb(sad_z, lam_mv, cost_z);
+                if score_z <= score_me {
+                    (0, 0)
+                } else {
+                    mv_me
+                }
+            } else {
+                mv_me
+            };
+            grid_pred[idx] = mv_use;
 
             let enc = encode_p_macroblock(
                 cur,
@@ -480,8 +676,8 @@ pub fn encode_yuv420_p_payload(
                 mbx,
                 mby,
                 mb_cols,
-                mvx_q,
-                mvy_q,
+                mv_use.0,
+                mv_use.1,
                 use_subpel,
                 allow_skip,
                 qp,
@@ -497,6 +693,13 @@ pub fn encode_yuv420_p_payload(
             mbs.push(enc);
         }
     }
+
+    ms.nonzero_motion_macroblocks =
+        mbs.iter().filter(|m| m.mvx_q != 0 || m.mvy_q != 0).count() as u32;
+    ms.sum_mv_l1 = mbs
+        .iter()
+        .map(|m| ((m.mvx_q.unsigned_abs() + m.mvy_q.unsigned_abs()) / 4) as u64)
+        .sum();
 
     let entropy_residual = matches!(
         settings.residual_entropy,
@@ -603,6 +806,31 @@ pub fn encode_yuv420_p_payload(
             }
         }
     }
+
+    let mvs_final: Vec<(i32, i32)> = mbs.iter().map(|m| (m.mvx_q, m.mvy_q)).collect();
+    let compact_tmp = encode_mv_grid_compact(&mvs_final, mb_cols, mb_rows);
+    let (z0, zn, sum_abs, avg_abs) = mv_compact_grid_delta_statistics(&mvs_final, mb_cols, mb_rows);
+    let residual_total: u64 = mbs
+        .iter()
+        .map(|mb| p_mb_residual_wire_bytes(mb, block_aq_wire))
+        .sum();
+    let mv_entropy_section =
+        if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1) {
+            let blob = rans_encode_mv_bytes(&compact_tmp)?;
+            8_u64.saturating_add(blob.len() as u64)
+        } else {
+            0
+        };
+    ms.inter_mv.mv_prediction_mode = MV_PREDICTION_MODE_LABEL;
+    ms.inter_mv.mv_raw_bytes_estimate = n_mb as u64 * if use_subpel { 8 } else { 4 };
+    ms.inter_mv.mv_compact_bytes = compact_tmp.len() as u64;
+    ms.inter_mv.mv_entropy_section_bytes = mv_entropy_section;
+    ms.inter_mv.mv_delta_zero_varints = z0;
+    ms.inter_mv.mv_delta_nonzero_varints = zn;
+    ms.inter_mv.mv_delta_sum_abs_components = sum_abs;
+    ms.inter_mv.mv_delta_avg_abs = avg_abs;
+    ms.inter_mv.residual_payload_bytes = residual_total;
+    ms.inter_mv.inter_header_bytes = out.len() as u64 - residual_total;
 
     if out.len() > MAX_FRAME_PAYLOAD_BYTES {
         return Err(SrsV2Error::AllocationLimit {
@@ -1372,6 +1600,85 @@ mod tests {
         payload[9] |= 0x08;
         let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
         assert!(matches!(err, SrsV2Error::Syntax(_)));
+    }
+
+    #[test]
+    fn p_compact_rev15_truncated_mv_stream_fails() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_radius: 16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
+        assert_eq!(payload[3], 15);
+        payload.truncate(10);
+        let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Truncated));
+    }
+
+    #[test]
+    fn p_compact_rev15_mv_varint_truncated_fails() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_radius: 16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
+        payload.truncate(11);
+        payload.push(0x80);
+        let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Truncated));
+    }
+
+    #[test]
+    fn p_entropy_rev17_mv_sym_count_out_of_range_fails() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_radius: 16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::EntropyV1,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
+        assert_eq!(payload[3], 17);
+        payload[10..14].copy_from_slice(&5000u32.to_le_bytes());
+        let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_)));
+    }
+
+    #[test]
+    fn p_entropy_rev17_mv_blob_truncated_fails() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_radius: 16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::EntropyV1,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &settings, None, None, None).unwrap();
+        let blob_len_idx = 14;
+        let declared =
+            u32::from_le_bytes(payload[blob_len_idx..blob_len_idx + 4].try_into().unwrap());
+        payload[blob_len_idx..blob_len_idx + 4]
+            .copy_from_slice(&(declared.saturating_add(4096)).to_le_bytes());
+        let err = decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Truncated));
     }
 
     #[test]

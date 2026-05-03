@@ -103,6 +103,48 @@ pub fn read_signed_varint(data: &[u8], cur: &mut usize) -> Result<i32, SrsV2Erro
 }
 
 /// Serialize one MV component stream (e.g. backward MVs) using median prediction + varints.
+/// Label echoed in bench JSON for MV prediction (left / top / top-right median).
+pub const MV_PREDICTION_MODE_LABEL: &str = "median-left-top-topright";
+
+/// Byte length of one zigzag signed varint as written by [`write_signed_varint`].
+pub fn signed_varint_wire_bytes(v: i32) -> usize {
+    let mut tmp = Vec::new();
+    write_signed_varint(&mut tmp, v);
+    tmp.len()
+}
+
+/// Per-component delta statistics for a compact MV grid (two varints per macroblock: Δx, Δy).
+pub fn mv_compact_grid_delta_statistics(
+    mvs: &[(i32, i32)],
+    mb_cols: u32,
+    mb_rows: u32,
+) -> (u64, u64, u64, f64) {
+    let mut decoded = vec![(0i32, 0i32); mvs.len()];
+    let mut zero_v = 0_u64;
+    let mut nonzero_v = 0_u64;
+    let mut sum_abs = 0_u64;
+    for mby in 0..mb_rows {
+        for mbx in 0..mb_cols {
+            let idx = (mby * mb_cols + mbx) as usize;
+            let (px, py) = predict_mv_qpel(mbx, mby, mb_cols, &decoded);
+            let dx = mvs[idx].0 - px;
+            let dy = mvs[idx].1 - py;
+            for &d in &[dx, dy] {
+                if d == 0 {
+                    zero_v += 1;
+                } else {
+                    nonzero_v += 1;
+                }
+                sum_abs += d.unsigned_abs() as u64;
+            }
+            decoded[idx] = mvs[idx];
+        }
+    }
+    let denom = (2u64 * mvs.len() as u64).max(1);
+    let avg = sum_abs as f64 / denom as f64;
+    (zero_v, nonzero_v, sum_abs, avg)
+}
+
 pub fn encode_mv_grid_compact(mvs: &[(i32, i32)], mb_cols: u32, mb_rows: u32) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut decoded = vec![(0i32, 0i32); mvs.len()];
@@ -236,5 +278,40 @@ mod tests {
         let blob = rans_encode_mv_bytes(&b).unwrap();
         let out = rans_decode_mv_bytes(&blob, b.len(), blob.len().saturating_mul(64)).unwrap();
         assert_eq!(out, b);
+    }
+
+    #[test]
+    fn mv_rans_decode_step_budget_exhausted_fails() {
+        let b = encode_mv_grid_compact(&[(0, 0), (4, -8)], 2, 1);
+        let blob = rans_encode_mv_bytes(&b).unwrap();
+        assert!(rans_decode_mv_bytes(&blob, b.len(), 0).is_err());
+    }
+
+    #[test]
+    fn random_mv_grid_roundtrip_deterministic() {
+        let mb_cols = 5_u32;
+        let mb_rows = 5_u32;
+        let n = (mb_cols * mb_rows) as usize;
+        let mut mvs = vec![(0_i32, 0_i32); n];
+        let mut s: u64 = 0xDECAFBAD;
+        for mv in &mut mvs {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1);
+            mv.0 = ((s >> 17) & 0x1FF) as i32 - 256;
+            mv.1 = ((s >> 33) & 0x1FF) as i32 - 256;
+        }
+        let enc = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
+        let mut c = 0usize;
+        let dec = decode_mv_grid_compact(&enc, &mut c, mb_cols, mb_rows, |_x, _y| Ok(())).unwrap();
+        assert_eq!(c, enc.len());
+        assert_eq!(dec, mvs);
+    }
+
+    #[test]
+    fn half_grid_even_qpels_roundtrip() {
+        let mvs = vec![(0_i32, 0_i32), (8, -4), (-16, 12)];
+        let enc = encode_mv_grid_compact(&mvs, 3, 1);
+        let mut c = 0usize;
+        let dec = decode_mv_grid_compact(&enc, &mut c, 3, 1, |_x, _y| Ok(())).unwrap();
+        assert_eq!(dec, mvs);
     }
 }
