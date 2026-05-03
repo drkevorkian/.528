@@ -714,6 +714,19 @@ mod tests {
     }
 
     #[test]
+    fn static_v1_entropy_validate_ok_with_any_inter_syntax() {
+        assert!(SrsV2EncodeSettings::default()
+            .validate_entropy_model_inter()
+            .is_ok());
+        let compact = SrsV2EncodeSettings {
+            entropy_model_mode: SrsV2EntropyModelMode::StaticV1,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            ..Default::default()
+        };
+        assert!(compact.validate_entropy_model_inter().is_ok());
+    }
+
+    #[test]
     fn context_v1_entropy_requires_entropy_inter_syntax() {
         let s = SrsV2EncodeSettings {
             inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,

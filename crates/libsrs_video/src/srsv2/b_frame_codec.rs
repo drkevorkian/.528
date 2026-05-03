@@ -2,10 +2,7 @@
 //! integer MV, **14** per-MB blend + half-pel MV grid + optional weighted prediction, **16**/**18**
 //! compact / entropy MV grids).
 
-use super::context_inter_entropy::{
-    mv_fixed_grid_compact_contexts, rans_decode_mv_bytes_context_v1_fixed,
-    rans_encode_mv_bytes_context_v1,
-};
+use super::context_inter_entropy::{decode_mv_context_v1_fixed, encode_mv_context_v1_fixed};
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::inter_mv::{
@@ -18,11 +15,11 @@ use super::motion_search::{
     pick_mv, sad_16x16, sample_u8_plane, SrsV2InterMvBenchStats, SrsV2RdoBenchStats,
 };
 use super::p_frame_codec::{copy_chroma_mb8, copy_chroma_mb8_qpel};
-use super::rdo::b_blend_rdo_score;
 use super::rate_control::{
     rdo_lambda_effective, ResidualEntropy, SrsV2BMotionSearchMode, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterSyntaxMode, SrsV2RdoMode,
 };
+use super::rdo::b_blend_rdo_score;
 use super::reference_manager::SrsV2ReferenceManager;
 use super::residual_entropy::{decode_p_residual_chunk, encode_p_residual_chunk};
 use super::residual_tokens::residual_token_model;
@@ -868,7 +865,8 @@ pub fn choose_b_macroblock(
                     )
                 };
                 stats.b_sad_evaluations += 1;
-                let sw_s = b_blend_rdo_score(sw, lam as i64, base_bytes, weighted_extra, hp_pen_bytes);
+                let sw_s =
+                    b_blend_rdo_score(sw, lam as i64, base_bytes, weighted_extra, hp_pen_bytes);
                 stats.rdo.candidates_tested += 1;
                 cands.push((sw_s, BBlendModeWire::Weighted, wa, wb));
             }
@@ -1072,14 +1070,10 @@ pub fn encode_yuv420_b_payload_mb_blend(
                 SrsV2EntropyModelMode::StaticV1 => {
                     (rans_encode_mv_bytes(&ca)?, rans_encode_mv_bytes(&cb)?)
                 }
-                SrsV2EntropyModelMode::ContextV1 => {
-                    let ctx_a = mv_fixed_grid_compact_contexts(&ca, mb_cols, mb_rows)?;
-                    let ctx_b = mv_fixed_grid_compact_contexts(&cb, mb_cols, mb_rows)?;
-                    (
-                        rans_encode_mv_bytes_context_v1(&ca, &ctx_a)?,
-                        rans_encode_mv_bytes_context_v1(&cb, &ctx_b)?,
-                    )
-                }
+                SrsV2EntropyModelMode::ContextV1 => (
+                    encode_mv_context_v1_fixed(&ca, mb_cols, mb_rows)?,
+                    encode_mv_context_v1_fixed(&cb, mb_cols, mb_rows)?,
+                ),
             })
         } else {
             None
@@ -1322,9 +1316,7 @@ pub fn decode_yuv420_b_payload(
                 cur = blob_end;
                 let budget = blob_len.saturating_mul(64).min(512_000);
                 let compact = if entropy_b_ctx {
-                    rans_decode_mv_bytes_context_v1_fixed(
-                        blob, sym_count, mb_cols, mb_rows, budget,
-                    )?
+                    decode_mv_context_v1_fixed(blob, sym_count, mb_cols, mb_rows, budget)?
                 } else {
                     rans_decode_mv_bytes(blob, sym_count, budget)?
                 };

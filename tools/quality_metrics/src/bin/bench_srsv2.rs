@@ -18,10 +18,10 @@ use libsrs_video::{
     PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
     SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode,
-    SrsV2MotionEncodeStats,
-    SrsV2MotionSearchMode, SrsV2PartitionCostModel, SrsV2PartitionMapEncoding,
-    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager,
-    SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
+    SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
+    SrsV2PartitionMapEncoding, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
+    SrsV2ReferenceManager, SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2,
+    YuvFrame,
 };
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
@@ -225,13 +225,43 @@ struct Args {
     #[arg(long, default_value = "auto")]
     transform_size: String,
 
-    /// MV rANS entropy model when **`--inter-syntax entropy`**: **`static`** (**StaticV1**, default) or **`context`** (**ContextV1**).
+    /// MV rANS entropy model when **`--inter-syntax entropy`**: **`static`** (**StaticV1**, default) or **`context`** (**ContextV1**). **`context`** without **`--inter-syntax entropy`** is rejected at validation.
     #[arg(long, default_value = "static")]
     entropy_model: String,
 
-    /// Run **StaticV1** then **ContextV1** MV entropy (**requires** **`--inter-syntax entropy`**). A failed **ContextV1** pass keeps an error row; **StaticV1** is still reported.
+    /// Run **StaticV1** then **ContextV1** in one report (**requires** **`--inter-syntax entropy`**). Emits two JSON rows + `entropy_model_compare_summary` (Δ total bytes / Δ MV section). If **ContextV1** fails, its row records `entropy_failure_reason`; **StaticV1** still runs. No FFmpeg.
     #[arg(long, default_value_t = false)]
     compare_entropy_models: bool,
+
+    /// Build `var/bench/srsv2_h264_progress_summary.{json,md}` from existing bench JSON artifacts (**no encode**; other compare flags must be off).
+    #[arg(long, default_value_t = false)]
+    h264_progress_summary: bool,
+
+    /// Input: `--compare-entropy-models` JSON (`compare_entropy_models[]`).
+    #[arg(long, default_value = "var/bench/compare_entropy_models.json")]
+    progress_entropy_json: PathBuf,
+
+    /// Input: `--compare-partition-costs` JSON (`compare_partition_costs[]`).
+    #[arg(long, default_value = "var/bench/compare_partition_costs.json")]
+    progress_partition_costs_json: PathBuf,
+
+    /// Input: `--sweep-quality-bitrate` JSON (`rows[]`, `pareto`).
+    #[arg(long, default_value = "var/bench/sweep_quality_bitrate.json")]
+    progress_sweep_json: PathBuf,
+
+    /// Optional input: primary **`bench_srsv2`** JSON that included **`--compare-x264`** (`table[]`).
+    #[arg(long)]
+    progress_x264_json: Option<PathBuf>,
+
+    /// Optional input: **`--compare-b-modes`** JSON (`compare_b_modes[]`) for B-half / weighted facts.
+    #[arg(long)]
+    progress_b_modes_json: Option<PathBuf>,
+
+    #[arg(long, default_value = "var/bench/srsv2_h264_progress_summary.json")]
+    h264_progress_summary_out_json: PathBuf,
+
+    #[arg(long, default_value = "var/bench/srsv2_h264_progress_summary.md")]
+    h264_progress_summary_out_md: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -411,6 +441,12 @@ struct MotionBenchReport {
     avg_fractional_mv_qpel_per_mb: f64,
     /// Experimental B-frame integer ME mode (`FR2` rev **13** bench).
     b_motion_search_mode: String,
+    /// Sum over **P** frames: macroblocks where **zero MV** beat ME under **RdoFast** λ·MV-bytes.
+    #[serde(default)]
+    rdo_inter_zero_mv_wins: u64,
+    /// Sum over **P** frames: macroblocks where **ME MV** was kept after **RdoFast**.
+    #[serde(default)]
+    rdo_inter_me_mv_wins: u64,
 }
 
 /// Aggregated partition / transform counters from **`SrsV2MotionEncodeStats::partition`** over **P** frames.
@@ -519,6 +555,12 @@ struct Srsv2Details {
     rdo_residual_decisions: u64,
     #[serde(default)]
     rdo_no_residual_decisions: u64,
+    /// **RdoFast** P-frame MV: macroblocks where **zero MV** beat ME (λ·MV side cost).
+    #[serde(default)]
+    rdo_inter_zero_mv_wins: u64,
+    /// **RdoFast** P-frame MV: macroblocks where **ME MV** was chosen.
+    #[serde(default)]
+    rdo_inter_me_mv_wins: u64,
     #[serde(default)]
     estimated_bits_used_for_decision: u64,
     legacy_explicit_total_payload_bytes: Option<u64>,
@@ -613,6 +655,8 @@ impl Default for Srsv2Details {
             rdo_halfpel_decisions: 0,
             rdo_residual_decisions: 0,
             rdo_no_residual_decisions: 0,
+            rdo_inter_zero_mv_wins: 0,
+            rdo_inter_me_mv_wins: 0,
             estimated_bits_used_for_decision: 0,
             legacy_explicit_total_payload_bytes: None,
             rc: None,
@@ -744,6 +788,9 @@ struct BenchReport {
     compare_partition_costs: Option<Vec<VariantBenchEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_entropy_models: Option<Vec<EntropyModelCompareEntry>>,
+    /// When `--compare-entropy-models`: Δ-bytes verdict (StaticV1 vs ContextV1 total and MV section).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entropy_model_compare_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     match_x264_bitrate_note: Option<String>,
     git_commit: Option<String>,
@@ -901,6 +948,25 @@ fn summarize_frame_bytes_hist(v: &[u64]) -> String {
 }
 
 fn validate_args(args: &Args) -> Result<()> {
+    if args.h264_progress_summary {
+        let conflict = args.sweep
+            || args.sweep_quality_bitrate
+            || args.compare_residual_modes
+            || args.compare_b_modes
+            || args.compare_inter_syntax
+            || args.compare_rdo
+            || args.compare_partitions
+            || args.compare_partition_costs
+            || args.compare_entropy_models
+            || args.compare_x264
+            || args.match_x264_bitrate;
+        if conflict {
+            bail!(
+                "--h264-progress-summary only reads JSON inputs; disable sweep/compare/x264 encode flags."
+            );
+        }
+        return Ok(());
+    }
     if args.match_x264_bitrate {
         bail!("bitrate matching is not implemented; use sweeps or target bitrate mode.");
     }
@@ -931,7 +997,9 @@ fn validate_args(args: &Args) -> Result<()> {
         bail!("--min-qp must be <= --max-qp");
     }
     if args.compare_residual_modes && (args.sweep || args.sweep_quality_bitrate) {
-        bail!("--compare-residual-modes cannot be combined with --sweep or --sweep-quality-bitrate");
+        bail!(
+            "--compare-residual-modes cannot be combined with --sweep or --sweep-quality-bitrate"
+        );
     }
     if args.sweep && args.sweep_quality_bitrate {
         bail!("--sweep and --sweep-quality-bitrate are mutually exclusive");
@@ -958,7 +1026,9 @@ fn validate_args(args: &Args) -> Result<()> {
     {
         bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, or --compare-b-modes");
     }
-    if args.compare_b_modes && (args.sweep || args.compare_residual_modes || args.sweep_quality_bitrate) {
+    if args.compare_b_modes
+        && (args.sweep || args.compare_residual_modes || args.sweep_quality_bitrate)
+    {
         bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, or --compare-residual-modes");
     }
     if args.compare_b_modes {
@@ -1318,6 +1388,8 @@ struct MotionAgg {
     rdo_halfpel_decisions: u64,
     rdo_residual_decisions: u64,
     rdo_no_residual_decisions: u64,
+    rdo_inter_zero_mv_wins: u64,
+    rdo_inter_me_mv_wins: u64,
     rdo_estimated_bits: u64,
     partition_16x16_count: u64,
     partition_16x8_count: u64,
@@ -1504,6 +1576,8 @@ fn motion_report_from_pass(settings: &SrsV2EncodeSettings, m: &MotionAgg) -> Mot
         additional_subpel_evaluations_total: m.additional_subpel_evaluations,
         avg_fractional_mv_qpel_per_mb: avg_frac,
         b_motion_search_mode: b_motion_mode_cli_label(settings.b_motion_search_mode).to_string(),
+        rdo_inter_zero_mv_wins: m.rdo_inter_zero_mv_wins,
+        rdo_inter_me_mv_wins: m.rdo_inter_me_mv_wins,
     }
 }
 
@@ -1728,6 +1802,8 @@ fn run_srsv2_numbers_b_gop(
                     motion_agg.rdo_skip_decisions += rd.skip_decisions;
                     motion_agg.rdo_residual_decisions += rd.residual_decisions;
                     motion_agg.rdo_no_residual_decisions += rd.no_residual_decisions;
+                    motion_agg.rdo_inter_zero_mv_wins += rd.inter_zero_mv_wins;
+                    motion_agg.rdo_inter_me_mv_wins += rd.inter_me_mv_wins;
                     motion_agg.rdo_estimated_bits += rd.estimated_bits_used_for_decision;
                     motion_agg_add_partition(&mut motion_agg, &motion_frame);
                 }
@@ -2002,6 +2078,8 @@ fn run_srsv2_numbers(
             motion_agg.rdo_skip_decisions += rd.skip_decisions;
             motion_agg.rdo_residual_decisions += rd.residual_decisions;
             motion_agg.rdo_no_residual_decisions += rd.no_residual_decisions;
+            motion_agg.rdo_inter_zero_mv_wins += rd.inter_zero_mv_wins;
+            motion_agg.rdo_inter_me_mv_wins += rd.inter_me_mv_wins;
             motion_agg.rdo_estimated_bits += rd.estimated_bits_used_for_decision;
             motion_agg_add_partition(&mut motion_agg, &motion_frame);
         }
@@ -2249,20 +2327,17 @@ fn pass_to_details(
     for pl in &p.payloads {
         match pl.get(3).copied() {
             Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
-            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25) => p_bytes.push(pl.len() as u64),
+            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25) => {
+                p_bytes.push(pl.len() as u64)
+            }
             Some(10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26) => b_bytes.push(pl.len() as u64),
             Some(12) => alt_bytes.push(pl.len() as u64),
             _ => {}
         }
     }
     let fr2 = fr2_revision_counts(&p.payloads);
-    let bframe_count = fr2.rev10
-        + fr2.rev11
-        + fr2.rev13
-        + fr2.rev14
-        + fr2.rev16
-        + fr2.rev18
-        + fr2.rev24;
+    let bframe_count =
+        fr2.rev10 + fr2.rev11 + fr2.rev13 + fr2.rev14 + fr2.rev16 + fr2.rev18 + fr2.rev24;
     let alt_ref_count = fr2.rev12;
     let enc_bytes: u64 = p.byte_hist.iter().sum();
     let raw_bytes = raw_len_for_bitrate(args);
@@ -2323,6 +2398,8 @@ fn pass_to_details(
         rdo_halfpel_decisions: m.rdo_halfpel_decisions,
         rdo_residual_decisions: m.rdo_residual_decisions,
         rdo_no_residual_decisions: m.rdo_no_residual_decisions,
+        rdo_inter_zero_mv_wins: m.rdo_inter_zero_mv_wins,
+        rdo_inter_me_mv_wins: m.rdo_inter_me_mv_wins,
         estimated_bits_used_for_decision: m.rdo_estimated_bits,
         legacy_explicit_total_payload_bytes: p.legacy_explicit_total_payload_bytes,
         rc: Some(rc_report_from_pass(args, settings, p)),
@@ -2555,6 +2632,7 @@ fn run_compare_b_modes_report(
         compare_partitions: None,
         compare_partition_costs: None,
         compare_entropy_models: None,
+        entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2625,6 +2703,7 @@ fn run_single_report(
         compare_partitions: None,
         compare_partition_costs: None,
         compare_entropy_models: None,
+        entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2764,6 +2843,7 @@ fn run_compare_residual_report(
         compare_partitions: None,
         compare_partition_costs: None,
         compare_entropy_models: None,
+        entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -2895,6 +2975,7 @@ fn run_compare_inter_syntax_report(
         compare_partitions: None,
         compare_partition_costs: None,
         compare_entropy_models: None,
+        entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3022,6 +3103,7 @@ fn run_compare_rdo_report(
         compare_partitions: None,
         compare_partition_costs: None,
         compare_entropy_models: None,
+        entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3154,6 +3236,7 @@ fn run_compare_partitions_report(
         compare_partitions: Some(entries),
         compare_partition_costs: None,
         compare_entropy_models: None,
+        entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3309,10 +3392,49 @@ fn run_compare_partition_costs_report(
         compare_partitions: None,
         compare_partition_costs: Some(entries),
         compare_entropy_models: None,
+        entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
+}
+
+/// One-line engineering summary for JSON/Markdown when `--compare-entropy-models` produces two rows.
+fn summarize_entropy_model_compare(entries: &[EntropyModelCompareEntry]) -> Option<String> {
+    let st = entries.iter().find(|e| e.entropy_model_mode == "static")?;
+    let ctx = entries.iter().find(|e| e.entropy_model_mode == "context")?;
+    if st.ok && ctx.ok {
+        let dt = ctx.row.bytes as i64 - st.row.bytes as i64;
+        let d_mv = ctx.context_mv_bytes as i64 - st.static_mv_bytes as i64;
+        Some(format!(
+            "Total compressed bytes: StaticV1={}, ContextV1={}, Δ(context−static)={:+}. MV entropy section bytes: StaticV1={}, ContextV1={}, Δ={:+}.",
+            st.row.bytes,
+            ctx.row.bytes,
+            dt,
+            st.static_mv_bytes,
+            ctx.context_mv_bytes,
+            d_mv
+        ))
+    } else if st.ok && !ctx.ok {
+        Some(format!(
+            "StaticV1 ok (total_bytes={} static_mv_bytes={}). ContextV1 failed: {}",
+            st.row.bytes,
+            st.static_mv_bytes,
+            ctx.error.as_deref().unwrap_or("unknown")
+        ))
+    } else if !st.ok && ctx.ok {
+        Some(format!(
+            "StaticV1 failed: {}. ContextV1 ok (total_bytes={} context_mv_bytes={}).",
+            st.error.as_deref().unwrap_or("unknown"),
+            ctx.row.bytes,
+            ctx.context_mv_bytes
+        ))
+    } else {
+        Some(format!(
+            "Both rows failed: static_err={:?} context_err={:?}",
+            st.error, ctx.error
+        ))
+    }
 }
 
 fn entropy_model_compare_row(
@@ -3349,14 +3471,7 @@ fn entropy_model_compare_row(
         ok: true,
         error: None,
         row: pass_to_row(args, label, p),
-        details: pass_to_details(
-            args,
-            seq,
-            settings,
-            &args.residual_entropy,
-            p,
-            deblock,
-        ),
+        details: pass_to_details(args, seq, settings, &args.residual_entropy, p, deblock),
     }
 }
 
@@ -3428,10 +3543,7 @@ fn run_compare_entropy_models_report(
             }
         };
         debug_assert_eq!(settings.entropy_model_mode, mode);
-        debug_assert_eq!(
-            settings.inter_syntax_mode,
-            SrsV2InterSyntaxMode::EntropyV1
-        );
+        debug_assert_eq!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1);
 
         match run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
             Ok(numbers) => {
@@ -3486,6 +3598,7 @@ fn run_compare_entropy_models_report(
     }
 
     let srsv2 = primary.unwrap_or_else(|| entries[0].details.clone());
+    let entropy_model_compare_summary = summarize_entropy_model_compare(&entries);
 
     Ok(BenchReport {
         note: "Engineering measurement only; not a marketing claim.",
@@ -3507,6 +3620,7 @@ fn run_compare_entropy_models_report(
         compare_partitions: None,
         compare_partition_costs: None,
         compare_entropy_models: Some(entries),
+        entropy_model_compare_summary,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3714,9 +3828,31 @@ fn sweep_to_markdown(rep: &SweepFileReport) -> String {
     out
 }
 
+fn run_h264_progress_summary(args: &Args) -> Result<()> {
+    let inputs = quality_metrics::srsv2_progress_report::ProgressReportInputs {
+        entropy_models_json: &args.progress_entropy_json,
+        partition_costs_json: &args.progress_partition_costs_json,
+        sweep_quality_bitrate_json: &args.progress_sweep_json,
+        compare_x264_bench_json: args.progress_x264_json.as_deref(),
+        compare_b_modes_json: args.progress_b_modes_json.as_deref(),
+    };
+    let rep = quality_metrics::srsv2_progress_report::write_progress_summary_files(
+        &inputs,
+        &args.h264_progress_summary_out_json,
+        &args.h264_progress_summary_out_md,
+    )
+    .map_err(|e| anyhow!("progress summary: {e}"))?;
+    println!("{}", serde_json::to_string_pretty(&rep)?);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
+
+    if args.h264_progress_summary {
+        return run_h264_progress_summary(&args);
+    }
 
     let raw = fs::read(&args.input).with_context(|| format!("read {}", args.input.display()))?;
     let expected_frame = yuv420_frame_bytes(args.width, args.height)?;
@@ -3734,19 +3870,19 @@ fn main() -> Result<()> {
     }
 
     if args.sweep_quality_bitrate {
-        let sweep_cfg = quality_metrics::srsv2_sweep::SweepConfig {
-            width: args.width,
-            height: args.height,
-            frames: args.frames,
-            fps: args.fps,
-            keyint: args.keyint,
-            motion_radius: args.motion_radius,
-            reference_frames: args.reference_frames,
-            residual_entropy: args.residual_entropy.clone(),
-            pareto_ssim_threshold: args.sweep_ssim_threshold,
-            pareto_byte_budget: args.sweep_byte_budget,
-            max_rows: None,
-        };
+        let sweep_cfg = quality_metrics::srsv2_sweep::SweepConfig::from_bench_cli(
+            args.width,
+            args.height,
+            args.frames,
+            args.fps,
+            args.keyint,
+            args.motion_radius,
+            args.reference_frames,
+            args.residual_entropy.clone(),
+            args.sweep_ssim_threshold,
+            args.sweep_byte_budget,
+            None,
+        );
         let report = quality_metrics::srsv2_sweep::run_quality_bitrate_sweep(&sweep_cfg, &raw)
             .map_err(|e| anyhow!("quality/bitrate sweep: {e}"))?;
         if let Some(p) = args.report_json.parent() {
@@ -4224,7 +4360,9 @@ fn to_markdown(r: &BenchReport) -> String {
 
     if let Some(rows) = &r.compare_entropy_models {
         out.push_str("\n## MV entropy model comparison (`--compare-entropy-models`)\n\n");
-        out.push_str("| Entropy model | Bytes | MV bytes | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS | Status |\n");
+        out.push_str(
+            "| Model | Bytes | MV bytes | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS | Status |\n",
+        );
         out.push_str("|---|---:|---:|---:|---:|---:|---:|---|\n");
         for e in rows {
             let mv_wire = e.static_mv_bytes.saturating_add(e.context_mv_bytes);
@@ -4252,7 +4390,13 @@ fn to_markdown(r: &BenchReport) -> String {
                 status
             ));
         }
-        out.push_str("\n_JSON rows include `entropy_model_mode`, `static_mv_bytes`, `context_mv_bytes`, `mv_delta_*`, `entropy_context_count`, `entropy_symbol_count`, `entropy_failure_reason`, `fr2_revision_counts`, and nested `details`._\n");
+        if let Some(sum) = &r.entropy_model_compare_summary {
+            out.push('\n');
+            out.push_str("**Summary:** ");
+            out.push_str(sum);
+            out.push('\n');
+        }
+        out.push_str("\n_JSON: `compare_entropy_models[]` includes `entropy_model_mode`, `static_mv_bytes`, `context_mv_bytes`, `mv_delta_zero_count`, `mv_delta_nonzero_count`, `mv_delta_avg_abs`, `entropy_context_count`, `entropy_symbol_count`, `entropy_failure_reason`, `fr2_revision_counts`, `entropy_model_compare_summary` (top-level), nested `details`._\n");
     }
 
     if let Some(note) = &r.match_x264_bitrate_note {
@@ -4640,6 +4784,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let raw = fs::read(&a.input).unwrap();
         let fb = yuv420_frame_bytes(a.width, a.height).unwrap();
@@ -4710,6 +4862,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         assert!(validate_args(&a).is_err());
         a.bframes = 0;
@@ -4779,6 +4939,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -4850,6 +5018,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -4921,6 +5097,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -4994,6 +5178,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         assert!(validate_args(&a).is_err());
         a.reference_frames = 2;
@@ -5081,6 +5273,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(
@@ -5159,6 +5359,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -5254,6 +5462,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -5332,6 +5548,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         validate_args(&args).unwrap();
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -5415,6 +5639,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         validate_args(&a).unwrap();
         let s = build_settings(&a, ResidualEntropy::Auto).unwrap();
@@ -5532,6 +5764,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
         let seq = build_seq_header(&args, &settings);
@@ -5603,6 +5843,8 @@ mod tests {
                 rdo_halfpel_decisions: 0,
                 rdo_residual_decisions: 0,
                 rdo_no_residual_decisions: 0,
+                rdo_inter_zero_mv_wins: 0,
+                rdo_inter_me_mv_wins: 0,
                 estimated_bits_used_for_decision: 0,
                 legacy_explicit_total_payload_bytes: None,
                 rc: Some(RcBenchReport {
@@ -5654,6 +5896,8 @@ mod tests {
                     additional_subpel_evaluations_total: 0,
                     avg_fractional_mv_qpel_per_mb: 0.0,
                     b_motion_search_mode: "off".to_string(),
+                    rdo_inter_zero_mv_wins: 0,
+                    rdo_inter_me_mv_wins: 0,
                 }),
                 deblock: DeblockBenchReport {
                     loop_filter_mode: "off".to_string(),
@@ -5705,6 +5949,7 @@ mod tests {
             compare_partitions: None,
             compare_partition_costs: None,
             compare_entropy_models: None,
+            entropy_model_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -5778,6 +6023,8 @@ mod tests {
                 rdo_halfpel_decisions: 0,
                 rdo_residual_decisions: 0,
                 rdo_no_residual_decisions: 0,
+                rdo_inter_zero_mv_wins: 0,
+                rdo_inter_me_mv_wins: 0,
                 estimated_bits_used_for_decision: 0,
                 legacy_explicit_total_payload_bytes: None,
                 rc: None,
@@ -5866,6 +6113,8 @@ mod tests {
                     rdo_halfpel_decisions: 0,
                     rdo_residual_decisions: 0,
                     rdo_no_residual_decisions: 0,
+                    rdo_inter_zero_mv_wins: 0,
+                    rdo_inter_me_mv_wins: 0,
                     estimated_bits_used_for_decision: 0,
                     legacy_explicit_total_payload_bytes: None,
                     rc: None,
@@ -5900,6 +6149,7 @@ mod tests {
             compare_partitions: None,
             compare_partition_costs: None,
             compare_entropy_models: None,
+            entropy_model_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -5929,6 +6179,7 @@ mod tests {
             compare_partitions: Some(vec![]),
             compare_partition_costs: None,
             compare_entropy_models: None,
+            entropy_model_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -5959,6 +6210,7 @@ mod tests {
             compare_partitions: None,
             compare_partition_costs: Some(vec![]),
             compare_entropy_models: None,
+            entropy_model_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -6035,6 +6287,8 @@ mod tests {
                     rdo_halfpel_decisions: 0,
                     rdo_residual_decisions: 0,
                     rdo_no_residual_decisions: 0,
+                    rdo_inter_zero_mv_wins: 0,
+                    rdo_inter_me_mv_wins: 0,
                     estimated_bits_used_for_decision: 0,
                     legacy_explicit_total_payload_bytes: None,
                     rc: None,
@@ -6131,6 +6385,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "context".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(err.contains("entropy-model context"), "{err}");
@@ -6200,12 +6462,96 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let s = build_settings(&base, ResidualEntropy::Explicit).unwrap();
         assert_eq!(s.entropy_model_mode, SrsV2EntropyModelMode::StaticV1);
         base.entropy_model = "context".to_string();
         let s2 = build_settings(&base, ResidualEntropy::Explicit).unwrap();
         assert_eq!(s2.entropy_model_mode, SrsV2EntropyModelMode::ContextV1);
+    }
+
+    #[test]
+    fn validate_rejects_h264_progress_summary_with_sweep() {
+        let a = Args {
+            input: PathBuf::from("nope"),
+            width: 64,
+            height: 64,
+            frames: 1,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 16,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: true,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "exhaustive-small".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+            inter_syntax: "raw".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
+            compare_inter_syntax: false,
+            compare_rdo: false,
+            compare_partitions: false,
+            compare_partition_costs: false,
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
+            h264_progress_summary: true,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
+        };
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(err.contains("h264-progress-summary"), "{err}");
     }
 
     #[test]
@@ -6271,6 +6617,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: true,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "{err}");
@@ -6332,6 +6686,7 @@ mod tests {
                 details: Srsv2Details::default(),
             },
         ];
+        let summary = summarize_entropy_model_compare(&rows);
         let r = BenchReport {
             note: "n",
             residual_note: "n",
@@ -6352,6 +6707,7 @@ mod tests {
             compare_partitions: None,
             compare_partition_costs: None,
             compare_entropy_models: Some(rows),
+            entropy_model_compare_summary: summary,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "x".into(),
@@ -6362,9 +6718,12 @@ mod tests {
         assert!(js.contains("compare_entropy_models"));
         assert!(js.contains("entropy_failure_reason"));
         assert!(js.contains("fr2_revision_counts"));
+        assert!(js.contains("entropy_model_compare_summary"), "{js}");
         let md = to_markdown(&r);
         assert!(md.contains("MV entropy model comparison"));
         assert!(md.contains("| static |"));
+        assert!(md.contains("| Model |"));
+        assert!(md.contains("**Summary:**"));
     }
 
     #[test]
@@ -6430,6 +6789,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         assert!(validate_args(&a).is_err());
         a.quality = Some(22);
@@ -6499,6 +6866,14 @@ mod tests {
             transform_size: "auto".to_string(),
             entropy_model: "static".to_string(),
             compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         assert!(validate_args(&a).is_err());
         a.aq = "off".to_string();

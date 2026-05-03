@@ -10,8 +10,7 @@ use super::block_aq::{
     validate_qp_clip_range, validate_wire_qp_delta,
 };
 use super::context_inter_entropy::{
-    mv_partitioned_compact_contexts, rans_decode_mv_bytes_context_v1_partitioned,
-    rans_encode_mv_bytes_context_v1,
+    decode_mv_context_v1_partitioned, encode_mv_context_v1_partitioned,
 };
 use super::dct::{fdct_4x4, fdct_8x8};
 use super::error::SrsV2Error;
@@ -33,7 +32,10 @@ use super::rate_control::{
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2PartitionCostModel,
     SrsV2PartitionMapEncoding, SrsV2SubpelMode, SrsV2TransformSizeMode,
 };
-use super::rdo::{choose_min_partition_by_precomputed_scores, partition_header_aware_score, partition_rdo_fast_score};
+use super::rdo::{
+    choose_min_partition_by_precomputed_scores, partition_header_aware_score,
+    partition_rdo_fast_score,
+};
 use super::residual_entropy::{
     decode_p_residual_chunk, decode_p_residual_chunk_4x4, encode_p_residual_chunk,
     encode_p_residual_chunk_4x4, BlockResidualCoding, PResidualChunkKind,
@@ -626,7 +628,8 @@ fn partition_choice_for_mb(
                 scored[i] = (pt, score);
             }
 
-            let best_pt = choose_min_partition_by_precomputed_scores(&scored[..cands.len()])?.chosen_id;
+            let best_pt =
+                choose_min_partition_by_precomputed_scores(&scored[..cands.len()])?.chosen_id;
 
             if sad_only_choice != best_pt {
                 match cm {
@@ -1227,9 +1230,7 @@ pub fn encode_yuv420_p_payload_var_partition(
         let mv_blob = match settings.entropy_model_mode {
             SrsV2EntropyModelMode::StaticV1 => rans_encode_mv_bytes(&mv_compact)?,
             SrsV2EntropyModelMode::ContextV1 => {
-                let ctx =
-                    mv_partitioned_compact_contexts(&mv_compact, mb_cols, mb_rows, &partitions)?;
-                rans_encode_mv_bytes_context_v1(&mv_compact, &ctx)?
+                encode_mv_context_v1_partitioned(&mv_compact, mb_cols, mb_rows, &partitions)?
             }
         };
         let sym_count =
@@ -1380,7 +1381,7 @@ pub fn decode_yuv420_p_payload_var_partition(
         let blob = &payload[cur..blob_end];
         cur = blob_end;
         let budget = blob_len.saturating_mul(64).min(512_000);
-        let compact = rans_decode_mv_bytes_context_v1_partitioned(
+        let compact = decode_mv_context_v1_partitioned(
             blob, sym_count, mb_cols, mb_rows, partitions, budget,
         )?;
         if compact.len() != sym_count {

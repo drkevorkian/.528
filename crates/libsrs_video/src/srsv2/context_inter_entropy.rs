@@ -1,4 +1,20 @@
-//! Context-conditioned **static** frequency tables for **ContextV1** inter MV rANS (**FR2** rev **23+**).
+//! **ContextV1** inter motion-vector entropy for SRSV2 (**FR2** rev **23+**).
+//!
+//! # Model
+//!
+//! ContextV1 uses **16 independent static rANS frequency tables** (one per context ID). Each table
+//! is fixed for the session: **not** CABAC-class adaptive arithmetic coding. Conditioning selects
+//! *which* static table encodes the next compact-MV byte; tables themselves do not update from
+//! previously coded symbols in this revision.
+//!
+//! # Properties
+//!
+//! - **Deterministic:** same compact MV bytes + grid/partition layout ⇒ same context IDs and codeword.
+//! - **Hostile-input bounded:** decode uses an explicit per-payload **symbol decode budget**
+//!   (`decode_budget`) so degenerate bitstreams cannot force unbounded rANS renorm work.
+//!
+//! Callers build **compact** MV bytes via [`crate::srsv2::inter_mv`] (`encode_mv_grid_compact`,
+//! `encode_mv_stream_partitioned`). This module owns labeling + multi-context rANS only.
 
 use libsrs_bitio::{
     rans_decode_step_symbol, rans_encode_symbols_multi_context, RansModel, RANS_SCALE,
@@ -8,6 +24,88 @@ use super::error::SrsV2Error;
 use super::inter_mv::{read_signed_varint, validate_partition_reserved_bits};
 
 const MV_CONTEXT_COUNT: usize = 16;
+
+/// Snapshot of the ContextV1 MV entropy design (for diagnostics / tooling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextV1ModelSummary {
+    /// Distinct context IDs: **`0 .. context_count`**.
+    pub context_count: usize,
+    /// rANS frequency normalization scale (matches [`RANS_SCALE`]).
+    pub rans_scale: u32,
+    /// Short description of how per-context frequencies are derived (fixed, indexed tables).
+    pub model_derivation: &'static str,
+}
+
+/// Returns a stable summary of the ContextV1 static multi-context rANS MV entropy model.
+#[must_use]
+pub fn context_model_summary() -> ContextV1ModelSummary {
+    ContextV1ModelSummary {
+        context_count: MV_CONTEXT_COUNT,
+        rans_scale: RANS_SCALE,
+        model_derivation: "per-context-id static 256-symbol frequency tables; deterministic tweak from context index",
+    }
+}
+
+/// Encode **compact** MV bytes (**fixed 16×16 macroblock grid**) with ContextV1 multi-context rANS.
+///
+/// `mv_compact` must be exactly the wire produced by [`crate::srsv2::inter_mv::encode_mv_grid_compact`]
+/// for `(mb_cols * mb_rows)` macroblocks.
+pub fn encode_mv_context_v1_fixed(
+    mv_compact: &[u8],
+    mb_cols: u32,
+    mb_rows: u32,
+) -> Result<Vec<u8>, SrsV2Error> {
+    let labels = fixed_grid_context_labels(mv_compact, mb_cols, mb_rows)?;
+    encode_mv_compact_with_context_labels(mv_compact, &labels)
+}
+
+/// Decode ContextV1 MV rANS blob for a **fixed macroblock grid** back to compact MV bytes.
+///
+/// `sym_count` is the compact byte length stored beside the blob on the wire. `decode_budget`
+/// bounds rANS normalize/repair steps (hostile-input safe).
+pub fn decode_mv_context_v1_fixed(
+    blob: &[u8],
+    sym_count: usize,
+    mb_cols: u32,
+    mb_rows: u32,
+    decode_budget: usize,
+) -> Result<Vec<u8>, SrsV2Error> {
+    decode_mv_compact_streaming_fixed(blob, sym_count, mb_cols, mb_rows, decode_budget)
+}
+
+/// Encode **compact** MV bytes for **variable partition** layouts with ContextV1 multi-context rANS.
+///
+/// `partition_types` is one wire partition byte per macroblock (see [`crate::srsv2::inter_mv`]).
+pub fn encode_mv_context_v1_partitioned(
+    mv_compact: &[u8],
+    mb_cols: u32,
+    mb_rows: u32,
+    partition_types: &[u8],
+) -> Result<Vec<u8>, SrsV2Error> {
+    let labels = partitioned_context_labels(mv_compact, mb_cols, mb_rows, partition_types)?;
+    encode_mv_compact_with_context_labels(mv_compact, &labels)
+}
+
+/// Decode ContextV1 MV rANS for **partitioned** PU streams back to compact MV bytes.
+pub fn decode_mv_context_v1_partitioned(
+    blob: &[u8],
+    sym_count: usize,
+    mb_cols: u32,
+    mb_rows: u32,
+    partition_types: &[u8],
+    decode_budget: usize,
+) -> Result<Vec<u8>, SrsV2Error> {
+    decode_mv_compact_streaming_partitioned(
+        blob,
+        sym_count,
+        mb_cols,
+        mb_rows,
+        partition_types,
+        decode_budget,
+    )
+}
+
+// --- labeling (private): one context byte per compact MV byte ------------------------------------
 
 #[inline]
 fn delta_mag_bucket_qpel(d: i32) -> u8 {
@@ -27,7 +125,7 @@ fn mv_context_id_from_prev_residual_deltas(prev_dx: i32, prev_dy: i32) -> u8 {
     (bx << 2) | by
 }
 
-pub fn mv_fixed_grid_compact_contexts(
+fn fixed_grid_context_labels(
     compact: &[u8],
     mb_cols: u32,
     mb_rows: u32,
@@ -58,7 +156,7 @@ pub fn mv_fixed_grid_compact_contexts(
     Ok(v)
 }
 
-pub fn mv_partitioned_compact_contexts(
+fn partitioned_context_labels(
     compact: &[u8],
     mb_cols: u32,
     mb_rows: u32,
@@ -101,6 +199,8 @@ pub fn mv_partitioned_compact_contexts(
     Ok(v)
 }
 
+// --- rANS core (private) -----------------------------------------------------------------------
+
 fn model_for_ctx(ctx: usize) -> Result<RansModel, SrsV2Error> {
     let mut freqs = vec![14_u32; 256];
     freqs[0] = RANS_SCALE - 255 * 14;
@@ -110,7 +210,7 @@ fn model_for_ctx(ctx: usize) -> Result<RansModel, SrsV2Error> {
     RansModel::try_from_freqs(freqs).map_err(|_| SrsV2Error::syntax("MV context rANS model"))
 }
 
-fn inter_mv_context_models_v1() -> Result<[RansModel; MV_CONTEXT_COUNT], SrsV2Error> {
+fn build_context_models_v1() -> Result<[RansModel; MV_CONTEXT_COUNT], SrsV2Error> {
     let v: Vec<RansModel> = (0..MV_CONTEXT_COUNT)
         .map(model_for_ctx)
         .collect::<Result<_, _>>()?;
@@ -118,22 +218,22 @@ fn inter_mv_context_models_v1() -> Result<[RansModel; MV_CONTEXT_COUNT], SrsV2Er
         .map_err(|_| SrsV2Error::syntax("MV context model array"))
 }
 
-pub fn rans_encode_mv_bytes_context_v1(
+fn encode_mv_compact_with_context_labels(
     compact: &[u8],
-    contexts: &[u8],
+    context_labels: &[u8],
 ) -> Result<Vec<u8>, SrsV2Error> {
-    if compact.len() != contexts.len() {
+    if compact.len() != context_labels.len() {
         return Err(SrsV2Error::syntax("MV context length mismatch"));
     }
-    for &c in contexts {
+    for &c in context_labels {
         if usize::from(c) >= MV_CONTEXT_COUNT {
             return Err(SrsV2Error::syntax("MV context id out of range"));
         }
     }
-    let models_arr = inter_mv_context_models_v1()?;
+    let models_arr = build_context_models_v1()?;
     let models: Vec<RansModel> = models_arr.into_iter().collect();
     let symbols: Vec<usize> = compact.iter().map(|&b| usize::from(b)).collect();
-    rans_encode_symbols_multi_context(&models, &symbols, contexts)
+    rans_encode_symbols_multi_context(&models, &symbols, context_labels)
         .map_err(|_| SrsV2Error::syntax("MV context rANS encode"))
 }
 
@@ -270,14 +370,14 @@ impl<'a> MvPartitionCtxParse<'a> {
     }
 }
 
-pub fn rans_decode_mv_bytes_context_v1_fixed(
+fn decode_mv_compact_streaming_fixed(
     blob: &[u8],
     sym_count: usize,
     mb_cols: u32,
     mb_rows: u32,
     decode_budget: usize,
 ) -> Result<Vec<u8>, SrsV2Error> {
-    let models_arr = inter_mv_context_models_v1()?;
+    let models_arr = build_context_models_v1()?;
     let models: Vec<RansModel> = models_arr.into_iter().collect();
     if blob.len() < 4 {
         return Err(SrsV2Error::Truncated);
@@ -301,11 +401,10 @@ pub fn rans_decode_mv_bytes_context_v1_fixed(
     if idx != blob.len() {
         return Err(SrsV2Error::syntax("trailing rANS bytes"));
     }
-    let _ = sm;
     Ok(out)
 }
 
-pub fn rans_decode_mv_bytes_context_v1_partitioned(
+fn decode_mv_compact_streaming_partitioned(
     blob: &[u8],
     sym_count: usize,
     mb_cols: u32,
@@ -313,7 +412,7 @@ pub fn rans_decode_mv_bytes_context_v1_partitioned(
     partition_types: &[u8],
     decode_budget: usize,
 ) -> Result<Vec<u8>, SrsV2Error> {
-    let models_arr = inter_mv_context_models_v1()?;
+    let models_arr = build_context_models_v1()?;
     let models: Vec<RansModel> = models_arr.into_iter().collect();
     if blob.len() < 4 {
         return Err(SrsV2Error::Truncated);
@@ -348,8 +447,19 @@ mod tests {
         rans_encode_mv_bytes, P_PART_WIRE_8X8,
     };
     use crate::srsv2::SrsV2Error;
-    use libsrs_bitio::{rans_decode_symbols_multi_context, rans_encode_symbols_multi_context};
+    use libsrs_bitio::{
+        rans_decode_symbols_multi_context, rans_encode_symbols_multi_context, RansModel,
+    };
 
+    #[test]
+    fn context_model_summary_matches_constants() {
+        let s = context_model_summary();
+        assert_eq!(s.context_count, MV_CONTEXT_COUNT);
+        assert_eq!(s.rans_scale, RANS_SCALE);
+        assert!(!s.model_derivation.is_empty());
+    }
+
+    /// StaticV1 single-model MV rANS remains unchanged (baseline for ContextV1 work).
     #[test]
     fn static_v1_mv_rans_roundtrip_unchanged() {
         let mb_cols = 1u32;
@@ -362,32 +472,66 @@ mod tests {
     }
 
     #[test]
-    fn context_encode_rejects_invalid_context_id() {
+    fn zero_mv_field_roundtrips() {
+        let mb_cols = 3u32;
+        let mb_rows = 2u32;
+        let mvs = vec![(0_i32, 0_i32); 6];
+        let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
+        let blob = encode_mv_context_v1_fixed(&compact, mb_cols, mb_rows).unwrap();
+        let dec =
+            decode_mv_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000).unwrap();
+        assert_eq!(dec, compact);
+    }
+
+    #[test]
+    fn smooth_pan_mv_field_roundtrips() {
+        let mb_cols = 3u32;
+        let mb_rows = 2u32;
+        let mvs = vec![(4, 0), (8, 0), (12, 0), (16, 0), (20, 0), (24, 0)];
+        let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
+        let blob = encode_mv_context_v1_fixed(&compact, mb_cols, mb_rows).unwrap();
+        let dec =
+            decode_mv_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000).unwrap();
+        assert_eq!(dec, compact);
+    }
+
+    #[test]
+    fn encode_rejects_invalid_context_id_injected() {
         let compact = vec![0_u8, 1_u8];
         let bad_ctx = vec![16_u8, 0_u8];
-        let err = rans_encode_mv_bytes_context_v1(&compact, &bad_ctx).unwrap_err();
+        let err = encode_mv_compact_with_context_labels(&compact, &bad_ctx).unwrap_err();
         assert!(matches!(err, SrsV2Error::Syntax(_)));
     }
 
     #[test]
-    fn context_decode_truncated_rans_fails() {
+    fn decode_truncated_rans_blob_fails() {
         let blob = [0_u8; 4];
-        let err = rans_decode_mv_bytes_context_v1_fixed(&blob, 4, 1, 1, 10_000).unwrap_err();
+        let err = decode_mv_context_v1_fixed(&blob, 4, 1, 1, 10_000).unwrap_err();
         assert!(matches!(err, SrsV2Error::Syntax(_) | SrsV2Error::Truncated));
     }
 
     #[test]
-    fn context_decode_trailing_garbage_fails() {
+    fn decode_trailing_garbage_rejected() {
         let mb_cols = 1u32;
         let mb_rows = 1u32;
         let mvs = vec![(4_i32, 0)];
         let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
-        let ctx = mv_fixed_grid_compact_contexts(&compact, mb_cols, mb_rows).unwrap();
-        let mut blob = rans_encode_mv_bytes_context_v1(&compact, &ctx).unwrap();
+        let mut blob = encode_mv_context_v1_fixed(&compact, mb_cols, mb_rows).unwrap();
         blob.push(0xAB);
+        let err = decode_mv_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000)
+            .unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_)));
+    }
+
+    #[test]
+    fn decode_symbol_budget_enforced() {
+        let mb_cols = 2u32;
+        let mb_rows = 2u32;
+        let mvs = vec![(4_i32, 0); 4];
+        let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
+        let blob = encode_mv_context_v1_fixed(&compact, mb_cols, mb_rows).unwrap();
         let err =
-            rans_decode_mv_bytes_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000)
-                .unwrap_err();
+            decode_mv_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 0).unwrap_err();
         assert!(matches!(err, SrsV2Error::Syntax(_)));
     }
 
@@ -397,16 +541,14 @@ mod tests {
         let mb_rows = 2u32;
         let mvs = vec![(4, 0), (8, 0), (12, -4), (16, 0)];
         let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
-        let ctx = mv_fixed_grid_compact_contexts(&compact, mb_cols, mb_rows).unwrap();
-        let blob = rans_encode_mv_bytes_context_v1(&compact, &ctx).unwrap();
+        let blob = encode_mv_context_v1_fixed(&compact, mb_cols, mb_rows).unwrap();
         let dec =
-            rans_decode_mv_bytes_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000)
-                .unwrap();
+            decode_mv_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000).unwrap();
         assert_eq!(dec, compact);
     }
 
     #[test]
-    fn partitioned_context_roundtrip_rans() {
+    fn partitioned_mv_stream_roundtrips() {
         let mb_cols = 2u32;
         let mb_rows = 1u32;
         let parts = vec![P_PART_WIRE_8X8; 2];
@@ -421,9 +563,8 @@ mod tests {
             (16, 0),
         ];
         let compact = encode_mv_stream_partitioned(mb_cols, mb_rows, &parts, &mvs).unwrap();
-        let ctx = mv_partitioned_compact_contexts(&compact, mb_cols, mb_rows, &parts).unwrap();
-        let blob = rans_encode_mv_bytes_context_v1(&compact, &ctx).unwrap();
-        let dec = rans_decode_mv_bytes_context_v1_partitioned(
+        let blob = encode_mv_context_v1_partitioned(&compact, mb_cols, mb_rows, &parts).unwrap();
+        let dec = decode_mv_context_v1_partitioned(
             &blob,
             compact.len(),
             mb_cols,
@@ -441,18 +582,20 @@ mod tests {
         let mb_rows = 2u32;
         let mvs = vec![(4i32, 0); 6];
         let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
-        let ctx = mv_fixed_grid_compact_contexts(&compact, mb_cols, mb_rows).unwrap();
-        let models_arr = inter_mv_context_models_v1().unwrap();
+        let labels = fixed_grid_context_labels(&compact, mb_cols, mb_rows).unwrap();
+        let models_arr = build_context_models_v1().unwrap();
         let models: Vec<RansModel> = models_arr.into_iter().collect();
         let blob = rans_encode_symbols_multi_context(
             &models,
             &compact.iter().map(|&b| usize::from(b)).collect::<Vec<_>>(),
-            &ctx,
+            &labels,
         )
         .unwrap();
-        let sy = rans_decode_symbols_multi_context(&models, &blob, compact.len(), &ctx, 512_000)
+        let sy = rans_decode_symbols_multi_context(&models, &blob, compact.len(), &labels, 512_000)
             .unwrap();
         let dec: Vec<u8> = sy.iter().map(|&s| s as u8).collect();
         assert_eq!(dec, compact);
+        let blob2 = encode_mv_context_v1_fixed(&compact, mb_cols, mb_rows).unwrap();
+        assert_eq!(blob, blob2);
     }
 }

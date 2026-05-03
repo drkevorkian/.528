@@ -23,8 +23,8 @@ pub mod motion_search;
 pub mod p_frame_codec;
 pub mod p_var_partition;
 pub mod payload_kind;
-pub mod rdo;
 pub mod rate_control;
+pub mod rdo;
 pub mod reference;
 pub mod reference_manager;
 pub mod residual_entropy;
@@ -74,13 +74,6 @@ pub use p_var_partition::{
     FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
 };
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
-pub use rdo::{
-    b_blend_rdo_score, choose_best_inter_mode_candidate, choose_min_partition_by_precomputed_scores,
-    estimate_mv_delta_wire_bytes, estimate_partition_candidate_bytes, partition_header_aware_score,
-    partition_rdo_fast_score, p_subblock_skip_residual_is_rdo_cheaper, rdo_fast_enabled, rdo_score,
-    score_candidate, choose_best_partition_candidate, RdoCandidate, RdoCost, RdoDecision, RdoStats,
-    MAX_RDO_CANDIDATES,
-};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
@@ -88,6 +81,15 @@ pub use rate_control::{
     SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2RateControlError,
     SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformSize,
     SrsV2TransformSizeMode,
+};
+pub use rdo::{
+    b_blend_rdo_score, bounded_candidate_push, choose_best_inter_mode_candidate,
+    choose_best_partition_candidate, choose_min_partition_by_precomputed_scores,
+    estimate_inter_header_bytes, estimate_mv_delta_wire_bytes,
+    estimate_partition_candidate_bytes, p_subblock_skip_residual_is_rdo_cheaper,
+    partition_header_aware_score, partition_rdo_fast_score, rdo_fast_enabled, rdo_score,
+    score_candidate, RdoCandidate, RdoCost, RdoDecision, RdoModeDecisionStats, RdoStats,
+    MAX_RDO_CANDIDATES,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};

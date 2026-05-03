@@ -9,30 +9,26 @@ use super::block_aq::{
     apply_qp_delta_clamped, choose_block_qp_delta, collect_p_subblock_variances,
     validate_qp_clip_range, validate_wire_qp_delta,
 };
-use super::context_inter_entropy::{
-    mv_fixed_grid_compact_contexts, rans_decode_mv_bytes_context_v1_fixed,
-    rans_encode_mv_bytes_context_v1,
-};
+use super::context_inter_entropy::{decode_mv_context_v1_fixed, encode_mv_context_v1_fixed};
 use super::dct::fdct_8x8;
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::inter_mv::{
     decode_mv_grid_compact, encode_mv_grid_compact, mv_compact_grid_delta_statistics,
-    rans_decode_mv_bytes, rans_encode_mv_bytes,
-    MV_PREDICTION_MODE_LABEL,
+    rans_decode_mv_bytes, rans_encode_mv_bytes, MV_PREDICTION_MODE_LABEL,
 };
 use super::intra_codec::{decode_residual_block_8x8, encode_residual_block_8x8, quantize};
 use super::limits::{MAX_FRAME_PAYLOAD_BYTES, MAX_MOTION_VECTOR_PELS};
 use super::model::{PixelFormat, VideoSequenceHeaderV2};
 use super::motion_search::{pick_mv, sad_16x16, sample_u8_plane, SrsV2MotionEncodeStats};
-use super::rdo::{
-    choose_best_inter_mode_candidate, estimate_mv_delta_wire_bytes, p_subblock_skip_residual_is_rdo_cheaper,
-    rdo_fast_enabled,
-};
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode,
     SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode,
     SrsV2SubpelMode,
+};
+use super::rdo::{
+    choose_best_inter_mode_candidate, estimate_mv_delta_wire_bytes,
+    p_subblock_skip_residual_is_rdo_cheaper, rdo_fast_enabled, RdoModeDecisionStats, RdoStats,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
@@ -651,17 +647,17 @@ pub fn encode_yuv420_p_payload(
                     &grid_pred,
                     (0, 0),
                 );
-                let dec = choose_best_inter_mode_candidate(lam_mv, &[(sad_z, cost_z), (sad_me, cost_me)], None)
-                    .expect("two MV RDO candidates");
-                ms.rdo.candidates_tested += 2;
-                ms.rdo.estimated_bits_used_for_decision = ms
-                    .rdo
-                    .estimated_bits_used_for_decision
-                    .saturating_add(cost_me.max(0) as u64);
-                ms.rdo.estimated_bits_used_for_decision = ms
-                    .rdo
-                    .estimated_bits_used_for_decision
-                    .saturating_add(cost_z.max(0) as u64);
+                let mut rdo_mv = RdoStats::default();
+                let dec = choose_best_inter_mode_candidate(
+                    lam_mv,
+                    &[(sad_z, cost_z), (sad_me, cost_me)],
+                    Some(&mut rdo_mv),
+                )
+                .expect("two MV RDO candidates");
+                rdo_mv.merge_into_bench(&mut ms.rdo);
+                let mut mode_mv = RdoModeDecisionStats::default();
+                mode_mv.record_inter_mv_pick(dec.chosen_index == 0);
+                mode_mv.merge_into_bench(&mut ms.rdo);
                 if dec.chosen_index == 0 {
                     (0, 0)
                 } else {
@@ -802,8 +798,7 @@ pub fn encode_yuv420_p_payload(
             let mv_blob = match settings.entropy_model_mode {
                 SrsV2EntropyModelMode::StaticV1 => rans_encode_mv_bytes(&mv_compact)?,
                 SrsV2EntropyModelMode::ContextV1 => {
-                    let ctx = mv_fixed_grid_compact_contexts(&mv_compact, mb_cols, mb_rows)?;
-                    rans_encode_mv_bytes_context_v1(&mv_compact, &ctx)?
+                    encode_mv_context_v1_fixed(&mv_compact, mb_cols, mb_rows)?
                 }
             };
             let sym_count = u32::try_from(mv_compact.len())
@@ -831,8 +826,7 @@ pub fn encode_yuv420_p_payload(
             let blob = match settings.entropy_model_mode {
                 SrsV2EntropyModelMode::StaticV1 => rans_encode_mv_bytes(&compact_tmp)?,
                 SrsV2EntropyModelMode::ContextV1 => {
-                    let ctx = mv_fixed_grid_compact_contexts(&compact_tmp, mb_cols, mb_rows)?;
-                    rans_encode_mv_bytes_context_v1(&compact_tmp, &ctx)?
+                    encode_mv_context_v1_fixed(&compact_tmp, mb_cols, mb_rows)?
                 }
             };
             8_u64.saturating_add(blob.len() as u64)
@@ -979,7 +973,7 @@ pub fn decode_yuv420_p_payload(
             cur = blob_end;
             let budget = blob_len.saturating_mul(64).min(512_000);
             let compact = if inter_entropy_ctx_v1 {
-                rans_decode_mv_bytes_context_v1_fixed(blob, sym_count, mb_cols, mb_rows, budget)?
+                decode_mv_context_v1_fixed(blob, sym_count, mb_cols, mb_rows, budget)?
             } else {
                 rans_decode_mv_bytes(blob, sym_count, budget)?
             };
@@ -1169,9 +1163,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(s_def.rdo_mode, SrsV2RdoMode::Off);
-        let p0 = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &s_off, None, None, None).unwrap();
-        let p1 = encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &s_def, None, None, None).unwrap();
-        assert_eq!(p0, p1, "RDO off path must be bit-identical to default (RDO off)");
+        let p0 =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &s_off, None, None, None).unwrap();
+        let p1 =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &s_def, None, None, None).unwrap();
+        assert_eq!(
+            p0, p1,
+            "RDO off path must be bit-identical to default (RDO off)"
+        );
     }
 
     #[test]

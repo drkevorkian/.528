@@ -1,13 +1,22 @@
 //! Centralized **rate–distortion** helpers for SRSV2 experimental encoders.
 //!
-//! **Score model (fixed-point λ, same as historical P-frame bench):**
-//! `score = distortion + (lambda_fp * wire_bytes) / 256`
+//! ## Score model
+//!
+//! Effective score (fixed-point λ, **`lambda_fp ≈ λ × 256`** from [`crate::srsv2::rate_control::rdo_lambda_effective`]):
+//!
+//! ```text
+//! score = distortion + (lambda_fp × estimated_wire_bytes) / 256
+//!       ≈ distortion + λ × estimated_wire_bytes    (when lambda_fp = round(λ × 256))
+//! ```
+//!
+//! [`RdoCost::total_wire_bytes`] sums **partition map**, **MV**, **residual**, **transform ID**,
+//! **block AQ**, **skip flags**, and **B blend/weight** buckets for λ·rate terms.
 //!
 //! Callers pass [`crate::srsv2::rate_control::rdo_lambda_effective`] as `lambda_fp` unless a
 //! partition-specific scaled λ is intentionally used (see [`partition_rdo_fast_score`]).
 //!
-//! **Safety:** candidate lists are **hard-capped** ([`MAX_RDO_CANDIDATES`]); helpers return
-//! [`crate::srsv2::error::SrsV2Error`] when exceeded. No unbounded `Vec` growth from RDO entry points.
+//! **Safety:** candidate lists are **hard-capped** ([`MAX_RDO_CANDIDATES`]); [`bounded_candidate_push`]
+//! and choosers return [`crate::srsv2::error::SrsV2Error`] when exceeded.
 
 use super::error::SrsV2Error;
 use super::inter_mv::{predict_mv_qpel, signed_varint_wire_bytes};
@@ -32,8 +41,12 @@ pub struct RdoCost {
 impl RdoCost {
     #[inline]
     pub fn total_wire_bytes(&self) -> i64 {
-        let s = self.partition_map_bytes.saturating_add(self.mv_compact_or_entropy_bytes);
-        let s = s.saturating_add(self.residual_bytes).saturating_add(self.transform_id_bytes);
+        let s = self
+            .partition_map_bytes
+            .saturating_add(self.mv_compact_or_entropy_bytes);
+        let s = s
+            .saturating_add(self.residual_bytes)
+            .saturating_add(self.transform_id_bytes);
         let s = s
             .saturating_add(self.block_aq_bytes)
             .saturating_add(self.skip_flags_bytes)
@@ -75,10 +88,39 @@ pub struct RdoStats {
 
 impl RdoStats {
     pub fn merge_into_bench(&self, bench: &mut SrsV2RdoBenchStats) {
-        bench.candidates_tested = bench.candidates_tested.saturating_add(u64::from(self.candidates_compared));
+        bench.candidates_tested = bench
+            .candidates_tested
+            .saturating_add(u64::from(self.candidates_compared));
         bench.estimated_bits_used_for_decision = bench
             .estimated_bits_used_for_decision
             .saturating_add(self.estimated_side_bytes);
+    }
+}
+
+/// Per-pass counters for high-level **mode** RDO decisions (merge into [`SrsV2RdoBenchStats`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RdoModeDecisionStats {
+    pub inter_zero_mv_wins: u64,
+    pub inter_me_mv_wins: u64,
+}
+
+impl RdoModeDecisionStats {
+    #[inline]
+    pub fn record_inter_mv_pick(&mut self, chose_zero_mv: bool) {
+        if chose_zero_mv {
+            self.inter_zero_mv_wins = self.inter_zero_mv_wins.saturating_add(1);
+        } else {
+            self.inter_me_mv_wins = self.inter_me_mv_wins.saturating_add(1);
+        }
+    }
+
+    pub fn merge_into_bench(&self, bench: &mut SrsV2RdoBenchStats) {
+        bench.inter_zero_mv_wins = bench
+            .inter_zero_mv_wins
+            .saturating_add(self.inter_zero_mv_wins);
+        bench.inter_me_mv_wins = bench
+            .inter_me_mv_wins
+            .saturating_add(self.inter_me_mv_wins);
     }
 }
 
@@ -91,6 +133,20 @@ pub fn rdo_score(distortion: u32, lambda_fp: i64, wire_bytes: i64) -> i128 {
 #[inline]
 pub fn score_candidate(distortion: u32, lambda_fp: i64, cost: &RdoCost) -> i128 {
     rdo_score(distortion, lambda_fp, cost.total_wire_bytes())
+}
+
+/// Best-effort **fixed** P-frame prefix bytes through QP/flags (and optional block-AQ clip range).
+/// Does **not** include MV grid, entropy blob, residuals, or transforms — use [`RdoCost`] fields for those.
+#[must_use]
+pub fn estimate_inter_header_bytes(
+    inter_syntax: SrsV2InterSyntaxMode,
+    block_aq_wire: bool,
+) -> u64 {
+    let aq = if block_aq_wire { 2u64 } else { 0 };
+    match inter_syntax {
+        SrsV2InterSyntaxMode::RawLegacy => 4 + 4 + 1 + aq,
+        SrsV2InterSyntaxMode::CompactV1 | SrsV2InterSyntaxMode::EntropyV1 => 4 + 4 + 1 + 1 + aq,
+    }
 }
 
 /// Fold explicit byte buckets into [`RdoCost`] (no magic — callers supply measured/estimated sizes).
@@ -116,7 +172,13 @@ pub fn estimate_partition_candidate_bytes(
 
 /// **Partition AutoFast `RdoFast`** score used on the wire today: distortion plus λ·quality_bias·(MV+res) / 256².
 #[inline]
-pub fn partition_rdo_fast_score(distortion: u32, lambda_partition_fp: i64, quality_bias_fp: u16, mv_b: usize, res_b: usize) -> i128 {
+pub fn partition_rdo_fast_score(
+    distortion: u32,
+    lambda_partition_fp: i64,
+    quality_bias_fp: u16,
+    mv_b: usize,
+    res_b: usize,
+) -> i128 {
     let side = (mv_b.saturating_add(res_b)) as i128;
     distortion as i128
         + (lambda_partition_fp as i128 * i128::from(quality_bias_fp) * side) / (256 * 256)
@@ -143,10 +205,26 @@ pub fn partition_header_aware_score(
 
 /// P subblock **skip vs residual** fast-path inequality (matches pre-centralization behavior).
 #[inline]
-pub fn p_subblock_skip_residual_is_rdo_cheaper(max_abs: i16, lambda_fp: i64, wire_residual_bytes: i64) -> bool {
+pub fn p_subblock_skip_residual_is_rdo_cheaper(
+    max_abs: i16,
+    lambda_fp: i64,
+    wire_residual_bytes: i64,
+) -> bool {
     let lhs = i128::from(max_abs as i32) * 256;
     let rhs = i128::from(lambda_fp) * i128::from(wire_residual_bytes.max(1));
     lhs <= rhs
+}
+
+/// Push one [`RdoCandidate`] if under [`MAX_RDO_CANDIDATES`].
+pub fn bounded_candidate_push(
+    vec: &mut Vec<RdoCandidate>,
+    c: RdoCandidate,
+) -> Result<(), SrsV2Error> {
+    if vec.len() >= MAX_RDO_CANDIDATES {
+        return Err(SrsV2Error::syntax("RDO: candidate cap reached"));
+    }
+    vec.push(c);
+    Ok(())
 }
 
 /// Compact / entropy MV **delta varint** byte estimate for one macroblock (median predictor).
@@ -259,7 +337,9 @@ pub fn choose_best_inter_mode_candidate(
 }
 
 /// Argmin over precomputed `(partition_wire_tag, score)` pairs (HeaderAware / RdoFast paths).
-pub fn choose_min_partition_by_precomputed_scores(scored_tags: &[(u8, i128)]) -> Result<RdoDecision, SrsV2Error> {
+pub fn choose_min_partition_by_precomputed_scores(
+    scored_tags: &[(u8, i128)],
+) -> Result<RdoDecision, SrsV2Error> {
     if scored_tags.is_empty() {
         return Err(SrsV2Error::syntax("RDO partition: empty score list"));
     }
@@ -270,7 +350,9 @@ pub fn choose_min_partition_by_precomputed_scores(scored_tags: &[(u8, i128)]) ->
     let mut best_s = scored_tags[0].1;
     let mut best_tag = scored_tags[0].0;
     for (i, &(tag, s)) in scored_tags.iter().enumerate().skip(1) {
-        let better = s < best_s || (s == best_s && tag < best_tag) || (s == best_s && tag == best_tag && i < best_i);
+        let better = s < best_s
+            || (s == best_s && tag < best_tag)
+            || (s == best_s && tag == best_tag && i < best_i);
         if better {
             best_i = i;
             best_s = s;
@@ -345,7 +427,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(dec.chosen_index, 0, "flat/global-like side cost should keep 16×16");
+        assert_eq!(
+            dec.chosen_index, 0,
+            "flat/global-like side cost should keep 16×16"
+        );
     }
 
     #[test]
@@ -378,7 +463,10 @@ mod tests {
         let lam = 512i64;
         let integ = b_blend_rdo_score(1000, lam, 8, 0, 0);
         let subp = b_blend_rdo_score(980, lam, 8, 0, 40);
-        assert!(integ < subp, "tiny SAD gain must not pay half-pel side bytes");
+        assert!(
+            integ < subp,
+            "tiny SAD gain must not pay half-pel side bytes"
+        );
     }
 
     #[test]
@@ -400,6 +488,32 @@ mod tests {
             });
         }
         assert!(choose_best_partition_candidate(256, &v, None).is_err());
+    }
+
+    #[test]
+    fn bounded_candidate_push_respects_cap() {
+        let mut v = Vec::new();
+        for i in 0..MAX_RDO_CANDIDATES {
+            bounded_candidate_push(
+                &mut v,
+                RdoCandidate {
+                    id: i as u8,
+                    distortion: 0,
+                    cost: RdoCost::default(),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(v.len(), MAX_RDO_CANDIDATES);
+        assert!(bounded_candidate_push(
+            &mut v,
+            RdoCandidate {
+                id: 0,
+                distortion: 0,
+                cost: RdoCost::default(),
+            },
+        )
+        .is_err());
     }
 
     #[test]

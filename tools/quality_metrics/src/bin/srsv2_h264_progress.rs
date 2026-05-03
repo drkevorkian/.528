@@ -183,6 +183,7 @@ fn run_gen_corpus(repo: &Path, out_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bench(
     exe: &Path,
     repo: &Path,
@@ -217,7 +218,9 @@ fn run_bench(
     for e in extra {
         c.arg(e);
     }
-    let st = c.status().with_context(|| format!("bench_srsv2 {:?}", c.get_args()))?;
+    let st = c
+        .status()
+        .with_context(|| format!("bench_srsv2 {:?}", c.get_args()))?;
     if !st.success() {
         bail!("bench_srsv2 failed ({st}) for {}", yuv.display());
     }
@@ -252,7 +255,10 @@ fn row_bytes_by_label(report: &Value, label_sub: &str) -> Option<u64> {
 }
 
 fn ingest_entropy_clip(agg: &mut AggregateEntropy, report: &Value) {
-    let Some(arr) = report.get("compare_entropy_models").and_then(|x| x.as_array()) else {
+    let Some(arr) = report
+        .get("compare_entropy_models")
+        .and_then(|x| x.as_array())
+    else {
         return;
     };
     let mut static_b: Option<u64> = None;
@@ -261,8 +267,14 @@ fn ingest_entropy_clip(agg: &mut AggregateEntropy, report: &Value) {
         if !e.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
             continue;
         }
-        let mode = e.get("entropy_model_mode").and_then(|x| x.as_str()).unwrap_or("");
-        let b = e.get("row").and_then(|r| r.get("bytes")).and_then(|x| x.as_u64());
+        let mode = e
+            .get("entropy_model_mode")
+            .and_then(|x| x.as_str())
+            .unwrap_or("");
+        let b = e
+            .get("row")
+            .and_then(|r| r.get("bytes"))
+            .and_then(|x| x.as_u64());
         let Some(b) = b else { continue };
         match mode {
             "static" => static_b = Some(b),
@@ -283,7 +295,10 @@ fn ingest_entropy_clip(agg: &mut AggregateEntropy, report: &Value) {
 }
 
 fn ingest_partition_clip(agg: &mut AggregatePartition, report: &Value) {
-    let Some(arr) = report.get("compare_partition_costs").and_then(|x| x.as_array()) else {
+    let Some(arr) = report
+        .get("compare_partition_costs")
+        .and_then(|x| x.as_array())
+    else {
         return;
     };
     let mut rdo_rej = 0u64;
@@ -299,10 +314,16 @@ fn ingest_partition_clip(agg: &mut AggregatePartition, report: &Value) {
         if label.contains("auto-fast-rdo") {
             rdo_rej += val_u64(det, &["partition", "partition_rejected_by_rdo"]);
             hdr_rej += val_u64(det, &["partition", "partition_rejected_by_header_cost"]);
-            auto_rdo_bytes = e.get("row").and_then(|r| r.get("bytes")).and_then(|x| x.as_u64());
+            auto_rdo_bytes = e
+                .get("row")
+                .and_then(|r| r.get("bytes"))
+                .and_then(|x| x.as_u64());
         }
         if label.contains("pc-fixed16x16") {
-            fixed_bytes = e.get("row").and_then(|r| r.get("bytes")).and_then(|x| x.as_u64());
+            fixed_bytes = e
+                .get("row")
+                .and_then(|r| r.get("bytes"))
+                .and_then(|x| x.as_u64());
         }
     }
     agg.sum_rejected_by_rdo += rdo_rej;
@@ -331,7 +352,10 @@ fn ingest_b_clip(agg: &mut AggregateB, report: &Value) {
             continue;
         }
         let mode = e.get("mode").and_then(|x| x.as_str()).unwrap_or("");
-        let b = e.get("row").and_then(|r| r.get("bytes")).and_then(|x| x.as_u64());
+        let b = e
+            .get("row")
+            .and_then(|r| r.get("bytes"))
+            .and_then(|x| x.as_u64());
         let Some(b) = b else { continue };
         match mode {
             "SRSV2-B-int" => int_b = Some(b),
@@ -359,12 +383,17 @@ fn ingest_b_clip(agg: &mut AggregateB, report: &Value) {
 
 fn ingest_bottleneck(ev: &mut BottleneckEvidence, report: &Value) {
     // Use first successful auto-fast-rdo row details if present.
-    let Some(arr) = report.get("compare_partition_costs").and_then(|x| x.as_array()) else {
+    let Some(arr) = report
+        .get("compare_partition_costs")
+        .and_then(|x| x.as_array())
+    else {
         return;
     };
     for e in arr {
         let label = e.get("label").and_then(|x| x.as_str()).unwrap_or("");
-        if !label.contains("auto-fast-rdo") || !e.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+        if !label.contains("auto-fast-rdo")
+            || !e.get("ok").and_then(|x| x.as_bool()).unwrap_or(false)
+        {
             continue;
         }
         let det = match e.get("details") {
@@ -402,7 +431,7 @@ fn finalize_bottleneck(ev: &mut BottleneckEvidence, n: u32) {
     ev.avg_share_partition_map /= nf;
     ev.avg_share_partition_mv /= nf;
     ev.avg_share_partition_residual /= nf;
-    let mut pairs = vec![
+    let mut pairs = [
         ("mv_header_compact_entropy", ev.avg_share_mv_header),
         ("inter_residual", ev.avg_share_residual),
         ("partition_map", ev.avg_share_partition_map),
@@ -435,7 +464,10 @@ fn meta_for_yuv(yuv: &Path) -> Result<SyntheticClipMetadata> {
 
 fn main() -> Result<()> {
     let a = Args::parse();
-    let repo = a.repo_root.canonicalize().context("repo_root canonicalize")?;
+    let repo = a
+        .repo_root
+        .canonicalize()
+        .context("repo_root canonicalize")?;
     let corpus = if a.corpus_dir.is_absolute() {
         a.corpus_dir.clone()
     } else {
@@ -463,7 +495,10 @@ fn main() -> Result<()> {
     }
     let exe = bench_exe(&repo, release);
     if !exe.is_file() {
-        bail!("missing bench binary at {} (run without --skip-build)", exe.display());
+        bail!(
+            "missing bench binary at {} (run without --skip-build)",
+            exe.display()
+        );
     }
 
     let ffmpeg = ffmpeg_available();
@@ -560,7 +595,10 @@ fn main() -> Result<()> {
         if let Some(n) = vs.get("emitted_rows").and_then(|x| x.as_u64()) {
             sweep_rows += n;
         }
-        if let Some(p) = vs.get("pareto").and_then(|p| p.get("smallest_bytes_ssim_ge_threshold")) {
+        if let Some(p) = vs
+            .get("pareto")
+            .and_then(|p| p.get("smallest_bytes_ssim_ge_threshold"))
+        {
             if !p.is_null() {
                 pareto_hits += 1;
             }
@@ -576,7 +614,13 @@ fn main() -> Result<()> {
             h,
             frames,
             fps,
-            &["--compare-b-modes", "--reference-frames", "2", "--bframes", "1"],
+            &[
+                "--compare-b-modes",
+                "--reference-frames",
+                "2",
+                "--bframes",
+                "1",
+            ],
             &jb,
             &mb,
         )?;
@@ -594,7 +638,14 @@ fn main() -> Result<()> {
                 h,
                 frames,
                 fps,
-                &["--compare-b-modes", "--reference-frames", "2", "--bframes", "1", "--compare-x264"],
+                &[
+                    "--compare-b-modes",
+                    "--reference-frames",
+                    "2",
+                    "--bframes",
+                    "1",
+                    "--compare-x264",
+                ],
                 &jxx,
                 &mxx,
             )
@@ -609,8 +660,9 @@ fn main() -> Result<()> {
                         .get("table")
                         .and_then(|t| t.as_array())
                         .and_then(|rows| {
-                            rows.iter()
-                                .find(|r| r.get("codec").and_then(|c| c.as_str()) == Some("SRSV2-B-int"))
+                            rows.iter().find(|r| {
+                                r.get("codec").and_then(|c| c.as_str()) == Some("SRSV2-B-int")
+                            })
                         })
                         .and_then(|r| r.get("psnr_y"))
                         .and_then(|x| x.as_f64())
@@ -618,7 +670,10 @@ fn main() -> Result<()> {
                     let px = vx
                         .get("table")
                         .and_then(|t| t.as_array())
-                        .and_then(|rows| rows.iter().find(|r| r.get("codec").and_then(|c| c.as_str()) == Some("x264")))
+                        .and_then(|rows| {
+                            rows.iter()
+                                .find(|r| r.get("codec").and_then(|c| c.as_str()) == Some("x264"))
+                        })
                         .and_then(|r| r.get("psnr_y"))
                         .and_then(|x| x.as_f64())
                         .unwrap_or(0.0);
@@ -657,7 +712,7 @@ fn main() -> Result<()> {
         sweep_rows_total: sweep_rows,
         sweep_pareto_smallest_bytes_threshold_hits: pareto_hits,
         x264_vs_srsv2_note: x264_note,
-        bottleneck: bottleneck,
+        bottleneck,
     };
 
     if let Some(p) = out_json.parent() {
@@ -731,7 +786,10 @@ fn render_md(s: &ProgressSummary) -> String {
     ));
 
     o.push_str("## 4. B-half and B-weighted vs B-int\n\n");
-    o.push_str(&format!("- Clips with full B row set OK: **{}**\n", s.b_modes.clips));
+    o.push_str(&format!(
+        "- Clips with full B row set OK: **{}**\n",
+        s.b_modes.clips
+    ));
     o.push_str(&format!(
         "- Clips where **B-half** total bytes < B-int: **{}**\n",
         s.b_modes.half_lower_bytes_than_int
@@ -770,7 +828,10 @@ fn render_md(s: &ProgressSummary) -> String {
 
     o.push_str("## Next bottleneck (by on-wire byte pressure, normalized)\n\n");
     o.push_str("Per-clip shares are **component_sum / (mv_entropy+mv_compact+inter_header+inter_residual+partition_map+partition_mv+partition_residual)** from the first successful **`SRSV2-pc-auto-fast-rdo`** row; table values are averaged across clips.\n\n");
-    o.push_str(&format!("- **Named bottleneck:** `{}`\n", s.bottleneck.dominant));
+    o.push_str(&format!(
+        "- **Named bottleneck:** `{}`\n",
+        s.bottleneck.dominant
+    ));
     o.push_str(&format!(
         "- Mean share MV/header/compact/entropy: **{:.4}**\n",
         s.bottleneck.avg_share_mv_header

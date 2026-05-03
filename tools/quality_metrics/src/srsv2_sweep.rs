@@ -1,6 +1,25 @@
 //! SRSV2 **quality vs bitrate** matrix sweep (encoder-only; in-process `libsrs_video` only).
 //!
-//! Used by `bench_srsv2 --sweep-quality-bitrate` and unit tests. All sweep logic lives here.
+//! ## Public API
+//!
+//! **Types:** [`SweepConfig`], [`SweepCase`], [`SweepRow`], [`SweepReport`], [`ParetoPoint`],
+//! [`ParetoSummary`], [`SweepError`].
+//!
+//! **Functions:** [`enumerate_sweep_cases`], [`run_quality_bitrate_sweep`], [`compute_pareto_summary`],
+//! [`write_sweep_json`], [`write_sweep_markdown`], [`validate_sweep_pareto`].
+//!
+//! ## Matrix (full enumeration)
+//!
+//! - **QP:** [`SWEEP_QPS`] — 18, 22, 26, 30, 34  
+//! - **inter syntax:** `compact`, `entropy`  
+//! - **entropy model:** `static`, `context` (context only with `entropy` inter syntax)  
+//! - **partition cost:** `header-aware`, `rdo-fast`  
+//! - **partition mode:** `fixed16x16`, `auto-fast`  
+//!
+//! Full row count: [`SWEEP_FULL_ROW_COUNT`] (**60**). Ordering is fixed: nested loops
+//! QP → inter → entropy model → partition cost → partition mode.
+//!
+//! No FFmpeg or external processes.
 
 use std::fs;
 use std::path::Path;
@@ -9,23 +28,28 @@ use std::time::Instant;
 use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::{
-    decode_yuv420_srsv2_payload_managed, encode_yuv420_inter_payload, PixelFormat, PreviousFrameRcStats,
-    ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode, SrsV2BMotionSearchMode,
-    SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2Error, SrsV2InterPartitionMode, SrsV2InterSyntaxMode,
-    SrsV2LoopFilterMode, SrsV2MotionSearchMode, SrsV2PartitionCostModel, SrsV2PartitionMapEncoding,
-    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager, SrsV2SubpelMode,
-    SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
+    decode_yuv420_srsv2_payload_managed, encode_yuv420_inter_payload, PixelFormat,
+    PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
+    SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2EntropyModelMode,
+    SrsV2Error, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode,
+    SrsV2MotionSearchMode, SrsV2PartitionCostModel, SrsV2PartitionMapEncoding,
+    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager,
+    SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::{psnr_u8, ssim_u8_simple};
 
-/// Fixed QP values in display order for the quality/bitrate matrix.
+/// Fixed QP values for the quality/bitrate matrix.
 pub const SWEEP_QPS: [u8; 5] = [18, 22, 26, 30, 34];
 
-/// Full matrix row count: **5 QPs** × **3** (inter×entropy, skipping invalid `compact`+`context`) × **2** costs × **2** partitions = **60**.
-pub const SWEEP_FULL_ROW_COUNT: usize = 5 * 3 * 2 * 2;
+/// Full matrix row count: **5 QPs** × **12** cases/QP  
+/// (compact+static: 4; entropy+static/context: 8) × **2** costs × **2** partitions → **5 × 12 = 60**.
+pub const SWEEP_FULL_ROW_COUNT: usize = {
+    let per_qp = 2 * 2 * (1 + 2);
+    SWEEP_QPS.len() * per_qp
+};
 
 const PSNR_JSON_SAFE_IDENTICAL_DB: f64 = 100.0;
 
@@ -85,6 +109,39 @@ pub struct SweepConfig {
     pub max_rows: Option<usize>,
 }
 
+impl SweepConfig {
+    /// Fields aligned with `bench_srsv2 --sweep-quality-bitrate` (full matrix when `max_rows` is `None`).
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_bench_cli(
+        width: u32,
+        height: u32,
+        frames: u32,
+        fps: u32,
+        keyint: u32,
+        motion_radius: i16,
+        reference_frames: u8,
+        residual_entropy: String,
+        pareto_ssim_threshold: f64,
+        pareto_byte_budget: u64,
+        max_rows: Option<usize>,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            frames,
+            fps,
+            keyint,
+            motion_radius,
+            reference_frames,
+            residual_entropy,
+            pareto_ssim_threshold,
+            pareto_byte_budget,
+            max_rows,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SweepRow {
     pub row_index: u32,
@@ -142,10 +199,20 @@ pub struct SweepReport {
     pub pareto: ParetoSummary,
 }
 
-/// Enumerate sweep cases in **deterministic** order (nested loops: QP → inter → entropy model → cost → partition).
-pub fn enumerate_sweep_cases() -> Vec<SweepCase> {
-    let mut v = Vec::with_capacity(SWEEP_FULL_ROW_COUNT * SWEEP_QPS.len());
-    for &qp in &SWEEP_QPS {
+/// Enumerate sweep cases in **deterministic** order  
+/// (QP → inter syntax → entropy model → partition cost → partition mode).
+///
+/// `max_rows`: truncate to the first N cases after enumeration (`None` = full [`SWEEP_FULL_ROW_COUNT`] rows).
+#[must_use]
+pub fn enumerate_sweep_cases(max_rows: Option<usize>) -> Vec<SweepCase> {
+    if max_rows == Some(0) {
+        return Vec::new();
+    }
+    let cap = max_rows
+        .unwrap_or(SWEEP_FULL_ROW_COUNT)
+        .min(SWEEP_FULL_ROW_COUNT);
+    let mut v = Vec::with_capacity(cap);
+    'outer: for &qp in &SWEEP_QPS {
         for inter in ["compact", "entropy"] {
             for em in ["static", "context"] {
                 if em == "context" && inter != "entropy" {
@@ -160,6 +227,9 @@ pub fn enumerate_sweep_cases() -> Vec<SweepCase> {
                             partition_cost_model: pcm.to_string(),
                             inter_partition: part.to_string(),
                         });
+                        if max_rows.is_some_and(|m| v.len() >= m) {
+                            break 'outer;
+                        }
                     }
                 }
             }
@@ -276,7 +346,9 @@ fn parse_partition_cost(s: &str) -> Result<SrsV2PartitionCostModel, SweepError> 
     match s.to_ascii_lowercase().replace('_', "-").as_str() {
         "header-aware" | "headeraware" => Ok(SrsV2PartitionCostModel::HeaderAware),
         "rdo-fast" | "rdofast" => Ok(SrsV2PartitionCostModel::RdoFast),
-        _ => Err(SweepError::Other(format!("invalid partition_cost_model {s}"))),
+        _ => Err(SweepError::Other(format!(
+            "invalid partition_cost_model {s}"
+        ))),
     }
 }
 
@@ -311,7 +383,10 @@ fn build_seq_header(cfg: &SweepConfig, settings: &SrsV2EncodeSettings) -> VideoS
     }
 }
 
-fn build_settings_for_case(cfg: &SweepConfig, case: &SweepCase) -> Result<SrsV2EncodeSettings, SweepError> {
+fn build_settings_for_case(
+    cfg: &SweepConfig,
+    case: &SweepCase,
+) -> Result<SrsV2EncodeSettings, SweepError> {
     let residual = parse_residual_entropy_label(&cfg.residual_entropy)?;
     let inter = parse_inter(&case.inter_syntax)?;
     let em = parse_entropy_model(&case.entropy_model)?;
@@ -348,7 +423,8 @@ fn build_settings_for_case(cfg: &SweepConfig, case: &SweepCase) -> Result<SrsV2E
         ..Default::default()
     };
     s.validate_rate_control()?;
-    validate_adaptive_quant_settings(&s).map_err(|e| SweepError::Other(format!("adaptive_quant: {e}")))?;
+    validate_adaptive_quant_settings(&s)
+        .map_err(|e| SweepError::Other(format!("adaptive_quant: {e}")))?;
     s.validate_entropy_model_inter()
         .map_err(|e| SweepError::Other(format!("entropy_model_inter: {e}")))?;
     Ok(s)
@@ -452,20 +528,13 @@ fn sweep_row_from_case(
     let mut src_luma = Vec::with_capacity(ylen * nf);
     let mut dec_luma = Vec::with_capacity(ylen * nf);
     for fi in 0..cfg.frames {
-        src_luma.extend_from_slice(frame_luma_slice(
-            raw,
-            fb,
-            fi,
-            cfg.width,
-            cfg.height,
-        ));
+        src_luma.extend_from_slice(frame_luma_slice(raw, fb, fi, cfg.width, cfg.height));
         dec_luma.extend_from_slice(&dec_by_frame[fi as usize]);
     }
     let dec_secs = t_dec.elapsed().as_secs_f64();
 
-    let psnr_y = psnr_y_json_safe(&src_luma, &dec_luma).map_err(|e| {
-        SweepError::Metrics(format!("row {row_index}"), e)
-    })?;
+    let psnr_y = psnr_y_json_safe(&src_luma, &dec_luma)
+        .map_err(|e| SweepError::Metrics(format!("row {row_index}"), e))?;
     if !psnr_y.is_finite() {
         return Err(SweepError::Metrics(
             format!("row {row_index}"),
@@ -514,20 +583,20 @@ fn row_to_point(r: &SweepRow, label: &str) -> ParetoPoint {
     }
 }
 
-/// Compute Pareto-style summaries from successful rows only.
-pub fn pareto_summary(rows: &[SweepRow], ssim_threshold: f64, byte_budget: u64) -> ParetoSummary {
+/// Compute Pareto-style summaries from successful rows only (deterministic tie-break by `row_index`).
+#[must_use]
+pub fn compute_pareto_summary(
+    rows: &[SweepRow],
+    ssim_threshold: f64,
+    byte_budget: u64,
+) -> ParetoSummary {
     let ok: Vec<&SweepRow> = rows.iter().filter(|r| r.ok).collect();
 
     let smallest_bytes_ssim_ge_threshold = ok
         .iter()
         .filter(|r| r.ssim_y >= ssim_threshold)
         .min_by_key(|r| (r.total_bytes, r.row_index))
-        .map(|r| {
-            row_to_point(
-                r,
-                "smallest_bytes_ssim_ge_threshold",
-            )
-        });
+        .map(|r| row_to_point(r, "smallest_bytes_ssim_ge_threshold"));
 
     let best_ssim_under_byte_budget = ok
         .iter()
@@ -596,10 +665,7 @@ pub fn run_quality_bitrate_sweep(
     validate_sweep_pareto(cfg.pareto_ssim_threshold, cfg.pareto_byte_budget)?;
     yuv420_frame_bytes(cfg.width, cfg.height)?;
 
-    let mut cases = enumerate_sweep_cases();
-    if let Some(max) = cfg.max_rows {
-        cases.truncate(max);
-    }
+    let cases = enumerate_sweep_cases(cfg.max_rows);
 
     let mut rows = Vec::with_capacity(cases.len());
     for (i, case) in cases.iter().enumerate() {
@@ -629,8 +695,8 @@ pub fn run_quality_bitrate_sweep(
         }
     }
 
-    let expected_matrix_rows = enumerate_sweep_cases().len();
-    let pareto = pareto_summary(&rows, cfg.pareto_ssim_threshold, cfg.pareto_byte_budget);
+    let expected_matrix_rows = enumerate_sweep_cases(None).len();
+    let pareto = compute_pareto_summary(&rows, cfg.pareto_ssim_threshold, cfg.pareto_byte_budget);
 
     Ok(SweepReport {
         note: "SRSV2 quality/bitrate matrix; engineering measurement only; in-process encoder/decoder only; no H.264 comparison.",
@@ -732,7 +798,11 @@ pub fn write_sweep_markdown(path: &Path, report: &SweepReport) -> Result<(), Swe
         &p.best_psnr_under_byte_budget,
         &mut out,
     );
-    fmt_point("Best overall (SSIM, then PSNR, then fewer bytes)", &p.best_bytes_quality_overall, &mut out);
+    fmt_point(
+        "Best overall (SSIM, then PSNR, then fewer bytes)",
+        &p.best_bytes_quality_overall,
+        &mut out,
+    );
 
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| SweepError::Other(format!("mkdir: {e}")))?;
@@ -748,11 +818,25 @@ mod tests {
 
     #[test]
     fn sweep_row_count_is_deterministic() {
-        let v = enumerate_sweep_cases();
+        let v = enumerate_sweep_cases(None);
         assert_eq!(v.len(), SWEEP_FULL_ROW_COUNT);
         assert_eq!(v.len(), 60);
-        let v2 = enumerate_sweep_cases();
+        let v2 = enumerate_sweep_cases(None);
         assert_eq!(v, v2);
+        assert_eq!(enumerate_sweep_cases(Some(4)).len(), 4);
+        assert!(enumerate_sweep_cases(Some(0)).is_empty());
+    }
+
+    #[test]
+    fn sweep_case_order_is_fixed() {
+        let v = enumerate_sweep_cases(None);
+        assert_eq!(v[0].qp, 18);
+        assert_eq!(v[0].inter_syntax, "compact");
+        assert_eq!(v[0].entropy_model, "static");
+        assert_eq!(v[0].partition_cost_model, "header-aware");
+        assert_eq!(v[0].inter_partition, "fixed16x16");
+        assert_eq!(v[11].qp, 18);
+        assert_eq!(v[12].qp, 22);
     }
 
     #[test]
@@ -768,7 +852,7 @@ mod tests {
     }
 
     #[test]
-    fn pareto_summary_is_deterministic() {
+    fn compute_pareto_summary_is_deterministic() {
         let rows = vec![
             SweepRow {
                 row_index: 0,
@@ -805,8 +889,8 @@ mod tests {
                 dec_fps: 10.0,
             },
         ];
-        let p1 = pareto_summary(&rows, 0.94, 950);
-        let p2 = pareto_summary(&rows, 0.94, 950);
+        let p1 = compute_pareto_summary(&rows, 0.94, 950);
+        let p2 = compute_pareto_summary(&rows, 0.94, 950);
         assert_eq!(
             serde_json::to_string(&p1).unwrap(),
             serde_json::to_string(&p2).unwrap()

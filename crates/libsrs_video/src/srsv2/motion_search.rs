@@ -86,6 +86,10 @@ pub struct SrsV2RdoBenchStats {
     pub residual_decisions: u64,
     pub no_residual_decisions: u64,
     pub estimated_bits_used_for_decision: u64,
+    /// P-frame MV **RdoFast**: macroblocks where **zero MV** beat ME under λ·bytes (`chosen_index == 0`).
+    pub inter_zero_mv_wins: u64,
+    /// P-frame MV **RdoFast**: macroblocks where **ME MV** was kept.
+    pub inter_me_mv_wins: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
