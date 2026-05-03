@@ -57,9 +57,9 @@ Reports: **`moving-square_128_compare_partitions.json`**, **`scrolling-bars_128_
 | Clip | fixed16×16 bytes | split8×8 bytes | auto-fast bytes | Notes |
 |------|------------------|----------------|-----------------|-------|
 | moving-square | 6772 | 18135 | 12456 | split/auto **raise** bytes vs fixed here but **improve** PSNR-Y (~27.97 vs ~26.06) / SSIM on this synthetic. |
-| scrolling-bars | 26516 | 58779 | 53629 | Higher motion texture; partitions add **MV + header** cost; quality metrics move slightly. |
-| checker | 25732 | 77295 | 71597 | Fine checker pattern; **4×4** transform path can activate under **`auto`** transform mode — bytes grow sharply vs fixed16×16. |
-| scene-cut | 23475 | 73523 | 67763 | Scene-change synthetic; split/auto increase size vs fixed on this clip at these settings. |
+| scrolling-bars | 26516 | 58779 | 53629 | Higher motion texture; partitions add **MV + header** cost; split/auto improve PSNR-Y (~25.4 vs ~24.2) at higher bytes vs fixed16×16 here. |
+| checker | 25732 | 77295 | 71597 | Fine checker pattern; **4×4** transform path can activate under **`auto`** transform mode — bytes grow sharply vs fixed16×16; metrics similar across modes at these settings. |
+| scene-cut | 23475 | 73523 | 67763 | Scene-change synthetic; split/auto increase size vs fixed on this clip at these settings; objective scores remain close. |
 
 This table is **not** proof of codec superiority vs **H.264** or any other encoder — only **repeatable local** SRSV2 engineering snapshots.
 

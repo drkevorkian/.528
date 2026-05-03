@@ -469,4 +469,23 @@ mod tests {
     fn partition_reserved_bits_rejected() {
         assert!(validate_partition_reserved_bits(4).is_err());
     }
+
+    #[test]
+    fn partition_unit_cap_exceeded_when_rows_do_not_match_budget() {
+        // Hostile or mismatched slice: three macroblocks worth of split8×8 partition bytes
+        // but budget allows only one macroblock → 12 PU > 4×1.
+        let parts = vec![P_PART_WIRE_8X8, P_PART_WIRE_8X8, P_PART_WIRE_8X8];
+        assert!(total_partition_units_bounded(&parts, 1).is_err());
+        assert_eq!(total_partition_units_bounded(&parts, 3).unwrap(), 12);
+    }
+
+    #[test]
+    fn partition_unit_sum_hits_exact_cap_all_split8x8() {
+        let n_mb = 5usize;
+        let parts = vec![P_PART_WIRE_8X8; n_mb];
+        assert_eq!(
+            total_partition_units_bounded(&parts, n_mb).unwrap(),
+            n_mb * 4
+        );
+    }
 }

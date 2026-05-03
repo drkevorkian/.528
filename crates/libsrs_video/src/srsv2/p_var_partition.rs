@@ -1014,6 +1014,8 @@ pub fn decode_yuv420_p_payload_var_partition(
                                 }
                             }
                         }
+                    } else {
+                        return Err(SrsV2Error::syntax("bad P var-partition transform wire"));
                     }
                 }
             }
@@ -1056,4 +1058,117 @@ pub fn decode_yuv420_p_payload_var_partition(
             v: v_plane,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::srsv2::color::rgb888_full_to_yuv420_bt709;
+    use crate::srsv2::error::SrsV2Error;
+    use crate::srsv2::inter_mv::decode_mv_stream_partitioned;
+    use crate::srsv2::model::{ColorRange, VideoSequenceHeaderV2};
+    use crate::srsv2::rate_control::{
+        ResidualEntropy, SrsV2EncodeSettings, SrsV2InterPartitionMode, SrsV2InterSyntaxMode,
+        SrsV2MotionSearchMode, SrsV2TransformSizeMode,
+    };
+
+    fn seq_inter16() -> VideoSequenceHeaderV2 {
+        VideoSequenceHeaderV2 {
+            width: 16,
+            height: 16,
+            profile: crate::srsv2::model::SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: crate::srsv2::model::ColorPrimaries::Bt709,
+            transfer: crate::srsv2::model::TransferFunction::Sdr,
+            matrix: crate::srsv2::model::MatrixCoefficients::Bt709,
+            chroma_siting: crate::srsv2::model::ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 1,
+        }
+    }
+
+    /// Byte index of the first residual control byte (matches [`decode_yuv420_p_payload_var_partition`] MV parse).
+    fn residual_cursor_after_mv(payload: &[u8], w: u32, h: u32) -> usize {
+        let mb_cols = w / 16;
+        let mb_rows = h / 16;
+        let n_mb = (mb_cols * mb_rows) as usize;
+        let mut cur = 4usize;
+        let _frame_index = read_u32(payload, &mut cur).unwrap();
+        let _qp = read_u8(payload, &mut cur).unwrap();
+        let flags = read_u8(payload, &mut cur).unwrap();
+        if flags & P_INTER_FLAG_BLOCK_AQ != 0 {
+            cur += 2;
+        }
+        assert!(payload.len() >= cur + n_mb);
+        let partitions = &payload[cur..cur + n_mb];
+        cur += n_mb;
+        if payload[3] == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR[3] {
+            let _sym_count = read_u32(payload, &mut cur).unwrap() as usize;
+            let blob_len = read_u32(payload, &mut cur).unwrap() as usize;
+            cur += blob_len;
+        } else {
+            let mut val = |_mx: i32, _my: i32| Ok(());
+            decode_mv_stream_partitioned(payload, &mut cur, mb_cols, mb_rows, partitions, &mut val)
+                .unwrap();
+        }
+        cur
+    }
+
+    #[test]
+    fn decode_rejects_unsupported_tx16_wire_value() {
+        let seq = seq_inter16();
+        let rgb = vec![90_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: SrsV2InterPartitionMode::Fixed16x16,
+            residual_entropy: ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let mut payload = encode_yuv420_p_payload_var_partition(
+            &seq, &yuv, &yuv, 1, 28, &settings, None, None, None,
+        )
+        .unwrap();
+        let res = residual_cursor_after_mv(&payload, 16, 16);
+        // First 8×8 subblock ctrl: force tx wire = TX_WIRE_16 (value 2) → bits (tx<<1) = 4.
+        payload[res] = 4;
+        let err = decode_yuv420_p_payload_var_partition(&seq, &payload, &yuv, 19).unwrap_err();
+        match err {
+            SrsV2Error::Syntax(s) => assert!(s.contains("unsupported P transform")),
+            e => panic!("expected Syntax unsupported transform: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_rejects_reserved_transform_wire_symbol() {
+        let seq = seq_inter16();
+        let rgb = vec![90_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: SrsV2InterPartitionMode::Fixed16x16,
+            residual_entropy: ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let mut payload = encode_yuv420_p_payload_var_partition(
+            &seq, &yuv, &yuv, 1, 28, &settings, None, None, None,
+        )
+        .unwrap();
+        let res = residual_cursor_after_mv(&payload, 16, 16);
+        // Illegal tx nibble 3 → ctrl byte (3<<1)=6 (still passes ctrl & !7 check).
+        payload[res] = 6;
+        let err = decode_yuv420_p_payload_var_partition(&seq, &payload, &yuv, 19).unwrap_err();
+        match err {
+            SrsV2Error::Syntax(s) => assert!(s.contains("bad P var-partition transform wire")),
+            e => panic!("expected Syntax bad transform wire: {e:?}"),
+        }
+    }
 }

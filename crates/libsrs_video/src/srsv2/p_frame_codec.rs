@@ -1873,4 +1873,113 @@ mod tests {
         assert_eq!(payload[3], 20);
         decode_yuv420_p_payload(&seq, &payload, &yuv).unwrap();
     }
+
+    #[test]
+    fn p_var_partition_rect16x8_rev19_roundtrip_smoke() {
+        let seq = seq_inter(16, 16);
+        let mut rgb_cur = vec![80_u8; 16 * 16 * 3];
+        let rgb_ref = vec![120_u8; 16 * 16 * 3];
+        for y in 0..8 {
+            for x in 0..16 {
+                let i = (y * 16 + x) * 3;
+                rgb_cur[i] = 200;
+                rgb_cur[i + 1] = 200;
+                rgb_cur[i + 2] = 200;
+            }
+        }
+        let y_cur = rgb888_full_to_yuv420_bt709(&rgb_cur, 16, 16, ColorRange::Limited).unwrap();
+        let y_ref = rgb888_full_to_yuv420_bt709(&rgb_ref, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: crate::srsv2::rate_control::SrsV2InterPartitionMode::Rect16x8,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: crate::srsv2::rate_control::SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let payload =
+            encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, 28, &settings, None, None, None)
+                .unwrap();
+        assert_eq!(payload[3], 19);
+        decode_yuv420_p_payload(&seq, &payload, &y_ref).unwrap();
+    }
+
+    #[test]
+    fn p_var_partition_rect8x16_rev19_roundtrip_smoke() {
+        let seq = seq_inter(16, 16);
+        let mut rgb_cur = vec![80_u8; 16 * 16 * 3];
+        let rgb_ref = vec![120_u8; 16 * 16 * 3];
+        for y in 0..16 {
+            for x in 0..8 {
+                let i = (y * 16 + x) * 3;
+                rgb_cur[i] = 200;
+                rgb_cur[i + 1] = 200;
+                rgb_cur[i + 2] = 200;
+            }
+        }
+        let y_cur = rgb888_full_to_yuv420_bt709(&rgb_cur, 16, 16, ColorRange::Limited).unwrap();
+        let y_ref = rgb888_full_to_yuv420_bt709(&rgb_ref, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: crate::srsv2::rate_control::SrsV2InterPartitionMode::Rect8x16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: crate::srsv2::rate_control::SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let payload =
+            encode_yuv420_p_payload(&seq, &y_cur, &y_ref, 1, 28, &settings, None, None, None)
+                .unwrap();
+        assert_eq!(payload[3], 19);
+        decode_yuv420_p_payload(&seq, &payload, &y_ref).unwrap();
+    }
+
+    #[test]
+    fn p_var_partition_force4x4_rev19_roundtrip_smoke() {
+        let seq = seq_inter(16, 16);
+        let mut rgb_cur = vec![40_u8; 16 * 16 * 3];
+        for y in 0..16usize {
+            for x in 0..16usize {
+                let v = (((x ^ y) & 1) * 200 + 40) as u8;
+                let i = (y * 16 + x) * 3;
+                rgb_cur[i] = v;
+                rgb_cur[i + 1] = v;
+                rgb_cur[i + 2] = v;
+            }
+        }
+        let rgb_ref = vec![128_u8; 16 * 16 * 3];
+        let y_cur = rgb888_full_to_yuv420_bt709(&rgb_cur, 16, 16, ColorRange::Limited).unwrap();
+        let y_ref = rgb888_full_to_yuv420_bt709(&rgb_ref, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: crate::srsv2::rate_control::SrsV2MotionSearchMode::None,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            // FR2 rev19 wire (`p_var_partition`) — required for per-subblock transform tagging.
+            inter_partition_mode: crate::srsv2::rate_control::SrsV2InterPartitionMode::Split8x8,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: crate::srsv2::rate_control::SrsV2TransformSizeMode::Force4x4,
+            ..Default::default()
+        };
+        let mut ms = crate::srsv2::motion_search::SrsV2MotionEncodeStats::default();
+        let payload = encode_yuv420_p_payload(
+            &seq,
+            &y_cur,
+            &y_ref,
+            1,
+            28,
+            &settings,
+            None,
+            Some(&mut ms),
+            None,
+        )
+        .unwrap();
+        assert_eq!(payload[3], 19);
+        assert!(
+            ms.partition.transform_4x4_count >= 1,
+            "Force4x4 should emit at least one 4×4 residual unit"
+        );
+        decode_yuv420_p_payload(&seq, &payload, &y_ref).unwrap();
+    }
 }
