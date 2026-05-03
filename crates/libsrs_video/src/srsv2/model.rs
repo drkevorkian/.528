@@ -131,8 +131,8 @@ impl FrameTypeV2 {
     pub fn from_srsv2_revision(rev: u8) -> Result<Self, super::error::SrsV2Error> {
         Ok(match rev {
             1 | 3 | 7 => Self::Intra,
-            2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 => Self::PredictedP,
-            10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 => Self::BidirectionalB,
+            2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 => Self::PredictedP,
+            10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26 => Self::BidirectionalB,
             12 => Self::AltRef,
             _ => {
                 return Err(super::error::SrsV2Error::syntax(
@@ -506,13 +506,13 @@ mod frame_type_revision_tests {
                 FrameTypeV2::Intra
             );
         }
-        for rev in [2u8, 4, 5, 6, 8, 9, 15, 17, 19, 20] {
+        for rev in [2u8, 4, 5, 6, 8, 9, 15, 17, 19, 20, 23, 25] {
             assert_eq!(
                 frame_type_from_srsv2_revision(rev).unwrap(),
                 FrameTypeV2::PredictedP
             );
         }
-        for rev in [10u8, 11, 13, 14, 16, 18, 21, 22] {
+        for rev in [10u8, 11, 13, 14, 16, 18, 21, 22, 24, 26] {
             assert_eq!(
                 frame_type_from_srsv2_revision(rev).unwrap(),
                 FrameTypeV2::BidirectionalB
@@ -527,7 +527,6 @@ mod frame_type_revision_tests {
     #[test]
     fn unknown_revision_errors() {
         assert!(frame_type_from_srsv2_revision(0).is_err());
-        assert!(frame_type_from_srsv2_revision(23).is_err());
         assert!(frame_type_from_srsv2_revision(255).is_err());
     }
 

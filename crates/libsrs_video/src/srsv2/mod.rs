@@ -8,6 +8,7 @@ pub mod adaptive_quant;
 pub mod b_frame_codec;
 pub mod block_aq;
 pub mod color;
+pub mod context_inter_entropy;
 mod dct;
 pub mod deblock;
 pub mod error;
@@ -38,11 +39,17 @@ pub use b_frame_codec::{
     decode_yuv420_b_payload, encode_yuv420_b_payload, encode_yuv420_b_payload_mb_blend,
     validate_b_prediction_weights, BBlendModeWire, BFrameEncodeStats, BMbEncodeChoice,
     B_WEIGHTED_PRED_CANDIDATES, FRAME_PAYLOAD_MAGIC_B, FRAME_PAYLOAD_MAGIC_B_COMPACT,
-    FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY, FRAME_PAYLOAD_MAGIC_B_MB_BLEND,
-    FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP, FRAME_PAYLOAD_MAGIC_B_SUBPEL,
+    FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY, FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY_CTX_V1,
+    FRAME_PAYLOAD_MAGIC_B_MB_BLEND, FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP,
+    FRAME_PAYLOAD_MAGIC_B_SUBPEL,
 };
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
+};
+pub use context_inter_entropy::{
+    mv_fixed_grid_compact_contexts, mv_partitioned_compact_contexts,
+    rans_decode_mv_bytes_context_v1_fixed, rans_decode_mv_bytes_context_v1_partitioned,
+    rans_encode_mv_bytes_context_v1, SRS_ENTROPY_MODEL_CONTEXT_V1, SRS_ENTROPY_MODEL_STATIC_V1,
 };
 pub use deblock::{
     apply_loop_filter_y, apply_simple_mb_boundary_deblock_y, resolve_deblock_strength,
@@ -65,16 +72,19 @@ pub use model::{
 pub use motion_search::{
     SrsV2InterMvBenchStats, SrsV2MotionEncodeStats, SrsV2PartitionEncodeStats, SrsV2RdoBenchStats,
 };
+pub use p_frame_codec::FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1;
 pub use p_var_partition::{
-    FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR, FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
+    FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR, FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1,
+    FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
 };
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
-    SrsV2PartitionMapEncoding, SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController,
-    SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformSize, SrsV2TransformSizeMode,
+    SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode,
+    SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2RateControlError,
+    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformSize,
+    SrsV2TransformSizeMode,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};

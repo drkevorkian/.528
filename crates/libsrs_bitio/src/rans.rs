@@ -72,7 +72,7 @@ impl RansModel {
         Self::try_from_freqs(vec![f; n])
     }
 
-    fn symbol_for_slot(&self, slot: u32) -> BitIoResult<usize> {
+    pub fn symbol_for_slot(&self, slot: u32) -> BitIoResult<usize> {
         if slot >= RANS_SCALE {
             return Err(BitIoError::Rans("slot out of range".into()));
         }
@@ -143,6 +143,135 @@ pub fn rans_decode(
     let mut steps = 0usize;
 
     for _ in 0..num_symbols {
+        let slot = state & (RANS_SCALE - 1);
+        let sym = model.symbol_for_slot(slot)?;
+        let start = model.cumulative[sym];
+        let freq = model.freqs[sym];
+        state = freq
+            .wrapping_mul(state >> RANS_SCALE_BITS)
+            .wrapping_add(slot.wrapping_sub(start));
+
+        while state < RANS_L {
+            if idx >= data.len() {
+                return Err(BitIoError::Rans("truncated renorm".into()));
+            }
+            steps += 1;
+            if steps > decode_step_budget {
+                return Err(BitIoError::RansDecodeBudget);
+            }
+            state = (state << 8) | u32::from(data[idx]);
+            idx += 1;
+        }
+        out.push(sym);
+    }
+
+    if idx != data.len() {
+        return Err(BitIoError::Rans("trailing bytes after rANS stream".into()));
+    }
+
+    Ok(out)
+}
+
+/// Decode **one** symbol (**forward** stream order). Updates `state`, `idx`, and `steps`.
+pub fn rans_decode_step_symbol(
+    model: &RansModel,
+    state: &mut u32,
+    data: &[u8],
+    idx: &mut usize,
+    steps: &mut usize,
+    decode_step_budget: usize,
+) -> BitIoResult<usize> {
+    let slot = *state & (RANS_SCALE - 1);
+    let sym = model.symbol_for_slot(slot)?;
+    let start = model.cumulative[sym];
+    let freq = model.freqs[sym];
+    *state = freq
+        .wrapping_mul(*state >> RANS_SCALE_BITS)
+        .wrapping_add(slot.wrapping_sub(start));
+
+    while *state < RANS_L {
+        if *idx >= data.len() {
+            return Err(BitIoError::Rans("truncated renorm".into()));
+        }
+        *steps += 1;
+        if *steps > decode_step_budget {
+            return Err(BitIoError::RansDecodeBudget);
+        }
+        *state = (*state << 8) | u32::from(data[*idx]);
+        *idx += 1;
+    }
+    Ok(sym)
+}
+
+/// Multi-context rANS encode: symbol `i` uses `models[contexts[i]]` (**same symbol order** as single-model [`rans_encode`]).
+pub fn rans_encode_symbols_multi_context(
+    models: &[RansModel],
+    symbols: &[usize],
+    contexts: &[u8],
+) -> BitIoResult<Vec<u8>> {
+    let n = symbols.len();
+    if n != contexts.len() {
+        return Err(BitIoError::Rans("symbols/contexts length mismatch".into()));
+    }
+    let mut state = RANS_L;
+    let mut renorm = Vec::new();
+    for i in (0..n).rev() {
+        let ctx = usize::from(contexts[i]);
+        let model = models
+            .get(ctx)
+            .ok_or_else(|| BitIoError::Rans("context model index out of range".into()))?;
+        let sym = symbols[i];
+        if sym >= model.freqs.len() {
+            return Err(BitIoError::Rans("symbol out of range".into()));
+        }
+        let freq = model.freqs[sym];
+        let start = model.cumulative[sym];
+        let max = ((RANS_L as u64 >> RANS_SCALE_BITS) << 8)
+            .checked_mul(u64::from(freq))
+            .ok_or_else(|| BitIoError::Rans("renorm bound overflow".into()))?;
+        while u64::from(state) >= max {
+            renorm.push(state as u8);
+            state >>= 8;
+        }
+        let q = state / freq;
+        let r = state % freq;
+        state = q
+            .checked_shl(RANS_SCALE_BITS)
+            .and_then(|x| x.checked_add(r))
+            .and_then(|x| x.checked_add(start))
+            .ok_or_else(|| BitIoError::Rans("state overflow".into()))?;
+    }
+    renorm.reverse();
+    let mut out = Vec::with_capacity(4 + renorm.len());
+    out.extend_from_slice(&state.to_le_bytes());
+    out.extend_from_slice(&renorm);
+    Ok(out)
+}
+
+/// Multi-context rANS decode (**forward** symbol order matches encode).
+pub fn rans_decode_symbols_multi_context(
+    models: &[RansModel],
+    data: &[u8],
+    num_symbols: usize,
+    contexts: &[u8],
+    decode_step_budget: usize,
+) -> BitIoResult<Vec<usize>> {
+    if num_symbols != contexts.len() {
+        return Err(BitIoError::Rans("context count mismatch".into()));
+    }
+    if data.len() < 4 {
+        return Err(BitIoError::Rans("truncated stream".into()));
+    }
+    let mut state = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let mut idx = 4usize;
+    let mut out = Vec::with_capacity(num_symbols);
+    let mut steps = 0usize;
+
+    for &ctx_byte in contexts.iter() {
+        let ctx = usize::from(ctx_byte);
+        let model = models
+            .get(ctx)
+            .ok_or_else(|| BitIoError::Rans("context model index out of range".into()))?;
         let slot = state & (RANS_SCALE - 1);
         let sym = model.symbol_for_slot(slot)?;
         let start = model.cumulative[sym];

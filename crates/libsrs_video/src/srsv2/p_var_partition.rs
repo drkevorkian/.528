@@ -9,6 +9,10 @@ use super::block_aq::{
     apply_qp_delta_clamped, choose_block_qp_delta, collect_p_subblock_variances,
     validate_qp_clip_range, validate_wire_qp_delta,
 };
+use super::context_inter_entropy::{
+    mv_partitioned_compact_contexts, rans_decode_mv_bytes_context_v1_partitioned,
+    rans_encode_mv_bytes_context_v1,
+};
 use super::dct::{fdct_4x4, fdct_8x8};
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
@@ -26,7 +30,7 @@ use super::motion_search::{
 };
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings,
-    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2PartitionCostModel,
+    SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2PartitionCostModel,
     SrsV2PartitionMapEncoding, SrsV2SubpelMode, SrsV2TransformSizeMode,
 };
 use super::residual_entropy::{
@@ -40,6 +44,8 @@ use super::subpel::{sample_luma_bilinear_qpel, validate_mv_qpel_halfgrid};
 pub const FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION: [u8; 4] = [b'F', b'R', b'2', 19];
 /// P-frame variable partitions — entropy-coded MV section (`FR2` rev **20**).
 pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR: [u8; 4] = [b'F', b'R', b'2', 20];
+/// P-frame variable partitions — **ContextV1** entropy MV (`FR2` rev **25**).
+pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 25];
 
 fn copy_chroma_mb8_qpel_local(
     ref_plane: &VideoPlane<u8>,
@@ -1001,6 +1007,7 @@ pub fn encode_yuv420_p_payload_var_partition(
     {
         return Err(SrsV2Error::Unsupported("P-frame encode requires YUV420p8"));
     }
+    settings.validate_entropy_model_inter()?;
     let w = seq.width;
     let h = seq.height;
     let mb_cols = w / 16;
@@ -1157,10 +1164,10 @@ pub fn encode_yuv420_p_payload_var_partition(
 
     let mut out = Vec::new();
     let inter_entropy_mv = matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1);
-    let magic = if inter_entropy_mv {
-        FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR
-    } else {
-        FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION
+    let magic = match (inter_entropy_mv, settings.entropy_model_mode) {
+        (true, SrsV2EntropyModelMode::ContextV1) => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1,
+        (true, _) => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR,
+        (false, _) => FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
     };
     out.extend_from_slice(&magic);
     out.extend_from_slice(&frame_index.to_le_bytes());
@@ -1214,7 +1221,14 @@ pub fn encode_yuv420_p_payload_var_partition(
     }
 
     if inter_entropy_mv {
-        let mv_blob = rans_encode_mv_bytes(&mv_compact)?;
+        let mv_blob = match settings.entropy_model_mode {
+            SrsV2EntropyModelMode::StaticV1 => rans_encode_mv_bytes(&mv_compact)?,
+            SrsV2EntropyModelMode::ContextV1 => {
+                let ctx =
+                    mv_partitioned_compact_contexts(&mv_compact, mb_cols, mb_rows, &partitions)?;
+                rans_encode_mv_bytes_context_v1(&mv_compact, &ctx)?
+            }
+        };
         let sym_count =
             u32::try_from(mv_compact.len()).map_err(|_| SrsV2Error::Overflow("mv sym"))?;
         let blob_len = u32::try_from(mv_blob.len()).map_err(|_| SrsV2Error::Overflow("mv blob"))?;
@@ -1338,9 +1352,35 @@ pub fn decode_yuv420_p_payload_var_partition(
         sl
     };
     let partitions = partitions_owned.as_slice();
-    let inter_entropy_mv = rev_byte == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR[3];
+    let inter_entropy_mv_static = rev_byte == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR[3];
+    let inter_entropy_mv_ctx = rev_byte == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1[3];
 
-    let pu_mvs = if inter_entropy_mv {
+    let pu_mvs = if inter_entropy_mv_ctx {
+        let sym_count = read_u32(payload, &mut cur)? as usize;
+        let blob_len = read_u32(payload, &mut cur)? as usize;
+        let max_compact = n_mb.saturating_mul(64).min(MAX_FRAME_PAYLOAD_BYTES);
+        if sym_count > max_compact {
+            return Err(SrsV2Error::syntax("P MV compact length out of range"));
+        }
+        let blob_end = cur
+            .checked_add(blob_len)
+            .ok_or(SrsV2Error::Overflow("mv rans blob"))?;
+        if blob_end > payload.len() {
+            return Err(SrsV2Error::Truncated);
+        }
+        let blob = &payload[cur..blob_end];
+        cur = blob_end;
+        let budget = blob_len.saturating_mul(64).min(512_000);
+        let compact = rans_decode_mv_bytes_context_v1_partitioned(
+            blob, sym_count, mb_cols, mb_rows, partitions, budget,
+        )?;
+        if compact.len() != sym_count {
+            return Err(SrsV2Error::syntax("P MV rANS output length mismatch"));
+        }
+        let mut cc = 0usize;
+        let mut val = |mx: i32, my: i32| validate_mv_wire(use_qpel, mx, my);
+        decode_mv_stream_partitioned(&compact, &mut cc, mb_cols, mb_rows, partitions, &mut val)?
+    } else if inter_entropy_mv_static {
         let sym_count = read_u32(payload, &mut cur)? as usize;
         let blob_len = read_u32(payload, &mut cur)? as usize;
         let max_compact = n_mb.saturating_mul(64).min(MAX_FRAME_PAYLOAD_BYTES);

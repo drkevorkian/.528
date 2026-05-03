@@ -2,6 +2,10 @@
 //! integer MV, **14** per-MB blend + half-pel MV grid + optional weighted prediction, **16**/**18**
 //! compact / entropy MV grids).
 
+use super::context_inter_entropy::{
+    mv_fixed_grid_compact_contexts, rans_decode_mv_bytes_context_v1_fixed,
+    rans_encode_mv_bytes_context_v1,
+};
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
 use super::inter_mv::{
@@ -16,7 +20,7 @@ use super::motion_search::{
 use super::p_frame_codec::{copy_chroma_mb8, copy_chroma_mb8_qpel};
 use super::rate_control::{
     rdo_lambda_effective, ResidualEntropy, SrsV2BMotionSearchMode, SrsV2EncodeSettings,
-    SrsV2InterSyntaxMode, SrsV2RdoMode,
+    SrsV2EntropyModelMode, SrsV2InterSyntaxMode, SrsV2RdoMode,
 };
 use super::reference_manager::SrsV2ReferenceManager;
 use super::residual_entropy::{decode_p_residual_chunk, encode_p_residual_chunk};
@@ -35,6 +39,8 @@ pub const FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP: [u8; 4] = [b'F', b'R', b'2', 14];
 pub const FRAME_PAYLOAD_MAGIC_B_COMPACT: [u8; 4] = [b'F', b'R', b'2', 16];
 /// **B** entropy-coded MV sections (`FR2` rev **18**).
 pub const FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 18];
+/// **B** ContextV1 entropy MV sections (`FR2` rev **24**).
+pub const FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 24];
 
 /// [`FR2` rev **16**/**18**] flags after reference slots: bit **0** qpel/half-pel MV grid, bit **1** weighted blend allowed.
 const B_INTER_FLAG_SUBPEL: u8 = 1;
@@ -1025,6 +1031,7 @@ pub fn encode_yuv420_b_payload_mb_blend(
             "variable inter partitions for B frames (FR2 rev21/rev22) are not implemented in this slice",
         ));
     }
+    settings.validate_entropy_model_inter()?;
     let w = seq.width;
     let h = seq.height;
     let qp_i = qp.max(1) as i16;
@@ -1060,7 +1067,19 @@ pub fn encode_yuv420_b_payload_mb_blend(
 
     let entropy_blobs: Option<(Vec<u8>, Vec<u8>)> =
         if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1) {
-            Some((rans_encode_mv_bytes(&ca)?, rans_encode_mv_bytes(&cb)?))
+            Some(match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => {
+                    (rans_encode_mv_bytes(&ca)?, rans_encode_mv_bytes(&cb)?)
+                }
+                SrsV2EntropyModelMode::ContextV1 => {
+                    let ctx_a = mv_fixed_grid_compact_contexts(&ca, mb_cols, mb_rows)?;
+                    let ctx_b = mv_fixed_grid_compact_contexts(&cb, mb_cols, mb_rows)?;
+                    (
+                        rans_encode_mv_bytes_context_v1(&ca, &ctx_a)?,
+                        rans_encode_mv_bytes_context_v1(&cb, &ctx_b)?,
+                    )
+                }
+            })
         } else {
             None
         };
@@ -1102,7 +1121,11 @@ pub fn encode_yuv420_b_payload_mb_blend(
             let (ba, bb) = entropy_blobs
                 .as_ref()
                 .ok_or_else(|| SrsV2Error::syntax("internal: B entropy inter blobs missing"))?;
-            out.extend_from_slice(&FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY);
+            let magic_b_entropy = match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY,
+                SrsV2EntropyModelMode::ContextV1 => FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY_CTX_V1,
+            };
+            out.extend_from_slice(&magic_b_entropy);
             out.extend_from_slice(&frame_index.to_le_bytes());
             out.push(qp);
             out.push(slot_a);
@@ -1184,10 +1207,17 @@ pub fn decode_yuv420_b_payload(
     if payload.len() < 4 + 4 + 1 + 2 {
         return Err(SrsV2Error::Truncated);
     }
-    if &payload[0..3] != b"FR2" || !matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22) {
+    if &payload[0..3] != b"FR2"
+        || !matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26)
+    {
         return Err(SrsV2Error::BadMagic);
     }
     let rev_byte = payload[3];
+    if rev_byte == 26 {
+        return Err(SrsV2Error::Unsupported(
+            "FR2 rev26 B-frame variable partition ContextV1 is not implemented in this slice",
+        ));
+    }
     if matches!(rev_byte, 21 | 22) {
         return Err(SrsV2Error::Unsupported(
             "FR2 rev21/rev22 variable B partitions are not implemented in this slice",
@@ -1195,8 +1225,9 @@ pub fn decode_yuv420_b_payload(
     }
     let half_pel_legacy = rev_byte == 11;
     let mb_blend_rev14 = rev_byte == 14;
-    let compact_b = matches!(rev_byte, 16 | 18);
-    let entropy_b = rev_byte == 18;
+    let compact_b = matches!(rev_byte, 16 | 18 | 24);
+    let entropy_b_ctx = rev_byte == 24;
+    let entropy_b = matches!(rev_byte, 18 | 24);
     let mut cur = 4usize;
     let frame_index = read_u32(payload, &mut cur)?;
     let qp = read_u8(payload, &mut cur)?;
@@ -1275,7 +1306,13 @@ pub fn decode_yuv420_b_payload(
                 let blob = &payload[cur..blob_end];
                 cur = blob_end;
                 let budget = blob_len.saturating_mul(64).min(512_000);
-                let compact = rans_decode_mv_bytes(blob, sym_count, budget)?;
+                let compact = if entropy_b_ctx {
+                    rans_decode_mv_bytes_context_v1_fixed(
+                        blob, sym_count, mb_cols, mb_rows, budget,
+                    )?
+                } else {
+                    rans_decode_mv_bytes(blob, sym_count, budget)?
+                };
                 if compact.len() != sym_count {
                     return Err(SrsV2Error::syntax("B MV rANS output length mismatch"));
                 }

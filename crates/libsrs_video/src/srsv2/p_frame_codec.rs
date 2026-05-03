@@ -9,6 +9,10 @@ use super::block_aq::{
     apply_qp_delta_clamped, choose_block_qp_delta, collect_p_subblock_variances,
     validate_qp_clip_range, validate_wire_qp_delta,
 };
+use super::context_inter_entropy::{
+    mv_fixed_grid_compact_contexts, rans_decode_mv_bytes_context_v1_fixed,
+    rans_encode_mv_bytes_context_v1,
+};
 use super::dct::fdct_8x8;
 use super::error::SrsV2Error;
 use super::frame::{DecodedVideoFrameV2, VideoPlane, YuvFrame};
@@ -23,8 +27,8 @@ use super::model::{PixelFormat, VideoSequenceHeaderV2};
 use super::motion_search::{pick_mv, sad_16x16, sample_u8_plane, SrsV2MotionEncodeStats};
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode,
-    SrsV2EncodeSettings, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2RdoMode,
-    SrsV2SubpelMode,
+    SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode,
+    SrsV2RdoMode, SrsV2SubpelMode,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
@@ -49,6 +53,8 @@ pub const FRAME_PAYLOAD_MAGIC_P_SUBPEL_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 9]
 pub const FRAME_PAYLOAD_MAGIC_P_COMPACT: [u8; 4] = [b'F', b'R', b'2', 15];
 /// P-frame **entropy-coded** MV section (`FR2` rev **17**).
 pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 17];
+/// P-frame **context entropy V1** MV section (`FR2` rev **23**).
+pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 23];
 
 /// One macroblock worth of P residuals (MV stored separately for compact modes).
 #[derive(Clone)]
@@ -491,6 +497,7 @@ pub fn encode_yuv420_p_payload(
     if cur.y.width != w || reference.y.width != w || cur.y.height != h || reference.y.height != h {
         return Err(SrsV2Error::syntax("plane geometry mismatch"));
     }
+    settings.validate_entropy_model_inter()?;
 
     let block_aq_wire = matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
         && matches!(
@@ -797,7 +804,11 @@ pub fn encode_yuv420_p_payload(
             }
         }
         SrsV2InterSyntaxMode::EntropyV1 => {
-            out.extend_from_slice(&FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY);
+            let magic_p_entropy = match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY,
+                SrsV2EntropyModelMode::ContextV1 => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1,
+            };
+            out.extend_from_slice(&magic_p_entropy);
             out.extend_from_slice(&frame_index.to_le_bytes());
             out.push(qp);
             let mut flags = 0_u8;
@@ -818,7 +829,13 @@ pub fn encode_yuv420_p_payload(
             }
             let mvs: Vec<(i32, i32)> = mbs.iter().map(|m| (m.mvx_q, m.mvy_q)).collect();
             let mv_compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
-            let mv_blob = rans_encode_mv_bytes(&mv_compact)?;
+            let mv_blob = match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => rans_encode_mv_bytes(&mv_compact)?,
+                SrsV2EntropyModelMode::ContextV1 => {
+                    let ctx = mv_fixed_grid_compact_contexts(&mv_compact, mb_cols, mb_rows)?;
+                    rans_encode_mv_bytes_context_v1(&mv_compact, &ctx)?
+                }
+            };
             let sym_count = u32::try_from(mv_compact.len())
                 .map_err(|_| SrsV2Error::Overflow("mv compact symbol count"))?;
             let blob_len = u32::try_from(mv_blob.len())
@@ -841,7 +858,13 @@ pub fn encode_yuv420_p_payload(
         .sum();
     let mv_entropy_section =
         if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1) {
-            let blob = rans_encode_mv_bytes(&compact_tmp)?;
+            let blob = match settings.entropy_model_mode {
+                SrsV2EntropyModelMode::StaticV1 => rans_encode_mv_bytes(&compact_tmp)?,
+                SrsV2EntropyModelMode::ContextV1 => {
+                    let ctx = mv_fixed_grid_compact_contexts(&compact_tmp, mb_cols, mb_rows)?;
+                    rans_encode_mv_bytes_context_v1(&compact_tmp, &ctx)?
+                }
+            };
             8_u64.saturating_add(blob.len() as u64)
         } else {
             0
@@ -897,16 +920,17 @@ pub fn decode_yuv420_p_payload(
     if payload.len() < 4 || &payload[0..3] != b"FR2" {
         return Err(SrsV2Error::BadMagic);
     }
-    if matches!(rev, 19 | 20) {
+    if matches!(rev, 19 | 20 | 25) {
         return super::p_var_partition::decode_yuv420_p_payload_var_partition(
             seq, payload, reference, rev,
         );
     }
-    if !matches!(rev, 2 | 4 | 5 | 6 | 8 | 9 | 15 | 17) {
+    if !matches!(rev, 2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 23) {
         return Err(SrsV2Error::BadMagic);
     }
-    let inter_compact = matches!(rev, 15 | 17);
-    let inter_entropy = rev == 17;
+    let inter_compact = matches!(rev, 15 | 17 | 23);
+    let inter_entropy = matches!(rev, 17 | 23);
+    let inter_entropy_ctx_v1 = rev == 23;
 
     let mut cur = 4usize;
     let frame_index = read_u32(payload, &mut cur)?;
@@ -971,7 +995,11 @@ pub fn decode_yuv420_p_payload(
             let blob = &payload[cur..blob_end];
             cur = blob_end;
             let budget = blob_len.saturating_mul(64).min(512_000);
-            let compact = rans_decode_mv_bytes(blob, sym_count, budget)?;
+            let compact = if inter_entropy_ctx_v1 {
+                rans_decode_mv_bytes_context_v1_fixed(blob, sym_count, mb_cols, mb_rows, budget)?
+            } else {
+                rans_decode_mv_bytes(blob, sym_count, budget)?
+            };
             if compact.len() != sym_count {
                 return Err(SrsV2Error::syntax("P MV rANS output length mismatch"));
             }
@@ -1612,6 +1640,43 @@ mod tests {
         let d_co = decode_yuv420_p_payload(&seq, &p_co, &yuv).unwrap();
         let d_en = decode_yuv420_p_payload(&seq, &p_en, &yuv).unwrap();
         assert_eq!(d_co.yuv.y.samples, d_en.yuv.y.samples);
+    }
+
+    #[test]
+    fn p_entropy_rev23_context_v1_roundtrip_matches_compact_luma() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let compact_settings = SrsV2EncodeSettings {
+            motion_search_radius: 16,
+            residual_entropy: crate::srsv2::rate_control::ResidualEntropy::Explicit,
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::CompactV1,
+            ..Default::default()
+        };
+        let entropy_ctx_settings = SrsV2EncodeSettings {
+            inter_syntax_mode: crate::srsv2::rate_control::SrsV2InterSyntaxMode::EntropyV1,
+            entropy_model_mode: crate::srsv2::rate_control::SrsV2EntropyModelMode::ContextV1,
+            ..compact_settings.clone()
+        };
+        let p_co =
+            encode_yuv420_p_payload(&seq, &yuv, &yuv, 1, 28, &compact_settings, None, None, None)
+                .unwrap();
+        let p_ctx = encode_yuv420_p_payload(
+            &seq,
+            &yuv,
+            &yuv,
+            1,
+            28,
+            &entropy_ctx_settings,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p_ctx[3], 23);
+        let d_co = decode_yuv420_p_payload(&seq, &p_co, &yuv).unwrap();
+        let d_ctx = decode_yuv420_p_payload(&seq, &p_ctx, &yuv).unwrap();
+        assert_eq!(d_co.yuv.y.samples, d_ctx.yuv.y.samples);
     }
 
     #[test]

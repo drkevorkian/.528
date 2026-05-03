@@ -1,6 +1,7 @@
 //! Encoder-side rate control: QP selection for benchmarks and future encode loops.
 
 use super::deblock::SrsV2LoopFilterMode;
+use super::error::SrsV2Error;
 use super::limits::{
     MAX_MOTION_SEARCH_RADIUS, MAX_MOTION_VECTOR_PELS, MAX_SUBPEL_REFINEMENT_RADIUS,
 };
@@ -123,6 +124,16 @@ pub enum SrsV2InterSyntaxMode {
     CompactV1,
     /// Compact MV bytes wrapped with static rANS (`FR2` rev **17** P / **18** B).
     EntropyV1,
+}
+
+/// Which **inter MV entropy** tables apply (**rev17**/**23**, **18**/**24**, **20**/**25** families).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2EntropyModelMode {
+    /// Single static rANS model over MV bytes (**`FR2` rev17 / rev18 / rev20**).
+    #[default]
+    StaticV1,
+    /// Deterministic per-context static frequency tables (**`FR2` rev23 / rev24 / rev25**); experimental, not CABAC-class.
+    ContextV1,
 }
 
 /// Experimental **rate–distortion** mode pick (bounded candidates; not production RDO).
@@ -280,6 +291,11 @@ pub struct SrsV2EncodeSettings {
     pub partition_quality_bias: u16,
     /// **`FR2` rev19** partition map packing (**default** legacy one-byte-per-MB).
     pub partition_map_encoding: SrsV2PartitionMapEncoding,
+
+    /// Inter MV entropy (**default** [`SrsV2EntropyModelMode::StaticV1`]).
+    pub entropy_model_mode: SrsV2EntropyModelMode,
+    /// Fixed-point bias (**256 ≈ 1 “byte”**) added to partition **RDO** byte estimates (`FR2` rev19+ tools).
+    pub rdo_partition_byte_bias: i16,
 }
 
 impl Default for SrsV2EncodeSettings {
@@ -332,6 +348,9 @@ impl Default for SrsV2EncodeSettings {
             partition_header_penalty: 512,
             partition_quality_bias: 256,
             partition_map_encoding: SrsV2PartitionMapEncoding::LegacyPerMb,
+
+            entropy_model_mode: SrsV2EntropyModelMode::StaticV1,
+            rdo_partition_byte_bias: 0,
         }
     }
 }
@@ -356,6 +375,22 @@ pub fn rdo_lambda_fp_from_qp(qp: u8) -> i64 {
 }
 
 impl SrsV2EncodeSettings {
+    /// [`SrsV2EntropyModelMode::ContextV1`] requires [`SrsV2InterSyntaxMode::EntropyV1`] (no silent downgrade).
+    pub fn validate_entropy_model_inter(&self) -> Result<(), SrsV2Error> {
+        match self.entropy_model_mode {
+            SrsV2EntropyModelMode::StaticV1 => Ok(()),
+            SrsV2EntropyModelMode::ContextV1 => {
+                if self.inter_syntax_mode != SrsV2InterSyntaxMode::EntropyV1 {
+                    Err(SrsV2Error::syntax(
+                        "ContextV1 entropy requires inter_syntax_mode EntropyV1",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
     /// Search radius bounded for hostile-input-safe encode (`≤ MAX_MOTION_SEARCH_RADIUS`).
     pub fn clamped_motion_search_radius(&self) -> i16 {
         self.motion_search_radius
@@ -676,6 +711,22 @@ mod tests {
         let s = SrsV2EncodeSettings::default();
         assert_eq!(s.motion_search_radius, 16);
         assert_eq!(s.clamped_motion_search_radius(), 16);
+    }
+
+    #[test]
+    fn context_v1_entropy_requires_entropy_inter_syntax() {
+        let s = SrsV2EncodeSettings {
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            entropy_model_mode: SrsV2EntropyModelMode::ContextV1,
+            ..Default::default()
+        };
+        assert!(s.validate_entropy_model_inter().is_err());
+        let ok = SrsV2EncodeSettings {
+            inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+            entropy_model_mode: SrsV2EntropyModelMode::ContextV1,
+            ..Default::default()
+        };
+        assert!(ok.validate_entropy_model_inter().is_ok());
     }
 
     #[test]
