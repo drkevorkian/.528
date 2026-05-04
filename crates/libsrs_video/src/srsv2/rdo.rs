@@ -19,7 +19,7 @@
 //! and choosers return [`crate::srsv2::error::SrsV2Error`] when exceeded.
 
 use super::error::SrsV2Error;
-use super::inter_mv::{predict_mv_qpel, signed_varint_wire_bytes};
+use super::inter_mv::{predict_mv_qpel, pu_count_partition_wire, signed_varint_wire_bytes};
 use super::motion_search::SrsV2RdoBenchStats;
 use super::rate_control::{SrsV2InterSyntaxMode, SrsV2RdoMode};
 
@@ -118,9 +118,7 @@ impl RdoModeDecisionStats {
         bench.inter_zero_mv_wins = bench
             .inter_zero_mv_wins
             .saturating_add(self.inter_zero_mv_wins);
-        bench.inter_me_mv_wins = bench
-            .inter_me_mv_wins
-            .saturating_add(self.inter_me_mv_wins);
+        bench.inter_me_mv_wins = bench.inter_me_mv_wins.saturating_add(self.inter_me_mv_wins);
     }
 }
 
@@ -138,10 +136,7 @@ pub fn score_candidate(distortion: u32, lambda_fp: i64, cost: &RdoCost) -> i128 
 /// Best-effort **fixed** P-frame prefix bytes through QP/flags (and optional block-AQ clip range).
 /// Does **not** include MV grid, entropy blob, residuals, or transforms — use [`RdoCost`] fields for those.
 #[must_use]
-pub fn estimate_inter_header_bytes(
-    inter_syntax: SrsV2InterSyntaxMode,
-    block_aq_wire: bool,
-) -> u64 {
+pub fn estimate_inter_header_bytes(inter_syntax: SrsV2InterSyntaxMode, block_aq_wire: bool) -> u64 {
     let aq = if block_aq_wire { 2u64 } else { 0 };
     match inter_syntax {
         SrsV2InterSyntaxMode::RawLegacy => 4 + 4 + 1 + aq,
@@ -170,7 +165,8 @@ pub fn estimate_partition_candidate_bytes(
     }
 }
 
-/// **Partition AutoFast `RdoFast`** score used on the wire today: distortion plus λ·quality_bias·(MV+res) / 256².
+/// **Partition AutoFast `RdoFast`** score (legacy): distortion plus λ·quality_bias·(MV+res) / 256².
+/// Prefer [`autofast_partition_mb_rdo_score`] for new code — it folds **full** [`RdoCost`] buckets.
 #[inline]
 pub fn partition_rdo_fast_score(
     distortion: u32,
@@ -182,6 +178,65 @@ pub fn partition_rdo_fast_score(
     let side = (mv_b.saturating_add(res_b)) as i128;
     distortion as i128
         + (lambda_partition_fp as i128 * i128::from(quality_bias_fp) * side) / (256 * 256)
+}
+
+/// Per-macroblock wire buckets for **AutoFast** + **`RdoFast`** (partition map, MV body, residual dry-run,
+/// transform tags, optional block-AQ signaling). Aligns [`pu_count_partition_wire`] with the unit tests
+/// in this module (`estimate_partition_candidate_bytes` proportions for **16×16** vs **8×8**).
+#[must_use]
+pub fn autofast_partition_mb_wire_cost(
+    partition_wire_tag: u8,
+    mv_body_bytes: usize,
+    residual_body_bytes: usize,
+    block_aq_wire: bool,
+) -> Result<RdoCost, SrsV2Error> {
+    let npu = pu_count_partition_wire(partition_wire_tag)?;
+    let (partition_map_bytes, transform_id_bytes) = match npu {
+        1 => (0u64, 0u64),
+        2 => (1u64, 2u64),
+        4 => (4u64, 4u64),
+        _ => {
+            let e = npu.saturating_sub(1) as u64;
+            (e.saturating_mul(2), e.saturating_mul(2))
+        }
+    };
+    let block_aq_bytes = if block_aq_wire {
+        npu.saturating_sub(1) as u64
+    } else {
+        0
+    };
+    Ok(estimate_partition_candidate_bytes(
+        partition_map_bytes,
+        mv_body_bytes as u64,
+        residual_body_bytes as u64,
+        transform_id_bytes,
+        block_aq_bytes,
+        0,
+        0,
+    ))
+}
+
+/// AutoFast **RdoFast** score: [`score_candidate`] over [`autofast_partition_mb_wire_cost`], with
+/// **`partition_quality_bias`** applied to λ the same way the legacy MV+res-only path scaled rate.
+#[must_use]
+pub fn autofast_partition_mb_rdo_score(
+    partition_wire_tag: u8,
+    distortion: u32,
+    lambda_partition_fp: i64,
+    quality_bias_fp: u16,
+    mv_body_bytes: usize,
+    residual_body_bytes: usize,
+    block_aq_wire: bool,
+) -> Result<i128, SrsV2Error> {
+    let cost = autofast_partition_mb_wire_cost(
+        partition_wire_tag,
+        mv_body_bytes,
+        residual_body_bytes,
+        block_aq_wire,
+    )?;
+    let bias = i64::from(quality_bias_fp.max(1));
+    let lam_eff = lambda_partition_fp.saturating_mul(bias) / 256;
+    Ok(score_candidate(distortion, lam_eff, &cost))
 }
 
 /// **Partition `HeaderAware`** heuristic (legacy encoder behavior).
@@ -545,5 +600,15 @@ mod tests {
         let a = partition_rdo_fast_score(900, 4096, 256, 30, 200);
         let b = partition_rdo_fast_score(900, 4096, 256, 30, 200);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn autofast_wire_cost_8x8_matches_expected_buckets() {
+        use crate::srsv2::inter_mv::P_PART_WIRE_8X8;
+        let c = autofast_partition_mb_wire_cost(P_PART_WIRE_8X8, 80, 220, false).unwrap();
+        assert_eq!(c.partition_map_bytes, 4);
+        assert_eq!(c.mv_compact_or_entropy_bytes, 80);
+        assert_eq!(c.residual_bytes, 220);
+        assert_eq!(c.transform_id_bytes, 4);
     }
 }

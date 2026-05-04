@@ -4790,7 +4790,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let raw = fs::read(&a.input).unwrap();
@@ -4868,7 +4870,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         assert!(validate_args(&a).is_err());
@@ -4945,7 +4949,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
@@ -5024,7 +5030,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
@@ -5103,7 +5111,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
@@ -5184,7 +5194,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         assert!(validate_args(&a).is_err());
@@ -5279,7 +5291,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
@@ -5365,7 +5379,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         validate_args(&args).unwrap();
@@ -5468,7 +5484,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         validate_args(&args).unwrap();
@@ -5554,7 +5572,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         validate_args(&args).unwrap();
@@ -5645,7 +5665,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         validate_args(&a).unwrap();
@@ -5770,7 +5792,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let settings = build_settings(&args, ResidualEntropy::Auto).unwrap();
@@ -6391,7 +6415,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
@@ -6468,7 +6494,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let s = build_settings(&base, ResidualEntropy::Explicit).unwrap();
@@ -6547,7 +6575,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
@@ -6623,7 +6653,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         let err = validate_args(&a).unwrap_err().to_string();
@@ -6795,7 +6827,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         assert!(validate_args(&a).is_err());
@@ -6872,7 +6906,9 @@ mod tests {
             progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
             progress_x264_json: None,
             progress_b_modes_json: None,
-            h264_progress_summary_out_json: PathBuf::from("var/bench/srsv2_h264_progress_summary.json"),
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
             h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
         };
         assert!(validate_args(&a).is_err());

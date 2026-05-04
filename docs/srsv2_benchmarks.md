@@ -1,5 +1,7 @@
 # SRSV2 measurement methodology (optional comparisons)
 
+For a short **engineering checklist** (what to run next, StaticV1 vs ContextV1, RDO/partitions, `--h264-progress-summary`), see [`next_codec_move.md`](next_codec_move.md).
+
 Workspace tools (engineering measurements):
 
 - Generate deterministic YUV420p8 clips (`--out`, `--meta`; patterns include `flat`, **`gradient`** (alias for `gray-ramp`), `moving-square`, `scrolling-bars`, `checker`, `noise`, `scene-cut`):

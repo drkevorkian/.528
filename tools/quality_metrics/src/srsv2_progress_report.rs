@@ -1,5 +1,9 @@
 //! Engineering progress summary from existing **`bench_srsv2`** JSON artifacts (no FFmpeg required).
 //!
+//! - [`build_progress_report`] tolerates missing required files (warnings + partial answers) — useful in tests.
+//! - [`build_progress_report_strict`] and [`write_progress_summary_files`] require the three primary JSON
+//!   inputs and minimal schema (`compare_entropy_models`, `compare_partition_costs`, `rows`).
+//!
 //! Consumes:
 //! - `--compare-entropy-models` report (`compare_entropy_models[]`)
 //! - `--compare-partition-costs` report (`compare_partition_costs[]`)
@@ -126,14 +130,125 @@ pub enum ProgressReportError {
     Io(String, std::io::Error),
     #[error("parse JSON {0}: {1}")]
     Json(String, serde_json::Error),
+    #[error("required benchmark JSON schema invalid ({path}): {detail}")]
+    SchemaInvalid { path: String, detail: String },
 }
 
 fn read_json(path: &Path) -> Result<Value, ProgressReportError> {
-    let s = fs::read_to_string(path).map_err(|e| {
-        ProgressReportError::Io(path.display().to_string(), e)
-    })?;
-    serde_json::from_str(&s).map_err(|e| {
-        ProgressReportError::Json(path.display().to_string(), e)
+    let s = fs::read_to_string(path)
+        .map_err(|e| ProgressReportError::Io(path.display().to_string(), e))?;
+    serde_json::from_str(&s).map_err(|e| ProgressReportError::Json(path.display().to_string(), e))
+}
+
+fn validate_entropy_models_schema(v: &Value) -> Result<(), ProgressReportError> {
+    match v.get("compare_entropy_models") {
+        Some(a) if a.is_array() => Ok(()),
+        _ => Err(ProgressReportError::SchemaInvalid {
+            path: "entropy_models_json".into(),
+            detail: "expected top-level compare_entropy_models array".into(),
+        }),
+    }
+}
+
+fn validate_partition_costs_schema(v: &Value) -> Result<(), ProgressReportError> {
+    match v.get("compare_partition_costs") {
+        Some(a) if a.is_array() => Ok(()),
+        _ => Err(ProgressReportError::SchemaInvalid {
+            path: "partition_costs_json".into(),
+            detail: "expected top-level compare_partition_costs array".into(),
+        }),
+    }
+}
+
+fn validate_sweep_schema(v: &Value) -> Result<(), ProgressReportError> {
+    match v.get("rows") {
+        Some(a) if a.is_array() => Ok(()),
+        _ => Err(ProgressReportError::SchemaInvalid {
+            path: "sweep_quality_bitrate_json".into(),
+            detail: "expected top-level rows array".into(),
+        }),
+    }
+}
+
+/// Like [`build_progress_report`], but **requires** the three benchmark JSON inputs to exist, parse,
+/// and match minimal **`bench_srsv2`** shapes. Use from CLI (`--h264-progress-summary`) so missing or
+/// malformed artifacts **fail fast** instead of emitting a partial report.
+pub fn build_progress_report_strict(
+    inputs: &ProgressReportInputs<'_>,
+) -> Result<ProgressReport, ProgressReportError> {
+    let entropy_v = read_json(inputs.entropy_models_json)?;
+    validate_entropy_models_schema(&entropy_v)?;
+    let part_v = read_json(inputs.partition_costs_json)?;
+    validate_partition_costs_schema(&part_v)?;
+    let sweep_v = read_json(inputs.sweep_quality_bitrate_json)?;
+    validate_sweep_schema(&sweep_v)?;
+
+    let mut warnings = Vec::new();
+    let mut inputs_read = vec![
+        inputs.entropy_models_json.display().to_string(),
+        inputs.partition_costs_json.display().to_string(),
+        inputs.sweep_quality_bitrate_json.display().to_string(),
+    ];
+
+    let x264_v = if let Some(p) = inputs.compare_x264_bench_json {
+        match read_json(p) {
+            Ok(v) => {
+                inputs_read.push(p.display().to_string());
+                Some(v)
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "optional x264 bench JSON unreadable ({}): {e}",
+                    p.display()
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let b_v = if let Some(p) = inputs.compare_b_modes_json {
+        match read_json(p) {
+            Ok(v) => {
+                inputs_read.push(p.display().to_string());
+                Some(v)
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "optional compare-b-modes JSON unreadable ({}): {e}",
+                    p.display()
+                ));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let q1 = answer_entropy(Some(&entropy_v));
+    let q2 = answer_rdo(Some(&part_v));
+    let q3 = answer_sweep_auto_fast(Some(&sweep_v));
+    let q4 = answer_b_modes(b_v.as_ref());
+    let q5 = answer_x264(x264_v.as_ref());
+
+    let breakdown = byte_breakdown_from_partition_report(Some(&part_v));
+    let (next_bottleneck, next_rationale) = select_next_bottleneck(&breakdown);
+
+    Ok(ProgressReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        inputs_read,
+        warnings,
+        questions: ProgressQuestions {
+            context_v1_vs_static_v1_bytes: q1,
+            rdo_partition_behavior: q2,
+            auto_fast_vs_fixed16_in_sweep: q3,
+            b_half_and_weighted: q4,
+            srsv2_vs_x264: q5,
+        },
+        byte_cost_breakdown: breakdown,
+        next_bottleneck,
+        next_bottleneck_rationale: next_rationale,
     })
 }
 
@@ -149,7 +264,9 @@ fn val_u64(v: &Value, path: &[&str]) -> u64 {
 }
 
 /// Build the engineering summary. Missing optional files add [`ProgressReport::warnings`] only.
-pub fn build_progress_report(inputs: &ProgressReportInputs<'_>) -> Result<ProgressReport, ProgressReportError> {
+pub fn build_progress_report(
+    inputs: &ProgressReportInputs<'_>,
+) -> Result<ProgressReport, ProgressReportError> {
     let mut warnings = Vec::new();
     let mut inputs_read: Vec<String> = Vec::new();
 
@@ -210,7 +327,6 @@ pub fn build_progress_report(inputs: &ProgressReportInputs<'_>) -> Result<Progre
             }
         }
     } else {
-        warnings.push("optional compare-x264 bench JSON not provided".to_string());
         None
     };
 
@@ -239,8 +355,7 @@ pub fn build_progress_report(inputs: &ProgressReportInputs<'_>) -> Result<Progre
     let q5 = answer_x264(x264_v.as_ref());
 
     let breakdown = byte_breakdown_from_partition_report(part_v.as_ref());
-    let (next_bottleneck, next_rationale) =
-        select_next_bottleneck(&breakdown);
+    let (next_bottleneck, next_rationale) = select_next_bottleneck(&breakdown);
 
     Ok(ProgressReport {
         note: "Engineering measurement only; not a marketing claim.",
@@ -308,8 +423,8 @@ fn answer_entropy(report: Option<&Value>) -> QuestionEntropyModels {
             static_total_bytes: static_b,
             context_total_bytes: context_b,
             delta_context_minus_static: None,
-            summary_sentence:
-                "Could not find ok rows for both static and context entropy models.".to_string(),
+            summary_sentence: "Could not find ok rows for both static and context entropy models."
+                .to_string(),
         };
     };
     let delta = i128::from(c) - i128::from(s);
@@ -493,8 +608,8 @@ fn answer_b_modes(report: Option<&Value>) -> QuestionBModes {
             answered: false,
             half_smaller_than_int_count: 0,
             weighted_smaller_than_int_count: 0,
-            summary_sentence:
-                "Optional compare-b-modes JSON not provided or unreadable; skipped.".to_string(),
+            summary_sentence: "Optional compare-b-modes JSON not provided or unreadable; skipped."
+                .to_string(),
         };
     };
     let Some(arr) = report.get("compare_b_modes").and_then(|x| x.as_array()) else {
@@ -539,6 +654,61 @@ fn answer_b_modes(report: Option<&Value>) -> QuestionBModes {
     }
 }
 
+/// Prefer the primary **`SRSV2`** row when present; otherwise the smallest-byte **SRSV2\*** row
+/// without an error field (handles `--compare-b-modes` tables that list multiple SRSV2 variants).
+fn pick_primary_srsv2_table_row(tab: &[Value]) -> Option<&Value> {
+    let mut exact: Option<&Value> = None;
+    let mut best: Option<&Value> = None;
+    let mut best_bytes: u64 = u64::MAX;
+    for row in tab {
+        if row.get("error").and_then(|x| x.as_str()).is_some() {
+            continue;
+        }
+        let codec = row.get("codec").and_then(|x| x.as_str()).unwrap_or("");
+        let c_lower = codec.to_ascii_lowercase();
+        if c_lower.contains("x264") {
+            continue;
+        }
+        if !codec.starts_with("SRSV2") {
+            continue;
+        }
+        let b = row.get("bytes").and_then(|x| x.as_u64());
+        let Some(b) = b else { continue };
+        if codec == "SRSV2" {
+            exact = Some(row);
+            break;
+        }
+        if b < best_bytes {
+            best_bytes = b;
+            best = Some(row);
+        }
+    }
+    exact.or(best)
+}
+
+fn pick_x264_table_row(tab: &[Value]) -> Option<&Value> {
+    let mut best: Option<&Value> = None;
+    let mut best_bytes: u64 = u64::MAX;
+    for row in tab {
+        if row.get("error").and_then(|x| x.as_str()).is_some() {
+            continue;
+        }
+        let codec = row.get("codec").and_then(|x| x.as_str()).unwrap_or("");
+        let c_lower = codec.to_ascii_lowercase();
+        if !(c_lower.contains("x264") || codec == "libx264") {
+            continue;
+        }
+        let Some(b) = row.get("bytes").and_then(|x| x.as_u64()) else {
+            continue;
+        };
+        if b < best_bytes {
+            best_bytes = b;
+            best = Some(row);
+        }
+    }
+    best
+}
+
 fn answer_x264(report: Option<&Value>) -> QuestionX264 {
     let Some(report) = report else {
         return QuestionX264 {
@@ -560,18 +730,15 @@ fn answer_x264(report: Option<&Value>) -> QuestionX264 {
     let mut x264_psnr: Option<f64> = None;
     let mut x264_ssim: Option<f64> = None;
     if let Some(tab) = report.get("table").and_then(|x| x.as_array()) {
-        for row in tab {
-            let codec = row.get("codec").and_then(|x| x.as_str()).unwrap_or("");
-            if codec.starts_with("SRSV2") && !codec.contains("x264") {
-                srs_b = row.get("bytes").and_then(|x| x.as_u64());
-                srs_psnr = row.get("psnr_y").and_then(|x| x.as_f64());
-                srs_ssim = row.get("ssim_y").and_then(|x| x.as_f64());
-            }
-            if codec.contains("x264") || codec == "libx264" {
-                x264_b = row.get("bytes").and_then(|x| x.as_u64());
-                x264_psnr = row.get("psnr_y").and_then(|x| x.as_f64());
-                x264_ssim = row.get("ssim_y").and_then(|x| x.as_f64());
-            }
+        if let Some(row) = pick_primary_srsv2_table_row(tab) {
+            srs_b = row.get("bytes").and_then(|x| x.as_u64());
+            srs_psnr = row.get("psnr_y").and_then(|x| x.as_f64());
+            srs_ssim = row.get("ssim_y").and_then(|x| x.as_f64());
+        }
+        if let Some(row) = pick_x264_table_row(tab) {
+            x264_b = row.get("bytes").and_then(|x| x.as_u64());
+            x264_psnr = row.get("psnr_y").and_then(|x| x.as_f64());
+            x264_ssim = row.get("ssim_y").and_then(|x| x.as_f64());
         }
     }
     let ratio = match (srs_b, x264_b) {
@@ -650,7 +817,10 @@ fn byte_breakdown_from_partition_report(report: Option<&Value>) -> ByteCostBreak
             .and_then(|r| r.get("bytes"))
             .and_then(|x| x.as_u64());
         let mv_header = mv_e.saturating_add(mv_c).saturating_add(hdr);
-        let accounted = mv_header.saturating_add(res).saturating_add(pm).saturating_add(tx);
+        let accounted = mv_header
+            .saturating_add(res)
+            .saturating_add(pm)
+            .saturating_add(tx);
         let total_guess = total_row.unwrap_or(accounted);
         let poor = total_guess.saturating_sub(accounted);
         let denom = total_guess.max(1) as f64;
@@ -719,27 +889,26 @@ fn select_next_bottleneck(b: &ByteCostBreakdown) -> (String, String) {
 }
 
 /// Write JSON + Markdown summary files (creates parent directories).
+///
+/// Uses [`build_progress_report_strict`] so invalid or missing required bench JSON fails before writing.
 pub fn write_progress_summary_files(
     inputs: &ProgressReportInputs<'_>,
     out_json: &Path,
     out_md: &Path,
 ) -> Result<ProgressReport, ProgressReportError> {
-    let rep = build_progress_report(inputs)?;
+    let rep = build_progress_report_strict(inputs)?;
     if let Some(p) = out_json.parent() {
         fs::create_dir_all(p).map_err(|e| ProgressReportError::Io(p.display().to_string(), e))?;
     }
     if let Some(p) = out_md.parent() {
         fs::create_dir_all(p).map_err(|e| ProgressReportError::Io(p.display().to_string(), e))?;
     }
-    let js = serde_json::to_string_pretty(&rep).map_err(|e| {
-        ProgressReportError::Json("progress report serialize".into(), e)
-    })?;
-    fs::write(out_json, js).map_err(|e| {
-        ProgressReportError::Io(out_json.display().to_string(), e)
-    })?;
-    fs::write(out_md, progress_report_markdown(&rep)).map_err(|e| {
-        ProgressReportError::Io(out_md.display().to_string(), e)
-    })?;
+    let js = serde_json::to_string_pretty(&rep)
+        .map_err(|e| ProgressReportError::Json("progress report serialize".into(), e))?;
+    fs::write(out_json, js)
+        .map_err(|e| ProgressReportError::Io(out_json.display().to_string(), e))?;
+    fs::write(out_md, progress_report_markdown(&rep))
+        .map_err(|e| ProgressReportError::Io(out_md.display().to_string(), e))?;
     Ok(rep)
 }
 
@@ -800,7 +969,10 @@ fn progress_report_markdown(rep: &ProgressReport) -> String {
         b.shares.poor_prediction_proxy
     ));
     out.push_str("\n## Next bottleneck\n\n");
-    out.push_str(&format!("**{}** — {}\n", rep.next_bottleneck, rep.next_bottleneck_rationale));
+    out.push_str(&format!(
+        "**{}** — {}\n",
+        rep.next_bottleneck, rep.next_bottleneck_rationale
+    ));
     out
 }
 
@@ -897,6 +1069,55 @@ mod tests {
     }
 
     #[test]
+    fn strict_rejects_bad_entropy_shape() {
+        let dir = std::env::temp_dir();
+        let id = std::process::id();
+        let e = dir.join(format!("qm_strict_e_{id}.json"));
+        let p = dir.join(format!("qm_strict_p_{id}.json"));
+        let sw = dir.join(format!("qm_strict_s_{id}.json"));
+        std::fs::write(&e, "{}").unwrap();
+        std::fs::write(&p, r#"{"compare_partition_costs":[]}"#).unwrap();
+        std::fs::write(&sw, r#"{"rows":[]}"#).unwrap();
+        let inputs = ProgressReportInputs {
+            entropy_models_json: &e,
+            partition_costs_json: &p,
+            sweep_quality_bitrate_json: &sw,
+            compare_x264_bench_json: None,
+            compare_b_modes_json: None,
+        };
+        assert!(matches!(
+            build_progress_report_strict(&inputs),
+            Err(ProgressReportError::SchemaInvalid { .. })
+        ));
+        let _ = std::fs::remove_file(e);
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(sw);
+    }
+
+    #[test]
+    fn strict_accepts_minimal_valid_shapes() {
+        let dir = std::env::temp_dir();
+        let id = std::process::id();
+        let e = dir.join(format!("qm_strict_ok_e_{id}.json"));
+        let p = dir.join(format!("qm_strict_ok_p_{id}.json"));
+        let sw = dir.join(format!("qm_strict_ok_s_{id}.json"));
+        std::fs::write(&e, r#"{"compare_entropy_models":[]}"#).unwrap();
+        std::fs::write(&p, r#"{"compare_partition_costs":[]}"#).unwrap();
+        std::fs::write(&sw, r#"{"rows":[]}"#).unwrap();
+        let inputs = ProgressReportInputs {
+            entropy_models_json: &e,
+            partition_costs_json: &p,
+            sweep_quality_bitrate_json: &sw,
+            compare_x264_bench_json: None,
+            compare_b_modes_json: None,
+        };
+        build_progress_report_strict(&inputs).unwrap();
+        let _ = std::fs::remove_file(e);
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(sw);
+    }
+
+    #[test]
     fn missing_x264_optional_handled() {
         let inputs = ProgressReportInputs {
             entropy_models_json: Path::new("/nonexistent/entropy.json"),
@@ -908,6 +1129,58 @@ mod tests {
         let r = build_progress_report(&inputs).unwrap();
         assert!(!r.questions.srsv2_vs_x264.answered);
         assert!(!r.warnings.is_empty());
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.contains("compare-x264 bench JSON not provided")),
+            "omitted optional x264 path should not spam warnings"
+        );
+    }
+
+    #[test]
+    fn answer_entropy_static_vs_context_delta() {
+        let v = serde_json::json!({
+            "compare_entropy_models": [
+                {"ok": true, "entropy_model_mode": "static", "row": {"bytes": 1000u64}},
+                {"ok": true, "entropy_model_mode": "context", "row": {"bytes": 950u64}}
+            ]
+        });
+        let q = answer_entropy(Some(&v));
+        assert!(q.answered);
+        assert_eq!(q.static_total_bytes, Some(1000));
+        assert_eq!(q.context_total_bytes, Some(950));
+        assert_eq!(q.delta_context_minus_static, Some(-50));
+        assert!(q.summary_sentence.contains("lower"));
+    }
+
+    #[test]
+    fn answer_x264_prefers_exact_srsv2_row() {
+        let v = serde_json::json!({
+            "table": [
+                {"codec": "SRSV2-B-int", "bytes": 100u64, "psnr_y": 30.0, "ssim_y": 0.9},
+                {"codec": "SRSV2", "bytes": 200u64, "psnr_y": 29.0, "ssim_y": 0.89},
+                {"codec": "x264 ref", "bytes": 150u64, "psnr_y": 31.0, "ssim_y": 0.91}
+            ]
+        });
+        let q = answer_x264(Some(&v));
+        assert!(q.answered);
+        assert_eq!(q.srsv2_bytes, Some(200));
+        assert_eq!(q.x264_bytes, Some(150));
+    }
+
+    #[test]
+    fn answer_x264_falls_back_to_smallest_srsv2_variant() {
+        let v = serde_json::json!({
+            "table": [
+                {"codec": "SRSV2-B-int", "bytes": 400u64},
+                {"codec": "SRSV2-P-only", "bytes": 300u64},
+                {"codec": "libx264", "bytes": 350u64}
+            ]
+        });
+        let q = answer_x264(Some(&v));
+        assert!(q.answered);
+        assert_eq!(q.srsv2_bytes, Some(300));
+        assert_eq!(q.x264_bytes, Some(350));
     }
 
     #[test]

@@ -83,13 +83,13 @@ pub use rate_control::{
     SrsV2TransformSizeMode,
 };
 pub use rdo::{
-    b_blend_rdo_score, bounded_candidate_push, choose_best_inter_mode_candidate,
-    choose_best_partition_candidate, choose_min_partition_by_precomputed_scores,
-    estimate_inter_header_bytes, estimate_mv_delta_wire_bytes,
-    estimate_partition_candidate_bytes, p_subblock_skip_residual_is_rdo_cheaper,
-    partition_header_aware_score, partition_rdo_fast_score, rdo_fast_enabled, rdo_score,
-    score_candidate, RdoCandidate, RdoCost, RdoDecision, RdoModeDecisionStats, RdoStats,
-    MAX_RDO_CANDIDATES,
+    autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost, b_blend_rdo_score,
+    bounded_candidate_push, choose_best_inter_mode_candidate, choose_best_partition_candidate,
+    choose_min_partition_by_precomputed_scores, estimate_inter_header_bytes,
+    estimate_mv_delta_wire_bytes, estimate_partition_candidate_bytes,
+    p_subblock_skip_residual_is_rdo_cheaper, partition_header_aware_score,
+    partition_rdo_fast_score, rdo_fast_enabled, rdo_score, score_candidate, RdoCandidate, RdoCost,
+    RdoDecision, RdoModeDecisionStats, RdoStats, MAX_RDO_CANDIDATES,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};

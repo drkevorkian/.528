@@ -15,6 +15,16 @@
 //!
 //! Callers build **compact** MV bytes via [`crate::srsv2::inter_mv`] (`encode_mv_grid_compact`,
 //! `encode_mv_stream_partitioned`). This module owns labeling + multi-context rANS only.
+//!
+//! ## Which entry points to use
+//!
+//! | Scenario | Encode API | Decode API |
+//! |----------|------------|------------|
+//! | Fixed **16×16** MB grid (**FR2** rev **23** / **24**) | [`encode_mv_context_v1_fixed`] | [`decode_mv_context_v1_fixed`] |
+//! | **Variable partitions** — one partition byte per MB, partitioned PU MV scan (**FR2** rev **25**) | [`encode_mv_context_v1_partitioned`] | [`decode_mv_context_v1_partitioned`] |
+//!
+//! Compact MV bytes must match [`crate::srsv2::inter_mv`] packing for the same `(mb_cols, mb_rows)` grid.
+//! **`decode_budget`** counts **rANS normalize/decode steps** per payload (see decode helpers): exhausted budget ⇒ [`crate::srsv2::error::SrsV2Error::syntax`] — hostile streams cannot force unbounded decoder work.
 
 use libsrs_bitio::{
     rans_decode_step_symbol, rans_encode_symbols_multi_context, RansModel, RANS_SCALE,
@@ -61,8 +71,11 @@ pub fn encode_mv_context_v1_fixed(
 
 /// Decode ContextV1 MV rANS blob for a **fixed macroblock grid** back to compact MV bytes.
 ///
-/// `sym_count` is the compact byte length stored beside the blob on the wire. `decode_budget`
-/// bounds rANS normalize/repair steps (hostile-input safe).
+/// `sym_count` is the compact byte length stored beside the blob on the wire.
+///
+/// **`decode_budget`:** upper bound on internal **rANS step work** (renormalization + symbol pulls). If
+/// the bitstream would require more steps than allowed (including malformed/corrupt blobs), decode fails
+/// with a syntax error rather than looping indefinitely.
 pub fn decode_mv_context_v1_fixed(
     blob: &[u8],
     sym_count: usize,
@@ -521,6 +534,22 @@ mod tests {
         let err = decode_mv_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000)
             .unwrap_err();
         assert!(matches!(err, SrsV2Error::Syntax(_)));
+    }
+
+    #[test]
+    fn decode_corrupt_mid_blob_rejected() {
+        let mb_cols = 4u32;
+        let mb_rows = 4u32;
+        let mvs = vec![(4_i32, 0); 16];
+        let compact = encode_mv_grid_compact(&mvs, mb_cols, mb_rows);
+        let mut blob = encode_mv_context_v1_fixed(&compact, mb_cols, mb_rows).unwrap();
+        assert!(blob.len() > 16);
+        for b in blob.iter_mut().skip(8).take(8) {
+            *b = !*b;
+        }
+        let err = decode_mv_context_v1_fixed(&blob, compact.len(), mb_cols, mb_rows, 512_000)
+            .unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_) | SrsV2Error::Truncated));
     }
 
     #[test]
