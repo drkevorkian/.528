@@ -33,8 +33,8 @@ use super::rate_control::{
     SrsV2PartitionMapEncoding, SrsV2SubpelMode, SrsV2TransformSizeMode,
 };
 use super::rdo::{
-    choose_min_partition_by_precomputed_scores, partition_header_aware_score,
-    partition_rdo_fast_score,
+    autofast_partition_mb_rdo_score, choose_min_partition_by_precomputed_scores,
+    partition_header_aware_score,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, decode_p_residual_chunk_4x4, encode_p_residual_chunk,
@@ -616,13 +616,15 @@ fn partition_choice_for_mb(
                             settings,
                             rans_model,
                         )?;
-                        partition_rdo_fast_score(
+                        autofast_partition_mb_rdo_score(
+                            pt,
                             sad,
                             lam_p,
                             settings.partition_quality_bias,
                             mv_b,
                             res_b,
-                        )
+                            block_aq_wire,
+                        )?
                     }
                 };
                 scored[i] = (pt, score);
