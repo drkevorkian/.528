@@ -129,12 +129,9 @@ pub enum ProgressReportError {
 }
 
 fn read_json(path: &Path) -> Result<Value, ProgressReportError> {
-    let s = fs::read_to_string(path).map_err(|e| {
-        ProgressReportError::Io(path.display().to_string(), e)
-    })?;
-    serde_json::from_str(&s).map_err(|e| {
-        ProgressReportError::Json(path.display().to_string(), e)
-    })
+    let s = fs::read_to_string(path)
+        .map_err(|e| ProgressReportError::Io(path.display().to_string(), e))?;
+    serde_json::from_str(&s).map_err(|e| ProgressReportError::Json(path.display().to_string(), e))
 }
 
 fn val_u64(v: &Value, path: &[&str]) -> u64 {
@@ -148,52 +145,24 @@ fn val_u64(v: &Value, path: &[&str]) -> u64 {
     cur.as_u64().unwrap_or(0)
 }
 
-/// Build the engineering summary. Missing optional files add [`ProgressReport::warnings`] only.
-pub fn build_progress_report(inputs: &ProgressReportInputs<'_>) -> Result<ProgressReport, ProgressReportError> {
+/// Build the engineering summary.
+///
+/// The entropy-model, partition-cost, and quality/bitrate sweep reports are required inputs:
+/// missing or malformed files fail clearly. Optional x264 and B-mode inputs only add warnings.
+pub fn build_progress_report(
+    inputs: &ProgressReportInputs<'_>,
+) -> Result<ProgressReport, ProgressReportError> {
     let mut warnings = Vec::new();
     let mut inputs_read: Vec<String> = Vec::new();
 
-    let entropy_v = match read_json(inputs.entropy_models_json) {
-        Ok(v) => {
-            inputs_read.push(inputs.entropy_models_json.display().to_string());
-            Some(v)
-        }
-        Err(e) => {
-            warnings.push(format!(
-                "entropy models JSON unavailable ({}): {e}",
-                inputs.entropy_models_json.display()
-            ));
-            None
-        }
-    };
+    let entropy_v = read_json(inputs.entropy_models_json)?;
+    inputs_read.push(inputs.entropy_models_json.display().to_string());
 
-    let part_v = match read_json(inputs.partition_costs_json) {
-        Ok(v) => {
-            inputs_read.push(inputs.partition_costs_json.display().to_string());
-            Some(v)
-        }
-        Err(e) => {
-            warnings.push(format!(
-                "partition costs JSON unavailable ({}): {e}",
-                inputs.partition_costs_json.display()
-            ));
-            None
-        }
-    };
+    let part_v = read_json(inputs.partition_costs_json)?;
+    inputs_read.push(inputs.partition_costs_json.display().to_string());
 
-    let sweep_v = match read_json(inputs.sweep_quality_bitrate_json) {
-        Ok(v) => {
-            inputs_read.push(inputs.sweep_quality_bitrate_json.display().to_string());
-            Some(v)
-        }
-        Err(e) => {
-            warnings.push(format!(
-                "sweep JSON unavailable ({}): {e}",
-                inputs.sweep_quality_bitrate_json.display()
-            ));
-            None
-        }
-    };
+    let sweep_v = read_json(inputs.sweep_quality_bitrate_json)?;
+    inputs_read.push(inputs.sweep_quality_bitrate_json.display().to_string());
 
     let x264_v = if let Some(p) = inputs.compare_x264_bench_json {
         match read_json(p) {
@@ -232,15 +201,14 @@ pub fn build_progress_report(inputs: &ProgressReportInputs<'_>) -> Result<Progre
         None
     };
 
-    let q1 = answer_entropy(entropy_v.as_ref());
-    let q2 = answer_rdo(part_v.as_ref());
-    let q3 = answer_sweep_auto_fast(sweep_v.as_ref());
+    let q1 = answer_entropy(Some(&entropy_v));
+    let q2 = answer_rdo(Some(&part_v));
+    let q3 = answer_sweep_auto_fast(Some(&sweep_v));
     let q4 = answer_b_modes(b_v.as_ref());
     let q5 = answer_x264(x264_v.as_ref());
 
-    let breakdown = byte_breakdown_from_partition_report(part_v.as_ref());
-    let (next_bottleneck, next_rationale) =
-        select_next_bottleneck(&breakdown);
+    let breakdown = byte_breakdown_from_partition_report(Some(&part_v));
+    let (next_bottleneck, next_rationale) = select_next_bottleneck(&breakdown);
 
     Ok(ProgressReport {
         note: "Engineering measurement only; not a marketing claim.",
@@ -308,8 +276,8 @@ fn answer_entropy(report: Option<&Value>) -> QuestionEntropyModels {
             static_total_bytes: static_b,
             context_total_bytes: context_b,
             delta_context_minus_static: None,
-            summary_sentence:
-                "Could not find ok rows for both static and context entropy models.".to_string(),
+            summary_sentence: "Could not find ok rows for both static and context entropy models."
+                .to_string(),
         };
     };
     let delta = i128::from(c) - i128::from(s);
@@ -493,8 +461,8 @@ fn answer_b_modes(report: Option<&Value>) -> QuestionBModes {
             answered: false,
             half_smaller_than_int_count: 0,
             weighted_smaller_than_int_count: 0,
-            summary_sentence:
-                "Optional compare-b-modes JSON not provided or unreadable; skipped.".to_string(),
+            summary_sentence: "Optional compare-b-modes JSON not provided or unreadable; skipped."
+                .to_string(),
         };
     };
     let Some(arr) = report.get("compare_b_modes").and_then(|x| x.as_array()) else {
@@ -650,7 +618,10 @@ fn byte_breakdown_from_partition_report(report: Option<&Value>) -> ByteCostBreak
             .and_then(|r| r.get("bytes"))
             .and_then(|x| x.as_u64());
         let mv_header = mv_e.saturating_add(mv_c).saturating_add(hdr);
-        let accounted = mv_header.saturating_add(res).saturating_add(pm).saturating_add(tx);
+        let accounted = mv_header
+            .saturating_add(res)
+            .saturating_add(pm)
+            .saturating_add(tx);
         let total_guess = total_row.unwrap_or(accounted);
         let poor = total_guess.saturating_sub(accounted);
         let denom = total_guess.max(1) as f64;
@@ -731,15 +702,12 @@ pub fn write_progress_summary_files(
     if let Some(p) = out_md.parent() {
         fs::create_dir_all(p).map_err(|e| ProgressReportError::Io(p.display().to_string(), e))?;
     }
-    let js = serde_json::to_string_pretty(&rep).map_err(|e| {
-        ProgressReportError::Json("progress report serialize".into(), e)
-    })?;
-    fs::write(out_json, js).map_err(|e| {
-        ProgressReportError::Io(out_json.display().to_string(), e)
-    })?;
-    fs::write(out_md, progress_report_markdown(&rep)).map_err(|e| {
-        ProgressReportError::Io(out_md.display().to_string(), e)
-    })?;
+    let js = serde_json::to_string_pretty(&rep)
+        .map_err(|e| ProgressReportError::Json("progress report serialize".into(), e))?;
+    fs::write(out_json, js)
+        .map_err(|e| ProgressReportError::Io(out_json.display().to_string(), e))?;
+    fs::write(out_md, progress_report_markdown(&rep))
+        .map_err(|e| ProgressReportError::Io(out_md.display().to_string(), e))?;
     Ok(rep)
 }
 
@@ -800,7 +768,10 @@ fn progress_report_markdown(rep: &ProgressReport) -> String {
         b.shares.poor_prediction_proxy
     ));
     out.push_str("\n## Next bottleneck\n\n");
-    out.push_str(&format!("**{}** — {}\n", rep.next_bottleneck, rep.next_bottleneck_rationale));
+    out.push_str(&format!(
+        "**{}** — {}\n",
+        rep.next_bottleneck, rep.next_bottleneck_rationale
+    ));
     out
 }
 
@@ -835,6 +806,52 @@ mod tests {
                 }
             ]
         })
+    }
+
+    fn sample_entropy_json() -> Value {
+        serde_json::json!({
+            "compare_entropy_models": [
+                {
+                    "entropy_model_mode": "static",
+                    "ok": true,
+                    "row": { "bytes": 1200u64 }
+                },
+                {
+                    "entropy_model_mode": "context",
+                    "ok": true,
+                    "row": { "bytes": 1100u64 }
+                }
+            ]
+        })
+    }
+
+    fn sample_sweep_json() -> Value {
+        serde_json::json!({
+            "rows": [
+                {
+                    "ok": true,
+                    "qp": 28u64,
+                    "inter_syntax": "compact",
+                    "entropy_model": "static",
+                    "partition_cost_model": "rdo-fast",
+                    "inter_partition": "fixed16x16",
+                    "total_bytes": 1300u64
+                },
+                {
+                    "ok": true,
+                    "qp": 28u64,
+                    "inter_syntax": "compact",
+                    "entropy_model": "static",
+                    "partition_cost_model": "rdo-fast",
+                    "inter_partition": "auto-fast",
+                    "total_bytes": 1250u64
+                }
+            ]
+        })
+    }
+
+    fn write_json(path: &Path, v: &Value) {
+        std::fs::write(path, serde_json::to_string(v).unwrap()).unwrap();
     }
 
     #[test]
@@ -897,7 +914,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_x264_optional_handled() {
+    fn missing_required_entropy_report_fails() {
         let inputs = ProgressReportInputs {
             entropy_models_json: Path::new("/nonexistent/entropy.json"),
             partition_costs_json: Path::new("/nonexistent/part.json"),
@@ -905,9 +922,62 @@ mod tests {
             compare_x264_bench_json: None,
             compare_b_modes_json: None,
         };
+        let err = build_progress_report(&inputs).unwrap_err().to_string();
+        assert!(err.contains("entropy.json"), "{err}");
+    }
+
+    #[test]
+    fn valid_required_reports_serialize_summary() {
+        let dir =
+            std::env::temp_dir().join(format!("srsv2-progress-report-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entropy = dir.join("entropy.json");
+        let part = dir.join("partition.json");
+        let sweep = dir.join("sweep.json");
+        write_json(&entropy, &sample_entropy_json());
+        write_json(&part, &sample_partition_json());
+        write_json(&sweep, &sample_sweep_json());
+
+        let inputs = ProgressReportInputs {
+            entropy_models_json: &entropy,
+            partition_costs_json: &part,
+            sweep_quality_bitrate_json: &sweep,
+            compare_x264_bench_json: None,
+            compare_b_modes_json: None,
+        };
+        let r = build_progress_report(&inputs).unwrap();
+        assert_eq!(r.next_bottleneck, "inter_residual");
+        assert!(r.questions.context_v1_vs_static_v1_bytes.answered);
+        assert!(r.questions.auto_fast_vs_fixed16_in_sweep.answered);
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("next_bottleneck"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_optional_x264_report_warns() {
+        let dir =
+            std::env::temp_dir().join(format!("srsv2-progress-report-opt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entropy = dir.join("entropy.json");
+        let part = dir.join("partition.json");
+        let sweep = dir.join("sweep.json");
+        let x264 = dir.join("missing-x264.json");
+        write_json(&entropy, &sample_entropy_json());
+        write_json(&part, &sample_partition_json());
+        write_json(&sweep, &sample_sweep_json());
+
+        let inputs = ProgressReportInputs {
+            entropy_models_json: &entropy,
+            partition_costs_json: &part,
+            sweep_quality_bitrate_json: &sweep,
+            compare_x264_bench_json: Some(&x264),
+            compare_b_modes_json: None,
+        };
         let r = build_progress_report(&inputs).unwrap();
         assert!(!r.questions.srsv2_vs_x264.answered);
-        assert!(!r.warnings.is_empty());
+        assert!(r.warnings.iter().any(|w| w.contains("x264")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

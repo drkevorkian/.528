@@ -1,7 +1,7 @@
 pub mod display_order;
 pub use display_order::{DisplayOrderError, DisplayReorderBuffer};
-pub mod srsv2_sweep;
 pub mod srsv2_progress_report;
+pub mod srsv2_sweep;
 pub mod synthetic;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
