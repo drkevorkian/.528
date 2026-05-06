@@ -62,7 +62,7 @@ error: this file contains an unclosed delimiter
 Error writing files: failed to resolve mod `srsv2_progress_report`: cannot parse \\?\C:\Users\owner\Documents\GitHub\.528\tools\quality_metrics\src\srsv2_progress_report.rs
 ```
 
-**Cause:** Unresolved Git merge conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`) in `tools/quality_metrics/src/srsv2_progress_report.rs`.
+**Cause:** Unresolved Git merge conflict delimiter lines (HEAD / separator / incoming branch) were left in `tools/quality_metrics/src/srsv2_progress_report.rs`.
 
 **Remediation:** Conflict markers removed; `read_json`, `build_progress_report_strict`, `build_progress_report`, and the `mod tests` section were merged into valid Rust. `cargo fmt --all --check` then **PASS**.
 

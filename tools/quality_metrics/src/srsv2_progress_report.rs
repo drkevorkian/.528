@@ -1,8 +1,10 @@
 //! Engineering progress summary from existing **`bench_srsv2`** JSON artifacts (no FFmpeg required).
 //!
-//! - [`build_progress_report`] reads the three primary JSON inputs with [`read_json`] (missing paths or
-//!   parse errors fail with [`ProgressReportError`]); optional x264 / B-mode paths add [`ProgressReport::warnings`]
-//!   when provided but unreadable.
+//! - [`build_progress_report`] reads the three primary JSON inputs with [`read_json`]. Missing paths or
+//!   parse errors fail with [`ProgressReportError`]. Required files that **parse** but omit expected arrays
+//!   still produce a **partial** report (questions may be unanswered); only [`build_progress_report_strict`]
+//!   rejects those shapes. Optional x264 / B-mode paths add [`ProgressReport::warnings`] when provided but
+//!   unreadable.
 //! - [`build_progress_report_strict`] also enforces minimal schema (`compare_entropy_models`, `compare_partition_costs`,
 //!   `rows`) on those three files. **`bench_srsv2 --h264-progress-summary`** uses [`write_progress_summary_files`]
 //!   (strict + writes JSON/Markdown).
@@ -1106,6 +1108,89 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err_s.contains("entropy.json"), "{err_s}");
+    }
+
+    #[test]
+    fn tolerant_malformed_entropy_shape_still_ok_partial() {
+        let dir = std::env::temp_dir().join(format!(
+            "srsv2-progress-tolerant-malformed-e-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let e = dir.join("entropy.json");
+        let p = dir.join("partition.json");
+        let sw = dir.join("sweep.json");
+        std::fs::write(&e, "{}").unwrap();
+        write_json(&p, &sample_partition_json());
+        write_json(&sw, &sample_sweep_json());
+        let inputs = ProgressReportInputs {
+            entropy_models_json: &e,
+            partition_costs_json: &p,
+            sweep_quality_bitrate_json: &sw,
+            compare_x264_bench_json: None,
+            compare_b_modes_json: None,
+        };
+        let r = build_progress_report(&inputs).unwrap();
+        assert!(
+            !r.questions.context_v1_vs_static_v1_bytes.answered,
+            "entropy JSON without compare_entropy_models should leave Q1 unanswered"
+        );
+        assert!(r.questions.rdo_partition_behavior.answered);
+        assert!(r.questions.auto_fast_vs_fixed16_in_sweep.answered);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn strict_rejects_bad_partition_shape() {
+        let dir = std::env::temp_dir();
+        let id = std::process::id();
+        let e = dir.join(format!("qm_strict_p_bad_e_{id}.json"));
+        let p = dir.join(format!("qm_strict_p_bad_p_{id}.json"));
+        let sw = dir.join(format!("qm_strict_p_bad_s_{id}.json"));
+        std::fs::write(&e, r#"{"compare_entropy_models":[]}"#).unwrap();
+        std::fs::write(&p, "{}").unwrap();
+        std::fs::write(&sw, r#"{"rows":[]}"#).unwrap();
+        let inputs = ProgressReportInputs {
+            entropy_models_json: &e,
+            partition_costs_json: &p,
+            sweep_quality_bitrate_json: &sw,
+            compare_x264_bench_json: None,
+            compare_b_modes_json: None,
+        };
+        let err = build_progress_report_strict(&inputs).unwrap_err();
+        assert!(matches!(err, ProgressReportError::SchemaInvalid { .. }));
+        assert!(
+            err.to_string().contains("partition_costs"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(e);
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(sw);
+    }
+
+    #[test]
+    fn strict_rejects_bad_sweep_shape() {
+        let dir = std::env::temp_dir();
+        let id = std::process::id();
+        let e = dir.join(format!("qm_strict_s_bad_e_{id}.json"));
+        let p = dir.join(format!("qm_strict_s_bad_p_{id}.json"));
+        let sw = dir.join(format!("qm_strict_s_bad_sw_{id}.json"));
+        std::fs::write(&e, r#"{"compare_entropy_models":[]}"#).unwrap();
+        std::fs::write(&p, r#"{"compare_partition_costs":[]}"#).unwrap();
+        std::fs::write(&sw, "{}").unwrap();
+        let inputs = ProgressReportInputs {
+            entropy_models_json: &e,
+            partition_costs_json: &p,
+            sweep_quality_bitrate_json: &sw,
+            compare_x264_bench_json: None,
+            compare_b_modes_json: None,
+        };
+        let err = build_progress_report_strict(&inputs).unwrap_err();
+        assert!(matches!(err, ProgressReportError::SchemaInvalid { .. }));
+        assert!(err.to_string().contains("sweep"), "{err}");
+        let _ = std::fs::remove_file(e);
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(sw);
     }
 
     #[test]
