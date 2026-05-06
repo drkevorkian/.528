@@ -46,7 +46,9 @@ pub struct ContextV1ModelSummary {
     pub model_derivation: &'static str,
 }
 
-/// Returns a stable summary of the ContextV1 static multi-context rANS MV entropy model.
+/// Returns a stable summary of the ContextV1 static multi-context rANS MV entropy model (table
+/// count, rANS scale, derivation note). For benchmark JSON and diagnostics only — **no bitrate
+/// claim** vs other codecs.
 #[must_use]
 pub fn context_model_summary() -> ContextV1ModelSummary {
     ContextV1ModelSummary {
@@ -57,6 +59,11 @@ pub fn context_model_summary() -> ContextV1ModelSummary {
 }
 
 /// Encode **compact** MV bytes (**fixed 16×16 macroblock grid**) with ContextV1 multi-context rANS.
+///
+/// # Errors
+///
+/// MV compact length does not match the `(mb_cols, mb_rows)` grid implied by labeling, or rANS
+/// encoder failure → [`SrsV2Error::Syntax`].
 ///
 /// `mv_compact` must be exactly the wire produced by [`crate::srsv2::inter_mv::encode_mv_grid_compact`]
 /// for `(mb_cols * mb_rows)` macroblocks.
@@ -76,6 +83,11 @@ pub fn encode_mv_context_v1_fixed(
 /// **`decode_budget`:** upper bound on internal **rANS step work** (renormalization + symbol pulls). If
 /// the bitstream would require more steps than allowed (including malformed/corrupt blobs), decode fails
 /// with a syntax error rather than looping indefinitely.
+///
+/// # Errors
+///
+/// Truncated header, `sym_count` mismatch vs bitstream, corrupt state, exhausted `decode_budget`,
+/// MV grid vs compact mismatch, or trailing bytes → [`SrsV2Error::Syntax`] or [`SrsV2Error::Truncated`].
 pub fn decode_mv_context_v1_fixed(
     blob: &[u8],
     sym_count: usize,
@@ -87,6 +99,11 @@ pub fn decode_mv_context_v1_fixed(
 }
 
 /// Encode **compact** MV bytes for **variable partition** layouts with ContextV1 multi-context rANS.
+///
+/// # Errors
+///
+/// `partition_types.len() != mb_cols * mb_rows`, illegal partition wire tags, MV stream / PU count
+/// mismatch vs partitions, or rANS failure → [`SrsV2Error::Syntax`].
 ///
 /// `partition_types` is one wire partition byte per macroblock (see [`crate::srsv2::inter_mv`]).
 pub fn encode_mv_context_v1_partitioned(
@@ -100,6 +117,15 @@ pub fn encode_mv_context_v1_partitioned(
 }
 
 /// Decode ContextV1 MV rANS for **partitioned** PU streams back to compact MV bytes.
+///
+/// **`decode_budget`:** same semantics as [`decode_mv_context_v1_fixed`] — bounds rANS normalize/decode
+/// steps so hostile blobs cannot force unbounded work.
+///
+/// # Errors
+///
+/// Partition map length mismatch, malformed partition types, truncated/corrupt blob, symbol count
+/// mismatch, exhausted `decode_budget`, or trailing bytes after decode → [`SrsV2Error::Syntax`] or
+/// [`SrsV2Error::Truncated`].
 pub fn decode_mv_context_v1_partitioned(
     blob: &[u8],
     sym_count: usize,
@@ -463,6 +489,17 @@ mod tests {
     use libsrs_bitio::{
         rans_decode_symbols_multi_context, rans_encode_symbols_multi_context, RansModel,
     };
+
+    #[test]
+    fn context_v1_apis_reexported_from_srsv2_root() {
+        let s = crate::srsv2::context_model_summary();
+        assert_eq!(s.context_count, MV_CONTEXT_COUNT);
+        let compact = encode_mv_grid_compact(&[(0_i32, 0_i32)], 1, 1);
+        let blob = crate::srsv2::encode_mv_context_v1_fixed(&compact, 1, 1).unwrap();
+        let dec =
+            crate::srsv2::decode_mv_context_v1_fixed(&blob, compact.len(), 1, 1, 4096).unwrap();
+        assert_eq!(dec, compact);
+    }
 
     #[test]
     fn context_model_summary_matches_constants() {

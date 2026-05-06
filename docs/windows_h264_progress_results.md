@@ -5,152 +5,151 @@ _Engineering measurement only. This report does not claim SRSV2 beats H.264._
 ## Run
 
 - Date: 2026-05-04
-- OS: Windows
-- Seed: 528
-- Clips: `moving-square`, `scrolling-bars`, `checker`, `scene-cut`
-- Geometry: 32x32, 6 frames, 30 fps
-- QP: 28
-- Keyint: 6
-- Motion radius: 4
-- Output root: `var/bench/windows_h264_progress/`
+- OS: Windows (`windows-x86_64` in report JSON)
+- Git (from bench JSON): `ec399b6`
+- Seed: 528; fps: 30; QP: 28; keyint: 6; motion radius: 4; residual entropy: `auto`
+- Clips: `moving_square`, `scrolling_bars`, `checker`, `scene_cut` (32×32, 6 frames each)
+- Machine output root: `var/bench/windows_h264_progress/`
 
-## Command List
+## Command list
 
-Primary gate command:
+Primary gate (from `tools/windows_h264_progress_baseline.ps1`):
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\windows_h264_progress_baseline.ps1
 ```
 
-The script ran these command classes for each clip:
+Executed commands are logged verbatim in `var/bench/windows_h264_progress/commands_run.txt`. Summary:
 
-- `cargo build --release -p quality_metrics --bin gen_synthetic_yuv --bin bench_srsv2`
-- `gen_synthetic_yuv --pattern <pattern> --width 32 --height 32 --frames 6 --fps 30 --seed 528 --out ... --meta ...`
-- `bench_srsv2 --inter-syntax entropy --compare-entropy-models`
-- `bench_srsv2 --inter-syntax compact --compare-partition-costs`
-- `bench_srsv2 --sweep-quality-bitrate`
-- `bench_srsv2 --compare-b-modes --reference-frames 2 --bframes 1`
-- `bench_srsv2 --compare-x264` on `moving_square` because FFmpeg was available
-- `bench_srsv2 --h264-progress-summary --entropy-models-json ... --partition-costs-json ... --sweep-quality-bitrate-json ... --compare-b-modes-json ... --compare-x264-json ... --progress-summary-json ... --progress-summary-md ...`
+1. `cargo build --release -p quality_metrics --bin gen_synthetic_yuv --bin bench_srsv2`
+2. Per clip: `gen_synthetic_yuv --pattern <pattern> --width 32 --height 32 --frames 6 --fps 30 --seed 528 --out ... --meta ...`
+3. Per clip: `bench_srsv2 ... --inter-syntax entropy --compare-entropy-models --report-json ... --report-md ...`
+4. Per clip: `bench_srsv2 ... --inter-syntax compact --compare-partition-costs --report-json ... --report-md ...`
+5. Per clip: `bench_srsv2 ... --sweep-quality-bitrate --report-json ... --report-md ...`
+6. Per clip: `bench_srsv2 ... --compare-b-modes --reference-frames 2 --bframes 1 --report-json ... --report-md ...`
+7. `moving_square` only (if `ffmpeg` on PATH): `bench_srsv2 ... --compare-x264 --report-json ... --report-md ...`
+8. `bench_srsv2 --h264-progress-summary --entropy-models-json ... --partition-costs-json ... --sweep-quality-bitrate-json ... --compare-b-modes-json ... [--compare-x264-json ...] --progress-summary-json ... --progress-summary-md ...`
 
-Full expanded command log: `var/bench/windows_h264_progress/commands_run.txt`.
+## Best StaticV1 row
 
-## Best Entropy Rows
+Source: `var/bench/windows_h264_progress/reports/moving_square/compare_entropy_models.json` (progress summary inputs use `moving_square`).
 
-Best StaticV1 row by total bytes:
+| Field | Value |
+| --- | ---: |
+| Row | `SRSV2-entropy-StaticV1` |
+| Total bytes | 607 |
+| PSNR-Y | 24.7927 |
+| SSIM-Y | 0.9177 |
+| Bitrate bps | 24280 |
+| Static MV entropy section bytes | 88 |
+| Inter header bytes (details) | 138 |
+| Inter residual bytes (details) | 304 |
 
-- Clip: `moving_square`
-- Row: `SRSV2-entropy-StaticV1`
-- Bytes: 607
-- PSNR-Y: 24.793
-- SSIM-Y: 0.9177
-- Static MV bytes: 88
-- MV deltas: zero 18, nonzero 22, avg abs 8.2
+## Best ContextV1 row
 
-Best ContextV1 row by total bytes:
+| Field | Value |
+| --- | ---: |
+| Row | `SRSV2-entropy-ContextV1` |
+| Total bytes | 607 |
+| PSNR-Y | 24.7927 |
+| SSIM-Y | 0.9177 |
+| Bitrate bps | 24280 |
+| Context MV entropy section bytes | 88 |
 
-- Clip: `moving_square`
-- Row: `SRSV2-entropy-ContextV1`
-- Bytes: 607
-- PSNR-Y: 24.793
-- SSIM-Y: 0.9177
-- Context MV bytes: 88
-- MV deltas: zero 18, nonzero 22, avg abs 8.2
+Result: **tie** — Δ(context − static) = **0** bytes on this gate (`summary.json` questions.context_v1_vs_static_v1_bytes).
 
-Result: ContextV1 tied StaticV1 on the best byte row. It did not reduce bytes on this gate run.
+## Best partition-cost row
 
-## Best Partition-Cost Row
+Source: `compare_partition_costs.json` for `moving_square`.
 
-Best partition-cost row by total bytes:
+**Smallest total bytes** (best byte row in the compare table):
 
-- Clip: `moving_square`
-- Row: `SRSV2-pc-fixed16x16`
-- Bytes: 559
-- PSNR-Y: 24.793
-- SSIM-Y: 0.9177
+| Field | Value |
+| --- | ---: |
+| Row | `SRSV2-pc-fixed16x16` |
+| Bytes | 559 |
+| PSNR-Y | 24.7927 |
+| SSIM-Y | 0.9177 |
 
-Progress-summary source row (`moving_square`, `SRSV2-pc-auto-fast-rdo`):
+Auto-fast variants on the same clip (same JSON `table`):
 
-- Auto-fast RDO bytes: 781
-- Auto-fast sad-only bytes: 837
-- RDO partition rejects: 4
-- Header-cost rejects: 0
-- RDO same or smaller than sad-only: true
+| Row | Bytes | SSIM-Y |
+| --- | ---: | ---: |
+| `SRSV2-pc-auto-fast-sad` | 837 | 0.9117 |
+| `SRSV2-pc-auto-fast-header-aware` | 769 | 0.9243 |
+| `SRSV2-pc-auto-fast-rdo` | 769 | 0.9243 |
+| `SRSV2-pc-split8x8` | 901 | 0.9205 |
 
-Result: RDO reduced the auto-fast sad-only cost, but fixed16x16 still beat auto-fast-rdo by 222 bytes on the summary clip.
+Progress-summary facts (`summary.json`): `partition_rejected_by_rdo` = **2**, `partition_rejected_by_header_cost` = **0**; auto-fast RDO bytes **769** vs sad-only **837** (RDO same or smaller than sad: **true**). Fixed16×16 still uses **210 fewer bytes** than auto-fast RDO on this clip (559 vs 769).
 
-## Best Quality / Bitrate Sweep Row
+## Best quality / bitrate sweep row
 
-Best row by quality in the generated sweep:
+Source: `var/bench/windows_h264_progress/reports/moving_square/sweep_quality_bitrate.json` (60 rows).
 
-- Clip: `moving_square`
-- QP: 22
-- Inter syntax: `compact`
-- Entropy model: `static`
-- Partition cost model: `rdo-fast`
-- Inter partition: `auto-fast`
-- Bytes: 789
-- PSNR-Y: 24.966
-- SSIM-Y: 0.9297
+**Highest SSIM-Y** among `ok: true` rows:
 
-Auto-fast vs fixed16x16 sweep result from the progress summary:
+| Field | Value |
+| --- | --- |
+| `row_index` | 15 |
+| QP | 22 |
+| `inter_syntax` | `compact` |
+| `entropy_model` | `static` |
+| `partition_cost_model` | `rdo-fast` |
+| `inter_partition` | `auto-fast` |
+| Total bytes | 789 |
+| PSNR-Y | 24.9662 |
+| SSIM-Y | **0.9297** |
 
-- Comparable slices: 30
-- Auto-fast smaller-byte wins: 0
+Sweep decision statistic from `summary.json`: **30** comparable slices; auto-fast **smaller total_bytes than fixed16×16: 0** (ties possible).
 
-## B-Mode Result
+## B-int vs B-half vs B-weighted
 
-| Clip | P-only bytes | B-int bytes | B-half bytes | B-weighted bytes | Result |
-|---|---:|---:|---:|---:|---|
-| `checker` | 2938 | 2328 | 2471 | 2392 | B-int was smallest among B modes; B-half and weighted did not pay. |
-| `moving_square` | 594 | 750 | 768 | 818 | P-only was smallest; B-half and weighted did not pay. |
-| `scene_cut` | 1343 | 1390 | 1492 | 1454 | P-only was smallest; B-half and weighted did not pay. |
-| `scrolling_bars` | 1855 | 1973 | 2001 | 2034 | P-only was smallest; B-half and weighted did not pay. |
+Per-clip totals from each `reports/<clip>/compare_b_modes.json` (`table` codec rows):
 
-Progress-summary B result for `moving_square`: B-int 750 bytes, B-half 768 bytes, B-weighted 818 bytes.
+| Clip | P-only | B-int | B-half | B-weighted | Note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `moving_square` | 594 | 750 | 768 | 818 | B-int +156 vs P-only; half +18 vs int; weighted +68 vs int. |
+| `scrolling_bars` | 1855 | 1973 | 2001 | 2034 | P-only smallest; B modes larger. |
+| `checker` | 2938 | 2328 | 2471 | 2392 | B-int smallest overall (2328 vs P-only 2938); B-half and weighted did not beat B-int. |
+| `scene_cut` | 1343 | 1390 | 1492 | 1454 | B-int smallest among B modes; all B rows ≥ P-only on this clip. |
 
-## Optional x264 Result
+`moving_square` (summary clip): half-pel and weighted paths **did not reduce** bytes versus B-int.
 
-FFmpeg was available, so the script ran the optional x264 report on `moving_square`.
+## Optional x264 result (FFmpeg present)
+
+Source: `reports/moving_square/compare_x264.json` (`x264.status`: **ok**).
 
 | Codec | Bytes | Bitrate bps | PSNR-Y | SSIM-Y |
-|---|---:|---:|---:|---:|
-| SRSV2 | 594 | 23760 | 24.793 | 0.9177 |
-| x264 | 1708 | 68320 | 100.000 | 1.0000 |
+| --- | ---: | ---: | ---: | ---: |
+| SRSV2 | 594 | 23760 | 24.7927 | 0.9177 |
+| x264 | 1708 | 68320 | 100.0 | 1.0 |
 
-This is not bitrate-matched. It is only a local reference row showing that the optional path works.
+Encoder line from JSON: `libx264`, preset **medium**, **CRF 23** (not QP-matched to SRSV2’s fixed-QP path). Metrics are **not** claimed comparable; this row only proves the optional tool ran.
 
-## Biggest Byte Bottleneck
+## Biggest byte bottleneck
 
-The progress summary used the `moving_square` report set and named:
+From `summary.json` → `byte_cost_breakdown` (source row `SRSV2-pc-auto-fast-rdo`, total **769** bytes):
 
-- Biggest bottleneck: `poor_prediction_proxy`
-- Source row: `SRSV2-pc-auto-fast-rdo`
-- Total row bytes: 781
-- MV/header bytes: 60 (7.68%)
-- Inter residual bytes: 0 (0.00%)
-- Partition map bytes: 20 (2.56%)
-- Transform syntax bytes: 20 (2.56%)
-- Other / unbucketed proxy bytes: 681 (87.20%)
+| Bucket | Bytes | Share of row |
+| --- | ---: | ---: |
+| MV/header (`mv_header_bytes`) | 48 | 0.0624 |
+| Inter residual (`inter_residual_bytes`) | 0 | 0.0000 |
+| Partition map | 20 | 0.0260 |
+| Transform / partition header syntax | 20 | 0.0260 |
+| `poor_prediction_proxy` (row total minus summed buckets) | 681 | 0.8856 |
 
-Interpretation: the currently instrumented byte buckets do not explain most of the auto-fast-rdo partition row. Given fixed16x16 wins the partition-cost compare and auto-fast has zero smaller-byte wins in 30 sweep slices, the immediate blocker is the partitioned syntax/decision path rather than ContextV1 MV entropy or B-half/weighted prediction.
+`next_bottleneck`: **`poor_prediction_proxy`**. Rationale in JSON: largest share is payload not yet mapped into the listed buckets (containers, slice headers, other syntax) until telemetry is extended.
 
-## Decision
+## Next recommended codec feature
 
-Chosen next codec feature: **C. Partition syntax redesign**.
+**Choice: C — Partition syntax redesign** (per gate rules: partition / map / MV side still wins for simple partition, and auto-fast does not beat fixed16×16 on bytes).
 
-Evidence:
+Evidence tied to numbers above:
 
-- Auto-fast-rdo did not beat fixed16x16 on the best partition-cost row: 781 bytes vs 559 bytes on `moving_square`.
-- Auto-fast had 0 smaller-byte wins across 30 comparable quality/bitrate sweep slices.
-- B-half and weighted B did not pay in any clip in this gate.
-- ContextV1 tied StaticV1 on the best entropy row: both 607 bytes, both 88 MV entropy bytes.
-- The summary bottleneck is `poor_prediction_proxy` at 681 / 781 bytes on the auto-fast-rdo row, which points to unaccounted partitioned syntax/overhead before adding a new prediction tool.
+- **C trigger:** In **30** comparable sweep slices, auto-fast was **never** smaller than fixed16×16 on `total_bytes` (`summary.json` `auto_fast_vs_fixed16_in_sweep`). On `moving_square`, `SRSV2-pc-fixed16x16` is **559** bytes vs **`SRSV2-pc-auto-fast-rdo` 769** bytes (+210 bytes for adaptive partition path on this clip).
+- **Not A (quarter-pel luma motion):** B-half **768** vs B-int **750** on `moving_square`—extra fractional MV work **increased** bytes here; gate does not show “half-pel helped quality without exploding bytes” at the bit accounting level.
+- **Not B (context-adaptive residual coefficient entropy):** ContextV1 **tied** StaticV1 on total bytes (**607** each); it did not establish a residual/MV-byte win for the next move.
+- **Not D (better intra prediction):** Single keyframe is part of cost (e.g. **165** B avg I-bytes in entropy details) but the summary bottleneck and sweep partition gap point to **inter partition / syntax accounting**, not an isolated I-frame dominance claim from this gate.
+- **Not E (bitrate-matched x264 sweep):** Payload ratio SRSV2/x264 = **594/1708 ≈ 0.348** on this optional row, with **different** rate control (CRF vs fixed QP). Measurement fairness is **not** the only remaining issue from these numbers.
 
-Do not choose A yet: half-pel did not help without byte growth in this gate.
-
-Do not choose B yet: residual bytes were not the named summary bottleneck, and ContextV1 did not reduce MV/header bytes.
-
-Do not choose D yet: this gate did not isolate I-frame/keyframe cost as the largest issue.
-
-Do not choose E yet: the x264 row was optional and not bitrate-matched; fairness still needs a separate bitrate-matched run, but these numbers do not make it the immediate blocker.
+Exactly **one** next feature: **C**.

@@ -1,8 +1,11 @@
 //! Engineering progress summary from existing **`bench_srsv2`** JSON artifacts (no FFmpeg required).
 //!
-//! - [`build_progress_report`] tolerates missing required files (warnings + partial answers) — useful in tests.
-//! - [`build_progress_report_strict`] and [`write_progress_summary_files`] require the three primary JSON
-//!   inputs and minimal schema (`compare_entropy_models`, `compare_partition_costs`, `rows`).
+//! - [`build_progress_report`] reads the three primary JSON inputs with [`read_json`] (missing paths or
+//!   parse errors fail with [`ProgressReportError`]); optional x264 / B-mode paths add [`ProgressReport::warnings`]
+//!   when provided but unreadable.
+//! - [`build_progress_report_strict`] also enforces minimal schema (`compare_entropy_models`, `compare_partition_costs`,
+//!   `rows`) on those three files. **`bench_srsv2 --h264-progress-summary`** uses [`write_progress_summary_files`]
+//!   (strict + writes JSON/Markdown).
 //!
 //! Consumes:
 //! - `--compare-entropy-models` report (`compare_entropy_models[]`)
@@ -138,8 +141,6 @@ fn read_json(path: &Path) -> Result<Value, ProgressReportError> {
     let s = fs::read_to_string(path)
         .map_err(|e| ProgressReportError::Io(path.display().to_string(), e))?;
     serde_json::from_str(&s).map_err(|e| ProgressReportError::Json(path.display().to_string(), e))
-<<<<<<< HEAD
-=======
 }
 
 fn validate_entropy_models_schema(v: &Value) -> Result<(), ProgressReportError> {
@@ -252,7 +253,6 @@ pub fn build_progress_report_strict(
         next_bottleneck,
         next_bottleneck_rationale: next_rationale,
     })
->>>>>>> a5be80226f52a3fc94b664fa04cf79f8665db27d
 }
 
 fn val_u64(v: &Value, path: &[&str]) -> u64 {
@@ -266,14 +266,10 @@ fn val_u64(v: &Value, path: &[&str]) -> u64 {
     cur.as_u64().unwrap_or(0)
 }
 
-<<<<<<< HEAD
 /// Build the engineering summary.
 ///
 /// The entropy-model, partition-cost, and quality/bitrate sweep reports are required inputs:
 /// missing or malformed files fail clearly. Optional x264 and B-mode inputs only add warnings.
-=======
-/// Build the engineering summary. Missing optional files add [`ProgressReport::warnings`] only.
->>>>>>> a5be80226f52a3fc94b664fa04cf79f8665db27d
 pub fn build_progress_report(
     inputs: &ProgressReportInputs<'_>,
 ) -> Result<ProgressReport, ProgressReportError> {
@@ -331,11 +327,7 @@ pub fn build_progress_report(
     let q4 = answer_b_modes(b_v.as_ref());
     let q5 = answer_x264(x264_v.as_ref());
 
-<<<<<<< HEAD
     let breakdown = byte_breakdown_from_partition_report(Some(&part_v));
-=======
-    let breakdown = byte_breakdown_from_partition_report(part_v.as_ref());
->>>>>>> a5be80226f52a3fc94b664fa04cf79f8665db27d
     let (next_bottleneck, next_rationale) = select_next_bottleneck(&breakdown);
 
     Ok(ProgressReport {
@@ -918,7 +910,16 @@ fn progress_report_markdown(rep: &ProgressReport) -> String {
     out.push_str(&rep.questions.b_half_and_weighted.summary_sentence);
     out.push_str("\n\n### 5. SRSV2 vs x264 (same bench JSON)\n\n");
     out.push_str(&rep.questions.srsv2_vs_x264.summary_sentence);
-    out.push_str("\n\n## Byte-cost snapshot (auto-fast RDO row when available)\n\n");
+    out.push_str(
+        "\n\n### 6. Largest remaining byte cost (bottleneck label)\n\n\
+Engineering bucket with the largest share of the instrumented partition-cost row (see snapshot below). \
+Labels match `next_bottleneck` in JSON (`mv_header`, `inter_residual`, `partition_map`, `transform_syntax`, `poor_prediction_proxy`).\n\n",
+    );
+    out.push_str(&format!(
+        "**{}** — {}\n",
+        rep.next_bottleneck, rep.next_bottleneck_rationale
+    ));
+    out.push_str("\n## Byte-cost snapshot (auto-fast RDO row when available)\n\n");
     let b = &rep.byte_cost_breakdown;
     out.push_str(&format!(
         "- Source row: `{}`\n- Total payload bytes (row): {:?}\n",
@@ -948,11 +949,6 @@ fn progress_report_markdown(rep: &ProgressReport) -> String {
         b.shares.partition_map,
         b.shares.transform_syntax,
         b.shares.poor_prediction_proxy
-    ));
-    out.push_str("\n## Next bottleneck\n\n");
-    out.push_str(&format!(
-        "**{}** — {}\n",
-        rep.next_bottleneck, rep.next_bottleneck_rationale
     ));
     out
 }
@@ -1096,9 +1092,23 @@ mod tests {
     }
 
     #[test]
-<<<<<<< HEAD
     fn missing_required_entropy_report_fails() {
-=======
+        let inputs = ProgressReportInputs {
+            entropy_models_json: Path::new("/nonexistent/entropy.json"),
+            partition_costs_json: Path::new("/nonexistent/part.json"),
+            sweep_quality_bitrate_json: Path::new("/nonexistent/sweep.json"),
+            compare_x264_bench_json: None,
+            compare_b_modes_json: None,
+        };
+        let err = build_progress_report(&inputs).unwrap_err().to_string();
+        assert!(err.contains("entropy.json"), "{err}");
+        let err_s = build_progress_report_strict(&inputs)
+            .unwrap_err()
+            .to_string();
+        assert!(err_s.contains("entropy.json"), "{err_s}");
+    }
+
+    #[test]
     fn strict_rejects_bad_entropy_shape() {
         let dir = std::env::temp_dir();
         let id = std::process::id();
@@ -1149,16 +1159,30 @@ mod tests {
 
     #[test]
     fn missing_x264_optional_handled() {
->>>>>>> a5be80226f52a3fc94b664fa04cf79f8665db27d
+        let dir =
+            std::env::temp_dir().join(format!("srsv2-progress-no-x264-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entropy = dir.join("entropy.json");
+        let part = dir.join("partition.json");
+        let sweep = dir.join("sweep.json");
+        write_json(&entropy, &sample_entropy_json());
+        write_json(&part, &sample_partition_json());
+        write_json(&sweep, &sample_sweep_json());
         let inputs = ProgressReportInputs {
-            entropy_models_json: Path::new("/nonexistent/entropy.json"),
-            partition_costs_json: Path::new("/nonexistent/part.json"),
-            sweep_quality_bitrate_json: Path::new("/nonexistent/sweep.json"),
+            entropy_models_json: &entropy,
+            partition_costs_json: &part,
+            sweep_quality_bitrate_json: &sweep,
             compare_x264_bench_json: None,
             compare_b_modes_json: None,
         };
-        let err = build_progress_report(&inputs).unwrap_err().to_string();
-        assert!(err.contains("entropy.json"), "{err}");
+        let r = build_progress_report(&inputs).unwrap();
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.contains("compare-x264 bench JSON not provided")),
+            "omitted optional x264 path should not spam warnings"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1180,12 +1204,49 @@ mod tests {
             compare_x264_bench_json: None,
             compare_b_modes_json: None,
         };
-        let r = build_progress_report(&inputs).unwrap();
+        let out_json = dir.join("summary_out.json");
+        let out_md = dir.join("summary_out.md");
+        let r = write_progress_summary_files(&inputs, &out_json, &out_md).unwrap();
         assert_eq!(r.next_bottleneck, "inter_residual");
         assert!(r.questions.context_v1_vs_static_v1_bytes.answered);
         assert!(r.questions.auto_fast_vs_fixed16_in_sweep.answered);
-        let s = serde_json::to_string(&r).unwrap();
-        assert!(s.contains("next_bottleneck"));
+        let disk = std::fs::read_to_string(&out_json).unwrap();
+        assert!(disk.contains("next_bottleneck"));
+        assert!(std::fs::read_to_string(&out_md)
+            .unwrap()
+            .contains("### 6. Largest remaining byte cost"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_optional_b_modes_report_warns() {
+        let dir =
+            std::env::temp_dir().join(format!("srsv2-progress-report-bm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entropy = dir.join("entropy.json");
+        let part = dir.join("partition.json");
+        let sweep = dir.join("sweep.json");
+        let bm = dir.join("missing-b-modes.json");
+        write_json(&entropy, &sample_entropy_json());
+        write_json(&part, &sample_partition_json());
+        write_json(&sweep, &sample_sweep_json());
+
+        let inputs = ProgressReportInputs {
+            entropy_models_json: &entropy,
+            partition_costs_json: &part,
+            sweep_quality_bitrate_json: &sweep,
+            compare_x264_bench_json: None,
+            compare_b_modes_json: Some(&bm),
+        };
+        let r = build_progress_report(&inputs).unwrap();
+        assert!(!r.questions.b_half_and_weighted.answered);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("compare-b-modes") || w.contains("b-modes")),
+            "{:?}",
+            r.warnings
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1211,17 +1272,8 @@ mod tests {
         };
         let r = build_progress_report(&inputs).unwrap();
         assert!(!r.questions.srsv2_vs_x264.answered);
-<<<<<<< HEAD
         assert!(r.warnings.iter().any(|w| w.contains("x264")));
         let _ = std::fs::remove_dir_all(dir);
-=======
-        assert!(!r.warnings.is_empty());
-        assert!(
-            !r.warnings
-                .iter()
-                .any(|w| w.contains("compare-x264 bench JSON not provided")),
-            "omitted optional x264 path should not spam warnings"
-        );
     }
 
     #[test]
@@ -1268,7 +1320,6 @@ mod tests {
         assert!(q.answered);
         assert_eq!(q.srsv2_bytes, Some(300));
         assert_eq!(q.x264_bytes, Some(350));
->>>>>>> a5be80226f52a3fc94b664fa04cf79f8665db27d
     }
 
     #[test]

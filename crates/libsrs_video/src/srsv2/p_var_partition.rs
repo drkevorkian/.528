@@ -33,8 +33,8 @@ use super::rate_control::{
     SrsV2PartitionMapEncoding, SrsV2SubpelMode, SrsV2TransformSizeMode,
 };
 use super::rdo::{
-    autofast_partition_mb_rdo_score, choose_min_partition_by_precomputed_scores,
-    partition_header_aware_score,
+    autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost,
+    choose_min_partition_by_precomputed_scores, partition_header_aware_rdo_score,
 };
 use super::residual_entropy::{
     decode_p_residual_chunk, decode_p_residual_chunk_4x4, encode_p_residual_chunk,
@@ -582,6 +582,21 @@ fn partition_choice_for_mb(
                 sad_by_pt[i] = (pt, sad);
                 let mv_b = encode_mv_stream_partitioned(1, 1, &[pt], &mvs)?.len();
                 let extra_pu = pu_index_layout(pt).saturating_sub(1);
+                let res_b = encode_one_mb_residual_body_len(
+                    cur_frame,
+                    reference,
+                    ctx.mbx,
+                    ctx.mby,
+                    mb_cols,
+                    pt,
+                    &mvs,
+                    qp,
+                    block_aq_wire,
+                    sub_vars,
+                    median_var,
+                    settings,
+                    rans_model,
+                )?;
                 let score = match cm {
                     SrsV2PartitionCostModel::SadOnly => unreachable!(),
                     SrsV2PartitionCostModel::HeaderAware => {
@@ -590,42 +605,26 @@ fn partition_choice_for_mb(
                         } else {
                             0
                         };
-                        partition_header_aware_score(
+                        let cost = autofast_partition_mb_wire_cost(pt, mv_b, res_b, block_aq_wire)?;
+                        partition_header_aware_rdo_score(
                             sad,
                             lam_p,
+                            settings.partition_quality_bias,
+                            &cost,
                             spl,
-                            mv_b,
-                            settings.partition_mv_penalty,
                             extra_pu as u32,
                             settings.partition_header_penalty,
                         )
                     }
-                    SrsV2PartitionCostModel::RdoFast => {
-                        let res_b = encode_one_mb_residual_body_len(
-                            cur_frame,
-                            reference,
-                            ctx.mbx,
-                            ctx.mby,
-                            mb_cols,
-                            pt,
-                            &mvs,
-                            qp,
-                            block_aq_wire,
-                            sub_vars,
-                            median_var,
-                            settings,
-                            rans_model,
-                        )?;
-                        autofast_partition_mb_rdo_score(
-                            pt,
-                            sad,
-                            lam_p,
-                            settings.partition_quality_bias,
-                            mv_b,
-                            res_b,
-                            block_aq_wire,
-                        )?
-                    }
+                    SrsV2PartitionCostModel::RdoFast => autofast_partition_mb_rdo_score(
+                        pt,
+                        sad,
+                        lam_p,
+                        settings.partition_quality_bias,
+                        mv_b,
+                        res_b,
+                        block_aq_wire,
+                    )?,
                 };
                 scored[i] = (pt, score);
             }

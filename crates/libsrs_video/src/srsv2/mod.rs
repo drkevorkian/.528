@@ -47,6 +47,10 @@ pub use b_frame_codec::{
 pub use color::{
     gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709, yuv420_bt709_to_rgb888_limited,
 };
+pub use context_inter_entropy::{
+    context_model_summary, decode_mv_context_v1_fixed, decode_mv_context_v1_partitioned,
+    encode_mv_context_v1_fixed, encode_mv_context_v1_partitioned, ContextV1ModelSummary,
+};
 pub use deblock::{
     apply_loop_filter_y, apply_simple_mb_boundary_deblock_y, resolve_deblock_strength,
     SrsV2LoopFilterMode, DEFAULT_DEBLOCK_STRENGTH,
@@ -87,9 +91,10 @@ pub use rdo::{
     bounded_candidate_push, choose_best_inter_mode_candidate, choose_best_partition_candidate,
     choose_min_partition_by_precomputed_scores, estimate_inter_header_bytes,
     estimate_mv_delta_wire_bytes, estimate_partition_candidate_bytes,
-    p_subblock_skip_residual_is_rdo_cheaper, partition_header_aware_score,
-    partition_rdo_fast_score, rdo_fast_enabled, rdo_score, score_candidate, RdoCandidate, RdoCost,
-    RdoDecision, RdoModeDecisionStats, RdoStats, MAX_RDO_CANDIDATES,
+    p_subblock_skip_residual_is_rdo_cheaper, partition_header_aware_rdo_score,
+    partition_header_aware_score, partition_rdo_fast_score, rdo_fast_enabled, rdo_score,
+    score_candidate, RdoCandidate, RdoCost, RdoDecision, RdoModeDecisionStats, RdoStats,
+    MAX_RDO_CANDIDATES,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};

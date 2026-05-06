@@ -93,6 +93,10 @@ fn compare_entropy_models_two_ok_rows_on_golden_without_ffmpeg() {
         md.contains("**Summary:**"),
         "markdown should include Δ-bytes summary"
     );
+    assert!(
+        md.contains("Telemetry") && md.contains("mv_delta_zero_count"),
+        "markdown should expose MV entropy telemetry fields"
+    );
 
     let summary = v["entropy_model_compare_summary"]
         .as_str()

@@ -10,7 +10,7 @@
 //! ```
 //!
 //! [`RdoCost::total_wire_bytes`] sums **partition map**, **MV**, **residual**, **transform ID**,
-//! **block AQ**, **skip flags**, and **B blend/weight** buckets for λ·rate terms.
+//! **block AQ**, **skip flags**, **B blend**, and **B weight** buckets for λ·rate terms.
 //!
 //! Callers pass [`crate::srsv2::rate_control::rdo_lambda_effective`] as `lambda_fp` unless a
 //! partition-specific scaled λ is intentionally used (see [`partition_rdo_fast_score`]).
@@ -35,7 +35,11 @@ pub struct RdoCost {
     pub transform_id_bytes: u64,
     pub block_aq_bytes: u64,
     pub skip_flags_bytes: u64,
-    pub blend_weight_bytes: u64,
+    /// Estimated on-wire bytes for **B** blend modes (avg / half / forward-backward), separate
+    /// from explicit weight coding.
+    pub b_blend_bytes: u64,
+    /// Estimated on-wire bytes for **B** weighted-prediction parameters.
+    pub b_weight_bytes: u64,
 }
 
 impl RdoCost {
@@ -49,9 +53,17 @@ impl RdoCost {
             .saturating_add(self.transform_id_bytes);
         let s = s
             .saturating_add(self.block_aq_bytes)
-            .saturating_add(self.skip_flags_bytes)
-            .saturating_add(self.blend_weight_bytes);
+            .saturating_add(self.skip_flags_bytes);
+        let s = s
+            .saturating_add(self.b_blend_bytes)
+            .saturating_add(self.b_weight_bytes);
         i64::try_from(s).unwrap_or(i64::MAX)
+    }
+
+    /// Sum of B-side buckets (same total as legacy single `blend_weight` bucket).
+    #[inline]
+    pub fn b_side_wire_bytes(&self) -> u64 {
+        self.b_blend_bytes.saturating_add(self.b_weight_bytes)
     }
 
     /// Single bucket (MV-only side cost, B blend base wire, etc.).
@@ -145,6 +157,7 @@ pub fn estimate_inter_header_bytes(inter_syntax: SrsV2InterSyntaxMode, block_aq_
 }
 
 /// Fold explicit byte buckets into [`RdoCost`] (no magic — callers supply measured/estimated sizes).
+#[allow(clippy::too_many_arguments)] // One argument per on-wire bucket; keep explicit for RDO audits.
 pub fn estimate_partition_candidate_bytes(
     partition_map_bytes: u64,
     mv_compact_or_entropy_bytes: u64,
@@ -152,7 +165,8 @@ pub fn estimate_partition_candidate_bytes(
     transform_id_bytes: u64,
     block_aq_bytes: u64,
     skip_flags_bytes: u64,
-    blend_weight_bytes: u64,
+    b_blend_bytes: u64,
+    b_weight_bytes: u64,
 ) -> RdoCost {
     RdoCost {
         partition_map_bytes,
@@ -161,7 +175,8 @@ pub fn estimate_partition_candidate_bytes(
         transform_id_bytes,
         block_aq_bytes,
         skip_flags_bytes,
-        blend_weight_bytes,
+        b_blend_bytes,
+        b_weight_bytes,
     }
 }
 
@@ -183,7 +198,6 @@ pub fn partition_rdo_fast_score(
 /// Per-macroblock wire buckets for **AutoFast** + **`RdoFast`** (partition map, MV body, residual dry-run,
 /// transform tags, optional block-AQ signaling). Aligns [`pu_count_partition_wire`] with the unit tests
 /// in this module (`estimate_partition_candidate_bytes` proportions for **16×16** vs **8×8**).
-#[must_use]
 pub fn autofast_partition_mb_wire_cost(
     partition_wire_tag: u8,
     mv_body_bytes: usize,
@@ -213,12 +227,12 @@ pub fn autofast_partition_mb_wire_cost(
         block_aq_bytes,
         0,
         0,
+        0,
     ))
 }
 
 /// AutoFast **RdoFast** score: [`score_candidate`] over [`autofast_partition_mb_wire_cost`], with
 /// **`partition_quality_bias`** applied to λ the same way the legacy MV+res-only path scaled rate.
-#[must_use]
 pub fn autofast_partition_mb_rdo_score(
     partition_wire_tag: u8,
     distortion: u32,
@@ -239,7 +253,32 @@ pub fn autofast_partition_mb_rdo_score(
     Ok(score_candidate(distortion, lam_eff, &cost))
 }
 
-/// **Partition `HeaderAware`** heuristic (legacy encoder behavior).
+/// **`HeaderAware`** partition score using **full** [`RdoCost`] (partition map, MV, residual,
+/// transform, AQ) via [`score_candidate`], plus fixed-point split / per-extra-PU penalties aligned
+/// with the legacy [`partition_header_aware_score`] **split** and **header** terms (does not
+/// re-apply a separate MV-byte multiplier on top of `cost` — MV is already in `cost`).
+#[inline]
+pub fn partition_header_aware_rdo_score(
+    distortion: u32,
+    lambda_partition_fp: i64,
+    quality_bias_fp: u16,
+    cost: &RdoCost,
+    split_penalty_fp: i128,
+    extra_pu: u32,
+    header_penalty_fp: u16,
+) -> i128 {
+    let bias = i64::from(quality_bias_fp.max(1));
+    let lam_eff = lambda_partition_fp.saturating_mul(bias) / 256;
+    let base = score_candidate(distortion, lam_eff, cost);
+    let pen = (lambda_partition_fp as i128 * split_penalty_fp) / (256 * 256)
+        + (lambda_partition_fp as i128 * i128::from(header_penalty_fp) * i128::from(extra_pu))
+            / (256 * 256);
+    base.saturating_add(pen)
+}
+
+/// **Partition `HeaderAware`** heuristic (**legacy**): SAD + λ-scaled MV wire and per-PU terms only
+/// (no partition-map / transform / residual buckets). Prefer [`partition_header_aware_rdo_score`] for
+/// AutoFast decisions that must price full side information.
 #[inline]
 pub fn partition_header_aware_score(
     distortion: u32,
@@ -463,8 +502,8 @@ mod tests {
     fn rdo_fast_rejects_split_when_side_cost_dominates() {
         // 16×16: SAD 1000, bytes 10. 8×8: SAD 950 (better) but huge MV+map bytes -> pick 16×16.
         let lam = 256i64;
-        let c16 = estimate_partition_candidate_bytes(0, 10, 200, 0, 0, 0, 0);
-        let c8 = estimate_partition_candidate_bytes(4, 80, 220, 4, 0, 0, 0);
+        let c16 = estimate_partition_candidate_bytes(0, 10, 200, 0, 0, 0, 0, 0);
+        let c8 = estimate_partition_candidate_bytes(4, 80, 220, 4, 0, 0, 0, 0);
         let dec = choose_best_partition_candidate(
             lam,
             &[
@@ -491,8 +530,8 @@ mod tests {
     #[test]
     fn rdo_fast_accepts_split_when_quality_win_overcomes_bytes() {
         let lam = 256i64;
-        let c16 = estimate_partition_candidate_bytes(0, 10, 400, 0, 0, 0, 0);
-        let c8 = estimate_partition_candidate_bytes(2, 24, 380, 2, 0, 0, 0);
+        let c16 = estimate_partition_candidate_bytes(0, 10, 400, 0, 0, 0, 0, 0);
+        let c8 = estimate_partition_candidate_bytes(2, 24, 380, 2, 0, 0, 0, 0);
         let dec = choose_best_partition_candidate(
             lam,
             &[
@@ -593,6 +632,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(dec.chosen_id, 1);
+    }
+
+    #[test]
+    fn rdocost_b_blend_and_weight_contribute_to_total() {
+        let c = estimate_partition_candidate_bytes(0, 0, 0, 0, 0, 0, 7, 13);
+        assert_eq!(c.b_side_wire_bytes(), 20);
+        assert_eq!(c.total_wire_bytes(), 20);
+    }
+
+    #[test]
+    fn partition_header_aware_rdo_score_matches_score_candidate_without_penalties() {
+        let cost = estimate_partition_candidate_bytes(2, 20, 100, 2, 0, 0, 0, 0);
+        let lam = 512i64;
+        let full = partition_header_aware_rdo_score(900, lam, 256, &cost, 0, 0, 0);
+        let base = score_candidate(900, lam, &cost);
+        assert_eq!(full, base);
+    }
+
+    #[test]
+    fn rdo_partition_rejects_high_mv_wire_at_lambda_like_halfpel_tax() {
+        let lam = 512i64;
+        let inte = estimate_partition_candidate_bytes(0, 14, 160, 0, 0, 0, 0, 0);
+        let heavy_mv = estimate_partition_candidate_bytes(0, 90, 160, 0, 0, 0, 0, 0);
+        let dec = choose_best_partition_candidate(
+            lam,
+            &[
+                RdoCandidate {
+                    id: 0,
+                    distortion: 800,
+                    cost: heavy_mv,
+                },
+                RdoCandidate {
+                    id: 1,
+                    distortion: 780,
+                    cost: inte,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            dec.chosen_index, 1,
+            "slight SAD win must not pay huge MV section"
+        );
+    }
+
+    #[test]
+    fn rdo_partition_rejects_b_weight_side_when_residual_gain_small() {
+        let lam = 1024i64;
+        let base = estimate_partition_candidate_bytes(0, 12, 200, 0, 0, 0, 2, 0);
+        let weighted = estimate_partition_candidate_bytes(0, 12, 190, 0, 0, 0, 2, 200);
+        let dec = choose_best_partition_candidate(
+            lam,
+            &[
+                RdoCandidate {
+                    id: 0,
+                    distortion: 3000,
+                    cost: base,
+                },
+                RdoCandidate {
+                    id: 1,
+                    distortion: 2900,
+                    cost: weighted,
+                },
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            dec.chosen_index, 0,
+            "B-weight bytes should not win without enough distortion reduction"
+        );
     }
 
     #[test]

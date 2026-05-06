@@ -241,41 +241,55 @@ struct Args {
     #[arg(long, default_value_t = false)]
     h264_progress_summary: bool,
 
-    /// Input: `--compare-entropy-models` JSON (`compare_entropy_models[]`).
+    /// **Required** with `--h264-progress-summary`: `--compare-entropy-models` JSON (`compare_entropy_models[]`).
     #[arg(
         long = "entropy-models-json",
         alias = "progress-entropy-json",
+        value_name = "PATH",
         default_value = "var/bench/compare_entropy_models.json"
     )]
     progress_entropy_json: PathBuf,
 
-    /// Input: `--compare-partition-costs` JSON (`compare_partition_costs[]`).
+    /// **Required** with `--h264-progress-summary`: `--compare-partition-costs` JSON (`compare_partition_costs[]`).
     #[arg(
         long = "partition-costs-json",
         alias = "progress-partition-costs-json",
+        value_name = "PATH",
         default_value = "var/bench/compare_partition_costs.json"
     )]
     progress_partition_costs_json: PathBuf,
 
-    /// Input: `--sweep-quality-bitrate` JSON (`rows[]`, `pareto`).
+    /// **Required** with `--h264-progress-summary`: `--sweep-quality-bitrate` JSON (`rows[]`, `pareto`).
     #[arg(
         long = "sweep-quality-bitrate-json",
         alias = "progress-sweep-json",
+        value_name = "PATH",
         default_value = "var/bench/sweep_quality_bitrate.json"
     )]
     progress_sweep_json: PathBuf,
 
-    /// Optional input: primary **`bench_srsv2`** JSON that included **`--compare-x264`** (`table[]`).
-    #[arg(long = "compare-x264-json", alias = "progress-x264-json")]
+    /// Optional with `--h264-progress-summary`: **`bench_srsv2`** JSON that included **`--compare-x264`** (`table[]`).
+    /// If missing or unreadable, the summary adds a warning and question 5 stays unanswered.
+    #[arg(
+        long = "compare-x264-json",
+        alias = "progress-x264-json",
+        value_name = "PATH"
+    )]
     progress_x264_json: Option<PathBuf>,
 
-    /// Optional input: **`--compare-b-modes`** JSON (`compare_b_modes[]`) for B-half / weighted facts.
-    #[arg(long = "compare-b-modes-json", alias = "progress-b-modes-json")]
+    /// Optional with `--h264-progress-summary`: `--compare-b-modes` JSON (`compare_b_modes[]`).
+    /// If missing or unreadable, the summary adds a warning; question 4 may be partial.
+    #[arg(
+        long = "compare-b-modes-json",
+        alias = "progress-b-modes-json",
+        value_name = "PATH"
+    )]
     progress_b_modes_json: Option<PathBuf>,
 
     #[arg(
         long = "progress-summary-json",
         alias = "h264-progress-summary-out-json",
+        value_name = "PATH",
         default_value = "var/bench/srsv2_h264_progress_summary.json"
     )]
     h264_progress_summary_out_json: PathBuf,
@@ -283,6 +297,7 @@ struct Args {
     #[arg(
         long = "progress-summary-md",
         alias = "h264-progress-summary-out-md",
+        value_name = "PATH",
         default_value = "var/bench/srsv2_h264_progress_summary.md"
     )]
     h264_progress_summary_out_md: PathBuf,
@@ -988,6 +1003,28 @@ fn validate_args(args: &Args) -> Result<()> {
             bail!(
                 "--h264-progress-summary only reads JSON inputs; disable sweep/compare/x264 encode flags."
             );
+        }
+        for (flag, path) in [
+            (
+                "--entropy-models-json",
+                args.progress_entropy_json.as_path(),
+            ),
+            (
+                "--partition-costs-json",
+                args.progress_partition_costs_json.as_path(),
+            ),
+            (
+                "--sweep-quality-bitrate-json",
+                args.progress_sweep_json.as_path(),
+            ),
+        ] {
+            if !path.is_file() {
+                bail!(
+                    "{flag}: required progress-summary input is missing or not a file ({}). \
+Provide paths from a prior `bench_srsv2` compare/sweep run.",
+                    path.display()
+                );
+            }
         }
         return Ok(());
     }
@@ -3439,14 +3476,30 @@ fn summarize_entropy_model_compare(entries: &[EntropyModelCompareEntry]) -> Opti
     if st.ok && ctx.ok {
         let dt = ctx.row.bytes as i64 - st.row.bytes as i64;
         let d_mv = ctx.context_mv_bytes as i64 - st.static_mv_bytes as i64;
+        let total_cmp = if dt < 0 {
+            "On this clip, ContextV1 used fewer total SRSV2 payload bytes than StaticV1 (Δ negative)."
+        } else if dt > 0 {
+            "On this clip, ContextV1 used more total SRSV2 payload bytes than StaticV1 (Δ positive)."
+        } else {
+            "On this clip, ContextV1 and StaticV1 tied on total SRSV2 payload bytes."
+        };
+        let mv_cmp = if d_mv < 0 {
+            "MV entropy section (sym+blob) is smaller under ContextV1 than StaticV1."
+        } else if d_mv > 0 {
+            "MV entropy section (sym+blob) is larger under ContextV1 than StaticV1."
+        } else {
+            "MV entropy section size matches between modes on this run (one mode carries all bytes)."
+        };
         Some(format!(
-            "Total compressed bytes: StaticV1={}, ContextV1={}, Δ(context−static)={:+}. MV entropy section bytes: StaticV1={}, ContextV1={}, Δ={:+}.",
+            "Total compressed bytes: StaticV1={}, ContextV1={}, Δ(context−static)={:+}. MV entropy section bytes: StaticV1={}, ContextV1={}, Δ={:+}. {} {}",
             st.row.bytes,
             ctx.row.bytes,
             dt,
             st.static_mv_bytes,
             ctx.context_mv_bytes,
-            d_mv
+            d_mv,
+            total_cmp,
+            mv_cmp
         ))
     } else if st.ok && !ctx.ok {
         Some(format!(
@@ -4429,6 +4482,21 @@ fn to_markdown(r: &BenchReport) -> String {
             out.push_str(sum);
             out.push('\n');
         }
+        out.push_str("\n### Telemetry (JSON columns; per entropy-model pass)\n\n");
+        for e in rows {
+            out.push_str(&format!(
+                "- **`{}`** (ok={}): `static_mv_bytes`={} `context_mv_bytes`={} `mv_delta_zero_count`={} `mv_delta_nonzero_count`={} `mv_delta_avg_abs`={:.4} `entropy_context_count`={} `entropy_symbol_count`={}\n",
+                e.entropy_model_mode,
+                e.ok,
+                e.static_mv_bytes,
+                e.context_mv_bytes,
+                e.mv_delta_zero_count,
+                e.mv_delta_nonzero_count,
+                e.mv_delta_avg_abs,
+                e.entropy_context_count,
+                e.entropy_symbol_count
+            ));
+        }
         out.push_str("\n_JSON: `compare_entropy_models[]` includes `entropy_model_mode`, `static_mv_bytes`, `context_mv_bytes`, `mv_delta_zero_count`, `mv_delta_nonzero_count`, `mv_delta_avg_abs`, `entropy_context_count`, `entropy_symbol_count`, `entropy_failure_reason`, `fr2_revision_counts`, `entropy_model_compare_summary` (top-level), nested `details`._\n");
     }
 
@@ -4591,7 +4659,7 @@ fn to_markdown(r: &BenchReport) -> String {
         sv.entropy_symbol_count,
     ));
     out.push_str(&format!(
-        "- RDO aggregate: candidates_tested={} skip={} forward={} backward={} average={} weighted={} halfpel={} residual={} no_residual={} estimated_bits_used_for_decision={}\n",
+        "- RDO aggregate: candidates_tested={} skip={} forward={} backward={} average={} weighted={} halfpel={} residual={} no_residual={} inter_zero_mv_wins={} inter_me_mv_wins={} estimated_bits_used_for_decision={}\n",
         sv.rdo_candidates_tested,
         sv.rdo_skip_decisions,
         sv.rdo_forward_decisions,
@@ -4601,6 +4669,8 @@ fn to_markdown(r: &BenchReport) -> String {
         sv.rdo_halfpel_decisions,
         sv.rdo_residual_decisions,
         sv.rdo_no_residual_decisions,
+        sv.rdo_inter_zero_mv_wins,
+        sv.rdo_inter_me_mv_wins,
         sv.estimated_bits_used_for_decision,
     ));
     if let Some(lb) = r.srsv2.legacy_explicit_total_payload_bytes {
@@ -6618,6 +6688,27 @@ mod tests {
     }
 
     #[test]
+    fn h264_progress_summary_requires_existing_required_json_files() {
+        let a = Args::try_parse_from([
+            "bench_srsv2",
+            "--h264-progress-summary",
+            "--entropy-models-json",
+            "definitely_missing_entropy_progress_528.json",
+            "--partition-costs-json",
+            "definitely_missing_partition_progress_528.json",
+            "--sweep-quality-bitrate-json",
+            "definitely_missing_sweep_progress_528.json",
+        ])
+        .expect("clap parse");
+        let err = validate_args(&a).unwrap_err().to_string();
+        assert!(
+            err.contains("--entropy-models-json")
+                && err.contains("required progress-summary input"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn validate_rejects_compare_entropy_models_with_compare_rdo() {
         let a = Args {
             input: PathBuf::from("nope"),
@@ -6693,6 +6784,46 @@ mod tests {
         };
         let err = validate_args(&a).unwrap_err().to_string();
         assert!(err.contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn summarize_entropy_model_compare_spells_byte_verdict_when_both_ok() {
+        let row =
+            |mode: &str, total: u64, static_mv: u64, context_mv: u64| EntropyModelCompareEntry {
+                entropy_model_mode: mode.to_string(),
+                context_mv_bytes: context_mv,
+                static_mv_bytes: static_mv,
+                mv_delta_zero_count: 1,
+                mv_delta_nonzero_count: 1,
+                mv_delta_avg_abs: 1.0,
+                entropy_context_count: u64::from(mode == "context") * 10,
+                entropy_symbol_count: 8,
+                entropy_failure_reason: None,
+                fr2_revision_counts: Fr2RevisionCounts::default(),
+                ok: true,
+                error: None,
+                row: CodecRow {
+                    codec: format!("SRSV2-{mode}"),
+                    error: None,
+                    bytes: total,
+                    ratio: 0.1,
+                    bitrate_bps: 1.0,
+                    psnr_y: 30.0,
+                    ssim_y: 0.9,
+                    enc_fps: 10.0,
+                    dec_fps: 10.0,
+                },
+                details: Srsv2Details::default(),
+            };
+        let lower_ctx = vec![row("static", 1000, 100, 0), row("context", 950, 0, 85)];
+        let s = summarize_entropy_model_compare(&lower_ctx).unwrap();
+        assert!(s.contains("fewer total SRSV2 payload bytes"), "{s}");
+        assert!(s.contains("smaller under ContextV1"), "{s}");
+
+        let higher_ctx = vec![row("static", 1000, 100, 0), row("context", 1050, 0, 110)];
+        let s2 = summarize_entropy_model_compare(&higher_ctx).unwrap();
+        assert!(s2.contains("more total SRSV2 payload bytes"), "{s2}");
+        assert!(s2.contains("larger under ContextV1"), "{s2}");
     }
 
     #[test]
@@ -6789,6 +6920,22 @@ mod tests {
         assert!(md.contains("| static |"));
         assert!(md.contains("| Model |"));
         assert!(md.contains("**Summary:**"));
+        assert!(md.contains("static_mv_bytes"));
+        assert!(md.contains("context_mv_bytes"));
+        assert!(md.contains("mv_delta_zero_count"));
+        assert!(md.contains("entropy_symbol_count"));
+        assert!(md.contains("Telemetry"));
+        for key in [
+            "static_mv_bytes",
+            "context_mv_bytes",
+            "mv_delta_zero_count",
+            "mv_delta_nonzero_count",
+            "mv_delta_avg_abs",
+            "entropy_context_count",
+            "entropy_symbol_count",
+        ] {
+            assert!(js.contains(key), "missing {key} in {js}");
+        }
     }
 
     #[test]

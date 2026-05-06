@@ -1,3 +1,9 @@
+# Block 1: Windows end-to-end SRSV2 benchmark pipeline + H.264-oriented *engineering* progress summary.
+# - Writes: var\bench\windows_h264_progress\{summary.json,summary.md,corpus\,reports\}
+# - Uses quality_metrics::srsv2_progress_report via bench_srsv2 --h264-progress-summary (strict JSON inputs).
+# - FFmpeg is NOT required; optional compare-x264 runs only if `ffmpeg` is on PATH.
+# - Does not claim SRSV2 beats H.264 (summary text is measurement-only).
+
 param(
     [int]$Seed = 528,
     [int]$Fps = 30,
