@@ -1,6 +1,6 @@
 # SRSV2 measurement methodology (optional comparisons)
 
-For a short **engineering checklist** (what to run next, StaticV1 vs ContextV1, RDO/partitions, `--h264-progress-summary`), see [`next_codec_move.md`](next_codec_move.md).
+For a short **engineering checklist** (what to run next, StaticV1 vs ContextV1, RDO/partitions, `--h264-progress-summary`), see [`next_codec_move.md`](next_codec_move.md). **HEVC-class** roadmap language (honest gap list, **no** superiority claims): [`hevc_competition_plan.md`](hevc_competition_plan.md).
 
 Workspace tools (engineering measurements):
 
@@ -8,7 +8,7 @@ Workspace tools (engineering measurements):
   - `cargo run -p quality_metrics --bin gen_synthetic_yuv -- --pattern moving-square --width 1920 --height 1080 --frames 60 --fps 60 --seed 528 --out samples/bench/moving_square_1080p.yuv --meta samples/bench/moving_square_1080p.json`
 - **Tiny multi-clip corpus** (writes several **64×64** / **128×128** files under one directory; deterministic seeds):
   - `cargo run -p quality_metrics --bin gen_synthetic_yuv -- --preset-corpus tiny --out-dir var/bench/corpus_tiny --seed 528`
-- Benchmark SRSV2 core (**no FFmpeg required**; optional x264 via ffmpeg/libx264):
+- Benchmark SRSV2 core (**no FFmpeg required**; optional **libx264** via ffmpeg for an **AVC** sanity row — **not** sufficient as the only external baseline; **HEVC-class** targets and **x265** are documented in [`hevc_competition_plan.md`](hevc_competition_plan.md)):
   - `cargo run -p quality_metrics --bin bench_srsv2 -- --input samples/bench/moving_square_1080p.yuv --width 1920 --height 1080 --frames 60 --fps 60 --qp 28 --keyint 30 --motion-radius 16 --residual-entropy auto --report-json var/bench/moving_square_srsv2.json --report-md var/bench/moving_square_srsv2.md`
   - Add `--compare-x264 --x264-crf 23 --x264-preset medium` if `ffmpeg` is on `PATH`. JSON/Markdown reports then include **x264 preset**, **CRF**, **achieved x264 bitrate** (when measurable), **SRSV2 bitrate at compare time**, **PSNR-Y / SSIM-Y for both**, and a **documented FFmpeg command string**. **`--match-x264-bitrate`** **fails fast** (not implemented — use RC sweeps or target bitrate instead).
   - **PSNR-Y JSON note:** when decoded luma matches the source exactly, raw PSNR is infinity; JSON cannot store `inf`, so the bench maps that case to **100.0 dB** as a finite sentinel (“lossless on luma for this measurement”), not a physical ceiling claim.
@@ -55,11 +55,11 @@ This document does **not** claim SRSV2 beats **H.264** or any other codec. **Rev
 - **Variable inter partitions (experimental, FR2 rev19+ on wire):** **`--inter-partition fixed16x16|split8x8|rect16x8|rect8x16|auto-fast`** (default **`fixed16x16`**), **`--transform-size auto|tx4x4|tx8x8`**. Non-default partitions require **`--inter-syntax compact`** or **`entropy`**. **`--compare-partitions`** runs three rows (**fixed16x16**, **split8x8**, **auto-fast**) with **`--inter-syntax compact`** for comparable MV packing; JSON/Markdown include nested **`partition`** counters (**`partition_*_count`**, **`transform_*_count`**, **`partition_*_bytes`**, **`rdo_partition_candidates_tested`**). **`--compare-partition-costs`** adds five rows: fixed16×16, split8×8, and three **AutoFast** cost models (**`--partition-cost-model sad-only|header-aware|rdo-fast`** per row). Reports include a **Partition decision telemetry** Markdown table (candidates tested, header/RDO rejections, partition/map/MV/residual bytes, transform picks). **`--partition-map-encoding legacy|rle`** selects one-byte-per-MB vs run-length when RLE is smaller on the wire. Early measurements often show **much larger** bitstreams for split/auto than fixed16×16; **`header-aware`** / **`rdo-fast`** are intended to reject splits that do not pay for their side information. **`AutoFast`** remains a **bounded deterministic** heuristic — not full partition **RDO**.
 - **Sweep grid** (optional regression / weak-spot finder): `--sweep` runs a fixed grid of QP values `{18, 22, 28, 34}` × residual `{explicit, auto}` × motion radius `{0, 8, 16}` and writes a JSON array plus a Markdown table (`--compare-residual-modes` and `--sweep` are mutually exclusive). **`--sweep-extended`** appends optional rows: AQ/motion comparisons, a small **integer vs half-pel** grid (`subpel-*`), and **`blockaq-off` vs `blockaq-delta`** rows — not enabled by default.
 - **Quality / bitrate matrix sweep:** **`--sweep-quality-bitrate`** runs the fixed in-process matrix (QP × inter-syntax × entropy model × partition cost × partition mode; see `quality_metrics::srsv2_sweep`). Writes **`--report-json`** / **`--report-md`** with **`rows`** and **`pareto`** summaries. Mutually exclusive with **`--sweep`** and **`--compare-residual-modes`** (validator).
-- **Engineering progress summary:** **`--h264-progress-summary`** reads previously generated bench JSON (**no encoder run**). Default inputs: **`var/bench/compare_entropy_models.json`** (`--compare-entropy-models`), **`var/bench/compare_partition_costs.json`** (`--compare-partition-costs`), **`var/bench/sweep_quality_bitrate.json`** (`--sweep-quality-bitrate`). Override with **`--progress-entropy-json`**, **`--progress-partition-costs-json`**, **`--progress-sweep-json`**; optional **`--progress-x264-json`** (a primary bench JSON produced with **`--compare-x264`**) and **`--progress-b-modes-json`** (`--compare-b-modes`). Outputs **`var/bench/srsv2_h264_progress_summary.json`** and **`.md`** (override with **`--h264-progress-summary-out-json`** / **`--h264-progress-summary-out-md`**). The report answers entropy-model deltas, partition/RDO telemetry, auto-fast vs fixed16×16 sweep slices, optional B/x264 rows, and names the largest remaining byte bucket (**engineering facts only**). Mutually exclusive with encode and compare flags.
+- **Engineering progress summary:** **`--h264-progress-summary`** reads previously generated bench JSON (**no encoder run**). *(CLI name retains “h264” for historical scripts; the **engineering target** for external comparison is **HEVC-class** — see [`hevc_competition_plan.md`](hevc_competition_plan.md).)* Default inputs: **`var/bench/compare_entropy_models.json`** (`--compare-entropy-models`), **`var/bench/compare_partition_costs.json`** (`--compare-partition-costs`), **`var/bench/sweep_quality_bitrate.json`** (`--sweep-quality-bitrate`). Override with **`--progress-entropy-json`**, **`--progress-partition-costs-json`**, **`--progress-sweep-json`**; optional **`--progress-x264-json`** (a primary bench JSON produced with **`--compare-x264`**) and **`--progress-b-modes-json`** (`--compare-b-modes`). Outputs **`var/bench/srsv2_h264_progress_summary.json`** and **`.md`** (override with **`--h264-progress-summary-out-json`** / **`--h264-progress-summary-out-md`**). The report answers entropy-model deltas, partition/RDO telemetry, auto-fast vs fixed16×16 sweep slices, optional B/x264 rows, and names the largest remaining byte bucket (**engineering facts only**). Mutually exclusive with encode and compare flags.
 
 Legacy helper: `cargo run -p codec_compare -- --help` (optional **libx264** branch via `ffmpeg`).
 
-This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders (for example a common **AVC** baseline). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge. This is a **compression engineering** step for the native codec, **not** a claim about beating H.264 or any other standard encoder.
+This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders — for example a common **AVC** baseline (**libx264**) **and**, when wired up, **HEVC-class** baselines (**libx265**). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge. This is **compression engineering** for the native codec, **not** a claim about beating **H.264**, **H.265/HEVC**, or any standard encoder.
 
 ### Local sample numbers (moving-square 128×128, 30 frames, seed 528)
 
@@ -96,7 +96,7 @@ Reports: **`moving-square_128_compare_partitions.json`**, **`scrolling-bars_128_
 | checker | 25732 | 77295 | 71597 | Fine checker pattern; **4×4** transform path can activate under **`auto`** transform mode — bytes grow sharply vs fixed16×16; metrics similar across modes at these settings. |
 | scene-cut | 23475 | 73523 | 67763 | Scene-change synthetic; split/auto increase size vs fixed on this clip at these settings; objective scores remain close. |
 
-This table is **not** proof of codec superiority vs **H.264** or any other encoder — only **repeatable local** SRSV2 engineering snapshots.
+This table is **not** proof of codec superiority vs **H.264/AVC**, **H.265/HEVC**, or any other encoder — only **repeatable local** SRSV2 engineering snapshots.
 
 ### Example: AQ + motion + skip flags (128×128 moving-square)
 
@@ -125,11 +125,11 @@ Command (after generating `var/bench/flat_128.yuv` / `.json` as in the snippets 
 
 ## Fair comparison checklist
 
-1. **Baseline encoder (optional):** e.g. **libx264** via **FFmpeg** (or another AVC encoder with documented settings) on the same machine class as SRSV2.
+1. **Baseline encoders (optional):** e.g. **libx264** via **FFmpeg** for a quick **AVC** row (or another AVC encoder with documented settings) on the same machine class as SRSV2. For **HEVC-class** discipline, plan **libx265** / **x265** when available — see [`hevc_competition_plan.md`](hevc_competition_plan.md). **SRSV2 does not beat H.265 today**; comparisons must stay methodology-heavy and **honest**.
 2. **Fair comparison:**
    - Same **resolution**, **frame count**, **chroma format** (or document conversions).
    - Same or documented **color range** / **transfer** when HDR is involved.
-   - **Bitrate** matched either by **two-pass** targeting bitrate or by **CRF** with **reported achieved bitrate for both sides**. **CRF-only** labels without achieved bitrate and quality numbers are **not** sufficient for serious encoder comparisons — prefer **`bench_srsv2`** x264 rows when FFmpeg is available, or manual sweeps (`docs/h264_competition_plan.md`).
+   - **Bitrate** matched either by **two-pass** targeting bitrate or by **CRF** with **reported achieved bitrate for both sides**. **CRF-only** labels without achieved bitrate and quality numbers are **not** sufficient for serious encoder comparisons — prefer **`bench_srsv2`** x264 rows when FFmpeg is available, or manual sweeps; **`x265`** matching is the **future** primary external target when the tool supports it (`docs/hevc_competition_plan.md`).
 3. **SRSV2 side:** documented **preset**, **profile byte**, **QP/keyframe** settings, commit hash.
 4. **Metrics** (report all that apply):
    - **Bitrate** (bits/s) and **compression ratio** vs uncompressed PCM/YUV size.
@@ -138,7 +138,7 @@ Command (after generating `var/bench/flat_128.yuv` / `.json` as in the snippets 
    - **VMAF** (optional; requires `vmaf`/`ffmpeg` with **libvmaf** or Netflix VMAF CLI).
    - **Encode FPS** and **decode FPS** (single-thread vs multi-thread noted).
 
-## Suggested FFmpeg skeleton (AVC baseline)
+## Suggested FFmpeg skeleton (AVC baseline — `libx264`)
 
 Exact flags evolve with test vectors; this is a **template**:
 
@@ -152,6 +152,17 @@ Extract throughput from **`ffmpeg` stderr** or wrap with `time` / perf counters.
 ```bash
 ffmpeg -benchmark -i out264.mp4 -f null -
 ```
+
+## Suggested FFmpeg skeleton (HEVC baseline — `libx265`, future comparison target)
+
+When **`libx265`** is available in your FFmpeg build, a **template** parallel to the AVC line above (exact **preset** / **CRF** / **two-pass** choices are methodology-dependent — document what you use):
+
+```bash
+ffmpeg -y -f rawvideo -pix_fmt yuv420p -s WIDTHxHEIGHT -r FRAMERATE -i input.yuv \
+  -c:v libx265 -preset medium -crf Q -an out265.mp4
+```
+
+**Not implemented in `bench_srsv2` today as a first-class `--compare-x265` mode** — treat this as the **documented direction** in [`hevc_competition_plan.md`](hevc_competition_plan.md), not a claim of feature parity.
 
 ## SRSV2 side
 

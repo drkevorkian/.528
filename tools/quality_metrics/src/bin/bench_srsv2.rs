@@ -1,6 +1,6 @@
 //! Benchmark SRSV2 core encoder/decoder on raw YUV420p8 input.
 //!
-//! Optional external comparison: `--compare-x264` uses `ffmpeg` + `libx264` when available.
+//! Optional external comparison: `--compare-x264` / `--compare-x265` use `ffmpeg` when available (skipped otherwise).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -12,6 +12,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser};
 use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
+use libsrs_video::srsv2::{decode_mv_share_groups_v2, decode_partition_map_v2, total_pu_slots_for_modes};
 use libsrs_video::{
     decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
     encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
@@ -19,10 +20,11 @@ use libsrs_video::{
     SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode,
     SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
-    SrsV2PartitionMapEncoding, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
-    SrsV2ReferenceManager, SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2,
-    YuvFrame,
+    SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2RateControlMode, SrsV2RateController,
+    SrsV2RdoMode, SrsV2ReferenceManager, SrsV2SubpelMode, SrsV2TransformSizeMode,
+    VideoSequenceHeaderV2, YuvFrame,
 };
+use quality_metrics::hevc_compare;
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
 
@@ -55,6 +57,12 @@ struct Args {
     report_md: PathBuf,
     #[arg(long, default_value_t = false)]
     compare_x264: bool,
+    /// Optional **HEVC** reference via `ffmpeg` **libx265** (YUV420p8 round-trip); skips if `ffmpeg` or encoder is missing.
+    #[arg(long, default_value_t = false)]
+    compare_x265: bool,
+    /// Run **`--compare-x264`** and **`--compare-x265`** together (reference measurements only; not a superiority claim).
+    #[arg(long, default_value_t = false)]
+    compare_x264_and_x265: bool,
     /// Target-bitrate matching vs x264 (**not implemented** — benchmark exits with an error when set).
     #[arg(long, default_value_t = false)]
     match_x264_bitrate: bool,
@@ -67,6 +75,10 @@ struct Args {
     x264_crf: u8,
     #[arg(long, default_value = "medium")]
     x264_preset: String,
+    #[arg(long, default_value_t = 28)]
+    x265_crf: u8,
+    #[arg(long, default_value = "medium")]
+    x265_preset: String,
     /// Residual coding: `auto` picks smaller per block, `explicit` legacy tuples only, `rans` prefers entropy.
     #[arg(long, default_value = "auto")]
     residual_entropy: String,
@@ -208,6 +220,14 @@ struct Args {
     /// Compare **fixed16x16**, **split8x8**, and **auto-fast** inter partitions (uses **`--inter-syntax compact`** for each row).
     #[arg(long, default_value_t = false)]
     compare_partitions: bool,
+
+    /// Compare **partition map v1** vs **v2** (`FR2` rev **19**/**25** vs **27**/**28`) across fixed / AutoFast+RDO / split8×8 rows (requires **`--inter-syntax compact`** on the CLI; no FFmpeg).
+    #[arg(long, default_value_t = false)]
+    compare_partition_syntax: bool,
+
+    /// Partition map wire family for normal (non-compare) encodes: **`v1`** (`V1Legacy`, default) or **`v2`** (`V2RleMvShare`, variable **P** only).
+    #[arg(long, default_value = "v1")]
+    partition_syntax: String,
 
     /// Compare partition cost models: **fixed16x16**, **split8x8**, **auto-fast** × (**sad-only**, **header-aware**, **rdo-fast**).
     #[arg(long, default_value_t = false)]
@@ -398,6 +418,8 @@ struct Fr2RevisionCounts {
     rev24: u32,
     rev25: u32,
     rev26: u32,
+    rev27: u32,
+    rev28: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -785,6 +807,36 @@ struct ResidualCompareEntry {
     pub details: Srsv2Details,
 }
 
+/// One row from `--compare-partition-syntax` (map v1 vs v2 measurability).
+#[derive(Debug, Clone, Serialize)]
+struct PartitionSyntaxCompareRow {
+    /// Row id: `fixed16x16`, `auto-fast-rdo-v1`, etc.
+    row: String,
+    /// `v1` (**V1Legacy**) or `v2` (**V2RleMvShare**) for this encode.
+    partition_syntax_mode: String,
+    /// On-wire partition map bytes when encoded as **v1** (paired row fills sibling).
+    partition_map_v1_bytes: u64,
+    /// On-wire partition map bytes when encoded as **v2**.
+    partition_map_v2_bytes: u64,
+    /// Sum of MV-share group counts parsed from **`S2G1`** blobs (typically **0**).
+    mv_share_group_count: u64,
+    /// Total MV-share blob bytes on wire.
+    mv_share_bytes: u64,
+    /// `partition_map_v1_bytes - partition_map_v2_bytes` from the paired v1/v2 maps (see pairing rules).
+    partition_syntax_savings_bytes: i64,
+    /// **100 × savings / v1** when **`partition_map_v1_bytes > 0`**.
+    partition_syntax_savings_percent: f64,
+    total_bytes: u64,
+    psnr_y: f64,
+    ssim_y: f64,
+    encode_fps: f64,
+    decode_fps: f64,
+    #[serde(default)]
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SweepRunReport {
     qp: u8,
@@ -810,6 +862,8 @@ struct BenchReport {
     fps: u32,
     srsv2: Srsv2Details,
     x264: Option<X264Details>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x265: Option<hevc_compare::X265CompareReport>,
     table: Vec<CodecRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_residual_modes: Option<Vec<ResidualCompareEntry>>,
@@ -825,6 +879,8 @@ struct BenchReport {
     compare_partitions: Option<Vec<VariantBenchEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_partition_costs: Option<Vec<VariantBenchEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_partition_syntax: Option<Vec<PartitionSyntaxCompareRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_entropy_models: Option<Vec<EntropyModelCompareEntry>>,
     /// When `--compare-entropy-models`: Δ-bytes verdict (StaticV1 vs ContextV1 total and MV section).
@@ -996,12 +1052,14 @@ fn validate_args(args: &Args) -> Result<()> {
             || args.compare_rdo
             || args.compare_partitions
             || args.compare_partition_costs
+            || args.compare_partition_syntax
             || args.compare_entropy_models
-            || args.compare_x264
+            || args.compare_x265
+            || args.compare_x264_and_x265
             || args.match_x264_bitrate;
         if conflict {
             bail!(
-                "--h264-progress-summary only reads JSON inputs; disable sweep/compare/x264 encode flags."
+                "--h264-progress-summary only reads JSON inputs; disable sweep/compare/x264/x265 encode flags."
             );
         }
         for (flag, path) in [
@@ -1078,16 +1136,18 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         + args.compare_rdo as u8
         + args.compare_partitions as u8
         + args.compare_partition_costs as u8
+        + args.compare_partition_syntax as u8
         + args.compare_entropy_models as u8;
     if compare_pass_count > 1 {
         bail!(
-            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, and --compare-entropy-models are mutually exclusive"
+            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, and --compare-entropy-models are mutually exclusive"
         );
     }
     if (args.compare_inter_syntax
         || args.compare_rdo
         || args.compare_partitions
         || args.compare_partition_costs
+        || args.compare_partition_syntax
         || args.compare_entropy_models)
         && (args.sweep
             || args.sweep_quality_bitrate
@@ -1137,6 +1197,15 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             args.inter_syntax
         );
     }
+    if args.compare_partition_syntax && inter_syn != SrsV2InterSyntaxMode::CompactV1 {
+        bail!(
+            "--compare-partition-syntax requires --inter-syntax compact (variable **P** map rows); got `--inter-syntax {}`",
+            args.inter_syntax
+        );
+    }
+    if args.compare_partition_syntax && args.bframes > 0 {
+        bail!("--compare-partition-syntax requires --bframes 0 in this slice");
+    }
     parse_rdo_mode(&args.rdo)?;
     let inter_partition_mode = parse_inter_partition_mode(&args.inter_partition)?;
     parse_transform_size_mode(&args.transform_size)?;
@@ -1177,6 +1246,7 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     }
     parse_partition_cost_model(&args.partition_cost_model)?;
     parse_partition_map_encoding(&args.partition_map_encoding)?;
+    parse_partition_syntax_mode(&args.partition_syntax)?;
     Ok(())
 }
 
@@ -1296,6 +1366,16 @@ fn parse_partition_map_encoding(s: &str) -> Result<SrsV2PartitionMapEncoding> {
     }
 }
 
+fn parse_partition_syntax_mode(s: &str) -> Result<SrsV2PartitionSyntaxMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "v1" | "legacy" | "v1legacy" => Ok(SrsV2PartitionSyntaxMode::V1Legacy),
+        "v2" | "v2rle" | "v2-rle-mv-share" | "v2rblemvshare" => Ok(SrsV2PartitionSyntaxMode::V2RleMvShare),
+        _ => Err(anyhow!(
+            "--partition-syntax must be v1 or v2 (got {s})"
+        )),
+    }
+}
+
 fn partition_cost_model_cli_label(m: SrsV2PartitionCostModel) -> &'static str {
     match m {
         SrsV2PartitionCostModel::SadOnly => "sad-only",
@@ -1382,6 +1462,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let transform_size_mode = parse_transform_size_mode(&args.transform_size)?;
     let partition_cost_model = parse_partition_cost_model(&args.partition_cost_model)?;
     let partition_map_encoding = parse_partition_map_encoding(&args.partition_map_encoding)?;
+    let partition_syntax_mode = parse_partition_syntax_mode(&args.partition_syntax)?;
     let entropy_model_mode = parse_entropy_model(&args.entropy_model)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
@@ -1416,6 +1497,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         transform_size_mode,
         partition_cost_model,
         partition_map_encoding,
+        partition_syntax_mode,
         entropy_model_mode,
         ..Default::default()
     };
@@ -1424,6 +1506,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     validate_adaptive_quant_settings(&s).map_err(|e| anyhow!("adaptive quant settings: {e}"))?;
     s.validate_entropy_model_inter()
         .map_err(|e| anyhow!("MV entropy configuration: {e}"))?;
+    s.validate_partition_syntax_inter()
+        .map_err(|e| anyhow!("partition syntax configuration: {e}"))?;
     Ok(s)
 }
 
@@ -1586,10 +1670,502 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             24 => c.rev24 += 1,
             25 => c.rev25 += 1,
             26 => c.rev26 += 1,
+            27 => c.rev27 += 1,
+            28 => c.rev28 += 1,
             _ => {}
         }
     }
     c
+}
+
+/// P inter flags (must match `p_var_partition` on-wire layout).
+const P_SYNTAX_INTER_FLAG_BLOCK_AQ: u8 = 2;
+
+#[inline]
+fn read_u8_payload(pl: &[u8], cur: &mut usize) -> Option<u8> {
+    let b = *pl.get(*cur)?;
+    *cur += 1;
+    Some(b)
+}
+
+#[inline]
+fn read_u32_le_payload(pl: &[u8], cur: &mut usize) -> Option<u32> {
+    if *cur + 4 > pl.len() {
+        return None;
+    }
+    let v = u32::from_le_bytes(pl[*cur..*cur + 4].try_into().ok()?);
+    *cur += 4;
+    Some(v)
+}
+
+/// Sum **MV-share** blob lengths and decoded **group counts** over **FR2** rev **27**/**28** **P** payloads.
+fn partition_syntax_mv_share_scan_payloads(
+    payloads: &[Vec<u8>],
+    width: u32,
+    height: u32,
+) -> (u64, u64) {
+    let mb_cols = width / 16;
+    let mb_rows = height / 16;
+    let mut total_groups = 0_u64;
+    let mut total_mv_share_bytes = 0_u64;
+    for pl in payloads {
+        let rev = match pl.get(3).copied() {
+            Some(b) => b,
+            None => continue,
+        };
+        if rev != 27 && rev != 28 {
+            continue;
+        }
+        let mut cur = 4usize;
+        let _fi = read_u32_le_payload(pl, &mut cur);
+        let _qp = read_u8_payload(pl, &mut cur);
+        let flags = match read_u8_payload(pl, &mut cur) {
+            Some(b) => b,
+            None => continue,
+        };
+        if flags & P_SYNTAX_INTER_FLAG_BLOCK_AQ != 0 {
+            cur = cur.saturating_add(2);
+        }
+        if rev == 28 {
+            cur = cur.saturating_add(1);
+        }
+        let Some(map_len) = read_u32_le_payload(pl, &mut cur).map(|u| u as usize) else {
+            continue;
+        };
+        let map_end = cur.saturating_add(map_len);
+        if map_end > pl.len() {
+            continue;
+        }
+        let map_slice = &pl[cur..map_end];
+        cur = map_end;
+        let Ok(map) = decode_partition_map_v2(map_slice, mb_cols, mb_rows) else {
+            continue;
+        };
+        let Some(mv_share_len) = read_u32_le_payload(pl, &mut cur).map(|u| u as usize) else {
+            continue;
+        };
+        let sh_end = cur.saturating_add(mv_share_len);
+        if sh_end > pl.len() {
+            continue;
+        }
+        let sh_slice = &pl[cur..sh_end];
+        total_mv_share_bytes += mv_share_len as u64;
+        if mv_share_len > 0 {
+            if let Ok(total_pu) = total_pu_slots_for_modes(&map.modes) {
+                if let Ok(gs) = decode_mv_share_groups_v2(sh_slice, total_pu) {
+                    total_groups += gs.len() as u64;
+                }
+            }
+        }
+    }
+    (total_groups, total_mv_share_bytes)
+}
+
+fn partition_syntax_compare_ok_row(
+    row: &str,
+    partition_syntax_mode: &str,
+    partition_map_v1_bytes: u64,
+    partition_map_v2_bytes: u64,
+    partition_syntax_savings_bytes: i64,
+    partition_syntax_savings_percent: f64,
+    p: &PassNumbers,
+    args: &Args,
+    mv_share_group_count: u64,
+    mv_share_bytes: u64,
+) -> PartitionSyntaxCompareRow {
+    let enc_fps = args.frames as f64 / p.enc_secs.max(1e-9);
+    let dec_fps = args.frames as f64 / p.dec_secs.max(1e-9);
+    let total_bytes: u64 = p.byte_hist.iter().sum();
+    PartitionSyntaxCompareRow {
+        row: row.to_string(),
+        partition_syntax_mode: partition_syntax_mode.to_string(),
+        partition_map_v1_bytes,
+        partition_map_v2_bytes,
+        mv_share_group_count,
+        mv_share_bytes,
+        partition_syntax_savings_bytes,
+        partition_syntax_savings_percent,
+        total_bytes,
+        psnr_y: p.psnr_y,
+        ssim_y: p.ssim_y,
+        encode_fps: enc_fps,
+        decode_fps: dec_fps,
+        ok: true,
+        error: None,
+    }
+}
+
+fn partition_syntax_compare_err_row(
+    row: &str,
+    partition_syntax_mode: &str,
+    err: &str,
+) -> PartitionSyntaxCompareRow {
+    PartitionSyntaxCompareRow {
+        row: row.to_string(),
+        partition_syntax_mode: partition_syntax_mode.to_string(),
+        partition_map_v1_bytes: 0,
+        partition_map_v2_bytes: 0,
+        mv_share_group_count: 0,
+        mv_share_bytes: 0,
+        partition_syntax_savings_bytes: 0,
+        partition_syntax_savings_percent: 0.0,
+        total_bytes: 0,
+        psnr_y: 0.0,
+        ssim_y: 0.0,
+        encode_fps: 0.0,
+        decode_fps: 0.0,
+        ok: false,
+        error: Some(err.to_string()),
+    }
+}
+
+fn partition_syntax_try_pass(
+    args_template: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    expected_frame: usize,
+    re: ResidualEntropy,
+    patch: impl FnOnce(&mut Args),
+) -> Result<(Args, SrsV2EncodeSettings, PassNumbers)> {
+    let mut a = args_template.clone();
+    patch(&mut a);
+    a.bframes = 0;
+    a.inter_syntax = "compact".to_string();
+    let settings = build_settings(&a, re)?;
+    let numbers = run_srsv2_pass(&a, seq, raw, &settings, expected_frame)?;
+    Ok((a, settings, numbers))
+}
+
+fn partition_syntax_err_codec_row(codec: &str, err: &str) -> CodecRow {
+    CodecRow {
+        codec: codec.to_string(),
+        error: Some(err.to_string()),
+        bytes: 0,
+        ratio: 0.0,
+        bitrate_bps: 0.0,
+        psnr_y: 0.0,
+        ssim_y: 0.0,
+        enc_fps: 0.0,
+        dec_fps: 0.0,
+    }
+}
+
+/// `--compare-partition-syntax`: fixed / AutoFast+RDO / split8×8 × (**v1** vs **v2** map) pairings.
+fn run_compare_partition_syntax_report(
+    args: &Args,
+    seq: &VideoSequenceHeaderV2,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    let re = parse_residual_entropy(&args.residual_entropy)?;
+    let mut compare_rows: Vec<PartitionSyntaxCompareRow> = Vec::new();
+    let mut table: Vec<CodecRow> = Vec::new();
+    let mut primary: Option<Srsv2Details> = None;
+
+    // --- fixed16x16 + v1 only (v2 is invalid for fixed partition) ---
+    {
+        let mut a = args.clone();
+        a.bframes = 0;
+        a.inter_syntax = "compact".to_string();
+        a.inter_partition = "fixed16x16".to_string();
+        a.partition_syntax = "v1".to_string();
+        match build_settings(&a, re) {
+            Ok(settings) => match run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
+                Ok(numbers) => {
+                    let map_v1 = numbers.motion_agg.partition_map_bytes;
+                    let (mv_g, mv_b) =
+                        partition_syntax_mv_share_scan_payloads(&numbers.payloads, seq.width, seq.height);
+                    let deblock = build_deblock_bench_report(
+                        &a,
+                        seq,
+                        &settings,
+                        raw,
+                        expected_frame,
+                        &numbers,
+                    )
+                    .unwrap_or_default();
+                    let details =
+                        pass_to_details(&a, seq, &settings, &a.residual_entropy, &numbers, deblock);
+                    primary = Some(details);
+                    compare_rows.push(partition_syntax_compare_ok_row(
+                        "fixed16x16",
+                        "v1",
+                        map_v1,
+                        0,
+                        0,
+                        0.0,
+                        &numbers,
+                        &a,
+                        mv_g,
+                        mv_b,
+                    ));
+                    table.push(pass_to_row(&a, "SRSV2-ps-fixed16x16", &numbers));
+                }
+                Err(e) => {
+                    compare_rows.push(partition_syntax_compare_err_row(
+                        "fixed16x16",
+                        "v1",
+                        &format!("{e:#}"),
+                    ));
+                    table.push(CodecRow {
+                        codec: "SRSV2-ps-fixed16x16".into(),
+                        error: Some(format!("{e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    });
+                }
+            },
+            Err(e) => {
+                compare_rows.push(partition_syntax_compare_err_row(
+                    "fixed16x16",
+                    "v1",
+                    &format!("settings: {e:#}"),
+                ));
+                table.push(CodecRow {
+                    codec: "SRSV2-ps-fixed16x16".into(),
+                    error: Some(format!("settings: {e:#}")),
+                    bytes: 0,
+                    ratio: 0.0,
+                    bitrate_bps: 0.0,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    enc_fps: 0.0,
+                    dec_fps: 0.0,
+                });
+            }
+        }
+    }
+
+    // --- auto-fast + rdo-fast + rdo fast × v1 / v2 ---
+    let auto_v1 = partition_syntax_try_pass(args, seq, raw, expected_frame, re, |a| {
+        a.inter_partition = "auto-fast".to_string();
+        a.partition_cost_model = "rdo-fast".to_string();
+        a.rdo = "fast".to_string();
+        a.partition_syntax = "v1".to_string();
+    });
+    let auto_v2 = partition_syntax_try_pass(args, seq, raw, expected_frame, re, |a| {
+        a.inter_partition = "auto-fast".to_string();
+        a.partition_cost_model = "rdo-fast".to_string();
+        a.rdo = "fast".to_string();
+        a.partition_syntax = "v2".to_string();
+    });
+    let (am1, am2, a_sav_b, a_sav_pct) = match (&auto_v1, &auto_v2) {
+        (Ok((_, _, n1)), Ok((_, _, n2))) => {
+            let m1 = n1.motion_agg.partition_map_bytes;
+            let m2 = n2.motion_agg.partition_map_bytes;
+            let sb = m1 as i64 - m2 as i64;
+            let pct = if m1 > 0 {
+                100.0 * (m1 as f64 - m2 as f64) / m1 as f64
+            } else {
+                0.0
+            };
+            (m1, m2, sb, pct)
+        }
+        _ => (0, 0, 0, 0.0),
+    };
+    match &auto_v1 {
+        Ok((a, settings, numbers)) => {
+            let deblock =
+                build_deblock_bench_report(a, seq, settings, raw, expected_frame, numbers)
+                    .unwrap_or_default();
+            if primary.is_none() {
+                primary = Some(pass_to_details(
+                    a,
+                    seq,
+                    settings,
+                    &a.residual_entropy,
+                    numbers,
+                    deblock.clone(),
+                ));
+            }
+            compare_rows.push(partition_syntax_compare_ok_row(
+                "auto-fast-rdo-v1",
+                "v1",
+                am1,
+                am2,
+                a_sav_b,
+                a_sav_pct,
+                numbers,
+                a,
+                0,
+                0,
+            ));
+            table.push(pass_to_row(a, "SRSV2-ps-auto-fast-rdo-v1", numbers));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            compare_rows.push(partition_syntax_compare_err_row("auto-fast-rdo-v1", "v1", &msg));
+            table.push(partition_syntax_err_codec_row("SRSV2-ps-auto-fast-rdo-v1", &msg));
+        }
+    }
+    match &auto_v2 {
+        Ok((a, settings, numbers)) => {
+            let (mv_g, mv_b) =
+                partition_syntax_mv_share_scan_payloads(&numbers.payloads, seq.width, seq.height);
+            if primary.is_none() {
+                let deblock =
+                    build_deblock_bench_report(a, seq, settings, raw, expected_frame, numbers)
+                        .unwrap_or_default();
+                primary = Some(pass_to_details(
+                    a,
+                    seq,
+                    settings,
+                    &a.residual_entropy,
+                    numbers,
+                    deblock,
+                ));
+            }
+            compare_rows.push(partition_syntax_compare_ok_row(
+                "auto-fast-rdo-v2",
+                "v2",
+                am1,
+                am2,
+                a_sav_b,
+                a_sav_pct,
+                numbers,
+                a,
+                mv_g,
+                mv_b,
+            ));
+            table.push(pass_to_row(a, "SRSV2-ps-auto-fast-rdo-v2", numbers));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            compare_rows.push(partition_syntax_compare_err_row("auto-fast-rdo-v2", "v2", &msg));
+            table.push(partition_syntax_err_codec_row("SRSV2-ps-auto-fast-rdo-v2", &msg));
+        }
+    }
+
+    // --- split8x8 × v1 / v2 (inherit user RDO + partition cost model) ---
+    let split_v1 = partition_syntax_try_pass(args, seq, raw, expected_frame, re, |a| {
+        a.inter_partition = "split8x8".to_string();
+        a.partition_syntax = "v1".to_string();
+    });
+    let split_v2 = partition_syntax_try_pass(args, seq, raw, expected_frame, re, |a| {
+        a.inter_partition = "split8x8".to_string();
+        a.partition_syntax = "v2".to_string();
+    });
+    let (sm1, sm2, s_sav_b, s_sav_pct) = match (&split_v1, &split_v2) {
+        (Ok((_, _, n1)), Ok((_, _, n2))) => {
+            let m1 = n1.motion_agg.partition_map_bytes;
+            let m2 = n2.motion_agg.partition_map_bytes;
+            let sb = m1 as i64 - m2 as i64;
+            let pct = if m1 > 0 {
+                100.0 * (m1 as f64 - m2 as f64) / m1 as f64
+            } else {
+                0.0
+            };
+            (m1, m2, sb, pct)
+        }
+        _ => (0, 0, 0, 0.0),
+    };
+    match &split_v1 {
+        Ok((a, settings, numbers)) => {
+            let deblock =
+                build_deblock_bench_report(a, seq, settings, raw, expected_frame, numbers)
+                    .unwrap_or_default();
+            if primary.is_none() {
+                primary = Some(pass_to_details(
+                    a,
+                    seq,
+                    settings,
+                    &a.residual_entropy,
+                    numbers,
+                    deblock.clone(),
+                ));
+            }
+            compare_rows.push(partition_syntax_compare_ok_row(
+                "split8x8-v1",
+                "v1",
+                sm1,
+                sm2,
+                s_sav_b,
+                s_sav_pct,
+                numbers,
+                a,
+                0,
+                0,
+            ));
+            table.push(pass_to_row(a, "SRSV2-ps-split8x8-v1", numbers));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            compare_rows.push(partition_syntax_compare_err_row("split8x8-v1", "v1", &msg));
+            table.push(partition_syntax_err_codec_row("SRSV2-ps-split8x8-v1", &msg));
+        }
+    }
+    match &split_v2 {
+        Ok((a, settings, numbers)) => {
+            let (mv_g, mv_b) =
+                partition_syntax_mv_share_scan_payloads(&numbers.payloads, seq.width, seq.height);
+            if primary.is_none() {
+                let deblock =
+                    build_deblock_bench_report(a, seq, settings, raw, expected_frame, numbers)
+                        .unwrap_or_default();
+                primary = Some(pass_to_details(
+                    a,
+                    seq,
+                    settings,
+                    &a.residual_entropy,
+                    numbers,
+                    deblock,
+                ));
+            }
+            compare_rows.push(partition_syntax_compare_ok_row(
+                "split8x8-v2",
+                "v2",
+                sm1,
+                sm2,
+                s_sav_b,
+                s_sav_pct,
+                numbers,
+                a,
+                mv_g,
+                mv_b,
+            ));
+            table.push(pass_to_row(a, "SRSV2-ps-split8x8-v2", numbers));
+        }
+        Err(e) => {
+            let msg = format!("{e:#}");
+            compare_rows.push(partition_syntax_compare_err_row("split8x8-v2", "v2", &msg));
+            table.push(partition_syntax_err_codec_row("SRSV2-ps-split8x8-v2", &msg));
+        }
+    }
+
+    let srsv2 = primary.unwrap_or_default();
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "`--compare-partition-syntax` holds RDO + cost model constant per row group; **AutoFast** rows use **`--partition-cost-model rdo-fast`** and **`--rdo fast`**.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2,
+        x264: None,
+        x265: None,
+        table,
+        compare_residual_modes: None,
+        sweep: None,
+        compare_b_modes: None,
+        compare_inter_syntax: None,
+        compare_rdo: None,
+        compare_partitions: None,
+        compare_partition_costs: None,
+        compare_partition_syntax: Some(compare_rows),
+        compare_entropy_models: None,
+        entropy_model_compare_summary: None,
+        match_x264_bitrate_note: None,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
 }
 
 fn b_blend_report_from_pass(p: &PassNumbers) -> BBlendBenchReport {
@@ -2672,12 +3248,25 @@ fn run_compare_b_modes_report(
 
     let mut table: Vec<CodecRow> = rows.iter().map(|r| r.row.clone()).collect();
 
-    let x264 = if args.compare_x264 {
+    let run_x264 = args.compare_x264 || args.compare_x264_and_x265;
+    let run_x265 = args.compare_x265 || args.compare_x264_and_x265;
+
+    let x264 = if run_x264 {
         let (row, det) = run_x264_compare(args, raw, ef, &src_luma, Some(srsv2_row.bitrate_bps))?;
         if let Some(r) = row {
             table.push(r);
         }
         Some(det)
+    } else {
+        None
+    };
+
+    let x265 = if run_x265 {
+        let (row, rep) = run_x265_compare(args, raw, ef, &src_luma)?;
+        if let Some(r) = row {
+            table.push(r);
+        }
+        Some(rep)
     } else {
         None
     };
@@ -2693,6 +3282,7 @@ fn run_compare_b_modes_report(
         fps: args.fps.max(1),
         srsv2: details,
         x264,
+        x265,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -2701,6 +3291,7 @@ fn run_compare_b_modes_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
@@ -2737,7 +3328,10 @@ fn run_single_report(
 
     let src_luma = flatten_src_luma(raw, expected_frame, args)?;
 
-    let x264 = if args.compare_x264 {
+    let run_x264 = args.compare_x264 || args.compare_x264_and_x265;
+    let run_x265 = args.compare_x265 || args.compare_x264_and_x265;
+
+    let x264 = if run_x264 {
         let (row, details_x264) = run_x264_compare(
             args,
             raw,
@@ -2753,6 +3347,16 @@ fn run_single_report(
         None
     };
 
+    let x265 = if run_x265 {
+        let (row, rep) = run_x265_compare(args, raw, expected_frame, &src_luma)?;
+        if let Some(r) = row {
+            table.push(r);
+        }
+        Some(rep)
+    } else {
+        None
+    };
+
     Ok(BenchReport {
         note: "Engineering measurement only; not a marketing claim.",
         residual_note: "Residual entropy (FR2 rev 3 intra / rev 4 P; rev 7–9 add optional block qp_delta with adaptive residuals) is experimental; auto mode never chooses a larger representation than explicit tuples per block.",
@@ -2764,6 +3368,7 @@ fn run_single_report(
         fps: args.fps.max(1),
         srsv2: details,
         x264,
+        x265,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -2772,6 +3377,7 @@ fn run_single_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
@@ -2904,6 +3510,7 @@ fn run_compare_residual_report(
         fps: args.fps.max(1),
         srsv2,
         x264: None,
+        x265: None,
         table,
         compare_residual_modes: Some(entries),
         sweep: None,
@@ -2912,6 +3519,7 @@ fn run_compare_residual_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
@@ -3036,6 +3644,7 @@ fn run_compare_inter_syntax_report(
         fps: args.fps.max(1),
         srsv2,
         x264: None,
+        x265: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3044,6 +3653,7 @@ fn run_compare_inter_syntax_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
@@ -3164,6 +3774,7 @@ fn run_compare_rdo_report(
         fps: args.fps.max(1),
         srsv2,
         x264: None,
+        x265: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3172,6 +3783,7 @@ fn run_compare_rdo_report(
         compare_rdo: Some(entries),
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
@@ -3297,6 +3909,7 @@ fn run_compare_partitions_report(
         fps: args.fps.max(1),
         srsv2,
         x264: None,
+        x265: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3305,6 +3918,7 @@ fn run_compare_partitions_report(
         compare_rdo: None,
         compare_partitions: Some(entries),
         compare_partition_costs: None,
+        compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
@@ -3453,6 +4067,7 @@ fn run_compare_partition_costs_report(
         fps: args.fps.max(1),
         srsv2,
         x264: None,
+        x265: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3461,6 +4076,7 @@ fn run_compare_partition_costs_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: Some(entries),
+        compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
         match_x264_bitrate_note: None,
@@ -3697,6 +4313,7 @@ fn run_compare_entropy_models_report(
         fps: args.fps.max(1),
         srsv2,
         x264: None,
+        x265: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3705,6 +4322,7 @@ fn run_compare_entropy_models_report(
         compare_rdo: None,
         compare_partitions: None,
         compare_partition_costs: None,
+        compare_partition_syntax: None,
         compare_entropy_models: Some(entries),
         entropy_model_compare_summary,
         match_x264_bitrate_note: None,
@@ -4003,6 +4621,8 @@ fn main() -> Result<()> {
         run_compare_partitions_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_partition_costs {
         run_compare_partition_costs_report(&args, &seq, &raw, expected_frame)?
+    } else if args.compare_partition_syntax {
+        run_compare_partition_syntax_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_entropy_models {
         run_compare_entropy_models_report(&args, &seq, &raw, expected_frame)?
     } else if args.compare_residual_modes {
@@ -4304,6 +4924,43 @@ fn run_x264_compare(
     ))
 }
 
+fn run_x265_compare(
+    args: &Args,
+    raw: &[u8],
+    yuv420_frame_bytes: usize,
+    src_luma: &[u8],
+) -> Result<(Option<CodecRow>, hevc_compare::X265CompareReport)> {
+    let p = hevc_compare::X265YuvParams {
+        width: args.width,
+        height: args.height,
+        fps: args.fps.max(1),
+        frames: args.frames,
+        input_path: &args.input,
+        uncompressed_raw_bytes: raw.len() as u64,
+        src_luma,
+        yuv420_frame_bytes,
+    };
+    let rep = hevc_compare::run_libx265_yuv_roundtrip(p, args.x265_crf, args.x265_preset.as_str())?;
+    let row = hevc_compare::table_metrics_from_report(
+        &rep,
+        raw.len() as u64,
+        args.frames,
+        args.fps.max(1),
+    )
+    .map(|m| CodecRow {
+        codec: "x265".to_string(),
+        error: None,
+        bytes: m.bytes,
+        ratio: m.ratio,
+        bitrate_bps: m.bitrate_bps,
+        psnr_y: m.psnr_y,
+        ssim_y: m.ssim_y,
+        enc_fps: m.enc_fps,
+        dec_fps: m.dec_fps,
+    });
+    Ok((row, rep))
+}
+
 fn to_markdown(r: &BenchReport) -> String {
     let mut out = String::new();
     out.push_str("# SRSV2 benchmark report\n\n");
@@ -4442,6 +5099,35 @@ fn to_markdown(r: &BenchReport) -> String {
                 e.error
             ));
         }
+    }
+
+    if let Some(rows) = &r.compare_partition_syntax {
+        out.push_str("\n## Partition syntax comparison\n\n");
+        out.push_str("| Row | Total bytes | Map bytes | MV-share bytes | PSNR-Y | SSIM-Y |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|\n");
+        for e in rows {
+            let map_b = if e.partition_syntax_mode == "v1" {
+                e.partition_map_v1_bytes
+            } else {
+                e.partition_map_v2_bytes
+            };
+            let err = e
+                .error
+                .as_ref()
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "| {}{} | {} | {} | {} | {:.2} | {:.4} |\n",
+                e.row,
+                err,
+                e.total_bytes,
+                map_b,
+                e.mv_share_bytes,
+                e.psnr_y,
+                e.ssim_y
+            ));
+        }
+        out.push_str("\n_JSON: `compare_partition_syntax[]` includes `partition_map_v1_bytes`, `partition_map_v2_bytes`, `partition_syntax_savings_bytes`, `partition_syntax_savings_percent`, `mv_share_group_count`, encode/decode FPS, and `total_bytes`._\n");
     }
 
     if let Some(rows) = &r.compare_entropy_models {
@@ -4815,6 +5501,39 @@ fn to_markdown(r: &BenchReport) -> String {
             out.push_str(&format!("- match-bitrate placeholder: {n}\n"));
         }
     }
+    if let Some(x) = &r.x265 {
+        out.push_str(
+            "\n## libx265 / FFmpeg HEVC reference (`--compare-x265` / `--compare-x264-and-x265`)\n\n",
+        );
+        out.push_str("_Optional HEVC-class reference measurement (YUV round-trip). This section states facts about the run only — **not** that HEVC or any encoder is superior to others in general._\n\n");
+        out.push_str(&format!("- status: {}\n", x.x265_status));
+        if let Some(b) = x.x265_bytes {
+            out.push_str(&format!("- output bytes (encoded container): {}\n", b));
+        }
+        if let Some(b) = x.x265_bitrate_bps {
+            out.push_str(&format!("- achieved bitrate (bps): {:.2}\n", b));
+        }
+        if let Some(py) = x.x265_psnr_y {
+            out.push_str(&format!("- PSNR-Y (vs source luma): {:.2}\n", py));
+            if (py - PSNR_Y_JSON_SAFE_IDENTICAL_DB).abs() <= 1e-6 {
+                out.push_str("  - Identical luma → raw PSNR is ∞; **100.0 dB** here is a JSON-safe sentinel, not a codec ceiling.\n");
+            }
+        }
+        if let Some(sy) = x.x265_ssim_y {
+            out.push_str(&format!("- SSIM-Y (vs source luma): {:.4}\n", sy));
+        }
+        if let Some(t) = x.x265_encode_seconds {
+            out.push_str(&format!("- encode wall time (s): {:.4}\n", t));
+        }
+        if let Some(t) = x.x265_decode_seconds {
+            out.push_str(&format!("- decode wall time (s): {:.4}\n", t));
+        }
+        if let Some(cmd) = &x.x265_command {
+            out.push_str(&format!(
+                "- FFmpeg command string (same style as JSON `x265_command`):\n\n```text\n{cmd}\n```\n"
+            ));
+        }
+    }
     out
 }
 
@@ -4838,8 +5557,12 @@ mod tests {
             report_json: std::env::temp_dir().join("x.json"),
             report_md: std::env::temp_dir().join("x.md"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -4881,6 +5604,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -4918,8 +5643,12 @@ mod tests {
             report_json: std::env::temp_dir().join("xb.json"),
             report_md: std::env::temp_dir().join("xb.md"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -4961,6 +5690,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -4997,8 +5728,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5040,6 +5775,8 @@ mod tests {
             compare_rdo: true,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5078,8 +5815,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5121,6 +5862,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: true,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5159,8 +5902,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5202,6 +5949,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5242,8 +5991,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5285,6 +6038,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5339,8 +6094,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5382,6 +6141,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5427,8 +6188,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5470,6 +6235,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5532,8 +6299,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5575,6 +6346,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5620,8 +6393,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5663,6 +6440,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5713,8 +6492,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5756,6 +6539,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -5840,8 +6625,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -5883,6 +6672,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -6057,6 +6848,7 @@ mod tests {
                 entropy_failure_reason: None,
             },
             x264: None,
+            x265: None,
             table: vec![CodecRow {
                 codec: "SRSV2".to_string(),
                 error: None,
@@ -6075,6 +6867,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: None,
             compare_partition_costs: None,
+            compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
             match_x264_bitrate_note: None,
@@ -6179,6 +6972,7 @@ mod tests {
                 entropy_failure_reason: None,
             },
             x264: None,
+            x265: None,
             table: vec![],
             compare_residual_modes: Some(vec![ResidualCompareEntry {
                 label: "SRSV2-explicit".to_string(),
@@ -6275,6 +7069,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: None,
             compare_partition_costs: None,
+            compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
             match_x264_bitrate_note: None,
@@ -6297,6 +7092,7 @@ mod tests {
             fps: 30,
             srsv2: Srsv2Details::default(),
             x264: None,
+            x265: None,
             table: vec![],
             compare_residual_modes: None,
             sweep: None,
@@ -6305,6 +7101,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: Some(vec![]),
             compare_partition_costs: None,
+            compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
             match_x264_bitrate_note: None,
@@ -6328,6 +7125,7 @@ mod tests {
             fps: 30,
             srsv2: Srsv2Details::default(),
             x264: None,
+            x265: None,
             table: vec![],
             compare_residual_modes: None,
             sweep: None,
@@ -6336,6 +7134,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: None,
             compare_partition_costs: Some(vec![]),
+            compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
             match_x264_bitrate_note: None,
@@ -6344,6 +7143,172 @@ mod tests {
         };
         let js = serde_json::to_string(&r).unwrap();
         assert!(js.contains("\"compare_partition_costs\":[]"));
+    }
+
+    #[test]
+    fn compare_partition_syntax_report_serializes() {
+        let r = BenchReport {
+            note: "x",
+            residual_note: "n",
+            command: "cmd".to_string(),
+            raw_bytes: 1,
+            width: 128,
+            height: 128,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            x265: None,
+            table: vec![],
+            compare_residual_modes: None,
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: None,
+            compare_partition_syntax: Some(vec![]),
+            compare_entropy_models: None,
+            entropy_model_compare_summary: None,
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "os".to_string(),
+        };
+        let js = serde_json::to_string(&r).unwrap();
+        assert!(js.contains("\"compare_partition_syntax\":[]"));
+    }
+
+    #[test]
+    fn compare_partition_syntax_five_rows_fixed_matches_single_pass() {
+        let w = 64u32;
+        let h = 64u32;
+        let frames = 4u32;
+        let fb = yuv420_frame_bytes(w, h).unwrap();
+        let raw: Vec<u8> = (0..fb * frames as usize).map(|i| (i % 251) as u8).collect();
+        let base = Args {
+            input: PathBuf::from("nope"),
+            width: w,
+            height: h,
+            frames,
+            fps: 30,
+            qp: 28,
+            keyint: 30,
+            motion_radius: 8,
+            report_json: PathBuf::from("j"),
+            report_md: PathBuf::from("m"),
+            compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
+            x264_crf: 23,
+            x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
+            residual_entropy: "auto".to_string(),
+            compare_residual_modes: false,
+            sweep: false,
+            sweep_quality_bitrate: false,
+            sweep_ssim_threshold: 0.95,
+            sweep_byte_budget: 10_000_000,
+            rc: "fixed-qp".to_string(),
+            quality: None,
+            target_bitrate_kbps: None,
+            max_bitrate_kbps: None,
+            min_qp: 4,
+            max_qp: 51,
+            qp_step_limit: 2,
+            aq: "off".to_string(),
+            aq_strength: 4,
+            motion_search: "diamond".to_string(),
+            early_exit_sad_threshold: 0,
+            enable_skip_blocks: true,
+            sweep_extended: false,
+            loop_filter: "off".to_string(),
+            deblock_strength: 0,
+            subpel: "off".to_string(),
+            subpel_refinement_radius: 1,
+            block_aq: "off".to_string(),
+            block_aq_delta_min: -6,
+            block_aq_delta_max: 6,
+            bframes: 0,
+            alt_ref: "off".to_string(),
+            b_motion_search: "off".to_string(),
+            gop: 0,
+            reference_frames: 1,
+            inter_syntax: "compact".to_string(),
+            rdo: "off".to_string(),
+            rdo_lambda_scale: 256,
+            match_x264_bitrate: false,
+            compare_b_modes: false,
+            b_weighted_prediction: false,
+            compare_inter_syntax: false,
+            compare_rdo: false,
+            compare_partitions: false,
+            compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
+            partition_cost_model: "sad-only".to_string(),
+            partition_map_encoding: "legacy".to_string(),
+            inter_partition: "fixed16x16".to_string(),
+            transform_size: "auto".to_string(),
+            entropy_model: "static".to_string(),
+            compare_entropy_models: false,
+            h264_progress_summary: false,
+            progress_entropy_json: PathBuf::from("var/bench/compare_entropy_models.json"),
+            progress_partition_costs_json: PathBuf::from("var/bench/compare_partition_costs.json"),
+            progress_sweep_json: PathBuf::from("var/bench/sweep_quality_bitrate.json"),
+            progress_x264_json: None,
+            progress_b_modes_json: None,
+            h264_progress_summary_out_json: PathBuf::from(
+                "var/bench/srsv2_h264_progress_summary.json",
+            ),
+            h264_progress_summary_out_md: PathBuf::from("var/bench/srsv2_h264_progress_summary.md"),
+        };
+        let re = parse_residual_entropy(&base.residual_entropy).unwrap();
+        let mut fixed_only = base.clone();
+        fixed_only.inter_partition = "fixed16x16".to_string();
+        fixed_only.partition_syntax = "v1".to_string();
+        fixed_only.inter_syntax = "compact".to_string();
+        fixed_only.bframes = 0;
+        let settings = build_settings(&fixed_only, re).unwrap();
+        let seq = build_seq_header(&fixed_only, &settings);
+        let single = run_srsv2_pass(&fixed_only, &seq, &raw, &settings, fb).unwrap();
+        let report = run_compare_partition_syntax_report(&base, &seq, &raw, fb).unwrap();
+        let rows = report
+            .compare_partition_syntax
+            .as_ref()
+            .expect("compare_partition_syntax");
+        assert_eq!(rows.len(), 5);
+        let v2_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.partition_syntax_mode == "v2")
+            .collect();
+        assert_eq!(v2_rows.len(), 2, "auto-fast-rdo-v2 and split8x8-v2");
+        let md = to_markdown(&report);
+        assert!(md.contains("## Partition syntax comparison"));
+
+        let fixed_row = rows.iter().find(|r| r.row == "fixed16x16").unwrap();
+        assert!(fixed_row.ok, "{:?}", fixed_row.error);
+        assert_eq!(
+            fixed_row.partition_map_v1_bytes,
+            single.motion_agg.partition_map_bytes
+        );
+        assert_eq!(
+            fixed_row.total_bytes,
+            single.byte_hist.iter().sum::<u64>()
+        );
+
+        let sp1 = rows.iter().find(|r| r.row == "split8x8-v1").unwrap();
+        let sp2 = rows.iter().find(|r| r.row == "split8x8-v2").unwrap();
+        assert!(sp1.ok && sp2.ok, "split8x8 pair must encode");
+        assert!(
+            sp2.partition_map_v2_bytes <= sp1.partition_map_v1_bytes,
+            "expected v2 partition map wire <= v1 on split8x8; v1={} v2={}",
+            sp1.partition_map_v1_bytes,
+            sp2.partition_map_v2_bytes
+        );
+        let js = serde_json::to_string(&report).unwrap();
+        assert!(js.contains("\"row\":\"auto-fast-rdo-v2\""));
+        assert!(js.contains("partition_syntax_savings_bytes"));
     }
 
     #[test]
@@ -6463,8 +7428,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -6506,6 +7475,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -6542,8 +7513,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "explicit".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -6585,6 +7560,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -6623,8 +7600,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: true,
@@ -6666,6 +7647,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -6722,8 +7705,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -6765,6 +7752,8 @@ mod tests {
             compare_rdo: true,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -6894,6 +7883,7 @@ mod tests {
             fps: 30,
             srsv2: Srsv2Details::default(),
             x264: None,
+            x265: None,
             table: vec![],
             compare_residual_modes: None,
             sweep: None,
@@ -6902,6 +7892,7 @@ mod tests {
             compare_rdo: None,
             compare_partitions: None,
             compare_partition_costs: None,
+            compare_partition_syntax: None,
             compare_entropy_models: Some(rows),
             entropy_model_compare_summary: summary,
             match_x264_bitrate_note: None,
@@ -6952,8 +7943,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -6995,6 +7990,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),
@@ -7031,8 +8028,12 @@ mod tests {
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
             compare_x264: false,
+            compare_x265: false,
+            compare_x264_and_x265: false,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
+            x265_crf: 28,
+            x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
             sweep: false,
@@ -7074,6 +8075,8 @@ mod tests {
             compare_rdo: false,
             compare_partitions: false,
             compare_partition_costs: false,
+            compare_partition_syntax: false,
+            partition_syntax: "v1".to_string(),
             partition_cost_model: "sad-only".to_string(),
             partition_map_encoding: "legacy".to_string(),
             inter_partition: "fixed16x16".to_string(),

@@ -206,6 +206,16 @@ pub enum SrsV2PartitionMapEncoding {
     RleRuns,
 }
 
+/// Macroblock partition **map** layout for variable **`P`** (`FR2` rev **19**–**20**/**25** vs **27**–**28**).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2PartitionSyntaxMode {
+    /// Legacy inline or RLE-packed map per rev **19** / **20** / **25**.
+    #[default]
+    V1Legacy,
+    /// Length-prefixed [`crate::srsv2::partition_syntax_v2`] map + MV-share blob prefix (`FR2` rev **27** / **28**).
+    V2RleMvShare,
+}
+
 /// Experimental **B-frame** motion / blend search (`FR2` rev **13** integer MVs, rev **14** half-pel MVs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2BMotionSearchMode {
@@ -291,6 +301,8 @@ pub struct SrsV2EncodeSettings {
     pub partition_quality_bias: u16,
     /// **`FR2` rev19** partition map packing (**default** legacy one-byte-per-MB).
     pub partition_map_encoding: SrsV2PartitionMapEncoding,
+    /// Partition map serializer for variable-inter-**P** (**default** [`SrsV2PartitionSyntaxMode::V1Legacy`]).
+    pub partition_syntax_mode: SrsV2PartitionSyntaxMode,
 
     /// Inter MV entropy (**default** [`SrsV2EntropyModelMode::StaticV1`]).
     pub entropy_model_mode: SrsV2EntropyModelMode,
@@ -348,6 +360,7 @@ impl Default for SrsV2EncodeSettings {
             partition_header_penalty: 512,
             partition_quality_bias: 256,
             partition_map_encoding: SrsV2PartitionMapEncoding::LegacyPerMb,
+            partition_syntax_mode: SrsV2PartitionSyntaxMode::V1Legacy,
 
             entropy_model_mode: SrsV2EntropyModelMode::StaticV1,
             rdo_partition_byte_bias: 0,
@@ -383,6 +396,22 @@ impl SrsV2EncodeSettings {
                 if self.inter_syntax_mode != SrsV2InterSyntaxMode::EntropyV1 {
                     Err(SrsV2Error::syntax(
                         "ContextV1 entropy requires inter_syntax_mode EntropyV1",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// [`SrsV2PartitionSyntaxMode::V2RleMvShare`] applies only on the variable-partition **P** path — reject incoherent pairings early.
+    pub fn validate_partition_syntax_inter(&self) -> Result<(), SrsV2Error> {
+        match self.partition_syntax_mode {
+            SrsV2PartitionSyntaxMode::V1Legacy => Ok(()),
+            SrsV2PartitionSyntaxMode::V2RleMvShare => {
+                if self.inter_partition_mode == SrsV2InterPartitionMode::Fixed16x16 {
+                    Err(SrsV2Error::syntax(
+                        "V2RleMvShare requires a non-fixed inter_partition_mode",
                     ))
                 } else {
                     Ok(())
@@ -740,6 +769,22 @@ mod tests {
             ..Default::default()
         };
         assert!(ok.validate_entropy_model_inter().is_ok());
+    }
+
+    #[test]
+    fn v2_partition_syntax_requires_non_fixed_inter_partition() {
+        let s = SrsV2EncodeSettings {
+            partition_syntax_mode: SrsV2PartitionSyntaxMode::V2RleMvShare,
+            ..Default::default()
+        };
+        assert!(s.validate_partition_syntax_inter().is_err());
+        let ok = SrsV2EncodeSettings {
+            partition_syntax_mode: SrsV2PartitionSyntaxMode::V2RleMvShare,
+            inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            ..Default::default()
+        };
+        assert!(ok.validate_partition_syntax_inter().is_ok());
     }
 
     #[test]

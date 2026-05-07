@@ -22,6 +22,8 @@ pub mod model;
 pub mod motion_search;
 pub mod p_frame_codec;
 pub mod p_var_partition;
+/// Experimental compact partition maps + MV-share blobs (embedded in **FR2** rev **27**/**28** when [`SrsV2PartitionSyntaxMode`](crate::srsv2::rate_control::SrsV2PartitionSyntaxMode) is **V2RleMvShare**).
+pub mod partition_syntax_v2;
 pub mod payload_kind;
 pub mod rate_control;
 pub mod rdo;
@@ -75,14 +77,22 @@ pub use motion_search::{
 pub use p_frame_codec::FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1;
 pub use p_var_partition::{
     FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR, FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1,
-    FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
+    FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_V2, FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
+    FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION_V2,
+};
+pub use partition_syntax_v2::{
+    decode_mv_share_groups_v2, decode_partition_map_v2, encode_mv_share_groups_v2,
+    encode_partition_map_v2, estimate_partition_syntax_v2_bytes, total_pu_slots_for_modes,
+    validate_partition_map_v2, v1_legacy_partition_map_bytes, MvShareGroupV2, PartitionMapV2,
+    PartitionModeV2, PartitionRunV2, PartitionSyntaxV2Error, PartitionSyntaxV2Stats,
+    MV_SHARE_GROUPS_V2_MAGIC, PARTITION_MAP_V2_MAGIC,
 };
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode,
-    SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2RateControlError,
+    SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2RateControlError,
     SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformSize,
     SrsV2TransformSizeMode,
 };

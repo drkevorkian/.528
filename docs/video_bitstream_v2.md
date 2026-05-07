@@ -67,13 +67,15 @@ This table is the **authoritative** mapping between **on-wire `FR2` byte 4** (th
 | **24** | `0x18` | **ContextV1** MV rANS | **B** (fixed MB grid) | Same dual-blob layout as rev **18**, each blob uses ContextV1 multi-model rANS | `EntropyV1` + **`ContextV1`** |
 | **25** | `0x19` | **ContextV1** MV rANS | **P** (variable partition) | Rev **19**/**20** partition map + flags; MV blob uses ContextV1 rANS aligned to partitioned MV scan | `EntropyV1` + **`ContextV1`** on variable-partition **P** path |
 | **26** | `0x1A` | *Reserved* | **B** (variable partition + ContextV1) | **Not implemented:** mux may see this revision for policy tests, but **`decode_yuv420_b_payload` returns `Unsupported`** — **no** working bitstream layout in this repository slice | — |
+| **27** | `0x1B` | **Compact** (map **v2**) | **P** (variable partition) | Same flags/residuals as rev **19**; **no** per-MB map bytes — length-prefixed **`S2P1`** blob (`partition_syntax_v2`), then **`u32` LE** MV-share section length (may be **0**) | `SrsV2PartitionSyntaxMode::V2RleMvShare` + compact inter |
+| **28** | `0x1C` | **StaticV1** or **ContextV1** MV rANS (map **v2**) | **P** (variable partition) | Same as rev **27** for map/MV-share; after optional AQ clip bytes, **`u8` entropy selector**: **0** = StaticV1 rANS, **1** = ContextV1; then **`sym_count` / `blob_len` / blob** as rev **20**/**25** | `V2RleMvShare` + `EntropyV1` + chosen `SrsV2EntropyModelMode` |
 
 **Policy statements (non-normative but required for project honesty):**
 
 - **`SrsV2EntropyModelMode::StaticV1`** remains the **default**; **`ContextV1`** is **experimental** and must be **measured** (bytes + quality at matched settings) before any discussion of making it default.
 - **ContextV1 is not CABAC-class** and does not implement H.264-style adaptive binary arithmetic coding; it uses **fixed, bounded** per-context frequency tables and **bounded** rANS decode steps.
 - **No superiority claim vs H.264** is stated or implied by these revisions; they exist for **native** SRSV2 experimentation only.
-- Payloads **`FR2` rev 1–22** remain **supported** decoders paths alongside **23–25** where implemented; rev **26** is **explicitly unsupported** decode today (fail-fast).
+- Payloads **`FR2` rev 1–22** remain **supported** decoders paths alongside **23–28** where implemented; rev **26** is **explicitly unsupported** decode today (fail-fast).
 
 ### Revision 15 — experimental **P** compact inter MV (`FR2\x0F`) — **opt-in**
 
@@ -142,6 +144,16 @@ Same honesty rule as rev **21**.
 
 **Implemented** (`FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1`): same partition map, flags, and residual layout as rev **19**/**20**, with MV **`sym_count` / `blob_len` / blob`** using **ContextV1** rANS over the **partitioned** compact MV byte stream.
 
+### Revision 27 — experimental **P** variable partition + compact MV + partition map **v2** (`FR2\x1B`) — **opt-in**
+
+**Implemented:** `FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION_V2`. After `frame_index`, `qp`, and **`flags`** (optional `clip_min`/`clip_max` when block AQ is on), the body is: **`u32` LE** length of an **`S2P1`** partition map blob (see `docs/partition_syntax_v2.md`), then the map bytes, then **`u32` LE** length of an optional **`S2G1`** MV-share blob (**0** when unused), then MV bytes (compact partitioned stream, same alphabet as rev **19**). **`P_INTER_FLAG_PACKED_PART_MAP` (bit 3) must be clear** — v2 maps are not the legacy RLE / one-byte-per-MB layout.
+
+Encoder enable: `SrsV2EncodeSettings::partition_syntax_mode` = **`V2RleMvShare`** with non-fixed `SrsV2InterPartitionMode` and compact inter syntax. Default remains **v1** map layouts (rev **19**/**20**/**25**).
+
+### Revision 28 — experimental **P** variable partition + entropy MV + partition map **v2** (`FR2\x1C`) — **opt-in**
+
+**Implemented:** `FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_V2`. Same header and map/MV-share prefix as **rev 27**, except after optional AQ clip bytes an explicit **`u8`** selects MV entropy: **0** = **StaticV1** rANS (same framing as rev **20**), **1** = **ContextV1** (same as rev **25**). Other values are rejected on decode.
+
 ### Revision 26 — experimental **B** variable partition + ContextV1 (`FR2\x1A`) — **reserved / unsupported**
 
 The revision byte **`26`** is recognized by **`FrameTypeV2`** / mux classifiers for **bidirectional** policy, but **`decode_yuv420_b_payload` returns structured `Unsupported`** — there is **no** end-to-end encoder or decoder payload specification wired in this repository slice. **Do not** describe rev **26** as “done”.
@@ -150,7 +162,7 @@ The revision byte **`26`** is recognized by **`FrameTypeV2`** / mux classifiers 
 
 Non-displayable intra-coded planes (same entropy style as **rev 3** in this slice): `frame_index`, `qp`, **`target_slot`**, **`reserved`** (must be **0**). Picture updates **`SrsV2ReferenceManager`** at **`target_slot`** with **`is_displayable == false`**; playback must **not** treat it as a presented frame.
 
-**Compatibility:** Revisions **1**–**14** remain readable. **15**–**22** extend **opt-in** inter experiments (**15**–**18**: fixed-MB compact / StaticV1 entropy MV; **19**–**20**: **P** variable partitions + compact or StaticV1 entropy MV; **21**–**22**: **B** variable partitions — **not implemented**, honest **`Unsupported`**). **23**–**25** are **implemented** ContextV1 MV rANS payloads (see per-revision sections above); **26** is **reserved** (mux may classify the revision; **decode returns `Unsupported`**). The legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**18** and **B**-class **21**/**22** — use **`decode_yuv420_srsv2_payload_managed`** for **B**, **alt-ref**, and reference-rich timelines (unchanged rule).
+**Compatibility:** Revisions **1**–**14** remain readable. **15**–**22** extend **opt-in** inter experiments (**15**–**18**: fixed-MB compact / StaticV1 entropy MV; **19**–**20**: **P** variable partitions + compact or StaticV1 entropy MV; **21**–**22**: **B** variable partitions — **not implemented**, honest **`Unsupported`**). **23**–**25** and **27**–**28** are **implemented** where noted above; **26** is **reserved** (mux may classify the revision; **decode returns `Unsupported`**). The legacy single-slot helper **`decode_yuv420_srsv2_payload`** returns **`Unsupported`** for **10**–**18** and **B**-class **21**/**22** — use **`decode_yuv420_srsv2_payload_managed`** for **B**, **alt-ref**, and reference-rich timelines (unchanged rule).
 
 ## Elementary `.srsv2` file
 

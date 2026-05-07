@@ -565,7 +565,7 @@ pub fn encode_yuv420_alt_ref_payload(
     Ok(out)
 }
 
-/// Multi-reference decode entry point for mux / playback (`FR2` rev **1**–**14** plus experimental **P** **15**/**17**/**23**/**25** and **B** **24** where wired).
+/// Multi-reference decode entry point for mux / playback (`FR2` rev **1**–**14** plus experimental **P** **15**/**17**/**23**/**25**/**27**/**28** and **B** **24** where wired).
 ///
 /// Updates `manager` for intra, **P**, and **alt-ref**; **B** frames (**10**/**11**/**13**/**14**) do not advance the last-displayed slot.
 pub fn decode_yuv420_srsv2_payload_managed(
@@ -585,7 +585,7 @@ pub fn decode_yuv420_srsv2_payload_managed(
             }
             d
         }
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 => {
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 => {
             let reference = manager
                 .primary_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -632,7 +632,7 @@ pub fn decode_yuv420_srsv2_payload(
     }
     let mut dec = match payload[3] {
         1 | 3 | 7 => decode_yuv420_intra_payload(seq, payload)?,
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 => {
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 => {
             let reference = ref_slot
                 .as_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;

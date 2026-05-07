@@ -464,6 +464,7 @@ pub fn encode_yuv420_p_payload(
         return Err(SrsV2Error::syntax("plane geometry mismatch"));
     }
     settings.validate_entropy_model_inter()?;
+    settings.validate_partition_syntax_inter()?;
 
     let block_aq_wire = matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
         && matches!(
@@ -897,7 +898,7 @@ pub fn decode_yuv420_p_payload(
     if payload.len() < 4 || &payload[0..3] != b"FR2" {
         return Err(SrsV2Error::BadMagic);
     }
-    if matches!(rev, 19 | 20 | 25) {
+    if matches!(rev, 19 | 20 | 25 | 27 | 28) {
         return super::p_var_partition::decode_yuv420_p_payload_var_partition(
             seq, payload, reference, rev,
         );

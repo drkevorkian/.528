@@ -1,5 +1,6 @@
 pub mod display_order;
 pub use display_order::{DisplayOrderError, DisplayReorderBuffer};
+pub mod hevc_compare;
 pub mod srsv2_progress_report;
 pub mod srsv2_sweep;
 pub mod synthetic;

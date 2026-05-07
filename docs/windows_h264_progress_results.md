@@ -2,6 +2,8 @@
 
 _Engineering measurement only. This report does not claim SRSV2 beats H.264._
 
+**Roadmap note:** This document and the `windows_h264_progress_baseline.ps1` / `--h264-progress-summary` names are **historical** (AVC-oriented optional row). The workspace **engineering comparison target** is **HEVC-class** (see [`hevc_competition_plan.md`](hevc_competition_plan.md)): **SRSV2 does not beat H.265 today**; **`libx264`** rows remain useful sanity checks but are **not** enough as the only external baseline.
+
 ## Run
 
 - Date: 2026-05-04

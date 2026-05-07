@@ -1,4 +1,5 @@
-//! Experimental **`FR2` rev 19 / 20** — P-frame variable inter partitions + transform tagging (`FR2` rev **19** compact MV, **20** entropy MV).
+//! Experimental **`FR2` rev 19 / 20 / 25 / 27 / 28** — P-frame variable inter partitions + transform tagging
+//! (`FR2` rev **19** compact MV, **20**/**25** entropy MV, **27** compact map v2, **28** entropy map v2 + explicit MV entropy byte).
 //!
 //! **`FR2` rev 21 / 22** (**B**) are reserved; see [`crate::srsv2::b_frame_codec`].
 
@@ -27,10 +28,15 @@ use super::motion_search::{
     pick_mv_rect, sad_rect_integer, sample_u8_plane, SrsV2MotionEncodeStats,
     SrsV2PartitionEncodeStats,
 };
+use super::partition_syntax_v2::{
+    decode_mv_share_groups_v2, decode_partition_map_v2, encode_partition_map_v2,
+    total_pu_slots_for_modes, PartitionMapV2, PartitionModeV2,
+};
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2PartitionCostModel,
-    SrsV2PartitionMapEncoding, SrsV2SubpelMode, SrsV2TransformSizeMode,
+    SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2SubpelMode,
+    SrsV2TransformSizeMode,
 };
 use super::rdo::{
     autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost,
@@ -49,6 +55,13 @@ pub const FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION: [u8; 4] = [b'F', b'R', b'2', 19];
 pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR: [u8; 4] = [b'F', b'R', b'2', 20];
 /// P-frame variable partitions — **ContextV1** entropy MV (`FR2` rev **25**).
 pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 25];
+/// P-frame variable partitions — partition map **v2** + compact MV (`FR2` rev **27**).
+pub const FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION_V2: [u8; 4] = [b'F', b'R', b'2', 27];
+/// P-frame variable partitions — partition map **v2** + entropy MV + explicit entropy selector (`FR2` rev **28**).
+pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_V2: [u8; 4] = [b'F', b'R', b'2', 28];
+
+const P_V2_MV_ENTROPY_STATIC: u8 = 0;
+const P_V2_MV_ENTROPY_CONTEXT: u8 = 1;
 
 fn copy_chroma_mb8_qpel_local(
     ref_plane: &VideoPlane<u8>,
@@ -995,7 +1008,7 @@ fn encode_residual_subblocks_for_pu(
     Ok(())
 }
 
-/// Encode **`FR2` rev 19** or **20** P-frame.
+/// Encode **`FR2` rev **19**–**20**/**25** (map v1) or **27**–**28** (map v2 when [`SrsV2PartitionSyntaxMode::V2RleMvShare`]) **P**-frame.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_yuv420_p_payload_var_partition(
     seq: &VideoSequenceHeaderV2,
@@ -1170,28 +1183,47 @@ pub fn encode_yuv420_p_payload_var_partition(
     }
 
     let mut out = Vec::new();
+    let use_v2 = matches!(
+        settings.partition_syntax_mode,
+        SrsV2PartitionSyntaxMode::V2RleMvShare
+    );
     let inter_entropy_mv = matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1);
-    let magic = match (inter_entropy_mv, settings.entropy_model_mode) {
-        (true, SrsV2EntropyModelMode::ContextV1) => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1,
-        (true, _) => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR,
-        (false, _) => FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
+    let magic = if use_v2 {
+        if inter_entropy_mv {
+            FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_V2
+        } else {
+            FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION_V2
+        }
+    } else {
+        match (inter_entropy_mv, settings.entropy_model_mode) {
+            (true, SrsV2EntropyModelMode::ContextV1) => {
+                FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1
+            }
+            (true, _) => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR,
+            (false, _) => FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
+        }
     };
     out.extend_from_slice(&magic);
     out.extend_from_slice(&frame_index.to_le_bytes());
     out.push(qp);
 
-    let rle_blob = if matches!(
-        settings.partition_map_encoding,
-        SrsV2PartitionMapEncoding::RleRuns
-    ) {
-        Some(rle_partition_payload(&partitions)?)
+    let (rle_blob, use_packed_part_map) = if use_v2 {
+        (None, false)
     } else {
-        None
+        let rle_blob = if matches!(
+            settings.partition_map_encoding,
+            SrsV2PartitionMapEncoding::RleRuns
+        ) {
+            Some(rle_partition_payload(&partitions)?)
+        } else {
+            None
+        };
+        let use_packed = rle_blob
+            .as_ref()
+            .map(|r| r.len() < partitions.len())
+            .unwrap_or(false);
+        (rle_blob, use_packed)
     };
-    let use_packed_part_map = rle_blob
-        .as_ref()
-        .map(|r| r.len() < partitions.len())
-        .unwrap_or(false);
 
     let mut flags = 0_u8;
     if use_subpel {
@@ -1212,7 +1244,29 @@ pub fn encode_yuv420_p_payload_var_partition(
         out.push(settings.min_qp);
         out.push(settings.max_qp);
     }
-    if use_packed_part_map {
+    if use_v2 && inter_entropy_mv {
+        let b = match settings.entropy_model_mode {
+            SrsV2EntropyModelMode::StaticV1 => P_V2_MV_ENTROPY_STATIC,
+            SrsV2EntropyModelMode::ContextV1 => P_V2_MV_ENTROPY_CONTEXT,
+        };
+        out.push(b);
+    }
+    if use_v2 {
+        let mut pm = Vec::with_capacity(partitions.len());
+        for &b in &partitions {
+            pm.push(PartitionModeV2::from_wire(b)?);
+        }
+        let map = PartitionMapV2::new(mb_cols, mb_rows, pm)?;
+        let blob = encode_partition_map_v2(&map)?;
+        let map_u32 =
+            u32::try_from(blob.len()).map_err(|_| SrsV2Error::Overflow("partition map v2"))?;
+        out.extend_from_slice(&map_u32.to_le_bytes());
+        out.extend_from_slice(&blob);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let map_wire = 4u64 + u64::from(map_u32) + 4;
+        ms.partition.partition_map_bytes = map_wire;
+        ms.partition.partition_header_bytes = map_wire;
+    } else if use_packed_part_map {
         let r = rle_blob
             .as_ref()
             .ok_or_else(|| SrsV2Error::syntax("missing partition RLE payload"))?;
@@ -1311,7 +1365,7 @@ fn apply_residual_8x8(y_plane: &mut VideoPlane<u8>, lx: u32, ly: u32, pix: &[[i1
     }
 }
 
-/// Decode **`FR2` rev 19** / **20** P-frame.
+/// Decode **`FR2` rev **19**/**20**/**25** (map v1) or **27**/**28** (map v2) **P**-frame.
 pub fn decode_yuv420_p_payload_var_partition(
     seq: &VideoSequenceHeaderV2,
     payload: &[u8],
@@ -1349,22 +1403,85 @@ pub fn decode_yuv420_p_payload_var_partition(
         (1_u8, 51_u8)
     };
 
-    let partitions_owned = if packed_part_map {
-        decode_rle_partition_map(payload, &mut cur, n_mb)?
-    } else {
-        if payload.len() < cur + n_mb {
+    let is_part_map_v2 = matches!(rev_byte, 27 | 28);
+
+    let mut inter_entropy_mv_static = false;
+    let mut inter_entropy_mv_ctx = false;
+
+    let partitions_owned = if is_part_map_v2 {
+        if packed_part_map {
+            return Err(SrsV2Error::syntax(
+                "P variable partition v2 rejects packed partition map flag",
+            ));
+        }
+        if rev_byte == 28 {
+            let ent = read_u8(payload, &mut cur)?;
+            match ent {
+                0 => inter_entropy_mv_static = true,
+                1 => inter_entropy_mv_ctx = true,
+                _ => {
+                    return Err(SrsV2Error::syntax(
+                        "unknown P partition v2 entropy model byte",
+                    ));
+                }
+            }
+        }
+        let map_len_u32 = read_u32(payload, &mut cur)?;
+        let map_len = map_len_u32 as usize;
+        if map_len > MAX_FRAME_PAYLOAD_BYTES {
+            return Err(SrsV2Error::AllocationLimit {
+                context: "P partition v2 map",
+            });
+        }
+        let map_end = cur
+            .checked_add(map_len)
+            .ok_or(SrsV2Error::Overflow("partition map v2"))?;
+        if map_end > payload.len() {
             return Err(SrsV2Error::Truncated);
         }
-        let sl = payload[cur..cur + n_mb].to_vec();
-        cur += n_mb;
-        for &b in &sl {
-            validate_partition_reserved_bits(b)?;
+        let map_slice = &payload[cur..map_end];
+        cur = map_end;
+        let map = decode_partition_map_v2(map_slice, mb_cols, mb_rows)?;
+        let out_modes: Vec<u8> = map.modes.iter().map(|m| m.to_wire()).collect();
+
+        let mv_share_len_u32 = read_u32(payload, &mut cur)?;
+        let mv_share_len = mv_share_len_u32 as usize;
+        if mv_share_len > MAX_FRAME_PAYLOAD_BYTES {
+            return Err(SrsV2Error::AllocationLimit {
+                context: "P partition v2 mv-share",
+            });
         }
-        sl
+        let sh_end = cur
+            .checked_add(mv_share_len)
+            .ok_or(SrsV2Error::Overflow("mv share v2"))?;
+        if sh_end > payload.len() {
+            return Err(SrsV2Error::Truncated);
+        }
+        let sh_slice = &payload[cur..sh_end];
+        cur = sh_end;
+        if mv_share_len > 0 {
+            let total_pu = total_pu_slots_for_modes(&map.modes)?;
+            decode_mv_share_groups_v2(sh_slice, total_pu)?;
+        }
+        out_modes
+    } else {
+        inter_entropy_mv_static = rev_byte == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR[3];
+        inter_entropy_mv_ctx = rev_byte == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1[3];
+        if packed_part_map {
+            decode_rle_partition_map(payload, &mut cur, n_mb)?
+        } else {
+            if payload.len() < cur + n_mb {
+                return Err(SrsV2Error::Truncated);
+            }
+            let sl = payload[cur..cur + n_mb].to_vec();
+            cur += n_mb;
+            for &b in &sl {
+                validate_partition_reserved_bits(b)?;
+            }
+            sl
+        }
     };
     let partitions = partitions_owned.as_slice();
-    let inter_entropy_mv_static = rev_byte == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR[3];
-    let inter_entropy_mv_ctx = rev_byte == FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1[3];
 
     let pu_mvs = if inter_entropy_mv_ctx {
         let sym_count = read_u32(payload, &mut cur)? as usize;
@@ -1580,8 +1697,9 @@ mod tests {
     use crate::srsv2::inter_mv::decode_mv_stream_partitioned;
     use crate::srsv2::model::{ColorRange, VideoSequenceHeaderV2};
     use crate::srsv2::rate_control::{
-        ResidualEntropy, SrsV2EncodeSettings, SrsV2InterPartitionMode, SrsV2InterSyntaxMode,
-        SrsV2MotionSearchMode, SrsV2TransformSizeMode,
+        ResidualEntropy, SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode,
+        SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2PartitionSyntaxMode,
+        SrsV2TransformSizeMode,
     };
 
     fn seq_inter16() -> VideoSequenceHeaderV2 {
@@ -1682,6 +1800,127 @@ mod tests {
             SrsV2Error::Syntax(s) => assert!(s.contains("bad P var-partition transform wire")),
             e => panic!("expected Syntax bad transform wire: {e:?}"),
         }
+    }
+
+    #[test]
+    fn p_var_partition_map_v2_compact_emits_fr2_rev27_and_roundtrips() {
+        let seq = seq_inter16();
+        let rgb = vec![90_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+            partition_syntax_mode: SrsV2PartitionSyntaxMode::V2RleMvShare,
+            residual_entropy: ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let payload = encode_yuv420_p_payload_var_partition(
+            &seq, &yuv, &yuv, 1, 28, &settings, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(payload[3], 27);
+        let _ = decode_yuv420_p_payload_var_partition(&seq, &payload, &yuv, 27).unwrap();
+    }
+
+    #[test]
+    fn p_var_partition_map_v2_entropy_emits_fr2_rev28_and_roundtrips() {
+        let seq = seq_inter16();
+        let rgb = vec![90_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+            inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+            partition_syntax_mode: SrsV2PartitionSyntaxMode::V2RleMvShare,
+            entropy_model_mode: SrsV2EntropyModelMode::StaticV1,
+            residual_entropy: ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let payload = encode_yuv420_p_payload_var_partition(
+            &seq, &yuv, &yuv, 1, 28, &settings, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(payload[3], 28);
+        let _ = decode_yuv420_p_payload_var_partition(&seq, &payload, &yuv, 28).unwrap();
+    }
+
+    #[test]
+    fn p_var_partition_default_map_syntax_still_fr2_rev19() {
+        let seq = seq_inter16();
+        let rgb = vec![90_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+            residual_entropy: ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let payload = encode_yuv420_p_payload_var_partition(
+            &seq, &yuv, &yuv, 1, 28, &settings, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(payload[3], 19);
+    }
+
+    #[test]
+    fn p_var_partition_v2_rev27_rejects_corrupt_partition_map_blob() {
+        let seq = seq_inter16();
+        let rgb = vec![90_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+            partition_syntax_mode: SrsV2PartitionSyntaxMode::V2RleMvShare,
+            residual_entropy: ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let mut payload = encode_yuv420_p_payload_var_partition(
+            &seq, &yuv, &yuv, 1, 28, &settings, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(payload[3], 27);
+        // First byte of `S2P1` map blob (after `u32` map length at offset 10).
+        payload[14] ^= 0x5A;
+        let err = decode_yuv420_p_payload_var_partition(&seq, &payload, &yuv, 27).unwrap_err();
+        assert!(matches!(err, SrsV2Error::PartitionMapSyntax(_)));
+    }
+
+    #[test]
+    fn p_var_partition_v2_rev28_rejects_unknown_entropy_model_byte() {
+        let seq = seq_inter16();
+        let rgb = vec![90_u8; 16 * 16 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+            inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+            partition_syntax_mode: SrsV2PartitionSyntaxMode::V2RleMvShare,
+            entropy_model_mode: SrsV2EntropyModelMode::StaticV1,
+            residual_entropy: ResidualEntropy::Explicit,
+            enable_skip_blocks: false,
+            transform_size_mode: SrsV2TransformSizeMode::Force8x8,
+            ..Default::default()
+        };
+        let mut payload = encode_yuv420_p_payload_var_partition(
+            &seq, &yuv, &yuv, 1, 28, &settings, None, None, None,
+        )
+        .unwrap();
+        assert_eq!(payload[3], 28);
+        // Explicit MV entropy selector after `flags` at byte 9.
+        payload[10] = 2;
+        let err = decode_yuv420_p_payload_var_partition(&seq, &payload, &yuv, 28).unwrap_err();
+        assert!(matches!(err, SrsV2Error::Syntax(_)));
     }
 
     #[test]

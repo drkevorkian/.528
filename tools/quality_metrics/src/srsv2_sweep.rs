@@ -427,6 +427,8 @@ fn build_settings_for_case(
         .map_err(|e| SweepError::Other(format!("adaptive_quant: {e}")))?;
     s.validate_entropy_model_inter()
         .map_err(|e| SweepError::Other(format!("entropy_model_inter: {e}")))?;
+    s.validate_partition_syntax_inter()
+        .map_err(|e| SweepError::Other(format!("partition_syntax_inter: {e}")))?;
     Ok(s)
 }
 

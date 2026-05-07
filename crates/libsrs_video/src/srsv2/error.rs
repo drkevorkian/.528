@@ -10,6 +10,8 @@ pub enum SrsV2Error {
     UnsupportedVersion(u8),
     #[error("syntax error: {0}")]
     Syntax(&'static str),
+    #[error("partition map syntax: {0}")]
+    PartitionMapSyntax(String),
     #[error("dimensions invalid: {width}x{height}")]
     Dimensions { width: u32, height: u32 },
     #[error("allocation limit exceeded ({context})")]
@@ -35,5 +37,11 @@ pub enum SrsV2Error {
 impl SrsV2Error {
     pub const fn syntax(msg: &'static str) -> Self {
         Self::Syntax(msg)
+    }
+}
+
+impl From<super::partition_syntax_v2::PartitionSyntaxV2Error> for SrsV2Error {
+    fn from(e: super::partition_syntax_v2::PartitionSyntaxV2Error) -> Self {
+        Self::PartitionMapSyntax(e.to_string())
     }
 }

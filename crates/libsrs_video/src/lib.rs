@@ -33,7 +33,7 @@ pub use srsv2::{
     SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings, SrsV2EntropyModelMode,
     SrsV2Error, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode,
     SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
-    SrsV2PartitionEncodeStats, SrsV2PartitionMapEncoding, SrsV2RateControlError,
+    SrsV2PartitionEncodeStats, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2RateControlError,
     SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceKind,
     SrsV2ReferenceManager, SrsV2ReferenceSlot, SrsV2SubpelMode, SrsV2TransformSize,
     SrsV2TransformSizeMode, SrsVideoCodecId, SrsVideoProfile, Srsv2PayloadKind, TransferFunction,
@@ -43,7 +43,8 @@ pub use srsv2::{
     FRAME_PAYLOAD_MAGIC_B_INTER_ENTROPY_CTX_V1, FRAME_PAYLOAD_MAGIC_B_MB_BLEND,
     FRAME_PAYLOAD_MAGIC_B_MB_BLEND_QP, FRAME_PAYLOAD_MAGIC_B_SUBPEL,
     FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1, FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR,
-    FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1, FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
+    FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1, FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_V2,
+    FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION, FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION_V2,
 };
 
 #[cfg(test)]
