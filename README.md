@@ -137,6 +137,36 @@ Further playback architecture: `docs/playback_pipeline.md`.
     --report-json var/bench/flat_part_cmp.json --report-md var/bench/flat_part_cmp.md
   ```
 
+- **Partition syntax v1/v2 measurement** (experimental; **v1 remains the default**, no FFmpeg). Exact single-pass examples:
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 --residual-entropy explicit \
+    --inter-syntax compact --inter-partition auto-fast --partition-cost-model rdo-fast --rdo fast \
+    --partition-syntax v1 \
+    --report-json var/bench/flat_partition_syntax_v1.json --report-md var/bench/flat_partition_syntax_v1.md
+
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 --residual-entropy explicit \
+    --inter-syntax compact --inter-partition auto-fast --partition-cost-model rdo-fast --rdo fast \
+    --partition-syntax v2 \
+    --report-json var/bench/flat_partition_syntax_v2.json --report-md var/bench/flat_partition_syntax_v2.md
+  ```
+
+  Compare both map families in one report:
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 --residual-entropy explicit \
+    --inter-syntax compact --compare-partition-syntax \
+    --report-json var/bench/flat_compare_partition_syntax.json --report-md var/bench/flat_compare_partition_syntax.md
+  ```
+
+  `compare_partition_syntax[]` reports `partition_map_v1_bytes`, `partition_map_v2_bytes`, `mv_share_group_count`, `mv_share_bytes`, `partition_syntax_savings_bytes`, and `partition_syntax_savings_percent`.
+
 - **Rate control knobs** (encoder-side QP selection for the benchmark loop; see `docs/rate_control.md`):
 
   ```bash

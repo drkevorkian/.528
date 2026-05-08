@@ -53,7 +53,41 @@ JSON array **`compare_entropy_models`** includes **`entropy_model_mode`**, **`st
 
 This document does **not** claim SRSV2 beats **H.264** or any other codec. **Rev 1–22** streams remain valid baseline compatibility targets; **23–25** extend the family as optional experiments.
 - **Fast RDO (experimental):** **`--rdo off|fast`** and **`--rdo-lambda-scale N`** (fixed-point; **256 ≈ 1.0**). **`--compare-rdo`** emits **SRSV2-rdo-off** vs **SRSV2-rdo-fast**. Reports include **`rdo_*`** counters (candidates tested, per-mode decisions, **`estimated_bits_used_for_decision`**). **Heuristic only** — not production Lagrangian RDO.
-- **Variable inter partitions (experimental, FR2 rev19+ on wire):** **`--inter-partition fixed16x16|split8x8|rect16x8|rect8x16|auto-fast`** (default **`fixed16x16`**), **`--transform-size auto|tx4x4|tx8x8`**. Non-default partitions require **`--inter-syntax compact`** or **`entropy`**. **`--compare-partitions`** runs three rows (**fixed16x16**, **split8x8**, **auto-fast**) with **`--inter-syntax compact`** for comparable MV packing; JSON/Markdown include nested **`partition`** counters (**`partition_*_count`**, **`transform_*_count`**, **`partition_*_bytes`**, **`rdo_partition_candidates_tested`**). **`--compare-partition-costs`** adds five rows: fixed16×16, split8×8, and three **AutoFast** cost models (**`--partition-cost-model sad-only|header-aware|rdo-fast`** per row). Reports include a **Partition decision telemetry** Markdown table (candidates tested, header/RDO rejections, partition/map/MV/residual bytes, transform picks). **`--partition-map-encoding legacy|rle`** selects one-byte-per-MB vs run-length when RLE is smaller on the wire. Early measurements often show **much larger** bitstreams for split/auto than fixed16×16; **`header-aware`** / **`rdo-fast`** are intended to reject splits that do not pay for their side information. **`AutoFast`** remains a **bounded deterministic** heuristic — not full partition **RDO**.
+- **Variable inter partitions (experimental, FR2 rev19+ on wire):** **`--inter-partition fixed16x16|split8x8|rect16x8|rect8x16|auto-fast`** (default **`fixed16x16`**), **`--transform-size auto|tx4x4|tx8x8`**. Non-default partitions require **`--inter-syntax compact`** or **`entropy`**. **`--compare-partitions`** runs three rows (**fixed16x16**, **split8x8**, **auto-fast**) with **`--inter-syntax compact`** for comparable MV packing; JSON/Markdown include nested **`partition`** counters (**`partition_*_count`**, **`transform_*_count`**, **`partition_*_bytes`**, **`rdo_partition_candidates_tested`**). **`--compare-partition-costs`** adds five rows: fixed16×16, split8×8, and three **AutoFast** cost models (**`--partition-cost-model sad-only|header-aware|rdo-fast`** per row). Reports include a **Partition decision telemetry** Markdown table (candidates tested, header/RDO rejections, partition/map/MV/residual bytes, transform picks). **`--partition-map-encoding legacy|rle`** selects one-byte-per-MB vs run-length when RLE is smaller on the wire. **`--partition-syntax v1|v2`** selects legacy map syntax (**v1**, default) or Partition Syntax V2 (**v2**, experimental; compact/entropy variable-P paths only). **`--compare-partition-syntax`** requires **`--inter-syntax compact`** and emits fixed rows for **fixed16x16**, **auto-fast-rdo-v1**, **auto-fast-rdo-v2**, **split8x8-v1**, and **split8x8-v2**. JSON rows include **`partition_map_v1_bytes`**, **`partition_map_v2_bytes`**, **`mv_share_group_count`**, **`mv_share_bytes`**, **`partition_syntax_savings_bytes`**, and **`partition_syntax_savings_percent`**. Early measurements often show **much larger** bitstreams for split/auto than fixed16×16; **`header-aware`** / **`rdo-fast`** are intended to reject splits that do not pay for their side information. **`AutoFast`** remains a **bounded deterministic** heuristic — not full partition **RDO**.
+
+### Partition syntax v1/v2 examples
+
+Single-pass **v1** (default) with variable P partitions:
+
+```bash
+cargo run -p quality_metrics --bin bench_srsv2 -- \
+  --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+  --qp 28 --keyint 30 --motion-radius 16 --residual-entropy explicit \
+  --inter-syntax compact --inter-partition auto-fast --partition-cost-model rdo-fast --rdo fast \
+  --partition-syntax v1 \
+  --report-json var/bench/flat_partition_syntax_v1.json --report-md var/bench/flat_partition_syntax_v1.md
+```
+
+Single-pass **v2** (experimental; not default):
+
+```bash
+cargo run -p quality_metrics --bin bench_srsv2 -- \
+  --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+  --qp 28 --keyint 30 --motion-radius 16 --residual-entropy explicit \
+  --inter-syntax compact --inter-partition auto-fast --partition-cost-model rdo-fast --rdo fast \
+  --partition-syntax v2 \
+  --report-json var/bench/flat_partition_syntax_v2.json --report-md var/bench/flat_partition_syntax_v2.md
+```
+
+Compare v1 vs v2 rows in one report:
+
+```bash
+cargo run -p quality_metrics --bin bench_srsv2 -- \
+  --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+  --qp 28 --keyint 30 --motion-radius 16 --residual-entropy explicit \
+  --inter-syntax compact --compare-partition-syntax \
+  --report-json var/bench/flat_compare_partition_syntax.json --report-md var/bench/flat_compare_partition_syntax.md
+```
 - **Sweep grid** (optional regression / weak-spot finder): `--sweep` runs a fixed grid of QP values `{18, 22, 28, 34}` × residual `{explicit, auto}` × motion radius `{0, 8, 16}` and writes a JSON array plus a Markdown table (`--compare-residual-modes` and `--sweep` are mutually exclusive). **`--sweep-extended`** appends optional rows: AQ/motion comparisons, a small **integer vs half-pel** grid (`subpel-*`), and **`blockaq-off` vs `blockaq-delta`** rows — not enabled by default.
 - **Quality / bitrate matrix sweep:** **`--sweep-quality-bitrate`** runs the fixed in-process matrix (QP × inter-syntax × entropy model × partition cost × partition mode; see `quality_metrics::srsv2_sweep`). Writes **`--report-json`** / **`--report-md`** with **`rows`** and **`pareto`** summaries. Mutually exclusive with **`--sweep`** and **`--compare-residual-modes`** (validator).
 - **Engineering progress summary:** **`--h264-progress-summary`** reads previously generated bench JSON (**no encoder run**). *(CLI name retains “h264” for historical scripts; the **engineering target** for external comparison is **HEVC-class** — see [`hevc_competition_plan.md`](hevc_competition_plan.md).)* Default inputs: **`var/bench/compare_entropy_models.json`** (`--compare-entropy-models`), **`var/bench/compare_partition_costs.json`** (`--compare-partition-costs`), **`var/bench/sweep_quality_bitrate.json`** (`--sweep-quality-bitrate`). Override with **`--progress-entropy-json`**, **`--progress-partition-costs-json`**, **`--progress-sweep-json`**; optional **`--progress-x264-json`** (a primary bench JSON produced with **`--compare-x264`**) and **`--progress-b-modes-json`** (`--compare-b-modes`). Outputs **`var/bench/srsv2_h264_progress_summary.json`** and **`.md`** (override with **`--h264-progress-summary-out-json`** / **`--h264-progress-summary-out-md`**). The report answers entropy-model deltas, partition/RDO telemetry, auto-fast vs fixed16×16 sweep slices, optional B/x264 rows, and names the largest remaining byte bucket (**engineering facts only**). Mutually exclusive with encode and compare flags.
