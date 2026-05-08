@@ -590,7 +590,57 @@ mod tests {
         blob.extend_from_slice(&1u16.to_le_bytes()); // n_runs
         blob.push(PartitionModeV2::Int16x16.to_wire());
         blob.extend_from_slice(&0u16.to_le_bytes()); // zero count — illegal
-        assert!(decode_partition_map_v2(&blob, 4, 1).is_err());
+        assert_eq!(
+            decode_partition_map_v2(&blob, 4, 1),
+            Err(PartitionSyntaxV2Error::ZeroRunLength)
+        );
+    }
+
+    #[test]
+    fn rle_run_count_zero_rejected() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&PARTITION_MAP_V2_MAGIC);
+        blob.push(MAP_KIND_RLE);
+        blob.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(
+            decode_partition_map_v2(&blob, 2, 2),
+            Err(PartitionSyntaxV2Error::RleRunCountOutOfRange { got: 0, n_mb: 4 })
+        );
+    }
+
+    #[test]
+    fn rle_expanded_length_short_rejected() {
+        // 4×4 MBs => 16; one run sums to 10
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&PARTITION_MAP_V2_MAGIC);
+        blob.push(MAP_KIND_RLE);
+        blob.extend_from_slice(&1u16.to_le_bytes());
+        blob.push(PartitionModeV2::Int16x16.to_wire());
+        blob.extend_from_slice(&10u16.to_le_bytes());
+        assert_eq!(
+            decode_partition_map_v2(&blob, 4, 4),
+            Err(PartitionSyntaxV2Error::RleLengthMismatch {
+                expected: 16,
+                got: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn rle_expanded_length_overflow_rejected() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&PARTITION_MAP_V2_MAGIC);
+        blob.push(MAP_KIND_RLE);
+        blob.extend_from_slice(&1u16.to_le_bytes());
+        blob.push(PartitionModeV2::Int16x16.to_wire());
+        blob.extend_from_slice(&20u16.to_le_bytes());
+        assert_eq!(
+            decode_partition_map_v2(&blob, 4, 4),
+            Err(PartitionSyntaxV2Error::RleLengthMismatch {
+                expected: 16,
+                got: 20,
+            })
+        );
     }
 
     #[test]
@@ -621,13 +671,22 @@ mod tests {
     }
 
     #[test]
-    fn all_16x16_byte_length_le_v1_for_mid_grid() {
+    fn all_16x16_encodes_smaller_than_v1_typical_grid() {
+        // UNIFORM kind is 6 bytes; legacy v1 is one byte per MB. For n_mb > 6, v2 is strictly smaller.
         let cols = 16u32;
         let rows = 16u32;
         let m = map_uniform(cols, rows, PartitionModeV2::Int16x16);
         let enc = encode_partition_map_v2(&m).unwrap();
         let v1 = v1_legacy_partition_map_bytes(m.n_mb());
-        assert!(enc.len() <= v1, "v2 {} bytes vs v1 {} bytes", enc.len(), v1);
+        assert!(enc.len() < v1, "v2 {} bytes vs v1 {} bytes", enc.len(), v1);
+    }
+
+    /// Micro-grids (`n_mb <= 6`) still use the 6-byte UNIFORM header; v1 is smaller when `n_mb < 6`.
+    #[test]
+    fn all_16x16_uniform_wire_is_six_bytes() {
+        let m = map_uniform(8, 8, PartitionModeV2::Int16x16);
+        let enc = encode_partition_map_v2(&m).unwrap();
+        assert_eq!(enc.len(), 6);
     }
 
     #[test]
@@ -660,6 +719,30 @@ mod tests {
         let g1 = MvShareGroupV2::new(vec![0, 1]).unwrap();
         let g2 = MvShareGroupV2::new(vec![1, 2]).unwrap();
         assert!(encode_mv_share_groups_v2(&[g1, g2], total).is_err());
+    }
+
+    #[test]
+    fn mv_share_duplicate_pu_inside_group_rejected_at_new() {
+        assert_eq!(
+            MvShareGroupV2::new(vec![0u32, 0u32]),
+            Err(PartitionSyntaxV2Error::DuplicatePuIndexInGroup)
+        );
+    }
+
+    #[test]
+    fn mv_share_decode_duplicate_member_in_group_rejected() {
+        let total = 4usize;
+        let mut v = Vec::new();
+        v.extend_from_slice(&MV_SHARE_GROUPS_V2_MAGIC);
+        v.extend_from_slice(&1u16.to_le_bytes());
+        v.extend_from_slice(&3u16.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(&1u16.to_le_bytes());
+        assert_eq!(
+            decode_mv_share_groups_v2(&v, total),
+            Err(PartitionSyntaxV2Error::DuplicatePuIndexInGroup)
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser};
+use libsrs_video::srsv2::ctu64::{ctu_grid_stats, CtuSize};
 use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::srsv2::{
@@ -51,6 +52,9 @@ struct Args {
     qp: u8,
     #[arg(long, default_value_t = 30)]
     keyint: u32,
+    /// Reporting-only CTU grid size (`16`, `32`, or `64`). Does **not** change encoded bytes yet.
+    #[arg(long, default_value_t = 16)]
+    ctu_size: u32,
     #[arg(long, default_value_t = 16)]
     motion_radius: i16,
     #[arg(long, default_value = "__progress_report_required__.json")]
@@ -582,6 +586,19 @@ struct Srsv2Details {
     /// CLI / settings mirror (`off` / `fast`).
     rdo_mode: String,
     rdo_lambda_scale: u16,
+    /// Reporting-only CTU grid edge size; does not affect encoded syntax yet.
+    #[serde(default)]
+    ctu_size: u32,
+    #[serde(default)]
+    ctu_cols: u32,
+    #[serde(default)]
+    ctu_rows: u32,
+    #[serde(default)]
+    ctu_count: u32,
+    #[serde(default)]
+    edge_ctu_count: u32,
+    #[serde(default)]
+    average_ctu_luma_area: f64,
     #[serde(default)]
     mv_prediction_mode: String,
     #[serde(default)]
@@ -700,6 +717,12 @@ impl Default for Srsv2Details {
             inter_syntax_mode: "raw".to_string(),
             rdo_mode: "off".to_string(),
             rdo_lambda_scale: 256,
+            ctu_size: 16,
+            ctu_cols: 0,
+            ctu_rows: 0,
+            ctu_count: 0,
+            edge_ctu_count: 0,
+            average_ctu_luma_area: 0.0,
             mv_prediction_mode: String::new(),
             mv_raw_bytes_estimate: 0,
             mv_compact_bytes: 0,
@@ -1097,6 +1120,7 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     if args.report_md.as_os_str() == "__progress_report_required__.md" {
         bail!("--report-md is required unless --h264-progress-summary is set");
     }
+    parse_ctu_size(args.ctu_size)?;
     if args.match_x264_bitrate {
         bail!("bitrate matching is not implemented; use sweeps or target bitrate mode.");
     }
@@ -1250,6 +1274,15 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     parse_partition_map_encoding(&args.partition_map_encoding)?;
     parse_partition_syntax_mode(&args.partition_syntax)?;
     Ok(())
+}
+
+fn parse_ctu_size(n: u32) -> Result<CtuSize> {
+    match n {
+        16 => Ok(CtuSize::Ctu16),
+        32 => Ok(CtuSize::Ctu32),
+        64 => Ok(CtuSize::Ctu64),
+        _ => bail!("--ctu-size must be 16, 32, or 64 (got {n})"),
+    }
 }
 
 fn parse_subpel_mode(s: &str) -> Result<SrsV2SubpelMode> {
@@ -1853,7 +1886,8 @@ fn partition_syntax_err_codec_row(codec: &str, err: &str) -> CodecRow {
     }
 }
 
-/// `--compare-partition-syntax`: fixed / AutoFast+RDO / split8×8 × (**v1** vs **v2** map) pairings.
+/// `--compare-partition-syntax`: five rows (fixed order) — `fixed16x16`, `auto-fast-rdo-v1`, `auto-fast-rdo-v2`,
+/// `split8x8-v1`, `split8x8-v2` — for map **v1** vs **v2** measurability on variable partition passes.
 fn run_compare_partition_syntax_report(
     args: &Args,
     seq: &VideoSequenceHeaderV2,
@@ -3019,6 +3053,12 @@ fn pass_to_details(
         } else {
             (0, 0)
         };
+    let ctu = ctu_grid_stats(
+        args.width,
+        args.height,
+        parse_ctu_size(args.ctu_size).unwrap(),
+    )
+    .unwrap_or_else(|_| ctu_grid_stats(args.width, args.height, CtuSize::Ctu16).unwrap());
     Srsv2Details {
         frames: args.frames,
         keyframes: i_bytes.len() as u32,
@@ -3046,6 +3086,12 @@ fn pass_to_details(
         inter_syntax_mode: args.inter_syntax.clone(),
         rdo_mode: args.rdo.clone(),
         rdo_lambda_scale: args.rdo_lambda_scale,
+        ctu_size: ctu.ctu_size,
+        ctu_cols: ctu.ctu_cols,
+        ctu_rows: ctu.ctu_rows,
+        ctu_count: ctu.ctu_count,
+        edge_ctu_count: ctu.edge_ctu_count,
+        average_ctu_luma_area: ctu.average_ctu_luma_area,
         mv_prediction_mode: libsrs_video::srsv2::inter_mv::MV_PREDICTION_MODE_LABEL.to_string(),
         mv_raw_bytes_estimate: m.mv_raw_bytes_estimate,
         mv_compact_bytes: m.mv_compact_bytes,
@@ -5217,6 +5263,15 @@ fn to_markdown(r: &BenchReport) -> String {
     ));
     let sv = &r.srsv2;
     out.push_str(&format!(
+        "- CTU grid (reporting only): size={} cols={} rows={} count={} edge_ctu_count={} avg_luma_area={:.2}\n",
+        sv.ctu_size,
+        sv.ctu_cols,
+        sv.ctu_rows,
+        sv.ctu_count,
+        sv.edge_ctu_count,
+        sv.average_ctu_luma_area,
+    ));
+    out.push_str(&format!(
         "- bframes_requested: {}\n- bframes_used: {}\n- decode_order_count: {}\n- decode_order_frame_indices: {:?}\n- display_order_frame_indices: {:?}\n- display_frame_count: {}\n- reference_frames_used: {}\n- p_anchor_count: {}\n- avg_p_anchor_bytes: {:.1}\n- bframe_count (wire): {}\n- avg_B_bytes: {:.1}\n- alt_ref_count: {}\n- avg_altref_bytes: {:.1}\n- bframe_psnr_y (B-only aggregate): {:.2}\n- bframe_ssim_y (B-only aggregate): {:.4}\n- b_blend: forward_mb={} backward_mb={} average_mb={} weighted_mb={} sad_eval={}\n",
         sv.bframes_requested,
         sv.bframes_used,
@@ -5555,6 +5610,120 @@ fn to_markdown(r: &BenchReport) -> String {
 mod tests {
     use super::*;
 
+    fn write_test_yuv(
+        tag: &str,
+        width: u32,
+        height: u32,
+        frames: u32,
+    ) -> (PathBuf, Vec<u8>, usize) {
+        let frame_bytes = yuv420_frame_bytes(width, height).unwrap();
+        let raw: Vec<u8> = (0..frame_bytes * frames as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "bench-srsv2-{tag}-{}-{}-{}-{}.yuv",
+            width,
+            height,
+            frames,
+            std::process::id()
+        ));
+        fs::write(&path, &raw).unwrap();
+        (path, raw, frame_bytes)
+    }
+
+    fn parse_test_args(
+        input: &std::path::Path,
+        width: u32,
+        height: u32,
+        frames: u32,
+        extra: &[&str],
+    ) -> Args {
+        let mut argv = vec![
+            "bench_srsv2".to_string(),
+            "--input".to_string(),
+            input.display().to_string(),
+            "--width".to_string(),
+            width.to_string(),
+            "--height".to_string(),
+            height.to_string(),
+            "--frames".to_string(),
+            frames.to_string(),
+            "--fps".to_string(),
+            "30".to_string(),
+            "--qp".to_string(),
+            "28".to_string(),
+            "--keyint".to_string(),
+            "30".to_string(),
+            "--motion-radius".to_string(),
+            "4".to_string(),
+            "--report-json".to_string(),
+            std::env::temp_dir()
+                .join("bench-srsv2-ctu.json")
+                .display()
+                .to_string(),
+            "--report-md".to_string(),
+            std::env::temp_dir()
+                .join("bench-srsv2-ctu.md")
+                .display()
+                .to_string(),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        Args::try_parse_from(argv).unwrap()
+    }
+
+    fn run_ctu_report(width: u32, height: u32, frames: u32, extra: &[&str]) -> BenchReport {
+        let (path, raw, frame_bytes) = write_test_yuv("ctu", width, height, frames);
+        let args = parse_test_args(&path, width, height, frames, extra);
+        validate_args(&args).unwrap();
+        let re = parse_residual_entropy(&args.residual_entropy).unwrap();
+        let settings = build_settings(&args, re).unwrap();
+        let seq = build_seq_header(&args, &settings);
+        let report = run_single_report(&args, &seq, &raw, frame_bytes).unwrap();
+        let _ = fs::remove_file(path);
+        report
+    }
+
+    #[test]
+    fn default_ctu_size_16_preserves_encoded_bytes_when_reporting_changes() {
+        let default_report = run_ctu_report(64, 64, 3, &[]);
+        let ctu64_report = run_ctu_report(64, 64, 3, &["--ctu-size", "64"]);
+        assert_eq!(default_report.srsv2.ctu_size, 16);
+        assert_eq!(default_report.table[0].bytes, ctu64_report.table[0].bytes);
+        assert_eq!(default_report.srsv2.frames, ctu64_report.srsv2.frames);
+        assert_eq!(default_report.srsv2.pframes, ctu64_report.srsv2.pframes);
+    }
+
+    #[test]
+    fn ctu_size_64_reports_correct_grid() {
+        let report = run_ctu_report(128, 128, 1, &["--ctu-size", "64"]);
+        assert_eq!(report.srsv2.ctu_size, 64);
+        assert_eq!(report.srsv2.ctu_cols, 2);
+        assert_eq!(report.srsv2.ctu_rows, 2);
+        assert_eq!(report.srsv2.ctu_count, 4);
+        assert_eq!(report.srsv2.edge_ctu_count, 0);
+        assert_eq!(report.srsv2.average_ctu_luma_area, 4096.0);
+    }
+
+    #[test]
+    fn ctu_reporting_handles_non_multiple_edges() {
+        let report = run_ctu_report(96, 80, 1, &["--ctu-size", "64"]);
+        assert_eq!(report.srsv2.ctu_cols, 2);
+        assert_eq!(report.srsv2.ctu_rows, 2);
+        assert_eq!(report.srsv2.ctu_count, 4);
+        assert_eq!(report.srsv2.edge_ctu_count, 3);
+        assert_eq!(report.srsv2.average_ctu_luma_area, (96 * 80) as f64 / 4.0);
+    }
+
+    #[test]
+    fn ctu_reporting_8k_grid_stats_safe() {
+        let stats = ctu_grid_stats(7680, 4320, CtuSize::Ctu64).unwrap();
+        assert_eq!(stats.ctu_size, 64);
+        assert_eq!(stats.ctu_cols, 120);
+        assert_eq!(stats.ctu_rows, 68);
+        assert_eq!(stats.ctu_count, 8160);
+        assert_eq!(stats.edge_ctu_count, 120);
+    }
+
     #[test]
     fn rejects_wrong_input_size() {
         let tmp = std::env::temp_dir().join("bench-wrong.yuv");
@@ -5567,6 +5736,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: std::env::temp_dir().join("x.json"),
             report_md: std::env::temp_dir().join("x.md"),
@@ -5653,6 +5823,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: std::env::temp_dir().join("xb.json"),
             report_md: std::env::temp_dir().join("xb.md"),
@@ -5738,6 +5909,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -5825,6 +5997,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -5912,6 +6085,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -6001,6 +6175,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -6104,6 +6279,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -6198,6 +6374,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 8,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -6309,6 +6486,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 8,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -6403,6 +6581,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -6502,6 +6681,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 8,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -6635,6 +6815,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 1,
+            ctu_size: 16,
             motion_radius: 8,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -6757,6 +6938,12 @@ mod tests {
                 inter_syntax_mode: "raw".to_string(),
                 rdo_mode: "off".to_string(),
                 rdo_lambda_scale: 256,
+                ctu_size: 16,
+                ctu_cols: 0,
+                ctu_rows: 0,
+                ctu_count: 0,
+                edge_ctu_count: 0,
+                average_ctu_luma_area: 0.0,
                 mv_prediction_mode: String::new(),
                 mv_raw_bytes_estimate: 0,
                 mv_compact_bytes: 0,
@@ -6939,6 +7126,12 @@ mod tests {
                 inter_syntax_mode: "raw".to_string(),
                 rdo_mode: "off".to_string(),
                 rdo_lambda_scale: 256,
+                ctu_size: 16,
+                ctu_cols: 0,
+                ctu_rows: 0,
+                ctu_count: 0,
+                edge_ctu_count: 0,
+                average_ctu_luma_area: 0.0,
                 mv_prediction_mode: String::new(),
                 mv_raw_bytes_estimate: 0,
                 mv_compact_bytes: 0,
@@ -7030,6 +7223,12 @@ mod tests {
                     inter_syntax_mode: "raw".to_string(),
                     rdo_mode: "off".to_string(),
                     rdo_lambda_scale: 256,
+                    ctu_size: 16,
+                    ctu_cols: 0,
+                    ctu_rows: 0,
+                    ctu_count: 0,
+                    edge_ctu_count: 0,
+                    average_ctu_luma_area: 0.0,
                     mv_prediction_mode: String::new(),
                     mv_raw_bytes_estimate: 0,
                     mv_compact_bytes: 0,
@@ -7207,6 +7406,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 8,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -7292,6 +7492,38 @@ mod tests {
             .as_ref()
             .expect("compare_partition_syntax");
         assert_eq!(rows.len(), 5);
+        let expected_row_ids = [
+            "fixed16x16",
+            "auto-fast-rdo-v1",
+            "auto-fast-rdo-v2",
+            "split8x8-v1",
+            "split8x8-v2",
+        ];
+        for (i, id) in expected_row_ids.iter().enumerate() {
+            assert_eq!(
+                rows[i].row.as_str(),
+                *id,
+                "compare-partition-syntax row order"
+            );
+        }
+        let report_json = serde_json::to_string(&report).unwrap();
+        for key in [
+            "partition_syntax_mode",
+            "partition_map_v1_bytes",
+            "partition_map_v2_bytes",
+            "mv_share_group_count",
+            "mv_share_bytes",
+            "partition_syntax_savings_bytes",
+            "partition_syntax_savings_percent",
+            "total_bytes",
+            "psnr_y",
+            "ssim_y",
+        ] {
+            assert!(
+                report_json.contains(key),
+                "JSON must include `{key}` for partition syntax measurability"
+            );
+        }
         let v2_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.partition_syntax_mode == "v2")
@@ -7372,6 +7604,12 @@ mod tests {
                     inter_syntax_mode: "raw".to_string(),
                     rdo_mode: "off".to_string(),
                     rdo_lambda_scale: 256,
+                    ctu_size: 16,
+                    ctu_cols: 0,
+                    ctu_rows: 0,
+                    ctu_count: 0,
+                    edge_ctu_count: 0,
+                    average_ctu_luma_area: 0.0,
                     mv_prediction_mode: String::new(),
                     mv_raw_bytes_estimate: 0,
                     mv_compact_bytes: 0,
@@ -7435,6 +7673,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -7520,6 +7759,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -7607,6 +7847,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -7712,6 +7953,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -7950,6 +8192,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),
@@ -8035,6 +8278,7 @@ mod tests {
             fps: 30,
             qp: 28,
             keyint: 30,
+            ctu_size: 16,
             motion_radius: 16,
             report_json: PathBuf::from("j"),
             report_md: PathBuf::from("m"),

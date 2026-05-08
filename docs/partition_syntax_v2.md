@@ -5,7 +5,44 @@ This document defines **experimental** on-disk structures for:
 1. **Partition map v2** — compact encoding of per-macroblock inter partition modes.
 2. **MV share groups v2** — optional grouping of partition-unit (PU) indices that share one MV delta payload in a higher layer (not specified here).
 
-Blobs are embedded in **FR2** rev **27** / **28** when the encoder selects **`SrsV2PartitionSyntaxMode::V2RleMvShare`** (see `docs/video_bitstream_v2.md`). The default **`V1Legacy`** mode keeps prior **FR2** rev **19**/**20**/**25** map layouts (`SrsV2PartitionMapEncoding`).
+Blobs are embedded in **FR2** rev **27** / **28** when the encoder selects **`SrsV2PartitionSyntaxMode::V2RleMvShare`** (see `docs/video_bitstream_v2.md`). The default **`V1Legacy`** mode keeps prior **FR2** rev **19**/**20**/**25** map layouts (`SrsV2PartitionMapEncoding`). **Decoders for rev 19/20 (and other pre–map-v2 revisions) are unaffected** — they never parse **`S2P1`** / **`S2G1`** blobs; **v2** is an additional wire path only when rev **27**/**28** is present.
+
+## Rust API (`crates/libsrs_video/.../partition_syntax_v2.rs`)
+
+Complete public surface:
+
+- **`encode_partition_map_v2`** / **`decode_partition_map_v2`**
+- **`encode_mv_share_groups_v2`** / **`decode_mv_share_groups_v2`**
+- **`estimate_partition_syntax_v2_bytes`**
+- **`validate_partition_map_v2`**
+
+Supporting helpers: **`v1_legacy_partition_map_bytes`**, **`total_pu_slots_for_modes`**, types **`PartitionMapV2`**, **`PartitionModeV2`**, **`MvShareGroupV2`**, **`PartitionSyntaxV2Stats`**, **`PartitionSyntaxV2Error`**.
+
+## Engineering benchmark (`bench_srsv2 --compare-partition-syntax`)
+
+Requires **`--inter-syntax compact`**, **`--bframes 0`** (validator). Runs five passes in fixed order; each JSON row includes:
+
+`partition_syntax_mode`, `partition_map_v1_bytes`, `partition_map_v2_bytes`, `mv_share_group_count`, `mv_share_bytes`, `partition_syntax_savings_bytes`, `partition_syntax_savings_percent`, `total_bytes`, `psnr_y`, `ssim_y` (plus `encode_fps` / `decode_fps` / `row` id).
+
+| Row id | Role |
+| --- | --- |
+| **`fixed16x16`** | Fixed partition; report row uses **`v1`** map only (`partition_map_v2_bytes` = **0** — no v2 map on wire for this mode). |
+| **`auto-fast-rdo-v1`** | **`inter-partition auto-fast`**, **`partition-cost-model rdo-fast`**, **`rdo fast`**, **`partition-syntax v1`**. |
+| **`auto-fast-rdo-v2`** | Same as above with **`partition-syntax v2`**. |
+| **`split8x8-v1`** | **`inter-partition split8x8`**, **`partition-syntax v1`**. |
+| **`split8x8-v2`** | **`inter-partition split8x8`**, **`partition-syntax v2`**. |
+
+For **AutoFast** and **split8×8** pairs, **`partition_map_v1_bytes`** and **`partition_map_v2_bytes`** are filled from both passes so **`partition_syntax_savings_*`** reflect **map** byte deltas. **Sparse** split maps (mostly **16×16**, rare splits) are intended to show **v2** smaller than **v1**; **uniform 16×16** at large **`n_mb`** uses the **UNIFORM** kind (**6 bytes**) vs **`n_mb`** legacy bytes.
+
+## Unit-test coverage (summary)
+
+The module tests include, among others:
+
+- **All-16×16** on a typical grid: **v2** wire **strictly smaller** than v1; **6-byte** uniform header on an 8×8 MB grid.
+- **Mostly 16×16** with a rare **8×8** split: **v2** smaller than v1 (**RLE**).
+- **All-8×8** and **mixed** maps: **roundtrip**.
+- **Invalid mode** wire byte, **zero RLE run length**, **zero `n_runs`**, **RLE length mismatch** (short / overflow), **truncated** map, **trailing** bytes after map.
+- **MV-share**: **roundtrip**; **missing PU leaf**; **duplicate PU inside group** (`MvShareGroupV2::new` and decode); **duplicate across groups**; malicious decode blob with duplicate members.
 
 ## `FR2` embedding (rev **27** / **28**)
 

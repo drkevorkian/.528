@@ -9,6 +9,8 @@ pub mod b_frame_codec;
 pub mod block_aq;
 pub mod color;
 pub mod context_inter_entropy;
+/// CTU-style 16/32/64 superblock grid planning only; no bitstream syntax or `FR2` revision.
+pub mod ctu64;
 mod dct;
 pub mod deblock;
 pub mod error;
