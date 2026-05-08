@@ -35,8 +35,7 @@ use super::partition_syntax_v2::{
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2PartitionCostModel,
-    SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2SubpelMode,
-    SrsV2TransformSizeMode,
+    SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2SubpelMode, SrsV2TransformSizeMode,
 };
 use super::rdo::{
     autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost,

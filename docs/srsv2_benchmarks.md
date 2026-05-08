@@ -8,9 +8,10 @@ Workspace tools (engineering measurements):
   - `cargo run -p quality_metrics --bin gen_synthetic_yuv -- --pattern moving-square --width 1920 --height 1080 --frames 60 --fps 60 --seed 528 --out samples/bench/moving_square_1080p.yuv --meta samples/bench/moving_square_1080p.json`
 - **Tiny multi-clip corpus** (writes several **64×64** / **128×128** files under one directory; deterministic seeds):
   - `cargo run -p quality_metrics --bin gen_synthetic_yuv -- --preset-corpus tiny --out-dir var/bench/corpus_tiny --seed 528`
-- Benchmark SRSV2 core (**no FFmpeg required**; optional **libx264** via ffmpeg for an **AVC** sanity row — **not** sufficient as the only external baseline; **HEVC-class** targets and **x265** are documented in [`hevc_competition_plan.md`](hevc_competition_plan.md)):
+- Benchmark SRSV2 core (**no FFmpeg required**; optional **libx264** / **libx265** via FFmpeg for **AVC** / **HEVC-class** sanity rows — neither row alone is sufficient as the only external baseline; methodology for **serious** HEVC-class comparison is in [`hevc_competition_plan.md`](hevc_competition_plan.md)):
   - `cargo run -p quality_metrics --bin bench_srsv2 -- --input samples/bench/moving_square_1080p.yuv --width 1920 --height 1080 --frames 60 --fps 60 --qp 28 --keyint 30 --motion-radius 16 --residual-entropy auto --report-json var/bench/moving_square_srsv2.json --report-md var/bench/moving_square_srsv2.md`
   - Add `--compare-x264 --x264-crf 23 --x264-preset medium` if `ffmpeg` is on `PATH`. JSON/Markdown reports then include **x264 preset**, **CRF**, **achieved x264 bitrate** (when measurable), **SRSV2 bitrate at compare time**, **PSNR-Y / SSIM-Y for both**, and a **documented FFmpeg command string**. **`--match-x264-bitrate`** **fails fast** (not implemented — use RC sweeps or target bitrate instead).
+  - Add **`--compare-x265 --x265-crf 28 --x265-preset medium`** (or **`--compare-x264-and-x265`** with the same **`--x264-*`** / **`--x265-*`** knobs) for an optional **libx265** round-trip helper implemented in **`tools/quality_metrics/src/hevc_compare.rs`**. If **`ffmpeg`** is missing or the build reports **no `libx265`** encoder, the report records a **skipped** status and does **not** fail the bench. This path is **CRF-style**, **not** bitrate-matched proof vs SRSV2 — see **Fair comparison checklist** below and [`hevc_competition_plan.md`](hevc_competition_plan.md).
   - **PSNR-Y JSON note:** when decoded luma matches the source exactly, raw PSNR is infinity; JSON cannot store `inf`, so the bench maps that case to **100.0 dB** as a finite sentinel (“lossless on luma for this measurement”), not a physical ceiling claim.
   - Residual coding: `--residual-entropy auto|explicit|rans`. **`auto`** never chooses rANS for a block when that would be larger than explicit tuples (unless forced **`rans`**). Reports include intra/P **explicit vs rANS** counts and optional **`legacy_explicit_total_payload_bytes`** when not `explicit`.
 - **Compare residual modes** (single command, three encode passes — **no FFmpeg**): `--compare-residual-modes` produces rows **SRSV2-explicit**, **SRSV2-auto**, **SRSV2-rans**. If forced **rans** fails (e.g. coefficients outside the static rANS alphabet), that row is marked failed with an error string and the other rows still appear.
@@ -18,7 +19,7 @@ Workspace tools (engineering measurements):
 - **Adaptive quantization** (experimental — see `docs/adaptive_quantization.md`): `--aq off|activity|edge-aware|screen-aware`, `--aq-strength N`. **Block-level AQ** (experimental): `--block-aq off|frame-only|block-delta` ( **`block-delta`** requires **`auto`/`rans`** residuals), `--block-aq-delta-min` / `--block-aq-delta-max` (encoder clamp; must fit wire **±24** when **`block-delta`**). JSON nests **`frame_aq`** (16×16 MB activity → effective QP) and **`block_aq_wire`** (on-wire 8×8 `qp_delta`, rev **7**–**9**), plus **`block_aq_mode`** and **`fr2_revision_counts`** (includes **rev14** when half-pel **B** or weighted **B** is on).
 - **Motion search** (see `docs/motion_search.md`): `--motion-search none|diamond|hex|hierarchical|exhaustive-small`, `--early-exit-sad-threshold N`, `--enable-skip-blocks` optional bool (`true` default; pass `--enable-skip-blocks false` to disable P-frame skip markers — integration tests assert **`skip_subblocks_total == 0`**). **Experimental P half-pel:** `--subpel off|half` (default **`off`**), `--subpel-refinement-radius N` (clamped; **`0`** skips subpel SAD refinement). JSON/Markdown **`motion`** detail includes subpel mode, tested/selected block counts, extra SAD evaluations, average fractional MV magnitude (quarter-pel units per MB), and **`b_motion_search_mode`** for the **FR2** rev **13** / **14** **B** path when **`--bframes 1`**.
 - **B-frame motion (`--bframes 1` only):** `--b-motion-search off|reuse-p|independent-forward-backward|independent-forward-backward-half` (default **`off`**). **`reuse-p`** is an alias for **`off`** today. **`independent-forward-backward`** runs integer ME per ref, then picks forward / backward / average by SAD (**`FR2` rev 13**). **`independent-forward-backward-half`** adds half-pel refinement on the **even quarter-pel** grid (**`FR2` rev 14**). **`--b-weighted-prediction`** enables a small fixed **`/256`** weight candidate set per macroblock when compatible (**rev 14**); JSON reports **`b_blend`** counters including **`b_weighted_*`** and **`b_subpel_*`** fields.
-- **Compare B modes (single command, no FFmpeg):** `--compare-b-modes` runs **SRSV2-P-only**, **SRSV2-B-int**, **SRSV2-B-half**, and **SRSV2-B-weighted** rows using the same clip/QP/motion/AQ settings; failures surface as **`error`** on that row (no silent downgrade). Combine with **`--compare-x264`** to append an optional x264 row when FFmpeg works.
+- **Compare B modes (single command, no FFmpeg):** `--compare-b-modes` runs **SRSV2-P-only**, **SRSV2-B-int**, **SRSV2-B-half**, and **SRSV2-B-weighted** rows using the same clip/QP/motion/AQ settings; failures surface as **`error`** on that row (no silent downgrade). Combine with **`--compare-x264`**, **`--compare-x265`**, or **`--compare-x264-and-x265`** to append optional reference rows when FFmpeg (and the relevant encoder) is available.
 - **Inter MV/header syntax (experimental, opt-in):** **`--inter-syntax raw|compact|entropy`** selects legacy **FR2** rev **2/4/5/6/8/9** (**P**) / **10–14** (**B**) vs compact **15**/**16** vs **StaticV1** entropy **17**/**18** (and, with variable partitions + entropy, **20**) when applicable. **`--compare-inter-syntax`** runs **SRSV2-raw**, **SRSV2-compact**, and **SRSV2-entropy** in one report; a failed variant (e.g. entropy) keeps an **error row** without aborting siblings. JSON **`srsv2`** (and each compare row’s **`details`**) includes **`mv_*`** aggregates (**`mv_prediction_mode`** is **`median-left-top-topright`** when populated), **`inter_header_bytes`**, **`inter_residual_bytes`**, and **`fr2_revision_counts`** for **rev15–18** (and higher revisions when those code paths emit them).
 
 ### Inter MV entropy model: StaticV1 vs ContextV1 (normative mapping)
@@ -59,7 +60,7 @@ This document does **not** claim SRSV2 beats **H.264** or any other codec. **Rev
 
 Legacy helper: `cargo run -p codec_compare -- --help` (optional **libx264** branch via `ffmpeg`).
 
-This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders — for example a common **AVC** baseline (**libx264**) **and**, when wired up, **HEVC-class** baselines (**libx265**). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge. This is **compression engineering** for the native codec, **not** a claim about beating **H.264**, **H.265/HEVC**, or any standard encoder.
+This file describes **reproducible** measurement practices when you compare SRSV2 to **other** video encoders — for example a common **AVC** baseline (**libx264**) and an optional **HEVC-class** reference row (**`libx265`** via **`bench_srsv2 --compare-x265`** when FFmpeg supports it). It is **not** a scorecard and implies **no** ranking — quality trade-offs are for **you** to judge. This is **compression engineering** for the native codec, **not** a claim about beating **H.264**, **H.265/HEVC**, or any standard encoder.
 
 ### Local sample numbers (moving-square 128×128, 30 frames, seed 528)
 
@@ -125,11 +126,11 @@ Command (after generating `var/bench/flat_128.yuv` / `.json` as in the snippets 
 
 ## Fair comparison checklist
 
-1. **Baseline encoders (optional):** e.g. **libx264** via **FFmpeg** for a quick **AVC** row (or another AVC encoder with documented settings) on the same machine class as SRSV2. For **HEVC-class** discipline, plan **libx265** / **x265** when available — see [`hevc_competition_plan.md`](hevc_competition_plan.md). **SRSV2 does not beat H.265 today**; comparisons must stay methodology-heavy and **honest**.
+1. **Baseline encoders (optional):** e.g. **libx264** via **FFmpeg** for a quick **AVC** row (or another AVC encoder with documented settings) on the same machine class as SRSV2. For **HEVC-class** reference, **`bench_srsv2 --compare-x265`** (or **`--compare-x264-and-x265`**) adds an optional **`libx265`** round-trip row when available — see [`hevc_competition_plan.md`](hevc_competition_plan.md) for **bitrate-matched** methodology goals. **SRSV2 does not beat H.265 today**; comparisons must stay methodology-heavy and **honest**.
 2. **Fair comparison:**
    - Same **resolution**, **frame count**, **chroma format** (or document conversions).
    - Same or documented **color range** / **transfer** when HDR is involved.
-   - **Bitrate** matched either by **two-pass** targeting bitrate or by **CRF** with **reported achieved bitrate for both sides**. **CRF-only** labels without achieved bitrate and quality numbers are **not** sufficient for serious encoder comparisons — prefer **`bench_srsv2`** x264 rows when FFmpeg is available, or manual sweeps; **`x265`** matching is the **future** primary external target when the tool supports it (`docs/hevc_competition_plan.md`).
+   - **Bitrate** matched either by **two-pass** targeting bitrate or by **CRF** with **reported achieved bitrate for both sides**. **CRF-only** labels without achieved bitrate and quality numbers are **not** sufficient for serious encoder comparisons — prefer **`bench_srsv2`** x264 / optional **`--compare-x265`** rows when FFmpeg is available, or manual sweeps. **Bitrate-matched** comparison vs **x265** remains a **future / serious** gate (not yet a first-class bench feature); see `docs/hevc_competition_plan.md`.
 3. **SRSV2 side:** documented **preset**, **profile byte**, **QP/keyframe** settings, commit hash.
 4. **Metrics** (report all that apply):
    - **Bitrate** (bits/s) and **compression ratio** vs uncompressed PCM/YUV size.
@@ -153,16 +154,31 @@ Extract throughput from **`ffmpeg` stderr** or wrap with `time` / perf counters.
 ffmpeg -benchmark -i out264.mp4 -f null -
 ```
 
-## Suggested FFmpeg skeleton (HEVC baseline — `libx265`, future comparison target)
+## Optional `bench_srsv2` HEVC reference row (`--compare-x265`, FFmpeg **`libx265`**)
 
-When **`libx265`** is available in your FFmpeg build, a **template** parallel to the AVC line above (exact **preset** / **CRF** / **two-pass** choices are methodology-dependent — document what you use):
+**Implemented** as an **optional** engineering helper: raw **YUV420p8** in → **`libx265`** encode → decode → **PSNR-Y / SSIM-Y** vs source luma, plus **container bytes**, **achieved bitrate**, **encode/decode wall time**, and the **exact FFmpeg command string** echoed in JSON (`x265_*` fields) and Markdown. It **does not** prove bitrate-matched competitiveness — same limitation as the **`--compare-x264`** CRF path: useful reference, not a fairness certificate.
+
+- If **`ffmpeg`** is not on `PATH`, or **`ffmpeg -encoders`** does not list **`libx265`**, the report **skips** cleanly (`x265_status` explains why).
+- **`--compare-x264-and-x265`** runs **both** optional reference rows in one report (still **not** a claim that one codec is universally better than the other).
+
+Exact **bench** invocation (same clip dimensions as your `--input` YUV):
+
+```bash
+cargo run -p quality_metrics --bin bench_srsv2 -- \
+  --input samples/bench/moving_square_1080p.yuv --width 1920 --height 1080 --frames 60 --fps 60 \
+  --qp 28 --keyint 30 --motion-radius 16 --residual-entropy auto \
+  --compare-x265 --x265-crf 28 --x265-preset medium \
+  --report-json var/bench/moving_square_srsv2_x265.json --report-md var/bench/moving_square_srsv2_x265.md
+```
+
+Manual **FFmpeg** template (what the helper automates; **preset** / **CRF** are methodology choices you must document):
 
 ```bash
 ffmpeg -y -f rawvideo -pix_fmt yuv420p -s WIDTHxHEIGHT -r FRAMERATE -i input.yuv \
   -c:v libx265 -preset medium -crf Q -an out265.mp4
 ```
 
-**Not implemented in `bench_srsv2` today as a first-class `--compare-x265` mode** — treat this as the **documented direction** in [`hevc_competition_plan.md`](hevc_competition_plan.md), not a claim of feature parity.
+For **serious** HEVC-class discipline (including **bitrate-matched** x265), see [`hevc_competition_plan.md`](hevc_competition_plan.md).
 
 ## SRSV2 side
 

@@ -1159,10 +1159,7 @@ mod tests {
         };
         let err = build_progress_report_strict(&inputs).unwrap_err();
         assert!(matches!(err, ProgressReportError::SchemaInvalid { .. }));
-        assert!(
-            err.to_string().contains("partition_costs"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("partition_costs"), "{err}");
         let _ = std::fs::remove_file(e);
         let _ = std::fs::remove_file(p);
         let _ = std::fs::remove_file(sw);

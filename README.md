@@ -83,6 +83,26 @@ Further playback architecture: `docs/playback_pipeline.md`.
     --report-json var/bench/flat_srsv2.json --report-md var/bench/flat_srsv2.md
   ```
 
+- **Optional libx265 (HEVC-class) reference row** (requires **`ffmpeg`** with **`libx265`**; **skips** with a clear status if missing — same **engineering measurement** stance as x264; **not** proof SRSV2 “beats” **H.265** or any mature encoder):
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 \
+    --compare-x265 --x265-crf 28 --x265-preset medium \
+    --report-json var/bench/flat_srsv2_x265.json --report-md var/bench/flat_srsv2_x265.md
+  ```
+
+  Run **both** optional FFmpeg rows in one report (still **not** a superiority claim):
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 \
+    --compare-x264-and-x265 --x264-crf 23 --x264-preset medium --x265-crf 28 --x265-preset medium \
+    --report-json var/bench/flat_srsv2_avc_hevc_ref.json --report-md var/bench/flat_srsv2_avc_hevc_ref.md
+  ```
+
 - **Residual entropy A/B/C** (`explicit` vs `auto` vs forced `rans`) in one report (no FFmpeg):
 
   ```bash

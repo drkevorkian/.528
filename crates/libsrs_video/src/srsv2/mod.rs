@@ -83,7 +83,7 @@ pub use p_var_partition::{
 pub use partition_syntax_v2::{
     decode_mv_share_groups_v2, decode_partition_map_v2, encode_mv_share_groups_v2,
     encode_partition_map_v2, estimate_partition_syntax_v2_bytes, total_pu_slots_for_modes,
-    validate_partition_map_v2, v1_legacy_partition_map_bytes, MvShareGroupV2, PartitionMapV2,
+    v1_legacy_partition_map_bytes, validate_partition_map_v2, MvShareGroupV2, PartitionMapV2,
     PartitionModeV2, PartitionRunV2, PartitionSyntaxV2Error, PartitionSyntaxV2Stats,
     MV_SHARE_GROUPS_V2_MAGIC, PARTITION_MAP_V2_MAGIC,
 };
@@ -92,9 +92,9 @@ pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode,
-    SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2RateControlError,
-    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformSize,
-    SrsV2TransformSizeMode,
+    SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode,
+    SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
+    SrsV2SubpelMode, SrsV2TransformSize, SrsV2TransformSizeMode,
 };
 pub use rdo::{
     autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost, b_blend_rdo_score,

@@ -196,7 +196,9 @@ pub fn v1_legacy_partition_map_bytes(n_mb: usize) -> usize {
 }
 
 /// Count total PU slots for MV indexing / validation.
-pub fn total_pu_slots_for_modes(modes: &[PartitionModeV2]) -> Result<usize, PartitionSyntaxV2Error> {
+pub fn total_pu_slots_for_modes(
+    modes: &[PartitionModeV2],
+) -> Result<usize, PartitionSyntaxV2Error> {
     let mut t = 0usize;
     for m in modes {
         let w = m.to_wire();
@@ -245,12 +247,18 @@ fn modes_to_rle_runs(modes: &[PartitionModeV2]) -> Vec<PartitionRunV2> {
         if m == cur && cnt < u32::from(u16::MAX) {
             cnt += 1;
         } else {
-            runs.push(PartitionRunV2 { mode: cur, count: cnt });
+            runs.push(PartitionRunV2 {
+                mode: cur,
+                count: cnt,
+            });
             cur = m;
             cnt = 1;
         }
     }
-    runs.push(PartitionRunV2 { mode: cur, count: cnt });
+    runs.push(PartitionRunV2 {
+        mode: cur,
+        count: cnt,
+    });
     runs
 }
 
@@ -425,10 +433,11 @@ fn validate_mv_groups_indices(
         }
         let mut local = HashSet::new();
         for &idx in &g.members {
-            let ii = usize::try_from(idx).map_err(|_| PartitionSyntaxV2Error::PuIndexOutOfRange {
-                index: idx,
-                total: total_pu_slots,
-            })?;
+            let ii =
+                usize::try_from(idx).map_err(|_| PartitionSyntaxV2Error::PuIndexOutOfRange {
+                    index: idx,
+                    total: total_pu_slots,
+                })?;
             if ii >= total_pu_slots {
                 return Err(PartitionSyntaxV2Error::MissingPuLeaf {
                     index: idx,
@@ -618,12 +627,7 @@ mod tests {
         let m = map_uniform(cols, rows, PartitionModeV2::Int16x16);
         let enc = encode_partition_map_v2(&m).unwrap();
         let v1 = v1_legacy_partition_map_bytes(m.n_mb());
-        assert!(
-            enc.len() <= v1,
-            "v2 {} bytes vs v1 {} bytes",
-            enc.len(),
-            v1
-        );
+        assert!(enc.len() <= v1, "v2 {} bytes vs v1 {} bytes", enc.len(), v1);
     }
 
     #[test]
@@ -673,7 +677,10 @@ mod tests {
     fn estimate_stats_matches_encode() {
         let m = map_uniform(8, 8, PartitionModeV2::Int16x16);
         let stats = estimate_partition_syntax_v2_bytes(&m, None, 0).unwrap();
-        assert_eq!(stats.map_wire_bytes, encode_partition_map_v2(&m).unwrap().len());
+        assert_eq!(
+            stats.map_wire_bytes,
+            encode_partition_map_v2(&m).unwrap().len()
+        );
         assert_eq!(stats.map_kind, MAP_KIND_UNIFORM);
     }
 }

@@ -12,7 +12,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser};
 use libsrs_video::srsv2::frame::VideoPlane;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
-use libsrs_video::srsv2::{decode_mv_share_groups_v2, decode_partition_map_v2, total_pu_slots_for_modes};
+use libsrs_video::srsv2::{
+    decode_mv_share_groups_v2, decode_partition_map_v2, total_pu_slots_for_modes,
+};
 use libsrs_video::{
     decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
     encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
@@ -1369,10 +1371,10 @@ fn parse_partition_map_encoding(s: &str) -> Result<SrsV2PartitionMapEncoding> {
 fn parse_partition_syntax_mode(s: &str) -> Result<SrsV2PartitionSyntaxMode> {
     match s.to_ascii_lowercase().as_str() {
         "v1" | "legacy" | "v1legacy" => Ok(SrsV2PartitionSyntaxMode::V1Legacy),
-        "v2" | "v2rle" | "v2-rle-mv-share" | "v2rblemvshare" => Ok(SrsV2PartitionSyntaxMode::V2RleMvShare),
-        _ => Err(anyhow!(
-            "--partition-syntax must be v1 or v2 (got {s})"
-        )),
+        "v2" | "v2rle" | "v2-rle-mv-share" | "v2rblemvshare" => {
+            Ok(SrsV2PartitionSyntaxMode::V2RleMvShare)
+        }
+        _ => Err(anyhow!("--partition-syntax must be v1 or v2 (got {s})")),
     }
 }
 
@@ -1761,6 +1763,7 @@ fn partition_syntax_mv_share_scan_payloads(
     (total_groups, total_mv_share_bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn partition_syntax_compare_ok_row(
     row: &str,
     partition_syntax_mode: &str,
@@ -1873,8 +1876,11 @@ fn run_compare_partition_syntax_report(
             Ok(settings) => match run_srsv2_pass(&a, seq, raw, &settings, expected_frame) {
                 Ok(numbers) => {
                     let map_v1 = numbers.motion_agg.partition_map_bytes;
-                    let (mv_g, mv_b) =
-                        partition_syntax_mv_share_scan_payloads(&numbers.payloads, seq.width, seq.height);
+                    let (mv_g, mv_b) = partition_syntax_mv_share_scan_payloads(
+                        &numbers.payloads,
+                        seq.width,
+                        seq.height,
+                    );
                     let deblock = build_deblock_bench_report(
                         &a,
                         seq,
@@ -1999,8 +2005,15 @@ fn run_compare_partition_syntax_report(
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            compare_rows.push(partition_syntax_compare_err_row("auto-fast-rdo-v1", "v1", &msg));
-            table.push(partition_syntax_err_codec_row("SRSV2-ps-auto-fast-rdo-v1", &msg));
+            compare_rows.push(partition_syntax_compare_err_row(
+                "auto-fast-rdo-v1",
+                "v1",
+                &msg,
+            ));
+            table.push(partition_syntax_err_codec_row(
+                "SRSV2-ps-auto-fast-rdo-v1",
+                &msg,
+            ));
         }
     }
     match &auto_v2 {
@@ -2036,8 +2049,15 @@ fn run_compare_partition_syntax_report(
         }
         Err(e) => {
             let msg = format!("{e:#}");
-            compare_rows.push(partition_syntax_compare_err_row("auto-fast-rdo-v2", "v2", &msg));
-            table.push(partition_syntax_err_codec_row("SRSV2-ps-auto-fast-rdo-v2", &msg));
+            compare_rows.push(partition_syntax_compare_err_row(
+                "auto-fast-rdo-v2",
+                "v2",
+                &msg,
+            ));
+            table.push(partition_syntax_err_codec_row(
+                "SRSV2-ps-auto-fast-rdo-v2",
+                &msg,
+            ));
         }
     }
 
@@ -5118,13 +5138,7 @@ fn to_markdown(r: &BenchReport) -> String {
                 .unwrap_or_default();
             out.push_str(&format!(
                 "| {}{} | {} | {} | {} | {:.2} | {:.4} |\n",
-                e.row,
-                err,
-                e.total_bytes,
-                map_b,
-                e.mv_share_bytes,
-                e.psnr_y,
-                e.ssim_y
+                e.row, err, e.total_bytes, map_b, e.mv_share_bytes, e.psnr_y, e.ssim_y
             ));
         }
         out.push_str("\n_JSON: `compare_partition_syntax[]` includes `partition_map_v1_bytes`, `partition_map_v2_bytes`, `partition_syntax_savings_bytes`, `partition_syntax_savings_percent`, `mv_share_group_count`, encode/decode FPS, and `total_bytes`._\n");
@@ -7292,10 +7306,7 @@ mod tests {
             fixed_row.partition_map_v1_bytes,
             single.motion_agg.partition_map_bytes
         );
-        assert_eq!(
-            fixed_row.total_bytes,
-            single.byte_hist.iter().sum::<u64>()
-        );
+        assert_eq!(fixed_row.total_bytes, single.byte_hist.iter().sum::<u64>());
 
         let sp1 = rows.iter().find(|r| r.row == "split8x8-v1").unwrap();
         let sp2 = rows.iter().find(|r| r.row == "split8x8-v2").unwrap();

@@ -8,7 +8,9 @@ Benchmarks and progress reports in this repository (**`bench_srsv2`**, Windows p
 
 **H.264 / AVC** comparisons remain **useful**: FFmpeg **`libx264`** is widely available, fast to invoke, and helps validate plumbing, sanity-check metrics, and regress obvious encode/decode bugs. For **serious efficiency targets**, that baseline is **no longer enough**. Modern reference encoders and production expectations center on **H.265 / HEVC**-class toolsets (**`libx265`**, hardware HEVC, Main10 pipelines).
 
-The **future primary external comparison target** for bitrate–quality discipline in this workspace is **x265 / libx265** (via FFmpeg when **`libx265`** is available), with **bitrate-matched** or tightly documented rate–distortion methodology. Until that path is implemented end-to-end, **`--compare-x264`** rows remain a **convenience**, not a substitute for HEVC-class benchmarking.
+The **future primary external comparison target** for bitrate–quality discipline in this workspace is **bitrate-matched** or tightly documented rate–distortion methodology against **x265 / libx265** (via FFmpeg when **`libx265`** is available). Until that **matching** path is implemented end-to-end, **`--compare-x264`** and the optional **`--compare-x265`** rows remain **convenience references** (CRF-style round-trips with reported achieved bitrate and simple luma metrics) — **not** a substitute for defensible HEVC-class benchmarking.
+
+**Today:** **`bench_srsv2`** includes an **optional** **`--compare-x265`** helper (plus **`--compare-x264-and-x265`**) wired through FFmpeg **`libx265`**: raw YUV in, encode, decode, **PSNR-Y / SSIM-Y**, sizes and timings, and the FFmpeg command string in the JSON/Markdown report. If **`ffmpeg`** is missing or **`libx265`** is not in the build, the report **skips** that subsection without failing the bench. This is **not** bitrate-matched proof vs SRSV2; it is an **engineering reference** only — see also [`docs/srsv2_benchmarks.md`](srsv2_benchmarks.md).
 
 ## HEVC-class engineering blockers (honest gap list)
 
@@ -21,7 +23,7 @@ These are **major** items typically associated with HEVC-class systems. Presence
 5. **SAO-like sample adaptive offset** — Optional **sample adaptive offset**-style loop filtering **after** deblock (restoration pass); deblock alone is not a full HEVC in-loop filter stack.
 6. **10-bit / HDR / Main10-style profile** — **8-bit 4:2:0** SDR is not sufficient for a **Main10**-class story; extended bit depth, range, and HDR metadata paths are out of scope for the current core unless explicitly scoped later.
 7. **Tile / threaded 8K encode and decode** — Parallel **tiles**, wavefront-friendly scheduling, and encoder threading for very large pictures (**8K-class**) are not production-complete here.
-8. **Bitrate-matched x265 comparison** — Defensible comparison requires **achieved bitrate** and quality on **both** sides (**two-pass**, constrained CRF sweeps, or a real matching loop—not CRF-only hand-waving). **`--match-x264-bitrate`**-style gaps apply equally to **x265** until implemented.
+8. **Bitrate-matched x265 comparison** — Defensible comparison requires **achieved bitrate** and quality on **both** sides (**two-pass**, constrained CRF sweeps, or a real matching loop—not CRF-only hand-waving). **`--match-x264-bitrate`**-style gaps apply equally to **x265** until implemented. *(Optional **`bench_srsv2 --compare-x265`** is a CRF-style FFmpeg round-trip helper only — not this matching gate.)*
 9. **Stronger RDO and mode decision** — Full **Lagrangian** mode decisions across partitions, references, transforms, and QP are production-grade in mature encoders; SRSV2’s RDO paths remain **bounded** and **heuristic**.
 10. **Eventual GPU compute acceleration** — Competitive turnarounds at high resolution often assume **GPU**-friendly kernels (MC, transform, entropy, or full pipelines); the workspace does not yet provide that.
 

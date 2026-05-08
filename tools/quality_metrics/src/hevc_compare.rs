@@ -287,11 +287,7 @@ pub fn run_libx265_yuv_roundtrip(
     };
     let ssim_y = if dec_luma.len() == p.src_luma.len() {
         Some(avg_ssim_per_frame(
-            p.src_luma,
-            &dec_luma,
-            p.width,
-            p.height,
-            p.frames,
+            p.src_luma, &dec_luma, p.width, p.height, p.frames,
         )?)
     } else {
         None
@@ -356,24 +352,8 @@ mod tests {
 
     #[test]
     fn reference_command_is_deterministic() {
-        let a = reference_ffmpeg_command(
-            128,
-            64,
-            30,
-            10,
-            Path::new("C:\\a\\b.yuv"),
-            "slow",
-            24,
-        );
-        let b = reference_ffmpeg_command(
-            128,
-            64,
-            30,
-            10,
-            Path::new("C:\\a\\b.yuv"),
-            "slow",
-            24,
-        );
+        let a = reference_ffmpeg_command(128, 64, 30, 10, Path::new("C:\\a\\b.yuv"), "slow", 24);
+        let b = reference_ffmpeg_command(128, 64, 30, 10, Path::new("C:\\a\\b.yuv"), "slow", 24);
         assert_eq!(a, b);
         assert!(a.contains("libx265"));
         assert!(a.contains("128x64"));
@@ -383,7 +363,9 @@ mod tests {
     fn encoder_list_probe_token() {
         assert!(!encoders_text_lists_libx265(""));
         assert!(!encoders_text_lists_libx265("libx264 only"));
-        assert!(encoders_text_lists_libx265("V....D libx265      libx265 HEVC (codec hevc)"));
+        assert!(encoders_text_lists_libx265(
+            "V....D libx265      libx265 HEVC (codec hevc)"
+        ));
     }
 
     #[test]
