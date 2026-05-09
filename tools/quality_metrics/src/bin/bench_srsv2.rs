@@ -28,6 +28,7 @@ use libsrs_video::{
     VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::hevc_compare;
+use quality_metrics::x265_bitrate_match;
 use quality_metrics::{compression_ratio, psnr_u8, ssim_u8_simple};
 use serde::Serialize;
 
@@ -69,6 +70,21 @@ struct Args {
     /// Run **`--compare-x264`** and **`--compare-x265`** together (reference measurements only; not a superiority claim).
     #[arg(long, default_value_t = false)]
     compare_x264_and_x265: bool,
+    /// Match **libx265** measured bitrate toward SRSV2 (or **`--x265-target-bitrate-kbps`**) — engineering reference only; **not** a superiority claim vs HEVC.
+    #[arg(long, default_value_t = false)]
+    match_x265_bitrate: bool,
+    /// Overrides SRSV2-derived bitrate target (**kbps**) for **`--match-x265-bitrate`**.
+    #[arg(long)]
+    x265_target_bitrate_kbps: Option<u32>,
+    /// When **`--match-x265-bitrate`**: sweep **CRF** from **`--x265-crf-*`** ; when omitted/false (default **`false`**), runs one **average-bitrate** libx265 encode toward the kbps goal.
+    #[arg(long, default_value_t = false)]
+    x265_bitrate_sweep: bool,
+    #[arg(long, default_value_t = 18)]
+    x265_crf_min: u8,
+    #[arg(long, default_value_t = 40)]
+    x265_crf_max: u8,
+    #[arg(long, default_value_t = 2)]
+    x265_crf_step: u8,
     /// Target-bitrate matching vs x264 (**not implemented** — benchmark exits with an error when set).
     #[arg(long, default_value_t = false)]
     match_x264_bitrate: bool,
@@ -597,8 +613,11 @@ struct Srsv2Details {
     ctu_count: u32,
     #[serde(default)]
     edge_ctu_count: u32,
+    /// Mean luma samples per CTU for the reporting grid (`--ctu-size`).
+    #[serde(default, alias = "average_ctu_luma_area")]
+    avg_ctu_luma_area: f64,
     #[serde(default)]
-    average_ctu_luma_area: f64,
+    max_ctu_luma_area: u64,
     #[serde(default)]
     mv_prediction_mode: String,
     #[serde(default)]
@@ -722,7 +741,8 @@ impl Default for Srsv2Details {
             ctu_rows: 0,
             ctu_count: 0,
             edge_ctu_count: 0,
-            average_ctu_luma_area: 0.0,
+            avg_ctu_luma_area: 0.0,
+            max_ctu_luma_area: 0,
             mv_prediction_mode: String::new(),
             mv_raw_bytes_estimate: 0,
             mv_compact_bytes: 0,
@@ -889,6 +909,8 @@ struct BenchReport {
     x264: Option<X264Details>,
     #[serde(skip_serializing_if = "Option::is_none")]
     x265: Option<hevc_compare::X265CompareReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    x265_bitrate_match: Option<x265_bitrate_match::X265BitrateMatchReport>,
     table: Vec<CodecRow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_residual_modes: Option<Vec<ResidualCompareEntry>>,
@@ -1081,7 +1103,8 @@ fn validate_args(args: &Args) -> Result<()> {
             || args.compare_entropy_models
             || args.compare_x265
             || args.compare_x264_and_x265
-            || args.match_x264_bitrate;
+            || args.match_x264_bitrate
+            || args.match_x265_bitrate;
         if conflict {
             bail!(
                 "--h264-progress-summary only reads JSON inputs; disable sweep/compare/x264/x265 encode flags."
@@ -1123,6 +1146,14 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     parse_ctu_size(args.ctu_size)?;
     if args.match_x264_bitrate {
         bail!("bitrate matching is not implemented; use sweeps or target bitrate mode.");
+    }
+    if args.match_x265_bitrate {
+        if args.x265_crf_min > args.x265_crf_max {
+            bail!("--x265-crf-min must be <= --x265-crf-max");
+        }
+        if args.x265_crf_step == 0 {
+            bail!("--x265-crf-step must be > 0");
+        }
     }
     if args.frames == 0 {
         bail!("--frames must be > 0");
@@ -2205,6 +2236,7 @@ fn run_compare_partition_syntax_report(
         srsv2,
         x264: None,
         x265: None,
+        x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3091,7 +3123,8 @@ fn pass_to_details(
         ctu_rows: ctu.ctu_rows,
         ctu_count: ctu.ctu_count,
         edge_ctu_count: ctu.edge_ctu_count,
-        average_ctu_luma_area: ctu.average_ctu_luma_area,
+        avg_ctu_luma_area: ctu.avg_ctu_luma_area,
+        max_ctu_luma_area: ctu.max_ctu_luma_area,
         mv_prediction_mode: libsrs_video::srsv2::inter_mv::MV_PREDICTION_MODE_LABEL.to_string(),
         mv_raw_bytes_estimate: m.mv_raw_bytes_estimate,
         mv_compact_bytes: m.mv_compact_bytes,
@@ -3337,6 +3370,9 @@ fn run_compare_b_modes_report(
         None
     };
 
+    let x265_bitrate_match =
+        run_match_x265_bitrate_report(args, raw, ef, &src_luma, srsv2_row.bitrate_bps)?;
+
     Ok(BenchReport {
         note: "Engineering measurement only; not a marketing claim.",
         residual_note: "Residual entropy (FR2 rev 3 intra / rev 4 P; rev 7–9 add optional block qp_delta with adaptive residuals) is experimental; auto mode never chooses a larger representation than explicit tuples per block.",
@@ -3349,6 +3385,7 @@ fn run_compare_b_modes_report(
         srsv2: details,
         x264,
         x265,
+        x265_bitrate_match,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3423,6 +3460,9 @@ fn run_single_report(
         None
     };
 
+    let x265_bitrate_match =
+        run_match_x265_bitrate_report(args, raw, expected_frame, &src_luma, srsv2_row.bitrate_bps)?;
+
     Ok(BenchReport {
         note: "Engineering measurement only; not a marketing claim.",
         residual_note: "Residual entropy (FR2 rev 3 intra / rev 4 P; rev 7–9 add optional block qp_delta with adaptive residuals) is experimental; auto mode never chooses a larger representation than explicit tuples per block.",
@@ -3435,6 +3475,7 @@ fn run_single_report(
         srsv2: details,
         x264,
         x265,
+        x265_bitrate_match,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3577,6 +3618,7 @@ fn run_compare_residual_report(
         srsv2,
         x264: None,
         x265: None,
+        x265_bitrate_match: None,
         table,
         compare_residual_modes: Some(entries),
         sweep: None,
@@ -3711,6 +3753,7 @@ fn run_compare_inter_syntax_report(
         srsv2,
         x264: None,
         x265: None,
+        x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3841,6 +3884,7 @@ fn run_compare_rdo_report(
         srsv2,
         x264: None,
         x265: None,
+        x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -3976,6 +4020,7 @@ fn run_compare_partitions_report(
         srsv2,
         x264: None,
         x265: None,
+        x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -4134,6 +4179,7 @@ fn run_compare_partition_costs_report(
         srsv2,
         x264: None,
         x265: None,
+        x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -4380,6 +4426,7 @@ fn run_compare_entropy_models_report(
         srsv2,
         x264: None,
         x265: None,
+        x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
         sweep: None,
@@ -4990,6 +5037,38 @@ fn run_x264_compare(
     ))
 }
 
+fn run_match_x265_bitrate_report(
+    args: &Args,
+    raw: &[u8],
+    yuv420_frame_bytes: usize,
+    src_luma: &[u8],
+    srsv2_bitrate_bps: f64,
+) -> Result<Option<x265_bitrate_match::X265BitrateMatchReport>> {
+    if !args.match_x265_bitrate {
+        return Ok(None);
+    }
+    let p = hevc_compare::X265YuvParams {
+        width: args.width,
+        height: args.height,
+        fps: args.fps.max(1),
+        frames: args.frames,
+        input_path: &args.input,
+        uncompressed_raw_bytes: raw.len() as u64,
+        src_luma,
+        yuv420_frame_bytes,
+    };
+    Ok(Some(x265_bitrate_match::run_x265_bitrate_match(
+        p,
+        args.x265_preset.as_str(),
+        srsv2_bitrate_bps,
+        args.x265_target_bitrate_kbps,
+        args.x265_bitrate_sweep,
+        args.x265_crf_min,
+        args.x265_crf_max,
+        args.x265_crf_step,
+    )?))
+}
+
 fn run_x265_compare(
     args: &Args,
     raw: &[u8],
@@ -5263,13 +5342,14 @@ fn to_markdown(r: &BenchReport) -> String {
     ));
     let sv = &r.srsv2;
     out.push_str(&format!(
-        "- CTU grid (reporting only): size={} cols={} rows={} count={} edge_ctu_count={} avg_luma_area={:.2}\n",
+        "- CTU grid (reporting only): size={} cols={} rows={} count={} edge_ctu_count={} avg_ctu_luma_area={:.2} max_ctu_luma_area={}\n",
         sv.ctu_size,
         sv.ctu_cols,
         sv.ctu_rows,
         sv.ctu_count,
         sv.edge_ctu_count,
-        sv.average_ctu_luma_area,
+        sv.avg_ctu_luma_area,
+        sv.max_ctu_luma_area,
     ));
     out.push_str(&format!(
         "- bframes_requested: {}\n- bframes_used: {}\n- decode_order_count: {}\n- decode_order_frame_indices: {:?}\n- display_order_frame_indices: {:?}\n- display_frame_count: {}\n- reference_frames_used: {}\n- p_anchor_count: {}\n- avg_p_anchor_bytes: {:.1}\n- bframe_count (wire): {}\n- avg_B_bytes: {:.1}\n- alt_ref_count: {}\n- avg_altref_bytes: {:.1}\n- bframe_psnr_y (B-only aggregate): {:.2}\n- bframe_ssim_y (B-only aggregate): {:.4}\n- b_blend: forward_mb={} backward_mb={} average_mb={} weighted_mb={} sad_eval={}\n",
@@ -5603,6 +5683,51 @@ fn to_markdown(r: &BenchReport) -> String {
             ));
         }
     }
+    if let Some(m) = &r.x265_bitrate_match {
+        out.push_str("\n## libx265 bitrate alignment (`--match-x265-bitrate`)\n\n");
+        out.push_str("_Selects the libx265 attempt whose **achieved bitrate** is closest to SRSV2's (or **`--x265-target-bitrate-kbps`**) using a CRF sweep or a single average-bitrate encode — **not** a claim that either encoder is better._\n\n");
+        out.push_str(&format!("- match status: {}\n", m.x265_match_status));
+        out.push_str(&format!(
+            "- target bitrate (kbps): {:.6}\n",
+            m.x265_target_bitrate_kbps
+        ));
+        if let Some(c) = m.x265_best_crf {
+            out.push_str(&format!("- best CRF (sweep): {c}\n"));
+        } else {
+            out.push_str(
+                "- best CRF (sweep): *(n/a — average-bitrate path or no qualifying row)*\n",
+            );
+        }
+        if let Some(b) = m.x265_best_bytes {
+            out.push_str(&format!("- best-row output bytes (container): {b}\n"));
+        }
+        if let Some(b) = m.x265_best_bitrate_bps {
+            out.push_str(&format!("- best-row bitrate (bps): {:.2}\n", b));
+        }
+        if let Some(p) = m.x265_best_psnr_y {
+            out.push_str(&format!("- best-row PSNR-Y: {:.2}\n", p));
+        }
+        if let Some(s) = m.x265_best_ssim_y {
+            out.push_str(&format!("- best-row SSIM-Y: {:.4}\n", s));
+        }
+        if let Some(e) = m.x265_bitrate_error_percent {
+            out.push_str(&format!(
+                "- best-row bitrate error vs target (%): {:.4}\n",
+                e
+            ));
+        }
+        out.push_str(&format!(
+            "- sweep / attempt rows: {} (JSON: `x265_sweep_rows`)\n",
+            m.x265_sweep_rows.len()
+        ));
+        for row in &m.x265_sweep_rows {
+            out.push_str(&format!(
+                "  - CRF {:?}; ok={}; status={}; bitrate_bps={:?}\n",
+                row.crf, row.ok, row.status, row.bitrate_bps
+            ));
+            out.push_str(&format!("```text\n{}\n```\n", row.encode_command));
+        }
+    }
     out
 }
 
@@ -5701,7 +5826,8 @@ mod tests {
         assert_eq!(report.srsv2.ctu_rows, 2);
         assert_eq!(report.srsv2.ctu_count, 4);
         assert_eq!(report.srsv2.edge_ctu_count, 0);
-        assert_eq!(report.srsv2.average_ctu_luma_area, 4096.0);
+        assert_eq!(report.srsv2.avg_ctu_luma_area, 4096.0);
+        assert_eq!(report.srsv2.max_ctu_luma_area, 4096);
     }
 
     #[test]
@@ -5711,7 +5837,20 @@ mod tests {
         assert_eq!(report.srsv2.ctu_rows, 2);
         assert_eq!(report.srsv2.ctu_count, 4);
         assert_eq!(report.srsv2.edge_ctu_count, 3);
-        assert_eq!(report.srsv2.average_ctu_luma_area, (96 * 80) as f64 / 4.0);
+        assert_eq!(report.srsv2.avg_ctu_luma_area, (96 * 80) as f64 / 4.0);
+        assert_eq!(report.srsv2.max_ctu_luma_area, 64 * 64);
+    }
+
+    #[test]
+    fn ctu_reporting_1920x1080_counts_bottom_edge_ctus() {
+        let report = run_ctu_report(1920, 1080, 1, &["--ctu-size", "64"]);
+        assert_eq!(report.srsv2.ctu_size, 64);
+        assert_eq!(report.srsv2.ctu_cols, 30);
+        assert_eq!(report.srsv2.ctu_rows, 17);
+        assert_eq!(report.srsv2.ctu_count, 510);
+        assert_eq!(report.srsv2.edge_ctu_count, 30);
+        assert_eq!(report.srsv2.avg_ctu_luma_area, (1920 * 1080) as f64 / 510.0);
+        assert_eq!(report.srsv2.max_ctu_luma_area, 64 * 64);
     }
 
     #[test]
@@ -5722,6 +5861,7 @@ mod tests {
         assert_eq!(stats.ctu_rows, 68);
         assert_eq!(stats.ctu_count, 8160);
         assert_eq!(stats.edge_ctu_count, 120);
+        assert_eq!(stats.max_ctu_luma_area, 64 * 64);
     }
 
     #[test]
@@ -5743,6 +5883,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -5830,6 +5976,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -5916,6 +6068,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6004,6 +6162,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6092,6 +6256,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6182,6 +6352,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6286,6 +6462,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6381,6 +6563,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6493,6 +6681,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6588,6 +6782,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6688,6 +6888,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6822,6 +7028,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -6943,7 +7155,8 @@ mod tests {
                 ctu_rows: 0,
                 ctu_count: 0,
                 edge_ctu_count: 0,
-                average_ctu_luma_area: 0.0,
+                avg_ctu_luma_area: 0.0,
+                max_ctu_luma_area: 0,
                 mv_prediction_mode: String::new(),
                 mv_raw_bytes_estimate: 0,
                 mv_compact_bytes: 0,
@@ -7050,6 +7263,7 @@ mod tests {
             },
             x264: None,
             x265: None,
+            x265_bitrate_match: None,
             table: vec![CodecRow {
                 codec: "SRSV2".to_string(),
                 error: None,
@@ -7086,6 +7300,8 @@ mod tests {
         assert!(js.contains("\"b_motion_search_mode\":\"off\""));
         assert!(js.contains("\"avg_p_anchor_bytes\":0"));
         assert!(js.contains("\"b_blend\""));
+        assert!(js.contains("\"avg_ctu_luma_area\""));
+        assert!(js.contains("\"max_ctu_luma_area\""));
     }
 
     #[test]
@@ -7131,7 +7347,8 @@ mod tests {
                 ctu_rows: 0,
                 ctu_count: 0,
                 edge_ctu_count: 0,
-                average_ctu_luma_area: 0.0,
+                avg_ctu_luma_area: 0.0,
+                max_ctu_luma_area: 0,
                 mv_prediction_mode: String::new(),
                 mv_raw_bytes_estimate: 0,
                 mv_compact_bytes: 0,
@@ -7180,6 +7397,7 @@ mod tests {
             },
             x264: None,
             x265: None,
+            x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: Some(vec![ResidualCompareEntry {
                 label: "SRSV2-explicit".to_string(),
@@ -7228,7 +7446,8 @@ mod tests {
                     ctu_rows: 0,
                     ctu_count: 0,
                     edge_ctu_count: 0,
-                    average_ctu_luma_area: 0.0,
+                    avg_ctu_luma_area: 0.0,
+                    max_ctu_luma_area: 0,
                     mv_prediction_mode: String::new(),
                     mv_raw_bytes_estimate: 0,
                     mv_compact_bytes: 0,
@@ -7306,6 +7525,7 @@ mod tests {
             srsv2: Srsv2Details::default(),
             x264: None,
             x265: None,
+            x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: None,
             sweep: None,
@@ -7339,6 +7559,7 @@ mod tests {
             srsv2: Srsv2Details::default(),
             x264: None,
             x265: None,
+            x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: None,
             sweep: None,
@@ -7372,6 +7593,7 @@ mod tests {
             srsv2: Srsv2Details::default(),
             x264: None,
             x265: None,
+            x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: None,
             sweep: None,
@@ -7413,6 +7635,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -7609,7 +7837,8 @@ mod tests {
                     ctu_rows: 0,
                     ctu_count: 0,
                     edge_ctu_count: 0,
-                    average_ctu_luma_area: 0.0,
+                    avg_ctu_luma_area: 0.0,
+                    max_ctu_luma_area: 0,
                     mv_prediction_mode: String::new(),
                     mv_raw_bytes_estimate: 0,
                     mv_compact_bytes: 0,
@@ -7680,6 +7909,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -7766,6 +8001,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -7854,6 +8095,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -7960,6 +8207,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -8137,6 +8390,7 @@ mod tests {
             srsv2: Srsv2Details::default(),
             x264: None,
             x265: None,
+            x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: None,
             sweep: None,
@@ -8199,6 +8453,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,
@@ -8285,6 +8545,12 @@ mod tests {
             compare_x264: false,
             compare_x265: false,
             compare_x264_and_x265: false,
+            match_x265_bitrate: false,
+            x265_target_bitrate_kbps: None,
+            x265_bitrate_sweep: false,
+            x265_crf_min: 18,
+            x265_crf_max: 40,
+            x265_crf_step: 2,
             x264_crf: 23,
             x264_preset: "medium".to_string(),
             x265_crf: 28,

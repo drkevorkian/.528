@@ -173,6 +173,12 @@ function Format-CandidateLine {
     return "clip=$($Row.clip), label=$($Row.label), mode=$($Row.mode), bytes=$($Row.bytes), PSNR-Y=$([Math]::Round($Row.psnr_y, 4)), SSIM-Y=$([Math]::Round($Row.ssim_y, 4))"
 }
 
+function Format-YesNo {
+    param([bool]$Value)
+    if ($Value) { return "yes" }
+    return "no"
+}
+
 function Get-CodecRow {
     param(
         [object]$Report,
@@ -219,17 +225,20 @@ function Select-NextFeature {
     }
 
     switch ($Bottleneck.name) {
-        "inter_residual_bytes" {
+        "residual" {
             return [PSCustomObject]@{ id = "C"; name = "context-adaptive residual coefficient entropy"; why = "Inter residual bytes are the largest named bucket." }
         }
-        "partition_map_bytes" {
+        "partition syntax" {
             return [PSCustomObject]@{ id = "B"; name = "bounded quadtree partitions"; why = "Partition map bytes are the largest named bucket." }
         }
-        "partition_mv_bytes" {
-            return [PSCustomObject]@{ id = "B"; name = "bounded quadtree partitions"; why = "Partition MV bytes dominate among named buckets." }
-        }
-        "motion_header_bytes" {
+        "MV/header" {
             return [PSCustomObject]@{ id = "D"; name = "quarter-pel luma motion"; why = "Motion/header bytes dominate among named buckets." }
+        }
+        "transform syntax" {
+            return [PSCustomObject]@{ id = "B"; name = "bounded quadtree partitions"; why = "Transform/partition syntax bytes dominate among named buckets." }
+        }
+        "intra/keyframe cost" {
+            return [PSCustomObject]@{ id = "A"; name = "CTU-style 64x64 superblocks"; why = "Intra/keyframe cost is the largest named bucket, so larger superblock structure is the next broad compression lever." }
         }
         default {
             if ($null -ne $BModes -and $BModes.b_half_beats_b_int_count -gt 0) {
@@ -402,6 +411,7 @@ try {
     $contextRows = @()
     $partSyntaxV1Rows = @()
     $partSyntaxV2Rows = @()
+    $partSyntaxPairs = @()
     $sweepRows = @()
     $bModeRows = @()
     $costRows = @()
@@ -421,6 +431,7 @@ try {
         }
 
         $partSyntax = Read-JsonFile (Join-Path $clipReports "compare_partition_syntax.json")
+        $partSyntaxEntries = @((Get-Prop $partSyntax "compare_partition_syntax"))
         foreach ($entry in @((Get-Prop $partSyntax "compare_partition_syntax"))) {
             $mode = [string](Get-Prop $entry "partition_syntax_mode")
             $rowId = [string](Get-Prop $entry "row")
@@ -428,6 +439,30 @@ try {
                 $partSyntaxV1Rows += New-Candidate $tag $rowId $mode $entry "partition_syntax"
             } elseif ($mode -eq "v2") {
                 $partSyntaxV2Rows += New-Candidate $tag $rowId $mode $entry "partition_syntax"
+            }
+        }
+        foreach ($baseName in @("auto-fast-rdo", "split8x8")) {
+            $v1 = $partSyntaxEntries | Where-Object { (Get-Prop $_ "row") -eq "$baseName-v1" } | Select-Object -First 1
+            $v2 = $partSyntaxEntries | Where-Object { (Get-Prop $_ "row") -eq "$baseName-v2" } | Select-Object -First 1
+            if ($null -ne $v1 -and $null -ne $v2) {
+                $v1Total = As-Int64 (Get-Prop $v1 "total_bytes")
+                $v2Total = As-Int64 (Get-Prop $v2 "total_bytes")
+                $v1Map = As-Int64 (Get-Prop $v1 "partition_map_v1_bytes")
+                $v2Map = As-Int64 (Get-Prop $v2 "partition_map_v2_bytes")
+                $partSyntaxPairs += [PSCustomObject]@{
+                    clip = $tag
+                    pair = $baseName
+                    v1_total_bytes = $v1Total
+                    v2_total_bytes = $v2Total
+                    total_delta_v2_minus_v1 = $v2Total - $v1Total
+                    v1_map_bytes = $v1Map
+                    v2_map_bytes = $v2Map
+                    map_delta_v2_minus_v1 = $v2Map - $v1Map
+                    v2_smaller_total = ($v2Total -gt 0 -and $v2Total -lt $v1Total)
+                    v2_smaller_map = ($v2Map -lt $v1Map)
+                    v1_ok = [bool](Get-Prop $v1 "ok")
+                    v2_ok = [bool](Get-Prop $v2 "ok")
+                }
             }
         }
 
@@ -463,6 +498,38 @@ try {
     $bestPartSyntaxV1 = Select-BestBytes $partSyntaxV1Rows
     $bestPartSyntaxV2 = Select-BestBytes $partSyntaxV2Rows
     $bestSweep = Select-BestQuality $sweepRows
+
+    $contextPairs = @()
+    foreach ($clip in $Clips) {
+        $tag = [string]$clip.Tag
+        $s = $staticRows | Where-Object { $_.clip -eq $tag } | Select-Object -First 1
+        $c = $contextRows | Where-Object { $_.clip -eq $tag } | Select-Object -First 1
+        if ($null -ne $s -and $null -ne $c) {
+            $contextPairs += [PSCustomObject]@{
+                clip = $tag
+                static_bytes = $s.bytes
+                context_bytes = $c.bytes
+                delta_context_minus_static = $c.bytes - $s.bytes
+                context_smaller = ($c.bytes -lt $s.bytes)
+            }
+        }
+    }
+
+    $autoFastPairs = @()
+    foreach ($clip in $Clips) {
+        $tag = [string]$clip.Tag
+        $fixed = $costRows | Where-Object { $_.clip -eq $tag -and $_.label -eq "SRSV2-pc-fixed16x16" } | Select-Object -First 1
+        $auto = $costRows | Where-Object { $_.clip -eq $tag -and $_.label -eq "SRSV2-pc-auto-fast-rdo" } | Select-Object -First 1
+        if ($null -ne $fixed -and $null -ne $auto) {
+            $autoFastPairs += [PSCustomObject]@{
+                clip = $tag
+                fixed16x16_bytes = $fixed.bytes
+                auto_fast_rdo_bytes = $auto.bytes
+                delta_auto_minus_fixed = $auto.bytes - $fixed.bytes
+                auto_fast_rdo_smaller = ($auto.bytes -lt $fixed.bytes)
+            }
+        }
+    }
 
     $bSummary = @()
     $bHalfBeats = 0
@@ -519,27 +586,120 @@ try {
         }
     }
 
+    $x265Approach = [PSCustomObject]@{
+        answered = ($null -ne $x265Result)
+        similar_bitrate = $false
+        bitrate_relative_gap = $null
+        srsv2_bitrate_bps = if ($null -ne $x265Result) { $x265Result.srsv2_bitrate_bps } else { 0.0 }
+        x265_bitrate_bps = if ($null -ne $x265Result) { $x265Result.x265_bitrate_bps } else { 0.0 }
+        summary = "x265 unavailable; skipped cleanly."
+    }
+    if ($null -ne $x265Result) {
+        $gap = 0.0
+        if ($x265Result.srsv2_bitrate_bps -gt 0 -and $x265Result.x265_bitrate_bps -gt 0) {
+            $gap = [Math]::Abs($x265Result.srsv2_bitrate_bps - $x265Result.x265_bitrate_bps) / [Math]::Max($x265Result.srsv2_bitrate_bps, $x265Result.x265_bitrate_bps)
+        }
+        $x265Approach.bitrate_relative_gap = $gap
+        $x265Approach.similar_bitrate = ($gap -le 0.10)
+        if ($x265Result.status -ne "ok") {
+            $x265Approach.summary = "x265 report status is '$($x265Result.status)'; comparison is unavailable."
+        } elseif ($x265Approach.similar_bitrate) {
+            $x265Approach.summary = "SRSV2 and x265 are within 10% achieved bitrate on the optional row; inspect quality metrics, but this is still not superiority proof."
+        } else {
+            $x265Approach.summary = "No: achieved bitrates are not similar (relative gap $([Math]::Round($gap, 4))); use a bitrate-matched x265 sweep for fairness."
+        }
+    }
+
     $bestCost = Select-BestBytes $costRows
     $details = if ($null -ne $bestCost) { $bestCost.details } else { $null }
     $partition = Get-Prop $details "partition"
     $total = if ($null -ne $bestCost) { [Int64]$bestCost.bytes } else { 0 }
-    $motionHeader = (As-Int64 (Get-Prop $details "inter_header_bytes")) + (As-Int64 (Get-Prop $details "mv_raw_bytes_estimate")) + (As-Int64 (Get-Prop $details "mv_compact_bytes")) + (As-Int64 (Get-Prop $details "mv_entropy_bytes"))
+    $interSyntaxMode = [string](Get-Prop $details "inter_syntax_mode")
+    $actualMvBytes = switch ($interSyntaxMode) {
+        "raw" { As-Int64 (Get-Prop $details "mv_raw_bytes_estimate") }
+        "compact" { As-Int64 (Get-Prop $details "mv_compact_bytes") }
+        "entropy" { As-Int64 (Get-Prop $details "mv_entropy_bytes") }
+        default { As-Int64 (Get-Prop $details "mv_compact_bytes") }
+    }
     $interResidual = As-Int64 (Get-Prop $details "inter_residual_bytes")
     $partitionMap = As-Int64 (Get-Prop $partition "partition_map_bytes")
     $partitionMv = As-Int64 (Get-Prop $partition "partition_mv_bytes")
     $partitionResidual = As-Int64 (Get-Prop $partition "partition_residual_bytes")
-    $known = $motionHeader + $interResidual + $partitionMap + $partitionMv + $partitionResidual
+    $partitionHeader = As-Int64 (Get-Prop $partition "partition_header_bytes")
+    $avgIBytes = As-Number (Get-Prop $details "avg_i_bytes")
+    $keyframes = As-Int64 (Get-Prop $details "keyframes")
+    $intraKeyframeCost = [Int64]([Math]::Round($avgIBytes * [double]$keyframes))
+    $partitionSyntaxBytes = $partitionMap + $partitionMv
+    $knownWithoutMvHeader = $interResidual + $partitionSyntaxBytes + $partitionHeader + $intraKeyframeCost
+    $motionHeaderEstimate = (As-Int64 (Get-Prop $details "inter_header_bytes")) + $actualMvBytes
+    $motionHeader = [Math]::Min([Math]::Max(0, $total - $knownWithoutMvHeader), $motionHeaderEstimate)
+    $known = $motionHeader + $knownWithoutMvHeader
     $other = [Math]::Max(0, $total - $known)
     $buckets = @(
-        [PSCustomObject]@{ name = "motion_header_bytes"; bytes = $motionHeader },
-        [PSCustomObject]@{ name = "inter_residual_bytes"; bytes = $interResidual },
-        [PSCustomObject]@{ name = "partition_map_bytes"; bytes = $partitionMap },
-        [PSCustomObject]@{ name = "partition_mv_bytes"; bytes = $partitionMv },
-        [PSCustomObject]@{ name = "partition_residual_bytes"; bytes = $partitionResidual },
-        [PSCustomObject]@{ name = "other_payload_bytes"; bytes = $other }
+        [PSCustomObject]@{ name = "MV/header"; bytes = $motionHeader },
+        [PSCustomObject]@{ name = "residual"; bytes = $interResidual },
+        [PSCustomObject]@{ name = "partition syntax"; bytes = $partitionSyntaxBytes },
+        [PSCustomObject]@{ name = "transform syntax"; bytes = $partitionHeader },
+        [PSCustomObject]@{ name = "intra/keyframe cost"; bytes = $intraKeyframeCost },
+        [PSCustomObject]@{ name = "poor prediction"; bytes = $other }
     )
     $biggestBottleneck = $buckets | Sort-Object @{ Expression = "bytes"; Ascending = $false }, @{ Expression = "name"; Ascending = $true } | Select-Object -First 1
     $nextFeature = Select-NextFeature $biggestBottleneck $x265Result $bestPartSyntaxV1 $bestPartSyntaxV2 $bModeAggregate
+
+    $partSyntaxV2SmallerTotalCount = @($partSyntaxPairs | Where-Object { $_.v2_smaller_total }).Count
+    $partSyntaxV2SmallerMapCount = @($partSyntaxPairs | Where-Object { $_.v2_smaller_map }).Count
+    $autoFastV2SmallerTotalCount = @($partSyntaxPairs | Where-Object { $_.pair -eq "auto-fast-rdo" -and $_.v2_smaller_total }).Count
+    $splitV2SmallerTotalCount = @($partSyntaxPairs | Where-Object { $_.pair -eq "split8x8" -and $_.v2_smaller_total }).Count
+    $partSyntaxSummary = if ($autoFastV2SmallerTotalCount -gt 0) {
+        "Yes: V2 reduced AutoFast RDO total bytes for at least one clip."
+    } elseif ($splitV2SmallerTotalCount -gt 0) {
+        "Partially: V2 reduced split8x8 total bytes and map bytes, but AutoFast RDO total bytes did not improve in this gate."
+    } elseif ($partSyntaxV2SmallerMapCount -gt 0) {
+        "Map-only: V2 reduced map bytes, but not adaptive partition total bytes in this gate."
+    } else {
+        "No: V2 did not reduce adaptive partition overhead in this gate."
+    }
+
+    $questions = [PSCustomObject]@{
+        partition_syntax_v2_reduced_adaptive_overhead = [PSCustomObject]@{
+            answered = ($partSyntaxPairs.Count -gt 0)
+            total_pairs = $partSyntaxPairs.Count
+            v2_smaller_total_count = $partSyntaxV2SmallerTotalCount
+            v2_smaller_map_count = $partSyntaxV2SmallerMapCount
+            auto_fast_v2_smaller_total_count = $autoFastV2SmallerTotalCount
+            split8x8_v2_smaller_total_count = $splitV2SmallerTotalCount
+            summary = $partSyntaxSummary
+            pairs = $partSyntaxPairs
+        }
+        context_v1_reduced_bytes_vs_static_v1 = [PSCustomObject]@{
+            answered = ($contextPairs.Count -gt 0)
+            total_pairs = $contextPairs.Count
+            context_smaller_count = @($contextPairs | Where-Object { $_.context_smaller }).Count
+            summary = if (@($contextPairs | Where-Object { $_.context_smaller }).Count -gt 0) { "Yes: ContextV1 reduced total bytes for at least one clip." } else { "No: ContextV1 did not reduce total bytes vs StaticV1 in this gate." }
+            pairs = $contextPairs
+        }
+        autofast_rdo_beat_fixed16x16_anywhere = [PSCustomObject]@{
+            answered = ($autoFastPairs.Count -gt 0)
+            total_pairs = $autoFastPairs.Count
+            auto_fast_smaller_count = @($autoFastPairs | Where-Object { $_.auto_fast_rdo_smaller }).Count
+            summary = if (@($autoFastPairs | Where-Object { $_.auto_fast_rdo_smaller }).Count -gt 0) { "Yes: AutoFast RDO beat fixed16x16 on at least one clip." } else { "No: AutoFast RDO did not beat fixed16x16 on total bytes in this gate." }
+            pairs = $autoFastPairs
+        }
+        b_half_or_weighted_useful = [PSCustomObject]@{
+            answered = ($bSummary.Count -gt 0)
+            b_half_beats_b_int_count = $bModeAggregate.b_half_beats_b_int_count
+            b_weighted_beats_b_int_count = $bModeAggregate.b_weighted_beats_b_int_count
+            summary = if (($bModeAggregate.b_half_beats_b_int_count + $bModeAggregate.b_weighted_beats_b_int_count) -gt 0) { "Yes: at least one B-half or B-weighted row beat B-int." } else { "No: B-half and B-weighted did not beat B-int in this gate." }
+            rows = $bSummary
+        }
+        srsv2_approached_x265_at_similar_bitrate_quality = $x265Approach
+        biggest_byte_bottleneck = [PSCustomObject]@{
+            category = $biggestBottleneck.name
+            bytes = $biggestBottleneck.bytes
+            source = if ($null -ne $bestCost) { "$($bestCost.clip)/$($bestCost.label)" } else { "" }
+            buckets = $buckets
+        }
+    }
 
     $summary = [PSCustomObject]@{
         note = "Engineering measurement only; no H.265 superiority claim."
@@ -557,6 +717,7 @@ try {
         b_modes = $bModeAggregate
         x265 = $x265Result
         x265_status = $x265Status
+        questions = $questions
         biggest_byte_bottleneck = [PSCustomObject]@{
             source = if ($null -ne $bestCost) { "$($bestCost.clip)/$($bestCost.label)" } else { "" }
             total_bytes = $total
@@ -572,6 +733,24 @@ try {
         "status=$($x265Result.status), bytes=$($x265Result.bytes), bitrate=$([Math]::Round($x265Result.x265_bitrate_bps, 2)), PSNR-Y=$([Math]::Round($x265Result.psnr_y, 4)), SSIM-Y=$([Math]::Round($x265Result.ssim_y, 4))"
     } else {
         $x265Status
+    }
+    $partSyntaxRowsMd = ($partSyntaxPairs | ForEach-Object {
+        "| ``{0}`` | ``{1}`` | {2} | {3} | {4} | {5} | {6} | {7} |" -f $_.clip, $_.pair, $_.v1_total_bytes, $_.v2_total_bytes, $_.total_delta_v2_minus_v1, $_.v1_map_bytes, $_.v2_map_bytes, $_.map_delta_v2_minus_v1
+    }) -join "`n"
+    if ([string]::IsNullOrWhiteSpace($partSyntaxRowsMd)) {
+        $partSyntaxRowsMd = "| _none_ | _none_ | 0 | 0 | 0 | 0 | 0 | 0 |"
+    }
+    $contextRowsMd = ($contextPairs | ForEach-Object {
+        "| ``{0}`` | {1} | {2} | {3} |" -f $_.clip, $_.static_bytes, $_.context_bytes, $_.delta_context_minus_static
+    }) -join "`n"
+    if ([string]::IsNullOrWhiteSpace($contextRowsMd)) {
+        $contextRowsMd = "| _none_ | 0 | 0 | 0 |"
+    }
+    $autoFastRowsMd = ($autoFastPairs | ForEach-Object {
+        "| ``{0}`` | {1} | {2} | {3} |" -f $_.clip, $_.fixed16x16_bytes, $_.auto_fast_rdo_bytes, $_.delta_auto_minus_fixed
+    }) -join "`n"
+    if ([string]::IsNullOrWhiteSpace($autoFastRowsMd)) {
+        $autoFastRowsMd = "| _none_ | 0 | 0 | 0 |"
     }
     $bRowsMd = ($bSummary | ForEach-Object {
         "| ``{0}`` | {1} | {2} | {3} | {4} |" -f $_.clip, $_.p_only_bytes, $_.b_int_bytes, $_.b_half_bytes, $_.b_weighted_bytes
@@ -604,6 +783,36 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 - Best sweep row: $(Format-CandidateLine $bestSweep)
 - Optional x265 result: $x265Line
 
+## Questions Answered
+
+### Did Partition Syntax V2 reduce adaptive partition overhead?
+
+**$($questions.partition_syntax_v2_reduced_adaptive_overhead.summary)**
+
+| Clip | Pair | v1 total bytes | v2 total bytes | Δ total (v2-v1) | v1 map bytes | v2 map bytes | Δ map (v2-v1) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+$partSyntaxRowsMd
+
+### Did ContextV1 reduce bytes vs StaticV1?
+
+**$($questions.context_v1_reduced_bytes_vs_static_v1.summary)**
+
+| Clip | StaticV1 bytes | ContextV1 bytes | Δ context-static |
+| --- | ---: | ---: | ---: |
+$contextRowsMd
+
+### Did AutoFast RDO beat fixed16x16 anywhere?
+
+**$($questions.autofast_rdo_beat_fixed16x16_anywhere.summary)**
+
+| Clip | fixed16x16 bytes | AutoFast RDO bytes | Δ auto-fixed |
+| --- | ---: | ---: | ---: |
+$autoFastRowsMd
+
+### Did B-half or B-weighted become useful?
+
+**$($questions.b_half_or_weighted_useful.summary)**
+
 ## B-Mode Results
 
 | Clip | P-only bytes | B-int bytes | B-half bytes | B-weighted bytes |
@@ -611,6 +820,14 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 $bRowsMd
 
 Counts: B-half smaller than B-int on **$($bModeAggregate.b_half_beats_b_int_count)** clips; B-weighted smaller than B-int on **$($bModeAggregate.b_weighted_beats_b_int_count)** clips.
+
+### Did SRSV2 approach x265 at similar bitrate/quality?
+
+**$($questions.srsv2_approached_x265_at_similar_bitrate_quality.summary)**
+
+- SRSV2 bitrate (optional x265 clip): $($questions.srsv2_approached_x265_at_similar_bitrate_quality.srsv2_bitrate_bps)
+- x265 bitrate: $($questions.srsv2_approached_x265_at_similar_bitrate_quality.x265_bitrate_bps)
+- Similar bitrate (<=10% gap): **$(Format-YesNo $questions.srsv2_approached_x265_at_similar_bitrate_quality.similar_bitrate)**
 
 ## Biggest Byte Bottleneck
 

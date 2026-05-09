@@ -103,6 +103,16 @@ Further playback architecture: `docs/playback_pipeline.md`.
     --report-json var/bench/flat_srsv2_avc_hevc_ref.json --report-md var/bench/flat_srsv2_avc_hevc_ref.md
   ```
 
+  **Bitrate-oriented libx265 reference** (same **no-superiority** rule; optional FFmpeg): sweeps CRF toward SRSV2’s bitrate — or use **`--x265-target-bitrate-kbps`** and omit **`--x265-bitrate-sweep`** for one average-bitrate encode:
+
+  ```bash
+  cargo run -p quality_metrics --bin bench_srsv2 -- \
+    --input var/bench/flat.yuv --width 128 --height 128 --frames 30 --fps 30 \
+    --qp 28 --keyint 30 --motion-radius 16 \
+    --match-x265-bitrate --x265-bitrate-sweep --x265-crf-min 22 --x265-crf-max 35 --x265-crf-step 2 --x265-preset medium \
+    --report-json var/bench/flat_srsv2_x265_br.json --report-md var/bench/flat_srsv2_x265_br.md
+  ```
+
 - **Residual entropy A/B/C** (`explicit` vs `auto` vs forced `rans`) in one report (no FFmpeg):
 
   ```bash

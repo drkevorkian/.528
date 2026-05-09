@@ -4,6 +4,7 @@ pub mod hevc_compare;
 pub mod srsv2_progress_report;
 pub mod srsv2_sweep;
 pub mod synthetic;
+pub mod x265_bitrate_match;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricError {
