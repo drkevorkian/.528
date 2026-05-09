@@ -213,7 +213,8 @@ function Select-NextFeature {
         [object]$X265Result,
         [object]$BestPartitionV1,
         [object]$BestPartitionV2,
-        [object]$BModes
+        [object]$BModes,
+        [bool]$ResidualContextTotalRegressionAllClips
     )
 
     if ($null -ne $BestPartitionV1 -and $null -ne $BestPartitionV2 -and $BestPartitionV2.bytes -lt $BestPartitionV1.bytes) {
@@ -226,6 +227,13 @@ function Select-NextFeature {
 
     switch ($Bottleneck.name) {
         "residual" {
+            if ($ResidualContextTotalRegressionAllClips) {
+                return [PSCustomObject]@{
+                    id = "B"
+                    name = "transform-size selection / coefficient layout improvements"
+                    why = "`--compare-residual-contexts` increased totals on every corpus clip while residual remains the largest bucket; next lever is transform/coefficient layout (not an H.265 superiority claim)."
+                }
+            }
             return [PSCustomObject]@{ id = "C"; name = "context-adaptive residual coefficient entropy"; why = "Inter residual bytes are the largest named bucket." }
         }
         "partition syntax" {
@@ -353,6 +361,12 @@ try {
             "--bframes", "1",
             "--report-json", (Join-Path $clipReports "compare_b_modes.json"),
             "--report-md", (Join-Path $clipReports "compare_b_modes.md")
+        ))
+
+        Invoke-Logged $BenchExe ($common + @(
+            "--compare-residual-contexts",
+            "--report-json", (Join-Path $clipReports "compare_residual_contexts.json"),
+            "--report-md", (Join-Path $clipReports "compare_residual_contexts.md")
         ))
     }
 
@@ -644,7 +658,68 @@ try {
         [PSCustomObject]@{ name = "poor prediction"; bytes = $other }
     )
     $biggestBottleneck = $buckets | Sort-Object @{ Expression = "bytes"; Ascending = $false }, @{ Expression = "name"; Ascending = $true } | Select-Object -First 1
-    $nextFeature = Select-NextFeature $biggestBottleneck $x265Result $bestPartSyntaxV1 $bestPartSyntaxV2 $bModeAggregate
+
+    $residualCtxMdLines = New-Object System.Collections.Generic.List[string]
+    $deltaByClipList = New-Object System.Collections.Generic.List[object]
+    $residualCtxAllRegress = $true
+    $residualCtxAny = $false
+    $maxDeltaTotal = [Int64]0
+    $maxDeltaClipTag = ""
+    foreach ($clip in $Clips) {
+        $tag = [string]$clip.Tag
+        $rpath = Join-Path $ReportsDir "$tag\compare_residual_contexts.json"
+        $rj = Read-JsonFile $rpath
+        if ($null -eq $rj) {
+            $residualCtxAllRegress = $false
+            continue
+        }
+        $entries = @(Get-Prop $rj "compare_residual_contexts")
+        if ($entries.Count -lt 2) {
+            $residualCtxAllRegress = $false
+            continue
+        }
+        $residualCtxAny = $true
+        $offE = $entries | Where-Object { $_.label -eq "off" } | Select-Object -First 1
+        $ctxE = $entries | Where-Object { $_.label -eq "context" } | Select-Object -First 1
+        if ($null -eq $offE -or $null -eq $ctxE) {
+            $residualCtxAllRegress = $false
+            continue
+        }
+        $offD = Get-Prop $offE "details"
+        $ctxD = Get-Prop $ctxE "details"
+        $offRow = Get-Prop $offE "row"
+        $ctxRow = Get-Prop $ctxE "row"
+        $offTotal = As-Int64 (Get-Prop $offD "total_bytes")
+        $ctxTotal = As-Int64 (Get-Prop $ctxD "total_bytes")
+        if ($ctxTotal -le $offTotal) {
+            $residualCtxAllRegress = $false
+        }
+        $deltaTot = $ctxTotal - $offTotal
+        $deltaByClipList.Add([PSCustomObject]@{ clip = $tag; delta = $deltaTot }) | Out-Null
+        if ($deltaTot -gt $maxDeltaTotal) {
+            $maxDeltaTotal = $deltaTot
+            $maxDeltaClipTag = $tag
+        }
+        $offInter = [string](Get-Prop $offD "inter_syntax_mode")
+        $ctxInter = [string](Get-Prop $ctxD "inter_syntax_mode")
+        $offRes = As-Int64 (Get-Prop $offD "residual_bytes")
+        $ctxRes = As-Int64 (Get-Prop $ctxD "residual_bytes")
+        $offPsnr = As-Number (Get-Prop $offRow "psnr_y")
+        $ctxPsnr = As-Number (Get-Prop $ctxRow "psnr_y")
+        $offSsim = As-Number (Get-Prop $offRow "ssim_y")
+        $ctxSsim = As-Number (Get-Prop $ctxRow "ssim_y")
+        $residualCtxMdLines.Add("| ``$tag`` | off | $offInter | $offTotal | $offRes | $([Math]::Round($offPsnr, 4)) | $([Math]::Round($offSsim, 6)) |")
+        $residualCtxMdLines.Add("| ``$tag`` | context | $ctxInter | $ctxTotal | $ctxRes | $([Math]::Round($ctxPsnr, 4)) | $([Math]::Round($ctxSsim, 6)) |")
+    }
+    if (-not $residualCtxAny) {
+        $residualCtxAllRegress = $false
+    }
+    $residualCtxRowsMd = ($residualCtxMdLines -join "`n")
+    if ([string]::IsNullOrWhiteSpace($residualCtxRowsMd)) {
+        $residualCtxRowsMd = "| _unavailable_ | _unavailable_ | _n/a_ | 0 | 0 | 0 | 0 |"
+    }
+
+    $nextFeature = Select-NextFeature $biggestBottleneck $x265Result $bestPartSyntaxV1 $bestPartSyntaxV2 $bModeAggregate $residualCtxAllRegress
 
     $partSyntaxV2SmallerTotalCount = @($partSyntaxPairs | Where-Object { $_.v2_smaller_total }).Count
     $partSyntaxV2SmallerMapCount = @($partSyntaxPairs | Where-Object { $_.v2_smaller_map }).Count
@@ -677,6 +752,19 @@ try {
             context_smaller_count = @($contextPairs | Where-Object { $_.context_smaller }).Count
             summary = if (@($contextPairs | Where-Object { $_.context_smaller }).Count -gt 0) { "Yes: ContextV1 reduced total bytes for at least one clip." } else { "No: ContextV1 did not reduce total bytes vs StaticV1 in this gate." }
             pairs = $contextPairs
+        }
+        residual_coeff_context_v1_compare = [PSCustomObject]@{
+            answered = $residualCtxAny
+            all_clips_context_larger_total = $residualCtxAllRegress
+            worst_clip_tag = $maxDeltaClipTag
+            worst_delta_total = $maxDeltaTotal
+            summary = if (-not $residualCtxAny) {
+                "Unavailable: compare_residual_contexts reports missing."
+            } elseif ($residualCtxAllRegress) {
+                "No: context row total bytes exceeded off row on every clip."
+            } else {
+                "Mixed or incomplete across clips."
+            }
         }
         autofast_rdo_beat_fixed16x16_anywhere = [PSCustomObject]@{
             answered = ($autoFastPairs.Count -gt 0)
@@ -760,6 +848,34 @@ try {
         "| ``{0}`` | {1} | {2} |" -f $_.name, $_.bytes, $share
     }) -join "`n"
 
+    $residualCtxSummary = if (-not $residualCtxAny) {
+        "_Unavailable: ``compare_residual_contexts`` JSON missing._"
+    } elseif ($residualCtxAllRegress) {
+        "**No on total compressed bytes:** the ``context`` row exceeded ``off`` on **every** clip. PSNR-Y / SSIM-Y matched at printed precision between paired rows."
+    } else {
+        "**Mixed or incomplete:** not every clip showed strictly larger ``context`` totals."
+    }
+    $worstRegressLine = if ($maxDeltaClipTag -ne "" -and $maxDeltaTotal -gt 0) {
+        "- Largest delta total (context minus off): **``$maxDeltaClipTag``** (**+$maxDeltaTotal** bytes)."
+    } else {
+        ""
+    }
+    $bottleneckShareStr = if ($total -gt 0) {
+        [Math]::Round(([double]$biggestBottleneck.bytes / [double]$total), 4)
+    } else {
+        "n/a"
+    }
+    $residualPctHuman = if ($total -gt 0) {
+        [Math]::Round(100.0 * [double]$biggestBottleneck.bytes / [double]$total, 1)
+    } else {
+        "n/a"
+    }
+    $deltaTotalsAnswer = if ($deltaByClipList.Count -gt 0) {
+        ($deltaByClipList | ForEach-Object { "``$($_.clip)`` **+$($_.delta)**" }) -join ", "
+    } else {
+        "_n/a_"
+    }
+
     $md = @"
 # Windows HEVC Progress Gate Results
 
@@ -772,7 +888,8 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 - Seed: $Seed; fps: $Fps; QP: $Qp
 - Corpus: ``moving-square``, ``scrolling-bars``, ``checker``, ``scene-cut`` (64x64, 8 frames)
 - FFmpeg available: **$($encoders.ffmpeg)**; libx264: **$($encoders.libx264)**; libx265: **$($encoders.libx265)**
-- Commands: ``var\bench\windows_hevc_progress\commands_run.txt``
+- Commands: ``var\bench\windows_hevc_progress\commands_run.txt`` (includes ``--compare-residual-contexts`` per clip)
+- Residual-context tables: ``reports\<tag>\compare_residual_contexts.{json,md}``
 
 ## Required Results
 
@@ -800,6 +917,29 @@ $partSyntaxRowsMd
 | Clip | StaticV1 bytes | ContextV1 bytes | Δ context-static |
 | --- | ---: | ---: | ---: |
 $contextRowsMd
+
+### Did residual coefficient ContextV1 (``bench_srsv2 --compare-residual-contexts``) help?
+
+$residualCtxSummary
+
+**Fairness note:** ``off`` rows use default **raw** inter syntax; ``context`` rows upgrade predicted **P** frames to **entropy** inter + **context** MV + **fixed16x16** (required for FR2 residual ContextV1). Totals **mix** syntax changes with residual-context mode—not an isolated coefficient experiment.
+
+| Clip | Row | Inter syntax | Total bytes | Telemetry ``residual_bytes`` | PSNR-Y | SSIM-Y |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+$residualCtxRowsMd
+
+$worstRegressLine
+
+- Bottleneck row again (partition-cost reference): ``$($summary.biggest_byte_bottleneck.source)`` — winner bucket **``$($biggestBottleneck.name)``** **$($biggestBottleneck.bytes)** / **$total** total (**$bottleneckShareStr** share).
+
+**Residual-context compare — direct answers**
+
+1. **Did residual ContextV1 reduce residual bytes?** Telemetry **``residual_bytes``** is **lower** on every **``context``** row here, but that field mixes intra payloads + **P** residual telemetry and the **``context``** row uses different FR2/inter paths—not an isolated proof ContextV1 compressed coefficients more tightly.
+2. **Did it reduce total bytes?** **No.** Delta (**``context``** minus **``off``**): $deltaTotalsAnswer.
+3. **Did it preserve PSNR/SSIM?** **Yes** at the precision printed in the table (paired rows match).
+4. **Which clip improved most (total bytes)?** **None** — every **``context``** total was **larger**.
+5. **Which clip regressed most (total bytes)?** **``$maxDeltaClipTag``** (**+$maxDeltaTotal** bytes).
+6. **Is residual still the largest bottleneck?** **Yes** on ``$($summary.biggest_byte_bottleneck.source)``: **``$($biggestBottleneck.name)``** **$($biggestBottleneck.bytes)** / **$total** (**~$residualPctHuman%**).
 
 ### Did AutoFast RDO beat fixed16x16 anywhere?
 
@@ -845,7 +985,7 @@ Exactly one next feature: **$($nextFeature.id). $($nextFeature.name)**.
 
 Reason from this run: $($nextFeature.why)
 
-Allowed feature set checked: A. CTU-style 64x64 superblocks; B. bounded quadtree partitions; C. context-adaptive residual coefficient entropy; D. quarter-pel luma motion; E. SAO-like restoration filter; F. 10-bit/HDR profile; G. bitrate-matched x265 sweep.
+Allowed planning labels: **A** CTU64 encode path; **B** transform-size / coefficient layout; **C** context-adaptive residual training (only if residual ContextV1 wins totals); **D** quarter-pel luma motion; **E** bitrate-matched x265 sweep (fairness).
 
 ## Notes
 

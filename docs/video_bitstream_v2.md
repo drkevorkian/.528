@@ -69,13 +69,28 @@ This table is the **authoritative** mapping between **on-wire `FR2` byte 4** (th
 | **26** | `0x1A` | *Reserved* | **B** (variable partition + ContextV1) | **Not implemented:** mux may see this revision for policy tests, but **`decode_yuv420_b_payload` returns `Unsupported`** — **no** working bitstream layout in this repository slice | — |
 | **27** | `0x1B` | **Compact** (map **v2**) | **P** (variable partition) | Same flags/residuals as rev **19**; **no** per-MB map bytes — length-prefixed **`S2P1`** blob (`partition_syntax_v2`), then **`u32` LE** MV-share section length (may be **0**) | `SrsV2PartitionSyntaxMode::V2RleMvShare` + compact inter |
 | **28** | `0x1C` | **StaticV1** or **ContextV1** MV rANS (map **v2**) | **P** (variable partition) | Same as rev **27** for map/MV-share; after optional AQ clip bytes, **`u8` entropy selector**: **0** = StaticV1 rANS, **1** = ContextV1; then **`sym_count` / `blob_len` / blob** as rev **20**/**25** | `V2RleMvShare` + `EntropyV1` + chosen `SrsV2EntropyModelMode` |
+| **29** | `0x1D` | — | **Intra** | Same top-level layout as **rev 3**; plane blocks **must** use residual tag **`TAG_CONTEXT_RANS_AC` (2)** only — decode rejects explicit tuples and static single-model rANS tags | `residual_context_mode = ContextV1` without block AQ (**rev 7** still used for ContextV1 + block `qp_delta`) |
+| **30** | `0x1E` | **ContextV1** MV rANS | **P** (fixed **16×16**) | Same header/framing as **rev 23**; non-skipped **8×8** residuals use adaptive wrapper **`1`** with inner **`TAG_CONTEXT_RANS_AC` only** | `EntropyV1` + **`ContextV1`** MV + **`residual_context_mode = ContextV1`** |
+| **31** | `0x1F` | *Reserved* | **B** | **Not implemented:** `decode_yuv420_b_payload` returns **`Unsupported`** — reserved for future **B** residual ContextV1 | — |
 
 **Policy statements (non-normative but required for project honesty):**
 
 - **`SrsV2EntropyModelMode::StaticV1`** remains the **default**; **`ContextV1`** is **experimental** and must be **measured** (bytes + quality at matched settings) before any discussion of making it default.
 - **ContextV1 is not CABAC-class** and does not implement H.264-style adaptive binary arithmetic coding; it uses **fixed, bounded** per-context frequency tables and **bounded** rANS decode steps.
 - **No superiority claim vs H.264** is stated or implied by these revisions; they exist for **native** SRSV2 experimentation only.
-- Payloads **`FR2` rev 1–22** remain **supported** decoders paths alongside **23–28** where implemented; rev **26** is **explicitly unsupported** decode today (fail-fast).
+- Payloads **`FR2` rev 1–22** remain **supported** decoder paths alongside **23–30** where implemented; rev **26** and **31** are **explicitly unsupported** decode today (fail-fast). **Rev 29**/**30** version strict residual ContextV1 syntax and **must not** be read as **rev 3**/**23** polyglot streams.
+
+### Revision 29 — intra strict residual ContextV1 (`FR2\x1D`) — **opt-in**
+
+Same **`frame_index`**, **`base_qp`**, and three length-prefixed Y/U/V blobs as **rev 3**. Each **8×8** block uses prediction **mode**, **DC**, then residual tag **`TAG_CONTEXT_RANS_AC`** with the bounded multi-context rANS blob (**rev 3**-style length framing). Tags **`TAG_EXPLICIT_AC`** and **`TAG_RANS_AC`** are **malformed** for **rev 29** decoders.
+
+### Revision 30 — **P** ContextV1 MV + strict residual ContextV1 (`FR2\x1E`) — **opt-in**
+
+Same compact MV byte grid, flags, optional AQ clip bytes, and **`sym_count` / `blob_len` / ContextV1 MV blob** as **rev 23**. Non-skipped **8×8** luma residual chunks use outer byte **`1`** (adaptive) and **only** inner **`TAG_CONTEXT_RANS_AC`** payloads.
+
+### Revision 31 — **B** residual ContextV1 (`FR2\x1F`) — **reserved**
+
+Magic and revision byte are recognized for classification / safe rejection; **`decode_yuv420_b_payload` returns `Unsupported`** until a normative **B** layout is implemented.
 
 ### Revision 15 — experimental **P** compact inter MV (`FR2\x0F`) — **opt-in**
 

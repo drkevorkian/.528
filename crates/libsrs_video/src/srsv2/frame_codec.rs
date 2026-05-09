@@ -19,17 +19,19 @@ use super::rate_control::{
 use super::reference_manager::SrsV2ReferenceManager;
 use super::residual_entropy::{
     decode_plane_intra_entropy, decode_plane_intra_entropy_block_aq, encode_plane_intra_entropy,
-    encode_plane_intra_entropy_block_aq,
+    encode_plane_intra_entropy_block_aq, ResidualPlane,
 };
 
 pub const FRAME_PAYLOAD_MAGIC: [u8; 4] = [b'F', b'R', b'2', 1];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 3];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 7];
+/// Intra adaptive residuals **strict** multi-context rANS (`FR2` rev **29**).
+pub const FRAME_PAYLOAD_MAGIC_INTRA_RESIDUAL_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 29];
 /// Non-displayable reference refresh (`FR2` rev **12**, experimental).
 pub const FRAME_PAYLOAD_MAGIC_ALT_REF: [u8; 4] = [b'F', b'R', b'2', 12];
 
 fn intra_magic_matches(payload: &[u8]) -> bool {
-    payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3 | 7)
+    payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3 | 7 | 29)
 }
 
 fn intra_use_block_aq_wire(settings: &SrsV2EncodeSettings) -> bool {
@@ -54,6 +56,7 @@ pub fn encode_yuv420_intra_payload(
             "encode path only supports YUV420p8 in this slice",
         ));
     }
+    settings.validate_residual_context_mode()?;
     if matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
         && matches!(settings.residual_entropy, ResidualEntropy::Explicit)
     {
@@ -65,6 +68,14 @@ pub fn encode_yuv420_intra_payload(
     let mut out = Vec::new();
     let magic = if intra_use_block_aq_wire(settings) {
         FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ
+    } else if matches!(
+        settings.residual_context_mode,
+        crate::srsv2::rate_control::SrsV2ResidualContextMode::ContextV1,
+    ) && matches!(
+        settings.residual_entropy,
+        ResidualEntropy::Auto | ResidualEntropy::Rans,
+    ) {
+        FRAME_PAYLOAD_MAGIC_INTRA_RESIDUAL_CTX_V1
     } else {
         match settings.residual_entropy {
             ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC,
@@ -87,6 +98,7 @@ pub fn encode_yuv420_intra_payload(
     let mut yb = Vec::new();
     let mut ub = Vec::new();
     let mut vb = Vec::new();
+    let strict_rev29 = magic == FRAME_PAYLOAD_MAGIC_INTRA_RESIDUAL_CTX_V1;
 
     match settings.residual_entropy {
         ResidualEntropy::Explicit => {
@@ -97,13 +109,19 @@ pub fn encode_yuv420_intra_payload(
         ResidualEntropy::Auto | ResidualEntropy::Rans => {
             let mut noop = ResidualEncodeStats::default();
             let acc: &mut ResidualEncodeStats = stats.unwrap_or(&mut noop);
+            if matches!(
+                settings.residual_context_mode,
+                crate::srsv2::rate_control::SrsV2ResidualContextMode::ContextV1
+            ) {
+                acc.residual_context_enabled = true;
+            }
             if intra_use_block_aq_wire(settings) {
                 let sy = encode_plane_intra_entropy_block_aq(
                     &yuv.y,
                     eff_qp,
                     clip_min,
                     clip_max,
-                    settings.residual_entropy,
+                    ResidualPlane::Y,
                     acc,
                     settings,
                     &mut yb,
@@ -113,7 +131,7 @@ pub fn encode_yuv420_intra_payload(
                     eff_qp,
                     clip_min,
                     clip_max,
-                    settings.residual_entropy,
+                    ResidualPlane::U,
                     acc,
                     settings,
                     &mut ub,
@@ -123,7 +141,7 @@ pub fn encode_yuv420_intra_payload(
                     eff_qp,
                     clip_min,
                     clip_max,
-                    settings.residual_entropy,
+                    ResidualPlane::V,
                     acc,
                     settings,
                     &mut vb,
@@ -158,10 +176,36 @@ pub fn encode_yuv420_intra_payload(
                     sv.neg_delta,
                     sv.zero_delta,
                 );
+                acc.finalize_residual_context_derived();
             } else {
-                encode_plane_intra_entropy(&yuv.y, qp_i, settings.residual_entropy, acc, &mut yb)?;
-                encode_plane_intra_entropy(&yuv.u, qp_i, settings.residual_entropy, acc, &mut ub)?;
-                encode_plane_intra_entropy(&yuv.v, qp_i, settings.residual_entropy, acc, &mut vb)?;
+                encode_plane_intra_entropy(
+                    &yuv.y,
+                    qp_i,
+                    settings,
+                    ResidualPlane::Y,
+                    acc,
+                    strict_rev29,
+                    &mut yb,
+                )?;
+                encode_plane_intra_entropy(
+                    &yuv.u,
+                    qp_i,
+                    settings,
+                    ResidualPlane::U,
+                    acc,
+                    strict_rev29,
+                    &mut ub,
+                )?;
+                encode_plane_intra_entropy(
+                    &yuv.v,
+                    qp_i,
+                    settings,
+                    ResidualPlane::V,
+                    acc,
+                    strict_rev29,
+                    &mut vb,
+                )?;
+                acc.finalize_residual_context_derived();
             }
         }
     }
@@ -301,17 +345,34 @@ pub fn decode_yuv420_intra_payload(
         }
         3 => {
             let mut c = 0usize;
-            decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i)?;
+            decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i, ResidualPlane::Y, false)?;
             if c != y_data.len() {
                 return Err(SrsV2Error::syntax("y plane trailing bits"));
             }
             c = 0;
-            decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i)?;
+            decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i, ResidualPlane::U, false)?;
             if c != u_data.len() {
                 return Err(SrsV2Error::syntax("u plane trailing bits"));
             }
             c = 0;
-            decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i)?;
+            decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i, ResidualPlane::V, false)?;
+            if c != v_data.len() {
+                return Err(SrsV2Error::syntax("v plane trailing bits"));
+            }
+        }
+        29 => {
+            let mut c = 0usize;
+            decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i, ResidualPlane::Y, true)?;
+            if c != y_data.len() {
+                return Err(SrsV2Error::syntax("y plane trailing bits"));
+            }
+            c = 0;
+            decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i, ResidualPlane::U, true)?;
+            if c != u_data.len() {
+                return Err(SrsV2Error::syntax("u plane trailing bits"));
+            }
+            c = 0;
+            decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i, ResidualPlane::V, true)?;
             if c != v_data.len() {
                 return Err(SrsV2Error::syntax("v plane trailing bits"));
             }
@@ -325,6 +386,7 @@ pub fn decode_yuv420_intra_payload(
                 base_qp,
                 clip_min,
                 clip_max,
+                ResidualPlane::Y,
             )?;
             if c != y_data.len() {
                 return Err(SrsV2Error::syntax("y plane trailing bits"));
@@ -337,6 +399,7 @@ pub fn decode_yuv420_intra_payload(
                 base_qp,
                 clip_min,
                 clip_max,
+                ResidualPlane::U,
             )?;
             if c != u_data.len() {
                 return Err(SrsV2Error::syntax("u plane trailing bits"));
@@ -349,6 +412,7 @@ pub fn decode_yuv420_intra_payload(
                 base_qp,
                 clip_min,
                 clip_max,
+                ResidualPlane::V,
             )?;
             if c != v_data.len() {
                 return Err(SrsV2Error::syntax("v plane trailing bits"));
@@ -395,6 +459,7 @@ pub fn encode_yuv420_inter_payload(
     if !seq.width.is_multiple_of(16) || !seq.height.is_multiple_of(16) {
         return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats, aq_out);
     }
+    settings.validate_residual_context_inter_residual()?;
     let (eff_qp, aq_st) = resolve_frame_adaptive_qp(qp, cur, settings)?;
     let block_wire = if let Some(a) = aq_out {
         *a = aq_st;
@@ -489,17 +554,17 @@ pub fn decode_yuv420_alt_ref_payload(
     let mut v_plane = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;
 
     let mut c = 0usize;
-    decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i)?;
+    decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i, ResidualPlane::Y, false)?;
     if c != y_data.len() {
         return Err(SrsV2Error::syntax("alt-ref y plane trailing bits"));
     }
     c = 0;
-    decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i)?;
+    decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i, ResidualPlane::U, false)?;
     if c != u_data.len() {
         return Err(SrsV2Error::syntax("alt-ref u plane trailing bits"));
     }
     c = 0;
-    decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i)?;
+    decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i, ResidualPlane::V, false)?;
     if c != v_data.len() {
         return Err(SrsV2Error::syntax("alt-ref v plane trailing bits"));
     }
@@ -551,9 +616,34 @@ pub fn encode_yuv420_alt_ref_payload(
     let mut yb = Vec::new();
     let mut ub = Vec::new();
     let mut vb = Vec::new();
-    encode_plane_intra_entropy(&yuv.y, qp_i, ResidualEntropy::Auto, &mut acc, &mut yb)?;
-    encode_plane_intra_entropy(&yuv.u, qp_i, ResidualEntropy::Auto, &mut acc, &mut ub)?;
-    encode_plane_intra_entropy(&yuv.v, qp_i, ResidualEntropy::Auto, &mut acc, &mut vb)?;
+    let intra_settings = SrsV2EncodeSettings::default();
+    encode_plane_intra_entropy(
+        &yuv.y,
+        qp_i,
+        &intra_settings,
+        ResidualPlane::Y,
+        &mut acc,
+        false,
+        &mut yb,
+    )?;
+    encode_plane_intra_entropy(
+        &yuv.u,
+        qp_i,
+        &intra_settings,
+        ResidualPlane::U,
+        &mut acc,
+        false,
+        &mut ub,
+    )?;
+    encode_plane_intra_entropy(
+        &yuv.v,
+        qp_i,
+        &intra_settings,
+        ResidualPlane::V,
+        &mut acc,
+        false,
+        &mut vb,
+    )?;
     push_chunk(&mut out, &yb)?;
     push_chunk(&mut out, &ub)?;
     push_chunk(&mut out, &vb)?;
@@ -578,14 +668,14 @@ pub fn decode_yuv420_srsv2_payload_managed(
     }
     let rev = payload[3];
     let mut dec = match rev {
-        1 | 3 | 7 => {
+        1 | 3 | 7 | 29 => {
             let d = decode_yuv420_intra_payload(seq, payload)?;
             if seq.max_ref_frames > 0 {
                 manager.replace_after_keyframe(d.frame_index, d.yuv.clone());
             }
             d
         }
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 => {
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 => {
             let reference = manager
                 .primary_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -595,7 +685,7 @@ pub fn decode_yuv420_srsv2_payload_managed(
             }
             d
         }
-        10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 => {
+        10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 31 => {
             if seq.max_ref_frames < 2 {
                 return Err(SrsV2Error::syntax(
                     "B-frame requires max_ref_frames >= 2 in sequence header",
@@ -625,14 +715,17 @@ pub fn decode_yuv420_srsv2_payload(
     if payload.len() < 4 {
         return Err(SrsV2Error::Truncated);
     }
-    if matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24) {
+    if matches!(
+        payload[3],
+        10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 31
+    ) {
         return Err(SrsV2Error::Unsupported(
             "multi-reference SRSV2 payloads require decode_yuv420_srsv2_payload_managed",
         ));
     }
     let mut dec = match payload[3] {
-        1 | 3 | 7 => decode_yuv420_intra_payload(seq, payload)?,
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 => {
+        1 | 3 | 7 | 29 => decode_yuv420_intra_payload(seq, payload)?,
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 => {
             let reference = ref_slot
                 .as_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -679,8 +772,10 @@ mod roundtrip_tests {
         TransferFunction, VideoSequenceHeaderV2,
     };
     use crate::srsv2::rate_control::{
-        ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
+        ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode,
+        SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterSyntaxMode, SrsV2ResidualContextMode,
     };
+    use crate::srsv2::reference_manager::SrsV2ReferenceManager;
 
     fn explicit_only_settings() -> SrsV2EncodeSettings {
         SrsV2EncodeSettings {
@@ -1058,6 +1153,427 @@ mod roundtrip_tests {
         let dec = decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
         let got = slot.expect("ref slot");
         assert_eq!(got.y.samples, dec.yuv.y.samples);
+    }
+
+    #[test]
+    fn intra_residual_context_v1_matches_static_rans_reconstruction() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let rgb = vec![77_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st_ctx = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Rans,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
+            keyframe_interval: 1,
+            ..Default::default()
+        };
+        let st_ref = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Rans,
+            residual_context_mode: SrsV2ResidualContextMode::Off,
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
+            keyframe_interval: 1,
+            ..Default::default()
+        };
+        let payload_ctx =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, 21, &st_ctx, None, None).unwrap();
+        let payload_ref =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, 21, &st_ref, None, None).unwrap();
+        assert_eq!(payload_ctx[3], 29);
+        assert_eq!(payload_ref[3], 3);
+        assert_ne!(
+            payload_ctx, payload_ref,
+            "expected ContextV1 to emit a distinct bitstream vs static rANS"
+        );
+        let dec_ctx = decode_yuv420_intra_payload(&seq, &payload_ctx).unwrap();
+        let dec_ref = decode_yuv420_intra_payload(&seq, &payload_ref).unwrap();
+        assert_eq!(dec_ctx.yuv.y.samples, dec_ref.yuv.y.samples);
+        assert_eq!(dec_ctx.yuv.u.samples, dec_ref.yuv.u.samples);
+        assert_eq!(dec_ctx.yuv.v.samples, dec_ref.yuv.v.samples);
+    }
+
+    #[test]
+    fn intra_context_v1_populates_residual_encode_stats() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let rgb = vec![77_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st_ctx = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Rans,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
+            keyframe_interval: 1,
+            ..Default::default()
+        };
+        let mut stats = ResidualEncodeStats::default();
+        let _payload = encode_yuv420_intra_payload(
+            &seq,
+            &yuv,
+            0,
+            21,
+            &st_ctx,
+            Some(&mut stats),
+            None,
+        )
+        .unwrap();
+        assert!(stats.residual_context_enabled);
+        assert!(stats.residual_context_blocks > 0);
+        assert!(stats.residual_context_bytes > 0);
+        assert!(stats.residual_static_bytes_estimate > 0);
+        assert!(stats.residual_context_savings_percent >= 0.0);
+    }
+
+    #[test]
+    fn fr2_rev30_p_populates_residual_context_stats_when_enabled() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 1,
+        };
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Rans,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+            entropy_model_mode: SrsV2EntropyModelMode::ContextV1,
+            keyframe_interval: 30,
+            ..Default::default()
+        };
+        let rgb = vec![101_u8; 64 * 64 * 3];
+        let yuv_ref = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut rgb_cur = rgb.clone();
+        for y in 16..48usize {
+            for x in 16..48usize {
+                let i = (y * 64 + x) * 3;
+                rgb_cur[i] = 40;
+                rgb_cur[i + 1] = 40;
+                rgb_cur[i + 2] = 40;
+            }
+        }
+        let yuv_cur = rgb888_full_to_yuv420_bt709(&rgb_cur, 64, 64, ColorRange::Limited).unwrap();
+        let slot = Some(yuv_ref.clone());
+        let mut stats = ResidualEncodeStats::default();
+        let p = encode_yuv420_inter_payload(
+            &seq,
+            &yuv_cur,
+            slot.as_ref(),
+            1,
+            26,
+            &st,
+            Some(&mut stats),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p[3], 30);
+        assert!(stats.residual_context_enabled);
+        assert!(
+            stats.residual_context_blocks > 0,
+            "expected non-skipped luma subblocks to emit context residuals"
+        );
+    }
+
+    #[test]
+    fn b_mb_blend_encode_rejects_residual_context_v1() {
+        use crate::srsv2::b_frame_codec::{encode_yuv420_b_payload_mb_blend, BFrameEncodeStats};
+        let seq = VideoSequenceHeaderV2 {
+            width: 16,
+            height: 16,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 2,
+        };
+        let rgb_a = vec![80_u8; 16 * 16 * 3];
+        let yuv_a = rgb888_full_to_yuv420_bt709(&rgb_a, 16, 16, ColorRange::Limited).unwrap();
+        let rgb_b = vec![120_u8; 16 * 16 * 3];
+        let yuv_b = rgb888_full_to_yuv420_bt709(&rgb_b, 16, 16, ColorRange::Limited).unwrap();
+        let rgb_c = vec![100_u8; 16 * 16 * 3];
+        let yuv_c = rgb888_full_to_yuv420_bt709(&rgb_c, 16, 16, ColorRange::Limited).unwrap();
+        let settings = SrsV2EncodeSettings {
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            residual_entropy: ResidualEntropy::Rans,
+            b_motion_search_mode: crate::srsv2::rate_control::SrsV2BMotionSearchMode::Off,
+            ..Default::default()
+        };
+        let mut st = BFrameEncodeStats::default();
+        let err = encode_yuv420_b_payload_mb_blend(
+            &seq, &yuv_c, &yuv_a, &yuv_b, 5, 28, 1, 0, &settings, &mut st,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::srsv2::error::SrsV2Error::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn fr2_rev29_intra_roundtrip_managed_matches_direct_decode() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![88_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Rans,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
+            keyframe_interval: 1,
+            ..Default::default()
+        };
+        let payload = encode_yuv420_intra_payload(&seq, &yuv, 2, 22, &st, None, None).unwrap();
+        assert_eq!(payload[3], 29);
+        let dec_intra = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        assert_eq!(dec_intra.frame_index, 2);
+        let mut mgr = SrsV2ReferenceManager::new(1).unwrap();
+        let dec_mgr = decode_yuv420_srsv2_payload_managed(&seq, &payload, &mut mgr).unwrap();
+        assert_eq!(dec_intra.yuv.y.samples, dec_mgr.yuv.y.samples);
+    }
+
+    #[test]
+    fn fr2_rev29_malformed_truncated_payload_fails() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let rgb = vec![90_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Rans,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
+            keyframe_interval: 1,
+            ..Default::default()
+        };
+        let payload = encode_yuv420_intra_payload(&seq, &yuv, 0, 20, &st, None, None).unwrap();
+        assert_eq!(payload[3], 29);
+        let mut bad = payload.clone();
+        bad.truncate(bad.len().saturating_sub(12));
+        assert!(decode_yuv420_intra_payload(&seq, &bad).is_err());
+    }
+
+    #[test]
+    fn fr2_rev30_p_roundtrip_dispatcher_decodes() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 1,
+        };
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Rans,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+            entropy_model_mode: SrsV2EntropyModelMode::ContextV1,
+            keyframe_interval: 30,
+            ..Default::default()
+        };
+        let rgb = vec![101_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut slot = Some(yuv.clone());
+        let p = encode_yuv420_inter_payload(
+            &seq,
+            &yuv,
+            slot.as_ref(),
+            1,
+            26,
+            &st,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p[3], 30);
+        decode_yuv420_srsv2_payload(&seq, &p, &mut slot).unwrap();
+    }
+
+    #[test]
+    fn fr2_rev30_malformed_truncated_payload_fails() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 1,
+        };
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Rans,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+            entropy_model_mode: SrsV2EntropyModelMode::ContextV1,
+            keyframe_interval: 30,
+            ..Default::default()
+        };
+        let rgb = vec![102_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut slot = Some(yuv.clone());
+        let p = encode_yuv420_inter_payload(
+            &seq,
+            &yuv,
+            slot.as_ref(),
+            1,
+            26,
+            &st,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p[3], 30);
+        let mut bad = p.clone();
+        bad.truncate(bad.len().saturating_sub(20));
+        assert!(decode_yuv420_srsv2_payload(&seq, &bad, &mut slot).is_err());
+    }
+
+    #[test]
+    fn fr2_rev31_b_reserved_managed_decode_unsupported() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 2,
+        };
+        let payload = vec![b'F', b'R', b'2', 31, 0, 0, 0, 0, 28, 0, 1];
+        let mut mgr = SrsV2ReferenceManager::new(2).unwrap();
+        let err = decode_yuv420_srsv2_payload_managed(&seq, &payload, &mut mgr).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::srsv2::error::SrsV2Error::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn inter_encode_rejects_residual_context_v1_until_wired() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 1,
+        };
+        let rgb = vec![80_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut slot = None;
+        let intra = encode_yuv420_intra_payload(
+            &seq,
+            &yuv,
+            0,
+            24,
+            &SrsV2EncodeSettings::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let st_bad = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Auto,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            keyframe_interval: 30,
+            ..Default::default()
+        };
+        assert!(
+            encode_yuv420_inter_payload(
+                &seq,
+                &yuv,
+                slot.as_ref(),
+                1,
+                24,
+                &st_bad,
+                None,
+                None,
+                None
+            )
+            .is_err()
+        );
     }
 
     #[test]

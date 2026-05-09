@@ -16,6 +16,7 @@ use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::srsv2::{
     decode_mv_share_groups_v2, decode_partition_map_v2, total_pu_slots_for_modes,
 };
+use libsrs_video::srsv2::rate_control::SrsV2ResidualContextMode;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
     encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
@@ -107,6 +108,15 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     compare_residual_modes: bool,
+
+    /// Residual coefficient context entropy (**[`SrsV2ResidualContextMode::ContextV1`]**): `off` (default) or `context`.
+    /// With predicted **P** frames, **`context`** requires **`--inter-syntax entropy`**, **`--entropy-model context`**, and **`--inter-partition fixed16x16`** (unless **`--compare-residual-contexts`** upgrades the context row automatically).
+    #[arg(long, default_value = "off")]
+    residual_context: String,
+
+    /// Run baseline (**`--residual-context off`**) then **ContextV1** residual entropy (two rows). **P** path upgrades the context row to the rev30 stack when needed. Failed context encode does not abort the baseline row. No FFmpeg.
+    #[arg(long, default_value_t = false)]
+    compare_residual_contexts: bool,
 
     #[arg(long, default_value_t = false)]
     sweep: bool,
@@ -442,6 +452,10 @@ struct Fr2RevisionCounts {
     rev26: u32,
     rev27: u32,
     rev28: u32,
+    #[serde(default)]
+    rev29: u32,
+    #[serde(default)]
+    rev30: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -702,6 +716,33 @@ struct Srsv2Details {
     /// Sum of per-frame **`SrsV2InterMvBenchStats::entropy_symbol_count`** (MV compact bytes under **EntropyV1**).
     #[serde(default)]
     entropy_symbol_count: u64,
+    /// CLI mirror: `off` or `context` (**ContextV1** residual tails).
+    #[serde(default)]
+    residual_context_mode: String,
+    #[serde(default)]
+    residual_context_enabled: bool,
+    #[serde(default)]
+    residual_context_blocks: u64,
+    #[serde(default)]
+    residual_context_bytes: u64,
+    #[serde(default)]
+    residual_static_bytes_estimate: u64,
+    #[serde(default)]
+    residual_context_savings_bytes: u64,
+    #[serde(default)]
+    residual_context_savings_percent: f64,
+    #[serde(default)]
+    residual_context_failed_blocks: u64,
+    /// Sum of encoded frame payload sizes (display-order bench aggregate).
+    #[serde(default)]
+    total_bytes: u64,
+    /// Intra Y/U/V plane chunk bytes plus **`inter_residual_bytes`** (**P**/ **B** residual telemetry).
+    #[serde(default)]
+    residual_bytes: u64,
+    #[serde(default)]
+    encode_fps: f64,
+    #[serde(default)]
+    decode_fps: f64,
     /// Populated when a benchmark pass fails before **`Srsv2Details`** is complete (reserved).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     entropy_failure_reason: Option<String>,
@@ -787,6 +828,18 @@ impl Default for Srsv2Details {
             context_mv_bytes: 0,
             entropy_context_count: 0,
             entropy_symbol_count: 0,
+            residual_context_mode: "off".to_string(),
+            residual_context_enabled: false,
+            residual_context_blocks: 0,
+            residual_context_bytes: 0,
+            residual_static_bytes_estimate: 0,
+            residual_context_savings_bytes: 0,
+            residual_context_savings_percent: 0.0,
+            residual_context_failed_blocks: 0,
+            total_bytes: 0,
+            residual_bytes: 0,
+            encode_fps: 0.0,
+            decode_fps: 0.0,
             entropy_failure_reason: None,
         }
     }
@@ -915,6 +968,8 @@ struct BenchReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_residual_modes: Option<Vec<ResidualCompareEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    compare_residual_contexts: Option<Vec<ResidualCompareEntry>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sweep: Option<Vec<SweepRunReport>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_b_modes: Option<Vec<CompareBModesEntry>>,
@@ -957,6 +1012,64 @@ fn parse_residual_entropy(s: &str) -> Result<ResidualEntropy> {
             "--residual-entropy must be auto, explicit, or rans (got {s})"
         )),
     }
+}
+
+fn parse_residual_context_mode(s: &str) -> Result<SrsV2ResidualContextMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "off" => Ok(SrsV2ResidualContextMode::Off),
+        "context" => Ok(SrsV2ResidualContextMode::ContextV1),
+        _ => Err(anyhow!(
+            "--residual-context must be off or context (got {s})"
+        )),
+    }
+}
+
+fn residual_context_cli_label(m: SrsV2ResidualContextMode) -> &'static str {
+    match m {
+        SrsV2ResidualContextMode::Off => "off",
+        SrsV2ResidualContextMode::ContextV1 => "context",
+    }
+}
+
+fn clip_has_inter_predicted_frames(args: &Args) -> bool {
+    if args.frames < 2 || args.reference_frames == 0 {
+        return false;
+    }
+    let k = args.keyint.max(1);
+    (1..args.frames).any(|i| i % k != 0)
+}
+
+fn apply_residual_context_v1_inter_stack_for_predicted_p(args: &mut Args) {
+    if !clip_has_inter_predicted_frames(args) {
+        return;
+    }
+    args.inter_syntax = "entropy".to_string();
+    args.entropy_model = "context".to_string();
+    args.inter_partition = "fixed16x16".to_string();
+}
+
+/// Sum Y/U/V plane chunk payloads for **FR2** intra **1**/**3**/**7**/**29** (coefficient-plane byte volume).
+fn intra_plane_chunks_payload_sum(pl: &[u8]) -> Option<u64> {
+    if pl.len() < 4 || &pl[0..3] != b"FR2" {
+        return None;
+    }
+    let rev = pl[3];
+    if !matches!(rev, 1 | 3 | 7 | 29) {
+        return None;
+    }
+    let mut cur = 4usize;
+    read_u32_le_payload(pl, &mut cur)?;
+    read_u8_payload(pl, &mut cur)?;
+    if rev == 7 {
+        cur = cur.checked_add(2)?;
+    }
+    let yl = read_u32_le_payload(pl, &mut cur)? as usize;
+    cur = cur.checked_add(yl)?;
+    let ul = read_u32_le_payload(pl, &mut cur)? as usize;
+    cur = cur.checked_add(ul)?;
+    let vl = read_u32_le_payload(pl, &mut cur)? as usize;
+    cur = cur.checked_add(vl)?;
+    (cur == pl.len()).then_some((yl + ul + vl) as u64)
 }
 
 fn parse_aq_mode(s: &str) -> Result<SrsV2AdaptiveQuantizationMode> {
@@ -1094,6 +1207,7 @@ fn validate_args(args: &Args) -> Result<()> {
         let conflict = args.sweep
             || args.sweep_quality_bitrate
             || args.compare_residual_modes
+            || args.compare_residual_contexts
             || args.compare_b_modes
             || args.compare_inter_syntax
             || args.compare_rdo
@@ -1161,6 +1275,7 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     if args.fps == 0 {
         bail!("--fps must be > 0");
     }
+    let rctx_mode = parse_residual_context_mode(&args.residual_context)?;
     let rc = parse_rc_mode(&args.rc)?;
     match rc {
         SrsV2RateControlMode::ConstantQuality => {
@@ -1186,6 +1301,14 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             "--compare-residual-modes cannot be combined with --sweep or --sweep-quality-bitrate"
         );
     }
+    if args.compare_residual_contexts && (args.sweep || args.sweep_quality_bitrate) {
+        bail!(
+            "--compare-residual-contexts cannot be combined with --sweep or --sweep-quality-bitrate"
+        );
+    }
+    if args.compare_residual_contexts && args.compare_residual_modes {
+        bail!("--compare-residual-contexts cannot be combined with --compare-residual-modes");
+    }
     if args.sweep && args.sweep_quality_bitrate {
         bail!("--sweep and --sweep-quality-bitrate are mutually exclusive");
     }
@@ -1194,10 +1317,11 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         + args.compare_partitions as u8
         + args.compare_partition_costs as u8
         + args.compare_partition_syntax as u8
-        + args.compare_entropy_models as u8;
+        + args.compare_entropy_models as u8
+        + args.compare_residual_contexts as u8;
     if compare_pass_count > 1 {
         bail!(
-            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, and --compare-entropy-models are mutually exclusive"
+            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, and --compare-residual-contexts are mutually exclusive"
         );
     }
     if (args.compare_inter_syntax
@@ -1209,14 +1333,18 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         && (args.sweep
             || args.sweep_quality_bitrate
             || args.compare_residual_modes
+            || args.compare_residual_contexts
             || args.compare_b_modes)
     {
-        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, or --compare-b-modes");
+        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, or --compare-b-modes");
     }
     if args.compare_b_modes
-        && (args.sweep || args.compare_residual_modes || args.sweep_quality_bitrate)
+        && (args.sweep
+            || args.compare_residual_modes
+            || args.compare_residual_contexts
+            || args.sweep_quality_bitrate)
     {
-        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, or --compare-residual-modes");
+        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, or --compare-residual-contexts");
     }
     if args.compare_b_modes {
         if args.reference_frames < 2 {
@@ -1274,6 +1402,19 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     if inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16 && args.bframes > 0 {
         bail!("non-default --inter-partition requires --bframes 0 in this slice");
     }
+    if matches!(rctx_mode, SrsV2ResidualContextMode::ContextV1)
+        && !args.compare_residual_contexts
+        && clip_has_inter_predicted_frames(args)
+    {
+        if inter_syn != SrsV2InterSyntaxMode::EntropyV1
+            || entropy_model != SrsV2EntropyModelMode::ContextV1
+            || inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16
+        {
+            bail!(
+                "--residual-context context with predicted P frames requires `--inter-syntax entropy`, `--entropy-model context`, and `--inter-partition fixed16x16` (FR2 rev30 stack)"
+            );
+        }
+    }
     if args.bframes > 1 {
         bail!(
             "only --bframes 0 or 1 is supported in this experimental slice (got {})",
@@ -1290,8 +1431,12 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         if !args.width.is_multiple_of(16) || !args.height.is_multiple_of(16) {
             bail!("--bframes 1 requires width and height divisible by 16");
         }
-        if args.sweep || args.compare_residual_modes || args.sweep_quality_bitrate {
-            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, or --compare-residual-modes");
+        if args.sweep
+            || args.compare_residual_modes
+            || args.compare_residual_contexts
+            || args.sweep_quality_bitrate
+        {
+            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, or --compare-residual-contexts");
         }
     }
     if args.sweep_quality_bitrate {
@@ -1530,6 +1675,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let partition_map_encoding = parse_partition_map_encoding(&args.partition_map_encoding)?;
     let partition_syntax_mode = parse_partition_syntax_mode(&args.partition_syntax)?;
     let entropy_model_mode = parse_entropy_model(&args.entropy_model)?;
+    let residual_context_mode = parse_residual_context_mode(&args.residual_context)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -1542,6 +1688,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         keyframe_interval: args.keyint.max(1),
         motion_search_radius: args.motion_radius,
         residual_entropy: residual,
+        residual_context_mode,
         adaptive_quantization_mode: aq_mode,
         aq_strength: args.aq_strength,
         min_block_qp_delta: args.block_aq_delta_min,
@@ -1567,6 +1714,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         entropy_model_mode,
         ..Default::default()
     };
+    s.validate_residual_context_mode()
+        .map_err(|e| anyhow!("residual context settings: {e}"))?;
     s.validate_rate_control()
         .map_err(|e| anyhow!("rate-control settings: {e}"))?;
     validate_adaptive_quant_settings(&s).map_err(|e| anyhow!("adaptive quant settings: {e}"))?;
@@ -1738,6 +1887,8 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             26 => c.rev26 += 1,
             27 => c.rev27 += 1,
             28 => c.rev28 += 1,
+            29 => c.rev29 += 1,
+            30 => c.rev30 += 1,
             _ => {}
         }
     }
@@ -2239,6 +2390,7 @@ fn run_compare_partition_syntax_report(
         x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
+        compare_residual_contexts: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -2892,6 +3044,7 @@ fn run_srsv2_numbers(
         } else {
             let mut settings_leg = settings.clone();
             settings_leg.residual_entropy = ResidualEntropy::Explicit;
+            settings_leg.residual_context_mode = SrsV2ResidualContextMode::Off;
             settings_leg.block_aq_mode = SrsV2BlockAqMode::Off;
             let mut sum = 0_u64;
             let mut slot = None::<YuvFrame>;
@@ -3056,9 +3209,14 @@ fn pass_to_details(
     let mut p_bytes = Vec::new();
     let mut b_bytes = Vec::new();
     let mut alt_bytes = Vec::new();
+    let intra_plane_chunks_sum: u64 = p
+        .payloads
+        .iter()
+        .filter_map(|pl| intra_plane_chunks_payload_sum(pl))
+        .sum();
     for pl in &p.payloads {
         match pl.get(3).copied() {
-            Some(1 | 3 | 7) => i_bytes.push(pl.len() as u64),
+            Some(1 | 3 | 7 | 29) => i_bytes.push(pl.len() as u64),
             Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25) => {
                 p_bytes.push(pl.len() as u64)
             }
@@ -3091,6 +3249,11 @@ fn pass_to_details(
         parse_ctu_size(args.ctu_size).unwrap(),
     )
     .unwrap_or_else(|_| ctu_grid_stats(args.width, args.height, CtuSize::Ctu16).unwrap());
+    let mut enc_agg = p.enc_stats.clone();
+    enc_agg.finalize_residual_context_derived();
+    let residual_bytes_total =
+        intra_plane_chunks_sum.saturating_add(m.residual_payload_bytes_p);
+    let frames_f = args.frames.max(1) as f64;
     Srsv2Details {
         frames: args.frames,
         keyframes: i_bytes.len() as u32,
@@ -3168,6 +3331,19 @@ fn pass_to_details(
         context_mv_bytes: context_mv_b,
         entropy_context_count: m.entropy_context_count,
         entropy_symbol_count: m.entropy_symbol_count,
+        residual_context_mode: residual_context_cli_label(settings.residual_context_mode)
+            .to_string(),
+        residual_context_enabled: enc_agg.residual_context_enabled,
+        residual_context_blocks: enc_agg.residual_context_blocks,
+        residual_context_bytes: enc_agg.residual_context_bytes,
+        residual_static_bytes_estimate: enc_agg.residual_static_bytes_estimate,
+        residual_context_savings_bytes: enc_agg.residual_context_savings_bytes,
+        residual_context_savings_percent: enc_agg.residual_context_savings_percent,
+        residual_context_failed_blocks: enc_agg.residual_context_failed_blocks,
+        total_bytes: enc_bytes,
+        residual_bytes: residual_bytes_total,
+        encode_fps: frames_f / p.enc_secs.max(1e-12),
+        decode_fps: frames_f / p.dec_secs.max(1e-12),
         entropy_failure_reason: None,
         partition: {
             let pcm = if matches!(
@@ -3388,6 +3564,7 @@ fn run_compare_b_modes_report(
         x265_bitrate_match,
         table,
         compare_residual_modes: None,
+        compare_residual_contexts: None,
         sweep: None,
         compare_b_modes: Some(rows),
         compare_inter_syntax: None,
@@ -3478,6 +3655,7 @@ fn run_single_report(
         x265_bitrate_match,
         table,
         compare_residual_modes: None,
+        compare_residual_contexts: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -3621,6 +3799,153 @@ fn run_compare_residual_report(
         x265_bitrate_match: None,
         table,
         compare_residual_modes: Some(entries),
+        compare_residual_contexts: None,
+        sweep: None,
+        compare_b_modes: None,
+        compare_inter_syntax: None,
+        compare_rdo: None,
+        compare_partitions: None,
+        compare_partition_costs: None,
+        compare_partition_syntax: None,
+        compare_entropy_models: None,
+        entropy_model_compare_summary: None,
+        match_x264_bitrate_note: None,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
+}
+
+fn run_compare_residual_contexts_report(
+    args: &Args,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    let re = parse_residual_entropy(&args.residual_entropy)?;
+    let res_entropy_str = match re {
+        ResidualEntropy::Explicit => "explicit",
+        ResidualEntropy::Auto => "auto",
+        ResidualEntropy::Rans => "rans",
+    };
+
+    let passes: [(&str, bool); 2] = [("off", false), ("context", true)];
+    let mut entries = Vec::new();
+    let mut table = Vec::new();
+    let mut primary_details: Option<Srsv2Details> = None;
+
+    for &(label, use_context) in &passes {
+        let mut a = args.clone();
+        if use_context {
+            apply_residual_context_v1_inter_stack_for_predicted_p(&mut a);
+            a.residual_context = "context".to_string();
+        } else {
+            a.residual_context = "off".to_string();
+        }
+
+        let st = match build_settings(&a, re) {
+            Ok(s) => s,
+            Err(e) => {
+                entries.push(ResidualCompareEntry {
+                    label: label.to_string(),
+                    ok: false,
+                    error: Some(format!("settings: {e:#}")),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(format!("settings: {e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        residual_entropy: res_entropy_str.to_string(),
+                        residual_context_mode: if use_context {
+                            "context".to_string()
+                        } else {
+                            "off".to_string()
+                        },
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+                continue;
+            }
+        };
+
+        let seq = build_seq_header(&a, &st);
+
+        match run_srsv2_pass(&a, &seq, raw, &st, expected_frame) {
+            Ok(numbers) => {
+                let row = pass_to_row(&a, label, &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, &seq, &st, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details = pass_to_details(&a, &seq, &st, res_entropy_str, &numbers, deblock);
+                if primary_details.is_none() {
+                    primary_details = Some(details.clone());
+                }
+                entries.push(ResidualCompareEntry {
+                    label: label.to_string(),
+                    ok: true,
+                    error: None,
+                    row: row.clone(),
+                    details,
+                });
+                table.push(row);
+            }
+            Err(e) => {
+                entries.push(ResidualCompareEntry {
+                    label: label.to_string(),
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(format!("{e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        residual_entropy: res_entropy_str.to_string(),
+                        residual_context_mode: if use_context {
+                            "context".to_string()
+                        } else {
+                            "off".to_string()
+                        },
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+            }
+        }
+    }
+
+    let srsv2 = primary_details.unwrap_or_else(|| entries[0].details.clone());
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "Residual coefficient context (`ContextV1`) is experimental; `--compare-residual-contexts` measures off vs context on the same clip (inter syntax aligned for predicted P frames when needed). Engineering measurement only.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2,
+        x264: None,
+        x265: None,
+        x265_bitrate_match: None,
+        table,
+        compare_residual_modes: None,
+        compare_residual_contexts: Some(entries),
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -3756,6 +4081,7 @@ fn run_compare_inter_syntax_report(
         x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
+        compare_residual_contexts: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: Some(entries),
@@ -3887,6 +4213,7 @@ fn run_compare_rdo_report(
         x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
+        compare_residual_contexts: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -4023,6 +4350,7 @@ fn run_compare_partitions_report(
         x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
+        compare_residual_contexts: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -4182,6 +4510,7 @@ fn run_compare_partition_costs_report(
         x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
+        compare_residual_contexts: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -4429,6 +4758,7 @@ fn run_compare_entropy_models_report(
         x265_bitrate_match: None,
         table,
         compare_residual_modes: None,
+        compare_residual_contexts: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -4717,6 +5047,21 @@ fn main() -> Result<()> {
     }
 
     let re = parse_residual_entropy(&args.residual_entropy)?;
+
+    if args.compare_residual_contexts {
+        let report = run_compare_residual_contexts_report(&args, &raw, expected_frame)?;
+        if let Some(p) = args.report_json.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        if let Some(p) = args.report_md.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        fs::write(&args.report_json, serde_json::to_string_pretty(&report)?)?;
+        fs::write(&args.report_md, to_markdown(&report))?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
     let settings = build_settings(&args, re)?;
     let seq = build_seq_header(&args, &settings);
 
@@ -5146,6 +5491,47 @@ fn to_markdown(r: &BenchReport) -> String {
             out.push_str(&format!(
                 "- **{}**: ok={} error={:?}\n",
                 e.label, e.ok, e.error
+            ));
+        }
+    }
+
+    if let Some(cr) = &r.compare_residual_contexts {
+        out.push_str("\n## Residual context comparison (`--compare-residual-contexts`)\n\n");
+        out.push_str(
+            "_Baseline **`off`** vs **`context`** (`ContextV1`) on the same clip; predicted **P** rows align inter syntax when needed. Byte savings come from encoder telemetry (`residual_context_savings_*`). Engineering measurement only — not a codec superiority claim._\n\n",
+        );
+        out.push_str("| Residual mode | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y | Status |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|---|\n");
+        for e in cr {
+            let d = &e.details;
+            let savings = format!(
+                "{} B ({:.2}%)",
+                d.residual_context_savings_bytes, d.residual_context_savings_percent
+            );
+            let status = if e.ok {
+                "ok".to_string()
+            } else {
+                e.error
+                    .as_deref()
+                    .map(|s| {
+                        let t = s.trim();
+                        if t.len() > 120 {
+                            format!("{}…", &t[..120])
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "error".to_string())
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {:.2} | {:.4} | {} |\n",
+                d.residual_context_mode,
+                d.total_bytes,
+                d.residual_bytes,
+                savings,
+                e.row.psnr_y,
+                e.row.ssim_y,
+                status.replace('|', "/"),
             ));
         }
     }
@@ -5809,6 +6195,124 @@ mod tests {
     }
 
     #[test]
+    fn residual_context_off_single_pass_reports_telemetry_fields() {
+        let report = run_ctu_report(64, 64, 2, &["--residual-context", "off"]);
+        assert_eq!(report.srsv2.residual_context_mode, "off");
+        assert!(report.srsv2.total_bytes > 0);
+        assert!(report.srsv2.encode_fps.is_finite());
+        assert!(report.srsv2.decode_fps.is_finite());
+    }
+
+    #[test]
+    fn residual_context_context_intra_only_clip_ok() {
+        let report = run_ctu_report(64, 64, 1, &["--residual-context", "context"]);
+        assert_eq!(report.srsv2.residual_context_mode, "context");
+        assert_eq!(report.srsv2.pframes, 0);
+    }
+
+    #[test]
+    fn compare_residual_contexts_two_passes_emit_rows_and_markdown_table() {
+        let (path, raw, fb) = write_test_yuv("rctx_cmp", 64, 64, 4);
+        let args = parse_test_args(&path, 64, 64, 4, &["--compare-residual-contexts"]);
+        validate_args(&args).unwrap();
+        let report = run_compare_residual_contexts_report(&args, &raw, fb).unwrap();
+        let rows = report.compare_residual_contexts.as_ref().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "off");
+        assert_eq!(rows[1].label, "context");
+        assert!(rows[0].ok, "{:?}", rows[0].error);
+        assert!(rows[1].ok, "{:?}", rows[1].error);
+        assert_eq!(rows[0].details.residual_context_mode, "off");
+        assert_eq!(rows[1].details.residual_context_mode, "context");
+        let md = to_markdown(&report);
+        assert!(md.contains("| Residual mode | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y | Status |"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_residual_contexts_second_row_error_still_emits_baseline_row() {
+        let md = to_markdown(&BenchReport {
+            note: "Engineering measurement only; not a marketing claim.",
+            residual_note: "n",
+            command: "test".into(),
+            raw_bytes: 1,
+            width: 64,
+            height: 64,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            x265: None,
+            x265_bitrate_match: None,
+            table: vec![],
+            compare_residual_modes: None,
+            compare_residual_contexts: Some(vec![
+                ResidualCompareEntry {
+                    label: "off".into(),
+                    ok: true,
+                    error: None,
+                    row: CodecRow {
+                        codec: "off".into(),
+                        error: None,
+                        bytes: 100,
+                        ratio: 1.0,
+                        bitrate_bps: 1.0,
+                        psnr_y: 40.0,
+                        ssim_y: 0.99,
+                        enc_fps: 10.0,
+                        dec_fps: 10.0,
+                    },
+                    details: Srsv2Details {
+                        frames: 2,
+                        residual_context_mode: "off".into(),
+                        total_bytes: 100,
+                        residual_bytes: 40,
+                        residual_context_savings_bytes: 0,
+                        residual_context_savings_percent: 0.0,
+                        ..Default::default()
+                    },
+                },
+                ResidualCompareEntry {
+                    label: "context".into(),
+                    ok: false,
+                    error: Some("simulated encode failure".into()),
+                    row: CodecRow {
+                        codec: "context".into(),
+                        error: Some("simulated encode failure".into()),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: 2,
+                        residual_context_mode: "context".into(),
+                        ..Default::default()
+                    },
+                },
+            ]),
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: None,
+            compare_partition_syntax: None,
+            compare_entropy_models: None,
+            entropy_model_compare_summary: None,
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "test".into(),
+        });
+        assert!(md.contains("| off |"));
+        assert!(md.contains("| context |"));
+        assert!(md.contains("simulated encode failure"));
+    }
+
+    #[test]
     fn default_ctu_size_16_preserves_encoded_bytes_when_reporting_changes() {
         let default_report = run_ctu_report(64, 64, 3, &[]);
         let ctu64_report = run_ctu_report(64, 64, 3, &["--ctu-size", "64"]);
@@ -5895,6 +6399,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -5988,6 +6494,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6080,6 +6588,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6174,6 +6684,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6268,6 +6780,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6364,6 +6878,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6474,6 +6990,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6575,6 +7093,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6693,6 +7213,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6794,6 +7316,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6900,6 +7424,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7040,6 +7566,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7259,6 +7787,18 @@ mod tests {
                 context_mv_bytes: 0,
                 entropy_context_count: 0,
                 entropy_symbol_count: 0,
+                residual_context_mode: "off".to_string(),
+                residual_context_enabled: false,
+                residual_context_blocks: 0,
+                residual_context_bytes: 0,
+                residual_static_bytes_estimate: 0,
+                residual_context_savings_bytes: 0,
+                residual_context_savings_percent: 0.0,
+                residual_context_failed_blocks: 0,
+                total_bytes: 0,
+                residual_bytes: 0,
+                encode_fps: 0.0,
+                decode_fps: 0.0,
                 entropy_failure_reason: None,
             },
             x264: None,
@@ -7276,6 +7816,7 @@ mod tests {
                 dec_fps: 1.0,
             }],
             compare_residual_modes: None,
+            compare_residual_contexts: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -7393,6 +7934,18 @@ mod tests {
                 context_mv_bytes: 0,
                 entropy_context_count: 0,
                 entropy_symbol_count: 0,
+                residual_context_mode: "off".to_string(),
+                residual_context_enabled: false,
+                residual_context_blocks: 0,
+                residual_context_bytes: 0,
+                residual_static_bytes_estimate: 0,
+                residual_context_savings_bytes: 0,
+                residual_context_savings_percent: 0.0,
+                residual_context_failed_blocks: 0,
+                total_bytes: 0,
+                residual_bytes: 0,
+                encode_fps: 0.0,
+                decode_fps: 0.0,
                 entropy_failure_reason: None,
             },
             x264: None,
@@ -7492,9 +8045,22 @@ mod tests {
                     context_mv_bytes: 0,
                     entropy_context_count: 0,
                     entropy_symbol_count: 0,
+                    residual_context_mode: "off".to_string(),
+                    residual_context_enabled: false,
+                    residual_context_blocks: 0,
+                    residual_context_bytes: 0,
+                    residual_static_bytes_estimate: 0,
+                    residual_context_savings_bytes: 0,
+                    residual_context_savings_percent: 0.0,
+                    residual_context_failed_blocks: 0,
+                    total_bytes: 0,
+                    residual_bytes: 0,
+                    encode_fps: 0.0,
+                    decode_fps: 0.0,
                     entropy_failure_reason: None,
                 },
             }]),
+            compare_residual_contexts: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -7528,6 +8094,7 @@ mod tests {
             x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: None,
+            compare_residual_contexts: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -7562,6 +8129,7 @@ mod tests {
             x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: None,
+            compare_residual_contexts: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -7596,6 +8164,7 @@ mod tests {
             x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: None,
+            compare_residual_contexts: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -7647,6 +8216,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7883,6 +8454,18 @@ mod tests {
                     context_mv_bytes: 0,
                     entropy_context_count: 0,
                     entropy_symbol_count: 0,
+                    residual_context_mode: "off".to_string(),
+                    residual_context_enabled: false,
+                    residual_context_blocks: 0,
+                    residual_context_bytes: 0,
+                    residual_static_bytes_estimate: 0,
+                    residual_context_savings_bytes: 0,
+                    residual_context_savings_percent: 0.0,
+                    residual_context_failed_blocks: 0,
+                    total_bytes: 0,
+                    residual_bytes: 0,
+                    encode_fps: 0.0,
+                    decode_fps: 0.0,
                     entropy_failure_reason: None,
                 },
             }],
@@ -7921,6 +8504,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8013,6 +8598,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "explicit".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8107,6 +8694,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: true,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8219,6 +8808,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8393,6 +8984,7 @@ mod tests {
             x265_bitrate_match: None,
             table: vec![],
             compare_residual_modes: None,
+            compare_residual_contexts: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -8465,6 +9057,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8557,6 +9151,8 @@ mod tests {
             x265_preset: "medium".to_string(),
             residual_entropy: "auto".to_string(),
             compare_residual_modes: false,
+            residual_context: "off".to_string(),
+            compare_residual_contexts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,

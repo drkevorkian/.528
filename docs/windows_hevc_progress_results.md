@@ -4,12 +4,13 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 
 ## Run
 
-- Date: 2026-05-08 21:35:39 -06:00
+- Date: 2026-05-09 16:16:05 -06:00
 - Output root: `var\bench\windows_hevc_progress\`
 - Seed: 528; fps: 30; QP: 28
 - Corpus: `moving-square`, `scrolling-bars`, `checker`, `scene-cut` (64x64, 8 frames)
 - FFmpeg available: **True**; libx264: **True**; libx265: **True**
-- Commands: `var\bench\windows_hevc_progress\commands_run.txt`
+- Commands: `var\bench\windows_hevc_progress\commands_run.txt` (includes `--compare-residual-contexts` per clip)
+- Residual-context tables: `reports\<tag>\compare_residual_contexts.{json,md}`
 
 ## Required Results
 
@@ -47,6 +48,36 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 | `scrolling_bars` | 8975 | 8976 | 1 |
 | `checker` | 16791 | 16792 | 1 |
 | `scene_cut` | 4956 | 4961 | 5 |
+
+### Did residual coefficient ContextV1 (`bench_srsv2 --compare-residual-contexts`) help?
+
+**No on total compressed bytes:** the `context` row exceeded `off` on **every** clip. PSNR-Y / SSIM-Y matched at printed precision between paired rows.
+
+**Fairness note:** `off` rows use default **raw** inter syntax; `context` rows upgrade predicted **P** frames to **entropy** inter + **context** MV + **fixed16x16** (required for FR2 residual ContextV1). Totals **mix** syntax changes with residual-context mode—not an isolated coefficient experiment.
+
+| Clip | Row | Inter syntax | Total bytes | Telemetry `residual_bytes` | PSNR-Y | SSIM-Y |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| `moving_square` | off | raw | 6783 | 6251 | 14.8952 | 0.619397 |
+| `moving_square` | context | entropy | 11264 | 1632 | 14.8952 | 0.619397 |
+| `scrolling_bars` | off | raw | 9190 | 8658 | 14.6554 | 0.557608 |
+| `scrolling_bars` | context | entropy | 14685 | 1632 | 14.6554 | 0.557608 |
+| `checker` | off | raw | 16978 | 16446 | 10.5063 | 0.13116 |
+| `checker` | context | entropy | 27086 | 1632 | 10.5063 | 0.13116 |
+| `scene_cut` | off | raw | 5166 | 4634 | 13.3004 | 0.693524 |
+| `scene_cut` | context | entropy | 9279 | 1632 | 13.3004 | 0.693524 |
+
+- Largest delta total (context minus off): **`checker`** (**+10108** bytes).
+
+- Bottleneck row again (partition-cost reference): `scene_cut/SRSV2-pc-fixed16x16` — winner bucket **`residual`** **4058** / **4949** total (**0.82** share).
+
+**Residual-context compare — direct answers**
+
+1. **Did residual ContextV1 reduce residual bytes?** Telemetry **`residual_bytes`** is **lower** on every **`context`** row here, but that field mixes intra payloads + **P** residual telemetry and the **`context`** row uses different FR2/inter paths—not an isolated proof ContextV1 compressed coefficients more tightly.
+2. **Did it reduce total bytes?** **No.** Delta (**`context`** minus **`off`**): `moving_square` **+4481**, `scrolling_bars` **+5495**, `checker` **+10108**, `scene_cut` **+4113**.
+3. **Did it preserve PSNR/SSIM?** **Yes** at the precision printed in the table (paired rows match).
+4. **Which clip improved most (total bytes)?** **None** — every **`context`** total was **larger**.
+5. **Which clip regressed most (total bytes)?** **`checker`** (**+10108** bytes).
+6. **Is residual still the largest bottleneck?** **Yes** on `scene_cut/SRSV2-pc-fixed16x16`: **`residual`** **4058** / **4949** (**~82%**).
 
 ### Did AutoFast RDO beat fixed16x16 anywhere?
 
@@ -99,11 +130,11 @@ Winner: **`residual`** with **4058** bytes.
 
 ## Next Feature
 
-Exactly one next feature: **C. context-adaptive residual coefficient entropy**.
+Exactly one next feature: **B. transform-size selection / coefficient layout improvements**.
 
-Reason from this run: Inter residual bytes are the largest named bucket.
+Reason from this run: --compare-residual-contexts increased totals on every corpus clip while residual remains the largest bucket; next lever is transform/coefficient layout (not an H.265 superiority claim).
 
-Allowed feature set checked: A. CTU-style 64x64 superblocks; B. bounded quadtree partitions; C. context-adaptive residual coefficient entropy; D. quarter-pel luma motion; E. SAO-like restoration filter; F. 10-bit/HDR profile; G. bitrate-matched x265 sweep.
+Allowed planning labels: **A** CTU64 encode path; **B** transform-size / coefficient layout; **C** context-adaptive residual training (only if residual ContextV1 wins totals); **D** quarter-pel luma motion; **E** bitrate-matched x265 sweep (fairness).
 
 ## Notes
 

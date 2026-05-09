@@ -153,6 +153,162 @@ fn compare_residual_modes_rans_row_can_fail_without_aborting() {
 }
 
 #[test]
+fn residual_context_off_on_golden_without_ffmpeg() {
+    let golden = golden_yuv_path();
+    let out_dir = std::env::temp_dir().join("qm-residual-ctx-off");
+    fs::create_dir_all(&out_dir).unwrap();
+    let report_json = out_dir.join("rctx_off.json");
+    let report_md = out_dir.join("rctx_off.md");
+    let bin = env!("CARGO_BIN_EXE_bench_srsv2");
+    let status = Command::new(bin)
+        .stdout(Stdio::null())
+        .args([
+            "--input",
+            golden.to_str().expect("utf-8 path"),
+            "--width",
+            "64",
+            "--height",
+            "64",
+            "--frames",
+            "10",
+            "--fps",
+            "24",
+            "--qp",
+            "28",
+            "--keyint",
+            "30",
+            "--motion-radius",
+            "16",
+            "--residual-context",
+            "off",
+            "--report-json",
+            report_json.to_str().expect("utf-8 path"),
+            "--report-md",
+            report_md.to_str().expect("utf-8 path"),
+        ])
+        .status()
+        .expect("spawn bench_srsv2");
+    assert!(status.success(), "{:?}", status.code());
+    let json = fs::read_to_string(&report_json).unwrap();
+    let v: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["srsv2"]["residual_context_mode"].as_str(),
+        Some("off"),
+        "{json}"
+    );
+}
+
+#[test]
+fn residual_context_context_one_frame_tiny_without_ffmpeg() {
+    let out_dir = std::env::temp_dir().join("qm-residual-ctx-intra");
+    fs::create_dir_all(&out_dir).unwrap();
+    let yuv = out_dir.join("one.yuv");
+    let meta = out_dir.join("one.json");
+    let spec = SyntheticClipSpec {
+        width: 64,
+        height: 64,
+        fps_num: 30,
+        fps_den: 1,
+        frames: 1,
+        pattern: SyntheticPattern::GrayRamp,
+        seed: 1,
+        allow_large: false,
+    };
+    write_yuv420p8_clip(&spec, &yuv, &meta).expect("write synthetic");
+    let report_json = out_dir.join("rctx_ctx.json");
+    let report_md = out_dir.join("rctx_ctx.md");
+    let bin = env!("CARGO_BIN_EXE_bench_srsv2");
+    let status = Command::new(bin)
+        .stdout(Stdio::null())
+        .args([
+            "--input",
+            yuv.to_str().expect("utf-8 path"),
+            "--width",
+            "64",
+            "--height",
+            "64",
+            "--frames",
+            "1",
+            "--fps",
+            "30",
+            "--qp",
+            "28",
+            "--keyint",
+            "30",
+            "--motion-radius",
+            "4",
+            "--residual-context",
+            "context",
+            "--report-json",
+            report_json.to_str().expect("utf-8 path"),
+            "--report-md",
+            report_md.to_str().expect("utf-8 path"),
+        ])
+        .status()
+        .expect("spawn bench_srsv2");
+    assert!(status.success(), "{:?}", status.code());
+    let json = fs::read_to_string(&report_json).unwrap();
+    let v: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["srsv2"]["residual_context_mode"].as_str(),
+        Some("context"),
+        "{json}"
+    );
+}
+
+#[test]
+fn compare_residual_contexts_two_rows_on_golden_without_ffmpeg() {
+    let golden = golden_yuv_path();
+    let out_dir = std::env::temp_dir().join("qm-compare-rctx");
+    fs::create_dir_all(&out_dir).unwrap();
+    let report_json = out_dir.join("cmp_rctx.json");
+    let report_md = out_dir.join("cmp_rctx.md");
+    let bin = env!("CARGO_BIN_EXE_bench_srsv2");
+    let status = Command::new(bin)
+        .stdout(Stdio::null())
+        .args([
+            "--input",
+            golden.to_str().expect("utf-8 path"),
+            "--width",
+            "64",
+            "--height",
+            "64",
+            "--frames",
+            "10",
+            "--fps",
+            "24",
+            "--qp",
+            "28",
+            "--keyint",
+            "30",
+            "--motion-radius",
+            "16",
+            "--compare-residual-contexts",
+            "--report-json",
+            report_json.to_str().expect("utf-8 path"),
+            "--report-md",
+            report_md.to_str().expect("utf-8 path"),
+        ])
+        .status()
+        .expect("spawn bench_srsv2");
+    assert!(status.success(), "{:?}", status.code());
+    let json = fs::read_to_string(&report_json).unwrap();
+    let v: Value = serde_json::from_str(&json).unwrap();
+    let arr = v["compare_residual_contexts"]
+        .as_array()
+        .expect("compare_residual_contexts array");
+    assert_eq!(arr.len(), 2);
+    assert_eq!(arr[0]["label"].as_str(), Some("off"));
+    assert_eq!(arr[1]["label"].as_str(), Some("context"));
+    assert!(arr[0]["ok"].as_bool() == Some(true));
+    assert!(arr[1]["ok"].as_bool() == Some(true));
+    let md = fs::read_to_string(&report_md).unwrap();
+    assert!(
+        md.contains("| Residual mode | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y | Status |")
+    );
+}
+
+#[test]
 fn sweep_emits_expected_grid_size() {
     let golden = golden_yuv_path();
     let out_dir = std::env::temp_dir().join("qm-sweep");

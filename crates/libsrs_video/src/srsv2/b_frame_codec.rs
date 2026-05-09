@@ -1031,6 +1031,7 @@ pub fn encode_yuv420_b_payload_mb_blend(
         ));
     }
     settings.validate_entropy_model_inter()?;
+    settings.validate_residual_context_b_frame()?;
     let w = seq.width;
     let h = seq.height;
     let qp_i = qp.max(1) as i16;
@@ -1217,11 +1218,16 @@ pub fn decode_yuv420_b_payload(
         return Err(SrsV2Error::Truncated);
     }
     if &payload[0..3] != b"FR2"
-        || !matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26)
+        || !matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26 | 31)
     {
         return Err(SrsV2Error::BadMagic);
     }
     let rev_byte = payload[3];
+    if rev_byte == 31 {
+        return Err(SrsV2Error::Unsupported(
+            "FR2 rev31 B-frame residual ContextV1 is reserved (not implemented)",
+        ));
+    }
     if rev_byte == 26 {
         return Err(SrsV2Error::Unsupported(
             "FR2 rev26 B-frame variable partition ContextV1 is not implemented in this slice",

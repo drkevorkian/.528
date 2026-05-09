@@ -24,15 +24,17 @@ use super::motion_search::{pick_mv, sad_16x16, sample_u8_plane, SrsV2MotionEncod
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode,
     SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode,
-    SrsV2SubpelMode,
+    SrsV2ResidualContextMode, SrsV2SubpelMode,
 };
 use super::rdo::{
     choose_best_inter_mode_candidate, estimate_mv_delta_wire_bytes,
     p_subblock_skip_residual_is_rdo_cheaper, rdo_fast_enabled, RdoModeDecisionStats, RdoStats,
 };
 use super::residual_entropy::{
-    decode_p_residual_chunk, encode_p_residual_chunk, BlockResidualCoding, PResidualChunkKind,
+    decode_p_residual_chunk, decode_p_residual_chunk_strict_rev30, encode_p_residual_chunk_with_opts,
+    BlockResidualCoding, PResidualChunkEncodeOpts, PResidualChunkKind, ResidualPlane,
 };
+use super::residual_context_entropy::ResidualContextModel;
 use super::residual_tokens::residual_token_model;
 use super::subpel::{
     refine_half_pel_center, sad_16x16_qpel, sample_luma_bilinear_qpel, validate_mv_qpel_halfgrid,
@@ -55,6 +57,8 @@ pub const FRAME_PAYLOAD_MAGIC_P_COMPACT: [u8; 4] = [b'F', b'R', b'2', 15];
 pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 17];
 /// P-frame **context entropy V1** MV section (`FR2` rev **23**).
 pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 23];
+/// **`P`** ContextV1 MV + strict residual ContextV1 (`FR2` rev **30**).
+pub const FRAME_PAYLOAD_MAGIC_P_RESIDUAL_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 30];
 
 /// One macroblock worth of P residuals (MV stored separately for compact modes).
 #[derive(Clone)]
@@ -203,6 +207,60 @@ fn read_u8(data: &[u8], cur: &mut usize) -> Result<u8, SrsV2Error> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn encode_p_subblock_residual_chunk(
+    qf: &[i16; 64],
+    settings: &SrsV2EncodeSettings,
+    rans_model: &RansModel,
+    ctx_model: Option<&ResidualContextModel>,
+    luma_nz_grid: &mut [bool],
+    luma_grid_bw: usize,
+    mbx: u32,
+    mby: u32,
+    si: usize,
+    strict_rev30_residual: bool,
+    residual_encode_stats: Option<&mut ResidualEncodeStats>,
+) -> Result<(Vec<u8>, PResidualChunkKind), SrsV2Error> {
+    let bx = (mbx * 2 + (si as u32 % 2)) as usize;
+    let by = (mby * 2 + (si as u32 / 2)) as usize;
+    let idx_b = by * luma_grid_bw + bx;
+    let left_nz = bx > 0 && luma_nz_grid[idx_b - 1];
+    let above_nz = by > 0 && luma_nz_grid[idx_b - luma_grid_bw];
+    let opts = PResidualChunkEncodeOpts {
+        residual_context_mode: settings.residual_context_mode,
+        context_model: ctx_model,
+        plane: ResidualPlane::Y,
+        left_neighbor_nonzero: left_nz,
+        above_neighbor_nonzero: above_nz,
+        strict_fr2_rev30_residual: strict_rev30_residual,
+    };
+    let (c, k) = encode_p_residual_chunk_with_opts(
+        qf,
+        settings.residual_entropy,
+        rans_model,
+        &opts,
+        residual_encode_stats,
+    )?;
+    let nz_ac = qf.iter().skip(1).any(|&v| v != 0);
+    luma_nz_grid[idx_b] = nz_ac;
+    Ok((c, k))
+}
+
+#[inline]
+fn mark_p_subblock_luma_nz(
+    luma_nz_grid: &mut [bool],
+    luma_grid_bw: usize,
+    mbx: u32,
+    mby: u32,
+    si: usize,
+    nz_ac: bool,
+) {
+    let bx = (mbx * 2 + (si as u32 % 2)) as usize;
+    let by = (mby * 2 + (si as u32 / 2)) as usize;
+    let idx_b = by * luma_grid_bw + bx;
+    luma_nz_grid[idx_b] = nz_ac;
+}
+
+#[allow(clippy::too_many_arguments)]
 fn encode_p_macroblock(
     cur: &YuvFrame,
     reference: &YuvFrame,
@@ -222,6 +280,10 @@ fn encode_p_macroblock(
     stats: &mut Option<&mut ResidualEncodeStats>,
     ms: &mut SrsV2MotionEncodeStats,
     block_wire_acc: &mut Option<&mut SrsV2BlockAqWireStats>,
+    ctx_model: Option<&ResidualContextModel>,
+    luma_nz_grid: &mut [bool],
+    luma_grid_bw: usize,
+    strict_rev30_residual: bool,
 ) -> Result<PMacroblockEncoded, SrsV2Error> {
     let mvx_i = (mvx_q / 4) as i16;
     let mvy_i = (mvy_q / 4) as i16;
@@ -277,8 +339,24 @@ fn encode_p_macroblock(
             if rdo_fast_enabled(settings.rdo_mode) {
                 let (chunk, kind) =
                     if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
+                        let mut linear = [0_i16; 64];
+                        for r in 0..8 {
+                            for c in 0..8 {
+                                linear[r * 8 + c] = blk[r][c];
+                            }
+                        }
+                        let f = fdct_8x8(&linear);
+                        let qf = quantize(&f, eff_i);
                         let mut c = Vec::new();
                         encode_residual_block_8x8(&blk, eff_i, &mut c)?;
+                        mark_p_subblock_luma_nz(
+                            luma_nz_grid,
+                            luma_grid_bw,
+                            mbx,
+                            mby,
+                            si,
+                            qf.iter().skip(1).any(|&v| v != 0),
+                        );
                         (c, None)
                     } else {
                         let mut linear = [0_i16; 64];
@@ -289,8 +367,22 @@ fn encode_p_macroblock(
                         }
                         let f = fdct_8x8(&linear);
                         let qf = quantize(&f, eff_i);
-                        let (c, k) =
-                            encode_p_residual_chunk(&qf, settings.residual_entropy, rans_model)?;
+                        let rs = stats
+                            .as_mut()
+                            .map(|slot| &mut **slot);
+                        let (c, k) = encode_p_subblock_residual_chunk(
+                            &qf,
+                            settings,
+                            rans_model,
+                            ctx_model,
+                            luma_nz_grid,
+                            luma_grid_bw,
+                            mbx,
+                            mby,
+                            si,
+                            strict_rev30_residual,
+                            rs,
+                        )?;
                         (c, Some(k))
                     };
                 let wire_res = (4 + chunk.len()) as i64 + if block_aq_wire { 1 } else { 0 };
@@ -305,6 +397,7 @@ fn encode_p_macroblock(
                     ms.skip_subblocks += 1;
                     ms.rdo.skip_decisions += 1;
                     ms.rdo.no_residual_decisions += 1;
+                    mark_p_subblock_luma_nz(luma_nz_grid, luma_grid_bw, mbx, mby, si, false);
                     continue;
                 }
                 ms.rdo.residual_decisions += 1;
@@ -320,6 +413,9 @@ fn encode_p_macroblock(
                                 s.p_explicit_chunks += 1;
                             }
                             PResidualChunkKind::Adaptive(BlockResidualCoding::RansV1) => {
+                                s.p_rans_chunks += 1;
+                            }
+                            PResidualChunkKind::Adaptive(BlockResidualCoding::ContextRansV1) => {
                                 s.p_rans_chunks += 1;
                             }
                         }
@@ -349,12 +445,29 @@ fn encode_p_macroblock(
             }
             pattern |= 1 << si;
             ms.skip_subblocks += 1;
+            mark_p_subblock_luma_nz(luma_nz_grid, luma_grid_bw, mbx, mby, si, false);
             continue;
         }
 
         let chunk = if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
+            let mut linear = [0_i16; 64];
+            for r in 0..8 {
+                for c in 0..8 {
+                    linear[r * 8 + c] = blk[r][c];
+                }
+            }
+            let f = fdct_8x8(&linear);
+            let qf = quantize(&f, eff_i);
             let mut c = Vec::new();
             encode_residual_block_8x8(&blk, eff_i, &mut c)?;
+            mark_p_subblock_luma_nz(
+                luma_nz_grid,
+                luma_grid_bw,
+                mbx,
+                mby,
+                si,
+                qf.iter().skip(1).any(|&v| v != 0),
+            );
             if let Some(s) = stats.as_mut() {
                 s.p_explicit_chunks += 1;
             }
@@ -368,7 +481,20 @@ fn encode_p_macroblock(
             }
             let f = fdct_8x8(&linear);
             let qf = quantize(&f, eff_i);
-            let (c, kind) = encode_p_residual_chunk(&qf, settings.residual_entropy, rans_model)?;
+            let rs = stats.as_mut().map(|slot| &mut **slot);
+            let (c, kind) = encode_p_subblock_residual_chunk(
+                &qf,
+                settings,
+                rans_model,
+                ctx_model,
+                luma_nz_grid,
+                luma_grid_bw,
+                mbx,
+                mby,
+                si,
+                strict_rev30_residual,
+                rs,
+            )?;
             if let Some(s) = stats.as_mut() {
                 match kind {
                     PResidualChunkKind::LegacyTuple => s.p_explicit_chunks += 1,
@@ -376,6 +502,9 @@ fn encode_p_macroblock(
                         s.p_explicit_chunks += 1;
                     }
                     PResidualChunkKind::Adaptive(BlockResidualCoding::RansV1) => {
+                        s.p_rans_chunks += 1;
+                    }
+                    PResidualChunkKind::Adaptive(BlockResidualCoding::ContextRansV1) => {
                         s.p_rans_chunks += 1;
                     }
                 }
@@ -465,6 +594,7 @@ pub fn encode_yuv420_p_payload(
     }
     settings.validate_entropy_model_inter()?;
     settings.validate_partition_syntax_inter()?;
+    settings.validate_residual_context_inter_residual()?;
 
     let block_aq_wire = matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
         && matches!(
@@ -548,6 +678,17 @@ pub fn encode_yuv420_p_payload(
     };
 
     let rans_model = residual_token_model();
+    let ctx_model_storage =
+        if matches!(settings.residual_context_mode, SrsV2ResidualContextMode::ContextV1) {
+            Some(ResidualContextModel::new())
+        } else {
+            None
+        };
+    let ctx_ref = ctx_model_storage.as_ref();
+    let block_bw_luma = (mb_cols * 2) as usize;
+    let mut luma_nz_grid = vec![false; block_bw_luma.saturating_mul(mb_rows as usize * 2)];
+    let strict_rev30_residual =
+        matches!(settings.residual_context_mode, SrsV2ResidualContextMode::ContextV1);
 
     let n_mb = (mb_cols as usize).saturating_mul(mb_rows as usize);
     let mut me_mvs: Vec<(i32, i32)> = Vec::with_capacity(n_mb);
@@ -688,6 +829,10 @@ pub fn encode_yuv420_p_payload(
                 &mut stats,
                 ms,
                 &mut block_wire_acc,
+                ctx_ref,
+                &mut luma_nz_grid,
+                block_bw_luma,
+                strict_rev30_residual,
             )?;
             mbs.push(enc);
         }
@@ -771,10 +916,15 @@ pub fn encode_yuv420_p_payload(
             }
         }
         SrsV2InterSyntaxMode::EntropyV1 => {
-            let magic_p_entropy = match settings.entropy_model_mode {
-                SrsV2EntropyModelMode::StaticV1 => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY,
-                SrsV2EntropyModelMode::ContextV1 => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1,
-            };
+            let magic_p_entropy =
+                if matches!(settings.residual_context_mode, SrsV2ResidualContextMode::ContextV1) {
+                    FRAME_PAYLOAD_MAGIC_P_RESIDUAL_CTX_V1
+                } else {
+                    match settings.entropy_model_mode {
+                        SrsV2EntropyModelMode::StaticV1 => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY,
+                        SrsV2EntropyModelMode::ContextV1 => FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1,
+                    }
+                };
             out.extend_from_slice(&magic_p_entropy);
             out.extend_from_slice(&frame_index.to_le_bytes());
             out.push(qp);
@@ -863,10 +1013,19 @@ pub fn encode_yuv420_p_payload(
             context: "encoded P-frame",
         });
     }
+    if let Some(s) = stats.as_mut() {
+        if matches!(
+            settings.residual_context_mode,
+            SrsV2ResidualContextMode::ContextV1
+        ) {
+            s.residual_context_enabled = true;
+        }
+        s.finalize_residual_context_derived();
+    }
     Ok(out)
 }
 
-/// Decode `FR2` rev **2**, **4**, **5**, **6**, **8**, **9**, **15**, or **17** P-frame into **reconstructed** YUV420p8 (no loop filter).
+/// Decode fixed-grid **`FR2` rev 2–9 / 15–17 / 23 / 30** **P**-frame into **reconstructed** YUV420p8 (no loop filter).
 ///
 /// Caller applies [`crate::srsv2::frame_codec::apply_reconstruction_filter_if_enabled`] before display/reference refresh when using raw decode entry points.
 pub fn decode_yuv420_p_payload(
@@ -903,12 +1062,13 @@ pub fn decode_yuv420_p_payload(
             seq, payload, reference, rev,
         );
     }
-    if !matches!(rev, 2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 23) {
+    if !matches!(rev, 2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 23 | 30) {
         return Err(SrsV2Error::BadMagic);
     }
-    let inter_compact = matches!(rev, 15 | 17 | 23);
-    let inter_entropy = matches!(rev, 17 | 23);
-    let inter_entropy_ctx_v1 = rev == 23;
+    let inter_compact = matches!(rev, 15 | 17 | 23 | 30);
+    let inter_entropy = matches!(rev, 17 | 23 | 30);
+    let inter_entropy_ctx_v1 = matches!(rev, 23 | 30);
+    let rev30_residual = rev == 30;
 
     let mut cur = 4usize;
     let frame_index = read_u32(payload, &mut cur)?;
@@ -943,6 +1103,8 @@ pub fn decode_yuv420_p_payload(
 
     let mb_cols = w / 16;
     let mb_rows = h / 16;
+    let block_bw_luma = (mb_cols * 2) as usize;
+    let mut luma_nz_grid = vec![false; block_bw_luma.saturating_mul(mb_rows as usize * 2)];
 
     let mv_grid: Option<Vec<(i32, i32)>> = if inter_compact {
         let validate_mv_wire = |mx: i32, my: i32| -> Result<(), SrsV2Error> {
@@ -1024,6 +1186,9 @@ pub fn decode_yuv420_p_payload(
 
             let sub_offsets = [(0_u32, 0_u32), (8, 0), (0, 8), (8, 8)];
             for (si, &(dx, dy)) in sub_offsets.iter().enumerate() {
+                let bx = (mbx * 2 + (si as u32 % 2)) as usize;
+                let by = (mby * 2 + (si as u32 / 2)) as usize;
+                let idx_blk = by * block_bw_luma + bx;
                 let skip = (pattern & (1 << si)) != 0;
                 if skip {
                     for row in 0..8 {
@@ -1040,6 +1205,7 @@ pub fn decode_yuv420_p_payload(
                             y_plane.samples[ly as usize * y_plane.stride + lx as usize] = pv;
                         }
                     }
+                    luma_nz_grid[idx_blk] = false;
                 } else {
                     let eff_i = if block_aq_wire {
                         let d = read_u8(payload, &mut cur)? as i8;
@@ -1059,7 +1225,21 @@ pub fn decode_yuv420_p_payload(
                     }
                     let chunk = &payload[chunk_start..chunk_end];
                     let res = if entropy_chunks {
-                        decode_p_residual_chunk(chunk, eff_i)?
+                        if rev30_residual {
+                            let left_nz = bx > 0 && luma_nz_grid[idx_blk - 1];
+                            let above_nz = by > 0 && luma_nz_grid[idx_blk - block_bw_luma];
+                            let (res, nz_ac) = decode_p_residual_chunk_strict_rev30(
+                                chunk,
+                                eff_i,
+                                ResidualPlane::Y,
+                                left_nz,
+                                above_nz,
+                            )?;
+                            luma_nz_grid[idx_blk] = nz_ac;
+                            res
+                        } else {
+                            decode_p_residual_chunk(chunk, eff_i)?
+                        }
                     } else {
                         let mut c = 0usize;
                         let r = decode_residual_block_8x8(chunk, &mut c, eff_i)?;

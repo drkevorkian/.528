@@ -32,6 +32,7 @@ pub mod rdo;
 pub mod reference;
 pub mod reference_manager;
 pub mod residual_entropy;
+pub mod residual_context_entropy;
 pub mod residual_tokens;
 pub mod subpel;
 
@@ -94,6 +95,7 @@ pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
     SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode,
+    SrsV2ResidualContextMode,
     SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode,
     SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
     SrsV2SubpelMode, SrsV2TransformSize, SrsV2TransformSizeMode,

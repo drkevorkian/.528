@@ -975,6 +975,9 @@ fn encode_residual_subblocks_for_pu(
                     PResidualChunkKind::Adaptive(BlockResidualCoding::RansV1) => {
                         s.p_rans_chunks += 1;
                     }
+                    PResidualChunkKind::Adaptive(BlockResidualCoding::ContextRansV1) => {
+                        s.p_rans_chunks += 1;
+                    }
                 }
             }
             push_chunk(chunk, stats, ms, block_wire_acc)?;
@@ -1027,6 +1030,7 @@ pub fn encode_yuv420_p_payload_var_partition(
         return Err(SrsV2Error::Unsupported("P-frame encode requires YUV420p8"));
     }
     settings.validate_entropy_model_inter()?;
+    settings.validate_residual_context_inter_residual()?;
     let w = seq.width;
     let h = seq.height;
     let mb_cols = w / 16;

@@ -6,6 +6,20 @@ use super::limits::{
     MAX_MOTION_SEARCH_RADIUS, MAX_MOTION_VECTOR_PELS, MAX_SUBPEL_REFINEMENT_RADIUS,
 };
 
+/// Experimental residual coefficient context entropy (`TAG_CONTEXT_RANS_AC` in intra plane payloads and **P** luma chunks).
+///
+/// **Intra** uses **`FR2` rev29** when combined with adaptive residual entropy; **P** uses **rev30** under
+/// [`SrsV2EncodeSettings::validate_residual_context_inter_residual`]. **B** encode rejects ContextV1 until **rev31**
+/// ([`SrsV2EncodeSettings::validate_residual_context_b_frame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2ResidualContextMode {
+    /// Legacy behavior: [`ResidualEntropy`] only (explicit / static rANS / auto).
+    #[default]
+    Off,
+    /// Multi-context static rANS over [`super::residual_tokens`] alphabet (opt-in; requires [`ResidualEntropy::Auto`] or [`ResidualEntropy::Rans`]).
+    ContextV1,
+}
+
 /// How 8×8 residual blocks choose explicit tuples vs static rANS (`FR2` rev 3/4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ResidualEntropy {
@@ -22,8 +36,37 @@ pub enum ResidualEntropy {
 pub struct ResidualEncodeStats {
     pub intra_explicit_blocks: u64,
     pub intra_rans_blocks: u64,
+    /// Intra blocks coded with [`SrsV2ResidualContextMode::ContextV1`] (`TAG_CONTEXT_RANS_AC`).
+    pub intra_context_residual_blocks: u64,
     pub p_explicit_chunks: u64,
     pub p_rans_chunks: u64,
+
+    /// True when [`SrsV2ResidualContextMode::ContextV1`] was enabled for this encode call (intra and/or P).
+    pub residual_context_enabled: bool,
+    /// Count of **`TAG_CONTEXT_RANS_AC`** tails (intra blocks + **P** adaptive chunks).
+    pub residual_context_blocks: u64,
+    /// Sum of context residual tail bytes (`1` tag + `2` length + blob) for [`Self::residual_context_blocks`].
+    pub residual_context_bytes: u64,
+    /// Sum of per-block estimates of the smaller non-context tail (`min`(explicit AC tail, static rANS tail)).
+    pub residual_static_bytes_estimate: u64,
+    /// Aggregate `max(0, estimate − context_tail)` over context blocks (best-effort “would have spent more” proxy).
+    pub residual_context_savings_bytes: u64,
+    /// `100 * residual_context_savings_bytes / residual_static_bytes_estimate`, or `0` if estimate is zero.
+    pub residual_context_savings_percent: f64,
+    /// Context blocks whose tail was larger than [`Self::residual_static_bytes_estimate`] contribution for that block.
+    pub residual_context_failed_blocks: u64,
+}
+
+impl ResidualEncodeStats {
+    /// Recompute [`Self::residual_context_savings_percent`] from accumulated byte counters (call after a frame).
+    pub fn finalize_residual_context_derived(&mut self) {
+        self.residual_context_savings_percent = if self.residual_static_bytes_estimate > 0 {
+            100.0 * self.residual_context_savings_bytes as f64
+                / self.residual_static_bytes_estimate as f64
+        } else {
+            0.0
+        };
+    }
 }
 
 /// High-level rate-control strategy (bench / encoder).
@@ -248,6 +291,8 @@ pub struct SrsV2EncodeSettings {
     pub motion_search_radius: i16,
     pub tune_quality_vs_speed: u8,
     pub residual_entropy: ResidualEntropy,
+    /// Intra-only experimental context residual entropy (**default** [`SrsV2ResidualContextMode::Off`]).
+    pub residual_context_mode: SrsV2ResidualContextMode,
 
     pub adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode,
     pub aq_strength: u8,
@@ -325,6 +370,7 @@ impl Default for SrsV2EncodeSettings {
             motion_search_radius: 16,
             tune_quality_vs_speed: 50,
             residual_entropy: ResidualEntropy::Auto,
+            residual_context_mode: SrsV2ResidualContextMode::Off,
 
             adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
             aq_strength: 4,
@@ -388,6 +434,70 @@ pub fn rdo_lambda_fp_from_qp(qp: u8) -> i64 {
 }
 
 impl SrsV2EncodeSettings {
+    /// [`SrsV2ResidualContextMode::ContextV1`] requires adaptive residual entropy (not [`ResidualEntropy::Explicit`]).
+    pub fn validate_residual_context_mode(&self) -> Result<(), SrsV2Error> {
+        match self.residual_context_mode {
+            SrsV2ResidualContextMode::Off => Ok(()),
+            SrsV2ResidualContextMode::ContextV1 => {
+                if matches!(self.residual_entropy, ResidualEntropy::Explicit) {
+                    Err(SrsV2Error::syntax(
+                        "residual_context_mode ContextV1 requires residual_entropy Auto or Rans",
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// **`P`** frames may use [`SrsV2ResidualContextMode::ContextV1`] only when emitting **`FR2` rev30**
+    /// (`EntropyV1` inter syntax + [`SrsV2EntropyModelMode::ContextV1`] MV + fixed **16×16** partitions).
+    ///
+    /// **`B`** frames: use [`Self::validate_residual_context_b_frame`] on B encode entry points (**`FR2` rev31** reserved).
+    pub fn validate_residual_context_inter_residual(&self) -> Result<(), SrsV2Error> {
+        if !matches!(
+            (self.residual_context_mode, self.residual_entropy),
+            (
+                SrsV2ResidualContextMode::ContextV1,
+                ResidualEntropy::Auto | ResidualEntropy::Rans
+            )
+        ) {
+            return Ok(());
+        }
+        if self.inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16 {
+            return Err(SrsV2Error::syntax(
+                "residual_context_mode ContextV1 for P requires fixed 16×16 partitions (FR2 rev30)",
+            ));
+        }
+        if self.inter_syntax_mode != SrsV2InterSyntaxMode::EntropyV1 {
+            return Err(SrsV2Error::syntax(
+                "residual_context_mode ContextV1 for P requires inter_syntax_mode EntropyV1 (FR2 rev30)",
+            ));
+        }
+        if self.entropy_model_mode != SrsV2EntropyModelMode::ContextV1 {
+            return Err(SrsV2Error::syntax(
+                "residual_context_mode ContextV1 for P requires entropy_model_mode ContextV1 (FR2 rev30)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// **B** encode rejects [`SrsV2ResidualContextMode::ContextV1`] until **`FR2` rev31** residual wiring exists.
+    pub fn validate_residual_context_b_frame(&self) -> Result<(), SrsV2Error> {
+        if !matches!(
+            (self.residual_context_mode, self.residual_entropy),
+            (
+                SrsV2ResidualContextMode::ContextV1,
+                ResidualEntropy::Auto | ResidualEntropy::Rans
+            )
+        ) {
+            return Ok(());
+        }
+        Err(SrsV2Error::Unsupported(
+            "residual_context_mode ContextV1 for B frames is not implemented in this slice (FR2 rev31 reserved)",
+        ))
+    }
+
     /// [`SrsV2EntropyModelMode::ContextV1`] requires [`SrsV2InterSyntaxMode::EntropyV1`] (no silent downgrade).
     pub fn validate_entropy_model_inter(&self) -> Result<(), SrsV2Error> {
         match self.entropy_model_mode {
@@ -798,5 +908,85 @@ mod tests {
             s.clamped_subpel_refinement_radius(),
             MAX_SUBPEL_REFINEMENT_RADIUS
         );
+    }
+
+    #[test]
+    fn residual_context_mode_defaults_off() {
+        let s = SrsV2EncodeSettings::default();
+        assert_eq!(s.residual_context_mode, SrsV2ResidualContextMode::Off);
+    }
+
+    #[test]
+    fn residual_context_context_v1_validates_with_auto_or_rans() {
+        let ok_auto = SrsV2EncodeSettings {
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            residual_entropy: ResidualEntropy::Auto,
+            ..Default::default()
+        };
+        assert!(ok_auto.validate_residual_context_mode().is_ok());
+        let ok_rans = SrsV2EncodeSettings {
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            residual_entropy: ResidualEntropy::Rans,
+            ..Default::default()
+        };
+        assert!(ok_rans.validate_residual_context_mode().is_ok());
+    }
+
+    #[test]
+    fn residual_context_context_v1_with_explicit_rejected() {
+        let s = SrsV2EncodeSettings {
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            residual_entropy: ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        assert!(s.validate_residual_context_mode().is_err());
+    }
+
+    #[test]
+    fn residual_context_inter_residual_rejects_context_v1_with_adaptive_entropy() {
+        let s = SrsV2EncodeSettings {
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            residual_entropy: ResidualEntropy::Auto,
+            ..Default::default()
+        };
+        assert!(s.validate_residual_context_inter_residual().is_err());
+        let s_rans = SrsV2EncodeSettings {
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            residual_entropy: ResidualEntropy::Rans,
+            ..Default::default()
+        };
+        assert!(s_rans.validate_residual_context_inter_residual().is_err());
+        let s_off = SrsV2EncodeSettings::default();
+        assert!(s_off.validate_residual_context_inter_residual().is_ok());
+    }
+
+    #[test]
+    fn residual_context_inter_residual_allows_fr2_rev30_stack() {
+        let s = SrsV2EncodeSettings {
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            residual_entropy: ResidualEntropy::Rans,
+            inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+            entropy_model_mode: SrsV2EntropyModelMode::ContextV1,
+            inter_partition_mode: SrsV2InterPartitionMode::Fixed16x16,
+            ..Default::default()
+        };
+        assert!(s.validate_residual_context_inter_residual().is_ok());
+    }
+
+    #[test]
+    fn residual_context_b_frame_rejects_context_v1_until_rev31() {
+        use crate::srsv2::error::SrsV2Error;
+        let s = SrsV2EncodeSettings {
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            residual_entropy: ResidualEntropy::Rans,
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate_residual_context_b_frame(),
+            Err(SrsV2Error::Unsupported(_))
+        ));
+        assert!(SrsV2EncodeSettings::default()
+            .validate_residual_context_b_frame()
+            .is_ok());
     }
 }
