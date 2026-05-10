@@ -29,8 +29,10 @@ pub const FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 3];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 7];
 /// Intra adaptive residuals **strict** multi-context rANS (`FR2` rev **29**).
 pub const FRAME_PAYLOAD_MAGIC_INTRA_RESIDUAL_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 29];
-/// Intra with [`SrsV2CoeffLayoutMode::CompactV1`] (`FR2` rev **32**): per-plane **Tx8×8** tag + per **8×8** block
-/// prediction mode, **resolved** scan tag, compact bitmap + scan-ordered quantized coefficients ([`encode_plane_intra_compact_v32`]).
+/// Intra with [`SrsV2CoeffLayoutMode::CompactV1`] (`FR2` rev **32**): per-plane layout tag (**`1`** = uniform **Tx8×8**;
+/// **`2`** = per-MB transform select when [`SrsV2TransformDecisionMode`] is **`Smooth8x8Detail4x4`** / **`RdoFast`**),
+/// then per **8×8** block prediction mode, **resolved** scan tag, compact bitmap + scan-ordered quantized coefficients
+/// ([`encode_plane_intra_compact_v32`] in `residual_entropy`).
 pub const FRAME_PAYLOAD_MAGIC_INTRA_COMPACT_V1: [u8; 4] = [b'F', b'R', b'2', 32];
 /// Non-displayable reference refresh (`FR2` rev **12**, experimental).
 pub const FRAME_PAYLOAD_MAGIC_ALT_REF: [u8; 4] = [b'F', b'R', b'2', 12];
@@ -1849,6 +1851,10 @@ mod roundtrip_tests {
             stats.intra_coeff_scan_mode,
             Some(SrsV2CoeffScanMode::ZigZag)
         );
+        assert_eq!(
+            stats.intra_tx4x4_blocks, 0,
+            "legacy transform decision keeps rev32 intra on Tx8×8 only"
+        );
         assert!(stats.intra_tx8x8_blocks > 0);
         assert!(stats.coeff_layout_bytes > 0);
         assert!(stats.coeff_legacy_estimated_bytes > 0);
@@ -2030,6 +2036,74 @@ mod roundtrip_tests {
             stats.coeff_legacy_estimated_bytes
         );
         assert!(stats.coeff_layout_savings_bytes >= 0);
+    }
+
+    #[test]
+    fn fr2_rev32_malformed_plane_layout_tag_fails_decode() {
+        let seq = seq64_intra();
+        let mut rgb = vec![0_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let i = (y * 64 + x) * 3;
+                let v = ((x.wrapping_mul(17)) ^ (y.wrapping_mul(31))) as u8;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            ..Default::default()
+        };
+        let mut payload = encode_yuv420_intra_payload(&seq, &yuv, 0, 18, &st, None, None).unwrap();
+        assert_eq!(payload[3], 32);
+        const Y_PLANE_TAG_OFF: usize = 4 + 4 + 1 + 4;
+        payload[Y_PLANE_TAG_OFF] = 99;
+        assert!(decode_yuv420_intra_payload(&seq, &payload).is_err());
+    }
+
+    #[test]
+    fn fr2_rev32_smooth_detail_uses_mixed_plane_tag_and_roundtrips() {
+        let seq = seq64_intra();
+        let mut rgb = vec![0_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let v = if ((x ^ y) & 1) == 0 { 20_u8 } else { 235_u8 };
+                let i = (y * 64 + x) * 3;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            transform_decision_mode: SrsV2TransformDecisionMode::Smooth8x8Detail4x4,
+            ..Default::default()
+        };
+        let mut stats = ResidualEncodeStats::default();
+        let payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 7, 22, &st, Some(&mut stats), None).unwrap();
+        assert_eq!(payload[3], 32);
+        const Y_PLANE_TAG_OFF: usize = 4 + 4 + 1 + 4;
+        assert_eq!(
+            payload[Y_PLANE_TAG_OFF], 2,
+            "mixed per-MB transform plane uses layout tag 2"
+        );
+        assert!(
+            stats.intra_tx4x4_blocks > 0,
+            "sharp checkerboard luma should pick some Tx4×4 MBs (got tx4={} tx8={})",
+            stats.intra_tx4x4_blocks,
+            stats.intra_tx8x8_blocks
+        );
+        let dec_a = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        let dec_b = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        assert_eq!(dec_a.frame_index, 7);
+        assert_eq!(dec_a.yuv.y.samples, dec_b.yuv.y.samples);
+        assert_eq!(dec_a.yuv.u.samples, dec_b.yuv.u.samples);
+        assert_eq!(dec_a.yuv.v.samples, dec_b.yuv.v.samples);
     }
 
     #[test]

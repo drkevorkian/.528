@@ -17,7 +17,7 @@ pub enum Srsv2PayloadKind {
 
 /// Classify a mux/elementary SRSV2 frame payload by its `FR2` revision.
 ///
-/// - `FR2\\x01` / `FR2\\x03` / `FR2\\x07` / `FR2\\x29` / `FR2\\x20` (**32**) → [`Srsv2PayloadKind::Intra`] (rev 3/7 use entropy residuals; rev 7 adds block `qp_delta`; rev **29** is strict intra residual ContextV1; rev **32** is intra CompactV1 coefficient layout)
+/// - `FR2\\x01` / `FR2\\x03` / `FR2\\x07` / `FR2\\x29` / `FR2\\x32` → [`Srsv2PayloadKind::Intra`] (rev 3/7 use entropy residuals; rev 7 adds block `qp_delta`; rev **29** is strict intra residual ContextV1; rev **32** is intra CompactV1 coefficient layout)
 /// - Forward/inter and experimental **B** revisions (**2**, **4**–**11**, **13**–**31**, **33**) → [`Srsv2PayloadKind::Predicted`] for mux/index policy (includes **P** rev **19**/**20**/**23**/**25**/**27**/**28**/**30**/**33** (CompactV1 P residuals), **B** rev **16**/**18**/**24**, and reserved **B** rev **21**/**22**/**26**/**31** — **decode** may still return `Unsupported` for some of these; see `docs/video_bitstream_v2.md`)
 /// - `FR2\\x0C` → [`Srsv2PayloadKind::AltRef`]
 /// - Other `FR2\\x??` → [`Srsv2PayloadKind::Unknown`]

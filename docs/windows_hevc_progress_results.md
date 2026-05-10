@@ -4,15 +4,15 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 
 ## Run
 
-- Date: 2026-05-10 12:29:45 -06:00
+- Date: 2026-05-10 13:43:30 -06:00 (baseline); **`--compare-coeff-layouts`** finished ~13:44 -06:00
 - Output root: `var\bench\windows_hevc_progress\`
 - Seed: 528; fps: 30; QP: 28
-- Corpus: `moving-square`, `scrolling-bars`, `checker`, `scene-cut` (64x64, 8 frames)
+- Corpus: `moving-square`, `scrolling-bars`, `checker`, `scene-cut` (64×64, 8 frames)
 - FFmpeg available: **True**; libx264: **True**; libx265: **True**
-- Commands: `var\bench\windows_hevc_progress\commands_run.txt` (includes `--compare-residual-contexts` per clip; **post-gate** `--compare-coeff-layouts` lines appended)
-- Git (coeff-layout JSON): **b1a4994**
+- Commands: `var\bench\windows_hevc_progress\commands_run.txt` (baseline per clip + **`--compare-coeff-layouts`** lines appended)
+- Git (coeff-layout JSON): **c4a2203**
 - Residual-context tables: `reports\<tag>\compare_residual_contexts.{json,md}`
-- Coefficient-layout compare: `reports\<tag>\compare_coeff_layouts.{json,md}` (`bench_srsv2 --compare-coeff-layouts`, same WxHxframes / QP / keyint / motion as gate)
+- Coefficient-layout compare: `reports\<tag>\compare_coeff_layouts.{json,md}` (`bench_srsv2 --compare-coeff-layouts`, same WxH×frames / QP **28** / keyint **8** / motion-radius **4** as gate)
 
 ## Required Results
 
@@ -92,11 +92,11 @@ Harness holds **`--residual-entropy auto`**, **`--residual-context off`**, **`--
 | `checker` | 16761 | 16446 | 18410 | 1283 | **+1649** | 10.5063 | 0.131160 |
 | `scene_cut` | 4949 | 4634 | 7698 | 1193 | **+2749** | 13.3004 | 0.693524 |
 
-On every clip, **zigzag**, **grouped-low-first**, **run-optimized**, and **auto** compact rows reported **identical** `total_bytes` / `residual_bytes` (table shows **compact-zigzag** as representative). Intra **CompactV1** telemetry on those rows reported **`coeff_layout_savings_percent`** ≈ **49.9–52.6%** vs the encoder’s legacy-estimate baseline for **rev32** intra coefficient packaging — **full clip totals still grew**, so estimated packaging savings did not win on total bitstream size here.
+On every clip, **zigzag**, **grouped-low-first**, **run-optimized**, and **auto** compact rows reported **identical** `total_bytes` / `residual_bytes` (table shows **compact-zigzag** as representative). Encoder telemetry on compact rows (**`coeff_layout_savings_percent`** vs legacy coefficient-byte **estimate**): **`moving_square`** ≈ **31.3%**, **`scrolling_bars`** ≈ **28.3%**, **`checker`** ≈ **1.4%**, **`scene_cut`** ≈ **39.7%** — **full clip totals still grew**, so estimated packaging savings did not translate into smaller bitstreams here.
 
 **Coefficient-layout compare — direct answers**
 
-1. **Did CompactV1 reduce residual bytes (telemetry)?** The reported **`residual_bytes`** field **drops** on compact rows while **`residual_bytes_delta_vs_legacy_zigzag`** is **negative** on every clip — but this mixes **rev32/33** attribution with legacy intra/**P** residual accounting; it is **not** proof the underlying prediction residual energy shrank.
+1. **Did CompactV1 reduce residual bytes (telemetry)?** The reported **`residual_bytes`** field **drops** on compact rows while **`residual_bytes_delta_vs_legacy_zigzag`** is **negative** on every clip — this reflects **mixed FR2 rev32/33 vs legacy** accounting in the bench metric, **not** proof that underlying prediction residual energy shrank.
 2. **Did CompactV1 reduce total bytes?** **No.** Δ total **+1649…+2921** on **every** clip (table above).
 3. **Did PSNR/SSIM stay the same or improve?** **Same** at the precision shown — all five rows match per clip.
 4. **Which scan won most often?** **None — four-way tie** on **`total_bytes`** / **`residual_bytes`** for every corpus clip in this run.
@@ -153,11 +153,11 @@ Winner: **`residual`** with **4058** bytes.
 
 ## Next Feature
 
-Exactly one next feature: **B. Transform-size decision / coefficient grouping** (Block 6 option **B**).
+Exactly one next feature: **B. transform-size selection / coefficient grouping improvements**.
 
-Reason from this run: **`--compare-coeff-layouts`** shows **CompactV1** compact scans **increase total bytes on every corpus clip** while **PSNR-Y / SSIM-Y** are unchanged; **scan modes tied**. Telemetry shows large **negative** `residual_bytes_delta_vs_legacy_zigzag` but **not** a total-byte win — per rubric, **do not** choose **A** (expand CompactV1 to **B** frames + variable partitions) until totals improve. **`--compare-residual-contexts`** still **increased totals on every clip**. The partition-cost reference row still has **`residual` ~82%** — **not C** (CTU64) or **D** (quarter-pel) as primary. Optional **E** (bitrate-matched x265) remains a **fairness** follow-up (achieved bitrate gap **~0.475** vs SRSV2 on the optional row); it **does not replace B**. No H.265/HEVC superiority claim.
+Reason from this run: **`--compare-coeff-layouts`** shows CompactV1 **increases** total bytes on **all four** clips despite favorable encoder **`coeff_layout_savings_percent`** on some clips; residual remains the dominant bucket on **`scene_cut/SRSV2-pc-fixed16x16`**. Next lever is **transform / coefficient grouping decisions**, not expanding CompactV1 surface (**not** an H.265 superiority claim).
 
-Allowed planning labels (Block 6): **A** integrate coefficient layout into **B** frames + variable partitions (if CompactV1 helps totals); **B** transform decision / coefficient grouping (if CompactV1 fails totals); **C** CTU64 encode path (if residual no longer dominates); **D** quarter-pel luma (if prediction error dominates); **E** bitrate-matched x265 sweep (if comparison fairness dominates).
+Allowed planning labels: **A** CTU64 encode path; **B** transform-size / coefficient layout; **C** context-adaptive residual training (only if residual ContextV1 wins totals); **D** quarter-pel luma motion; **E** bitrate-matched x265 sweep (fairness).
 
 ## Notes
 

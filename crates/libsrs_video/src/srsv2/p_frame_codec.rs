@@ -228,18 +228,12 @@ fn encode_p_subblock_residual_chunk(
     residual_encode_stats: Option<&mut ResidualEncodeStats>,
 ) -> Result<(Vec<u8>, PResidualChunkKind), SrsV2Error> {
     if matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1) {
-        let wire = encode_p_residual_chunk_compact_v33_wire(qf, settings)?;
+        let wire = encode_p_residual_chunk_compact_v33_wire(qf, settings, residual_encode_stats)?;
         let nz_ac = qf.iter().skip(1).any(|&v| v != 0);
         let bx = (mbx * 2 + (si as u32 % 2)) as usize;
         let by = (mby * 2 + (si as u32 / 2)) as usize;
         let idx_b = by * luma_grid_bw + bx;
         luma_nz_grid[idx_b] = nz_ac;
-        if let Some(s) = residual_encode_stats {
-            s.p_compact_coeff_chunks = s.p_compact_coeff_chunks.saturating_add(1);
-            s.p_compact_coeff_payload_bytes = s
-                .p_compact_coeff_payload_bytes
-                .saturating_add(wire.len() as u64);
-        }
         return Ok((wire, PResidualChunkKind::CompactCoeffV1));
     }
     let bx = (mbx * 2 + (si as u32 % 2)) as usize;
@@ -1097,6 +1091,7 @@ pub fn encode_yuv420_p_payload(
             s.residual_context_enabled = true;
         }
         s.finalize_residual_context_derived();
+        s.finalize_coeff_layout_derived();
     }
     Ok(out)
 }
@@ -2385,6 +2380,10 @@ mod tests {
         assert!(
             rs.p_compact_coeff_payload_bytes > 0,
             "expected nonzero compact coeff bytes"
+        );
+        assert!(
+            rs.coeff_layout_bytes > 0 && rs.coeff_legacy_estimated_bytes > 0,
+            "coeff_layout telemetry should include rev33 P chunks"
         );
         assert!(
             ms.inter_mv.residual_payload_bytes > 0,

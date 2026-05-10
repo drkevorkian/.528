@@ -731,6 +731,12 @@ mod tests {
         c[ZIGZAG[10]] = -7;
         c[45] = 3;
         assert_roundtrip(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::RunOptimized);
+        let mut c4 = [0_i16; 64];
+        for q in 0..4 {
+            c4[q * 16] = (q as i16 + 1) * 10;
+            c4[q * 16 + 5] = -3;
+        }
+        assert_roundtrip(&c4, SrsV2TransformKind::Tx4x4, SrsV2CoeffScan::RunOptimized);
     }
 
     #[test]
@@ -877,6 +883,20 @@ mod tests {
             decode_coeff_layout_compact_v1(&badver),
             Err(TransformLayoutError::UnsupportedVersion(99))
         ));
+        let mut bad_layout = encode_coeff_layout_compact_v1(
+            &[7_i16; 64],
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::ZigZag,
+        )
+        .unwrap();
+        bad_layout[7] = 0;
+        assert!(matches!(
+            decode_coeff_layout_compact_v1(&bad_layout),
+            Err(TransformLayoutError::InvalidDiscriminant(
+                "coeff_layout_mode",
+                0
+            ))
+        ));
     }
 
     #[test]
@@ -889,6 +909,19 @@ mod tests {
             encode_coeff_layout_compact_v1(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::ZigZag)
                 .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn transform_layout_summary_deterministic_for_same_input() {
+        let mut c = [0_i16; 64];
+        c[0] = 5;
+        c[3] = -2;
+        c[ZIGZAG[15]] = 17;
+        let s1 = transform_layout_summary(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::ZigZag)
+            .unwrap();
+        let s2 = transform_layout_summary(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::ZigZag)
+            .unwrap();
+        assert_eq!(s1, s2);
     }
 
     #[test]

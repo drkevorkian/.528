@@ -7,16 +7,16 @@ use super::block_aq::{
     apply_qp_delta_clamped, choose_block_qp_delta, collect_plane_block_variances,
     validate_qp_clip_range, validate_wire_qp_delta,
 };
-use super::dct::{fdct_8x8, idct_4x4, idct_8x8, ZIGZAG, ZIGZAG_4X4};
+use super::dct::{fdct_4x4, fdct_8x8, idct_4x4, idct_8x8, ZIGZAG, ZIGZAG_4X4};
 use super::error::SrsV2Error;
 use super::frame::VideoPlane;
 use super::intra_codec::{
-    dequantize, dequantize_4x4, pick_mode, predict_block, quantize, PredMode,
+    dequantize, dequantize_4x4, pick_mode, predict_block, quantize, quantize_4x4, PredMode,
 };
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::rate_control::{
     ResidualEncodeStats, ResidualEntropy, SrsV2CoeffScanMode, SrsV2EncodeSettings,
-    SrsV2ResidualContextMode,
+    SrsV2ResidualContextMode, SrsV2TransformDecisionMode,
 };
 pub use super::residual_context_entropy::ResidualPlane;
 use super::residual_context_entropy::{
@@ -27,10 +27,10 @@ use super::residual_tokens::{
     MAX_SYMBOLS_PER_BLOCK,
 };
 use super::transform_layout::{
-    choose_coeff_scan, decode_coeff_compact_rev32_intra_block,
+    choose_coeff_scan, choose_transform_kind, decode_coeff_compact_rev32_intra_block,
     encode_coeff_compact_rev32_intra_block, estimate_coeff_layout_bytes,
     SrsV2CoeffLayoutMode as TlCoeffLayoutMode, SrsV2CoeffScan, SrsV2TransformKind,
-    TransformLayoutError,
+    TransformDecisionConfig, TransformDecisionInput, TransformLayoutError,
 };
 
 pub const TAG_EXPLICIT_AC: u8 = 0;
@@ -741,6 +741,7 @@ fn rev32_intra_mb_scan_from_wire(b: u8) -> Result<SrsV2CoeffScan, SrsV2Error> {
 
 fn resolve_intra_compact_scan(
     settings: &SrsV2EncodeSettings,
+    kind: SrsV2TransformKind,
     qfreq: &[i16; 64],
 ) -> Result<SrsV2CoeffScan, SrsV2Error> {
     Ok(match settings.coeff_scan_mode {
@@ -748,20 +749,122 @@ fn resolve_intra_compact_scan(
         SrsV2CoeffScanMode::GroupedLowFirst => SrsV2CoeffScan::GroupedLowFirst,
         SrsV2CoeffScanMode::RunOptimized => SrsV2CoeffScan::RunOptimized,
         SrsV2CoeffScanMode::Auto => {
-            choose_coeff_scan(SrsV2TransformKind::Tx8x8, qfreq).map_err(map_transform_layout_err)?
+            choose_coeff_scan(kind, qfreq).map_err(map_transform_layout_err)?
         }
     })
+}
+
+/// Plane tag **`1`**: legacy rev32 compact — every MB is **Tx8×8** (`[pred][scan][u16 len][body]`).
+/// Plane tag **`2`**: per-MB **`transform_kind`** (`0` **Tx4×4**, `1` **Tx8×8**) precedes `[pred][scan]…`.
+const REV32_INTRA_PLANE_ALL_TX8: u8 = 1;
+const REV32_INTRA_PLANE_MIXED_TRANSFORM: u8 = 2;
+
+fn rev32_mb_transform_from_wire(b: u8) -> Result<SrsV2TransformKind, SrsV2Error> {
+    match b {
+        0 => Ok(SrsV2TransformKind::Tx4x4),
+        1 => Ok(SrsV2TransformKind::Tx8x8),
+        _ => Err(SrsV2Error::syntax(
+            "FR2 rev32 intra: bad per-macroblock transform_kind byte",
+        )),
+    }
+}
+
+fn rev32_intra_use_mixed_mb_transform(settings: &SrsV2EncodeSettings) -> bool {
+    matches!(
+        settings.transform_decision_mode,
+        SrsV2TransformDecisionMode::Smooth8x8Detail4x4 | SrsV2TransformDecisionMode::RdoFast
+    )
+}
+
+fn intra_compact_pick_transform_kind(
+    settings: &SrsV2EncodeSettings,
+    orig: &[[i16; 8]; 8],
+    diff_flat: &[i16; 64],
+) -> SrsV2TransformKind {
+    match settings.transform_decision_mode {
+        SrsV2TransformDecisionMode::Legacy => SrsV2TransformKind::Tx8x8,
+        SrsV2TransformDecisionMode::Smooth8x8Detail4x4 | SrsV2TransformDecisionMode::RdoFast => {
+            let mut sum = 0.0f64;
+            let mut sum2 = 0.0f64;
+            for row in orig.iter() {
+                for &cell in row.iter() {
+                    let v = cell as f64;
+                    sum += v;
+                    sum2 += v * v;
+                }
+            }
+            let mean = sum / 64.0;
+            let spatial_variance = (sum2 / 64.0 - mean * mean).max(0.0);
+            let freq = fdct_8x8(diff_flat);
+            let hf_energy: f64 = freq.iter().skip(1).map(|c| (*c as f64).abs()).sum();
+            let max_abs = diff_flat.iter().map(|c| c.abs()).max().unwrap_or(0);
+            let nz = diff_flat.iter().filter(|&&c| c != 0).count();
+            let inp = TransformDecisionInput {
+                spatial_variance,
+                hf_energy,
+                max_abs_coeff: max_abs,
+                nonzero_count: nz,
+            };
+            choose_transform_kind(&inp, &TransformDecisionConfig::default())
+        }
+    }
+}
+
+fn quantize_residual_tx4x4_natural(diff: &[[i16; 8]; 8], qp: i16) -> [i16; 64] {
+    let mut qfreq = [0_i16; 64];
+    let quads = [(0usize, 0usize), (0, 4), (4, 0), (4, 4)];
+    for (qi, &(r0, c0)) in quads.iter().enumerate() {
+        let mut patch = [0_i16; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                patch[r * 4 + c] = diff[r0 + r][c0 + c];
+            }
+        }
+        let f = fdct_4x4(&patch);
+        let q = quantize_4x4(&f, qp);
+        for r in 0..4 {
+            for c in 0..4 {
+                qfreq[qi * 16 + r * 4 + c] = q[r * 4 + c];
+            }
+        }
+    }
+    qfreq
+}
+
+fn idct_residual_tx4x4_from_qfreq(qfreq: &[i16; 64], qp: i16) -> [[i16; 8]; 8] {
+    let mut out = [[0_i16; 8]; 8];
+    let quads = [(0usize, 0usize), (0, 4), (4, 0), (4, 4)];
+    for (qi, &(r0, c0)) in quads.iter().enumerate() {
+        let mut q = [0_i16; 16];
+        for i in 0..16 {
+            q[i] = qfreq[qi * 16 + i];
+        }
+        let dq = dequantize_4x4(&q, qp);
+        let rpix = idct_4x4(&dq);
+        for r in 0..4 {
+            for c in 0..4 {
+                out[r0 + r][c0 + c] = rpix[r * 4 + c];
+            }
+        }
+    }
+    out
 }
 
 /// Encode one fixed-grid **`FR2` rev33** **P** 8×8 quantized coefficient block (`transform_layout` compact).
 ///
 /// Wire: [`TAG_P_RESIDUAL_COMPACT_V1`] + [`PredMode::Dc`] + **resolved** scan byte (`0..=2`) + `u16` body length +
 /// [`encode_coeff_compact_rev32_intra_block`] (bitmap + values in scan order; [`SrsV2CoeffScanMode::Auto`] resolved per chunk).
+///
+/// When `residual_encode_stats` is set, accumulates [`ResidualEncodeStats::coeff_layout_bytes`],
+/// [`ResidualEncodeStats::coeff_legacy_estimated_bytes`], and [`ResidualEncodeStats::coeff_layout_savings_bytes`]
+/// using the same header + [`estimate_coeff_layout_bytes`] (**Legacy**) accounting as rev32 intra macroblocks
+/// (chunk overhead = **5** bytes before the compact body).
 pub fn encode_p_residual_chunk_compact_v33_wire(
     qfreq: &[i16; 64],
     settings: &SrsV2EncodeSettings,
+    residual_encode_stats: Option<&mut ResidualEncodeStats>,
 ) -> Result<Vec<u8>, SrsV2Error> {
-    let scan = resolve_intra_compact_scan(settings, qfreq)?;
+    let scan = resolve_intra_compact_scan(settings, SrsV2TransformKind::Tx8x8, qfreq)?;
     let mut out = Vec::with_capacity(4 + 8 + 64 * 2);
     out.push(TAG_P_RESIDUAL_COMPACT_V1);
     out.push(PredMode::Dc as u8);
@@ -772,6 +875,29 @@ pub fn encode_p_residual_chunk_compact_v33_wire(
         u16::try_from(body.len()).map_err(|_| SrsV2Error::syntax("FR2 rev33 P compact length"))?;
     out.extend_from_slice(&bl.to_le_bytes());
     out.extend_from_slice(&body);
+    if let Some(stats) = residual_encode_stats {
+        let legacy_est = estimate_coeff_layout_bytes(
+            qfreq,
+            SrsV2TransformKind::Tx8x8,
+            scan,
+            TlCoeffLayoutMode::Legacy,
+        )
+        .map_err(map_transform_layout_err)? as u64;
+        let block_wire = 5usize.saturating_add(body.len());
+        stats.coeff_legacy_estimated_bytes = stats
+            .coeff_legacy_estimated_bytes
+            .saturating_add(legacy_est);
+        stats.coeff_layout_bytes = stats
+            .coeff_layout_bytes
+            .saturating_add(block_wire as u64);
+        stats.coeff_layout_savings_bytes = stats.coeff_layout_savings_bytes.saturating_add(
+            legacy_est as i64 - block_wire as i64,
+        );
+        stats.p_compact_coeff_chunks = stats.p_compact_coeff_chunks.saturating_add(1);
+        stats.p_compact_coeff_payload_bytes = stats
+            .p_compact_coeff_payload_bytes
+            .saturating_add(out.len() as u64);
+    }
     Ok(out)
 }
 
@@ -822,7 +948,10 @@ pub fn decode_p_residual_chunk_compact_v33(
 
 /// Encode one luma/chroma plane for **`FR2` rev32** intra (`CompactV1` bitmap + scan-ordered coefficients).
 ///
-/// Plane header: transform-kind tag (**Tx8×8**). Each **8×8** macroblock: prediction mode + **resolved**
+/// Plane header: **`1`** = uniform **Tx8×8** MBs (default [`SrsV2TransformDecisionMode::Legacy`]).
+/// **`2`** = per-MB **`transform_kind`** byte (`0` **Tx4×4**, `1` **Tx8×8**) when the transform decision mode is
+/// [`SrsV2TransformDecisionMode::Smooth8x8Detail4x4`] or [`SrsV2TransformDecisionMode::RdoFast`].
+/// Each **8×8** macroblock: optional transform tag + prediction mode + **resolved**
 /// scan tag + `u16` body length + [`encode_coeff_compact_rev32_intra_block`] payload.
 pub(crate) fn encode_plane_intra_compact_v32(
     plane: &VideoPlane<u8>,
@@ -835,7 +964,13 @@ pub(crate) fn encode_plane_intra_compact_v32(
         stats.intra_coeff_layout_mode = Some(settings.coeff_layout_mode);
         stats.intra_coeff_scan_mode = Some(settings.coeff_scan_mode);
     }
-    out.push(kind_tag_wire(SrsV2TransformKind::Tx8x8));
+    let mixed_mb = rev32_intra_use_mixed_mb_transform(settings);
+    let plane_tag = if mixed_mb {
+        REV32_INTRA_PLANE_MIXED_TRANSFORM
+    } else {
+        REV32_INTRA_PLANE_ALL_TX8
+    };
+    out.push(plane_tag);
     stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(1);
     stats.coeff_legacy_estimated_bytes = stats.coeff_legacy_estimated_bytes.saturating_add(1);
 
@@ -881,20 +1016,32 @@ pub(crate) fn encode_plane_intra_compact_v32(
                     blk[r * 8 + c] = diff[r][c];
                 }
             }
-            let freq = fdct_8x8(&blk);
-            let qfreq = quantize(&freq, qp);
-            let scan = resolve_intra_compact_scan(settings, &qfreq)?;
-            let legacy_est = estimate_coeff_layout_bytes(
-                &qfreq,
-                SrsV2TransformKind::Tx8x8,
-                scan,
-                TlCoeffLayoutMode::Legacy,
-            )
-            .map_err(map_transform_layout_err)? as u64;
-            let body =
-                encode_coeff_compact_rev32_intra_block(&qfreq, SrsV2TransformKind::Tx8x8, scan)
-                    .map_err(map_transform_layout_err)?;
-            let block_wire = 1usize + 1 + 2 + body.len();
+            let kind = if mixed_mb {
+                intra_compact_pick_transform_kind(settings, &orig, &blk)
+            } else {
+                SrsV2TransformKind::Tx8x8
+            };
+            if mixed_mb {
+                out.push(kind_tag_wire(kind));
+                stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(1);
+            }
+
+            let qfreq = match kind {
+                SrsV2TransformKind::Tx8x8 => {
+                    let freq = fdct_8x8(&blk);
+                    quantize(&freq, qp)
+                }
+                SrsV2TransformKind::Tx4x4 => quantize_residual_tx4x4_natural(&diff, qp),
+            };
+
+            let scan = resolve_intra_compact_scan(settings, kind, &qfreq)?;
+            let legacy_est =
+                estimate_coeff_layout_bytes(&qfreq, kind, scan, TlCoeffLayoutMode::Legacy)
+                    .map_err(map_transform_layout_err)? as u64;
+            let body = encode_coeff_compact_rev32_intra_block(&qfreq, kind, scan)
+                .map_err(map_transform_layout_err)?;
+            let mb_tx = usize::from(mixed_mb);
+            let block_wire = mb_tx + 1 + 1 + 2 + body.len();
             stats.coeff_legacy_estimated_bytes = stats
                 .coeff_legacy_estimated_bytes
                 .saturating_add(legacy_est);
@@ -902,7 +1049,14 @@ pub(crate) fn encode_plane_intra_compact_v32(
             stats.coeff_layout_savings_bytes = stats
                 .coeff_layout_savings_bytes
                 .saturating_add(legacy_est as i64 - block_wire as i64);
-            stats.intra_tx8x8_blocks = stats.intra_tx8x8_blocks.saturating_add(1);
+            match kind {
+                SrsV2TransformKind::Tx8x8 => {
+                    stats.intra_tx8x8_blocks = stats.intra_tx8x8_blocks.saturating_add(1);
+                }
+                SrsV2TransformKind::Tx4x4 => {
+                    stats.intra_tx4x4_blocks = stats.intra_tx4x4_blocks.saturating_add(1);
+                }
+            }
 
             out.push(mode as u8);
             out.push(rev32_intra_mb_scan_wire(scan));
@@ -911,18 +1065,41 @@ pub(crate) fn encode_plane_intra_compact_v32(
             out.extend_from_slice(&bl.to_le_bytes());
             out.extend_from_slice(&body);
 
-            let nz_ac = qfreq.iter().skip(1).any(|&v| v != 0);
+            let nz_ac = match kind {
+                SrsV2TransformKind::Tx8x8 => qfreq.iter().skip(1).any(|&v| v != 0),
+                SrsV2TransformKind::Tx4x4 => qfreq
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &v)| v != 0 && (i % 16) != 0),
+            };
             left_nz = nz_ac;
             *prev_slot = nz_ac;
-            let recon_freq = dequantize(&qfreq, qp);
-            let rpix = idct_8x8(&recon_freq);
-            for r in 0..8 {
-                for c in 0..8 {
-                    let x = bx * 8 + c;
-                    let y = by * 8 + r;
-                    let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
-                    if x < pw && y < ph {
-                        rec[y * pw + x] = pv as u8;
+            match kind {
+                SrsV2TransformKind::Tx8x8 => {
+                    let recon_freq = dequantize(&qfreq, qp);
+                    let rpix = idct_8x8(&recon_freq);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            let y = by * 8 + r;
+                            let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
+                            if x < pw && y < ph {
+                                rec[y * pw + x] = pv as u8;
+                            }
+                        }
+                    }
+                }
+                SrsV2TransformKind::Tx4x4 => {
+                    let residual = idct_residual_tx4x4_from_qfreq(&qfreq, qp);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            let y = by * 8 + r;
+                            let pv = (pred[r][c] as i32 + residual[r][c] as i32).clamp(0, 255);
+                            if x < pw && y < ph {
+                                rec[y * pw + x] = pv as u8;
+                            }
+                        }
                     }
                 }
             }
@@ -945,12 +1122,16 @@ pub(crate) fn decode_plane_intra_compact_v32(
     plane: &mut VideoPlane<u8>,
     qp: i16,
 ) -> Result<(), SrsV2Error> {
-    let kind_b = read_u8(data, cursor)?;
-    if kind_b != kind_tag_wire(SrsV2TransformKind::Tx8x8) {
-        return Err(SrsV2Error::syntax(
-            "FR2 rev32 intra expects Tx8x8 transform kind tag",
-        ));
-    }
+    let plane_tag = read_u8(data, cursor)?;
+    let mixed_mb = match plane_tag {
+        REV32_INTRA_PLANE_ALL_TX8 => false,
+        REV32_INTRA_PLANE_MIXED_TRANSFORM => true,
+        _ => {
+            return Err(SrsV2Error::syntax(
+                "FR2 rev32 intra: bad plane transform layout tag",
+            ));
+        }
+    };
 
     let w = plane.width as usize;
     let h = plane.height as usize;
@@ -967,6 +1148,12 @@ pub(crate) fn decode_plane_intra_compact_v32(
             let above_nz = if by == 0 { false } else { *prev_slot };
             let _ = (left_nz, above_nz);
 
+            let kind = if mixed_mb {
+                rev32_mb_transform_from_wire(read_u8(data, cursor)?)?
+            } else {
+                SrsV2TransformKind::Tx8x8
+            };
+
             let mode_b = read_u8(data, cursor)?;
             let mode = PredMode::from_u8(mode_b)?;
             let scan_mb_b = read_u8(data, cursor)?;
@@ -980,22 +1167,44 @@ pub(crate) fn decode_plane_intra_compact_v32(
             }
             let body = &data[*cursor..end];
             *cursor = end;
-            let qfreq =
-                decode_coeff_compact_rev32_intra_block(body, SrsV2TransformKind::Tx8x8, scan)
-                    .map_err(map_transform_layout_err)?;
+            let qfreq = decode_coeff_compact_rev32_intra_block(body, kind, scan)
+                .map_err(map_transform_layout_err)?;
             let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
-            let recon_freq = dequantize(&qfreq, qp);
-            let rpix = idct_8x8(&recon_freq);
-            let nz_ac = qfreq.iter().skip(1).any(|&v| v != 0);
+            let nz_ac = match kind {
+                SrsV2TransformKind::Tx8x8 => qfreq.iter().skip(1).any(|&v| v != 0),
+                SrsV2TransformKind::Tx4x4 => qfreq
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &v)| v != 0 && (i % 16) != 0),
+            };
             left_nz = nz_ac;
             *prev_slot = nz_ac;
-            for r in 0..8 {
-                for c in 0..8 {
-                    let x = bx * 8 + c;
-                    let y = by * 8 + r;
-                    let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
-                    if x < pw && y < ph {
-                        rec[y * pw + x] = pv as u8;
+            match kind {
+                SrsV2TransformKind::Tx8x8 => {
+                    let recon_freq = dequantize(&qfreq, qp);
+                    let rpix = idct_8x8(&recon_freq);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            let y = by * 8 + r;
+                            let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
+                            if x < pw && y < ph {
+                                rec[y * pw + x] = pv as u8;
+                            }
+                        }
+                    }
+                }
+                SrsV2TransformKind::Tx4x4 => {
+                    let residual = idct_residual_tx4x4_from_qfreq(&qfreq, qp);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            let y = by * 8 + r;
+                            let pv = (pred[r][c] as i32 + residual[r][c] as i32).clamp(0, 255);
+                            if x < pw && y < ph {
+                                rec[y * pw + x] = pv as u8;
+                            }
+                        }
                     }
                 }
             }
@@ -1738,8 +1947,8 @@ mod residual_entropy_tests {
             coeff_scan_mode: SrsV2CoeffScanMode::GroupedLowFirst,
             ..st_zz.clone()
         };
-        let wz = encode_p_residual_chunk_compact_v33_wire(&qf, &st_zz).unwrap();
-        let wg = encode_p_residual_chunk_compact_v33_wire(&qf, &st_gl).unwrap();
+        let wz = encode_p_residual_chunk_compact_v33_wire(&qf, &st_zz, None).unwrap();
+        let wg = encode_p_residual_chunk_compact_v33_wire(&qf, &st_gl, None).unwrap();
         assert_ne!(
             wz, wg,
             "different scans should reorder compact payload bytes"

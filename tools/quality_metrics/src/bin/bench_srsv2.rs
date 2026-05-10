@@ -119,14 +119,24 @@ struct Args {
     compare_residual_contexts: bool,
 
     /// **`--coeff-layout`**: intra / **P** coefficient packaging — **`legacy`** (default) or **`compact`** (**CompactV1**: intra **`FR2` rev32**, fixed-grid **P** **`FR2` rev33** when inter syntax allows).
-    #[arg(long = "coeff-layout", visible_alias = "coeff_layout", default_value = "legacy")]
+    #[arg(
+        long = "coeff-layout",
+        visible_alias = "coeff_layout",
+        default_value = "legacy",
+        value_parser = parse_coeff_layout_cli_flag
+    )]
     coeff_layout: String,
 
     /// **`--coeff-scan`**: scan for compact layout — **`zigzag`** (default), **`grouped-low-first`**, **`run-optimized`**, or **`auto`**.
-    #[arg(long = "coeff-scan", visible_alias = "coeff_scan", default_value = "zigzag")]
+    #[arg(
+        long = "coeff-scan",
+        visible_alias = "coeff_scan",
+        default_value = "zigzag",
+        value_parser = parse_coeff_scan_cli_flag
+    )]
     coeff_scan: String,
 
-    /// **`--compare-coeff-layouts`**: five-row harness — **`legacy-zigzag`**, **`compact-zigzag`**, **`compact-grouped-low-first`**, **`compact-run-optimized`**, **`compact-auto`**. Normalizes **`--residual-entropy auto`**, **`--residual-context off`**, **`--inter-partition fixed16x16`**, **`--block-aq off`**, upgrades **`--inter-syntax raw`** → **`compact`** for rev33 **P**. No FFmpeg; engineering measurement only (not a superiority claim vs other codecs).
+    /// **`--compare-coeff-layouts`**: five-row harness — **`legacy-zigzag`**, **`compact-zigzag`**, **`compact-grouped-low-first`**, **`compact-run-optimized`**, **`compact-auto`**. Normalizes **`--residual-entropy auto`**, **`--residual-context off`**, **`--inter-partition fixed16x16`**, **`--block-aq off`**, upgrades **`--inter-syntax raw`** → **`compact`** for rev33 **P**. No FFmpeg; engineering measurement only (**not** a superiority claim vs **HEVC**, **H.265**, or other codecs).
     #[arg(
         long = "compare-coeff-layouts",
         visible_alias = "compare_coeff_layouts",
@@ -1104,6 +1114,16 @@ fn parse_coeff_scan_mode(s: &str) -> Result<SrsV2CoeffScanMode> {
             "--coeff-scan must be zigzag, grouped-low-first, run-optimized, or auto (got {s})"
         )),
     }
+}
+
+/// Clap [`value_parser`](clap::builder::ValueParser) — normalizes to `legacy` / `compact`.
+fn parse_coeff_layout_cli_flag(s: &str) -> Result<String> {
+    Ok(coeff_layout_mode_cli_label(parse_coeff_layout_mode(s)?).to_string())
+}
+
+/// Clap [`value_parser`](clap::builder::ValueParser) — normalizes scan labels (accepts `_` or `-` in tokens).
+fn parse_coeff_scan_cli_flag(s: &str) -> Result<String> {
+    Ok(coeff_scan_mode_cli_label(parse_coeff_scan_mode(s)?).to_string())
 }
 
 fn parse_residual_context_mode(s: &str) -> Result<SrsV2ResidualContextMode> {
@@ -4313,7 +4333,7 @@ fn run_compare_coeff_layouts_report(
 
     Ok(BenchReport {
         note: "Engineering measurement only; not a marketing claim.",
-        residual_note: "`--compare-coeff-layouts` measures intra **CompactV1** telemetry (**FR2 rev32**) and fixed-grid **P** coefficient packaging where enabled (**rev33**); residual-byte deltas are vs the first-row baseline on the same clip. Engineering measurement only.",
+        residual_note: "`--compare-coeff-layouts` measures whether **CompactV1** changes measurable byte totals (encoder coeff-layout telemetry **FR2 rev32** intra + **rev33** fixed-grid **P** residuals; residual-byte deltas vs **legacy-zigzag** on the same clip). Use **`coeff_layout_savings_percent`** / **`coeff_layout_bytes`** vs **`coeff_legacy_estimated_bytes`** together with **total** / **residual** bytes — engineering measurement only; **not** a superiority claim vs **HEVC**/**H.265** or other codecs.",
         command: std::env::args().collect::<Vec<_>>().join(" "),
         raw_bytes: raw.len() as u64,
         width: args.width,
@@ -5946,13 +5966,15 @@ fn to_markdown(r: &BenchReport) -> String {
     if let Some(rows) = &r.compare_coeff_layouts {
         out.push_str("\n## Coefficient layout comparison (`--compare-coeff-layouts`)\n\n");
         out.push_str(
-            "_Fixed five-row order on one clip; compact telemetry reflects **FR2 rev32** intra where enabled and **rev33** fixed-grid **P** residuals where applicable. **Savings** uses encoder coefficient-layout telemetry (`coeff_layout_savings_percent` / legacy estimate vs compact wire where populated). Engineering measurement only — not a superiority claim vs **HEVC** or other codecs._\n\n",
+            "_Fixed five-row order on one clip; compact telemetry reflects **FR2 rev32** intra where enabled and **rev33** fixed-grid **P** residuals where applicable. **Savings** column uses **`coeff_layout_savings_percent`** (encoder estimate vs compact wire). Engineering measurement only — not a superiority claim vs **HEVC**/**H.265** or other codecs._\n\n",
         );
         if let Some(s) = &r.coeff_layout_compare_summary {
             out.push_str(&format!("**Summary:** {s}\n\n"));
         }
         out.push_str("### Summary table\n\n");
-        out.push_str("| Coeff layout | Scan | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y |\n");
+        out.push_str(
+            "| Coeff layout | Scan | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y |\n",
+        );
         out.push_str("|---|---|---:|---:|---:|---:|---:|\n");
         for e in rows {
             let (tot_s, res_s, sav_s, psnr_s, ssim_s) = if e.ok {
@@ -6764,6 +6786,45 @@ mod tests {
             assert!(js.contains(key), "missing {key} in {js}");
         }
         assert!(js.contains("compare_coeff_layouts"));
+        let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+        let rows_json = v
+            .get("compare_coeff_layouts")
+            .and_then(|x| x.as_array())
+            .expect("compare_coeff_layouts array");
+        assert_eq!(rows_json.len(), 5, "all harness rows must serialize");
+        let required_row_keys = [
+            "row_label",
+            "coeff_layout_mode",
+            "coeff_scan_mode",
+            "coeff_layout_bytes",
+            "coeff_legacy_estimated_bytes",
+            "coeff_layout_savings_bytes",
+            "coeff_layout_savings_percent",
+            "tx4x4_blocks",
+            "tx8x8_blocks",
+            "residual_bytes",
+            "total_bytes",
+            "psnr_y",
+            "ssim_y",
+            "encode_fps",
+            "decode_fps",
+            "ok",
+        ];
+        for (i, row) in rows_json.iter().enumerate() {
+            let obj = row.as_object().unwrap_or_else(|| panic!("row {i} not object"));
+            for k in required_row_keys {
+                assert!(
+                    obj.contains_key(k),
+                    "row {i} missing {k}: {obj:?}"
+                );
+            }
+        }
+        assert!(
+            rows_json[1]
+                .get("residual_bytes_delta_vs_legacy_zigzag")
+                .is_some(),
+            "non-baseline rows report Δ_residual vs legacy-zigzag"
+        );
         let md = to_markdown(&report);
         assert!(md.contains("Coefficient layout comparison"));
         assert!(
@@ -6773,6 +6834,7 @@ mod tests {
         assert!(md.contains("### Summary table"));
         assert!(md.contains("### Full telemetry"));
         assert!(md.contains("| Row | Layout | Scan |"));
+        assert!(md.contains("Δ res.") || md.contains("Δ res"));
         assert!(report.x264.is_none());
         assert!(report.x265.is_none());
         let re = parse_residual_entropy(&args.residual_entropy).unwrap();
@@ -6796,6 +6858,49 @@ mod tests {
         let s = build_settings(&args, re).unwrap();
         assert_eq!(s.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
         assert_eq!(s.coeff_scan_mode, SrsV2CoeffScanMode::ZigZag);
+        let _ = fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn coeff_layout_and_scan_invalid_cli_values_rejected_at_parse() {
+        let tmp = std::env::temp_dir().join(format!("bench-coeff-bad-{}.yuv", std::process::id()));
+        let fb = yuv420_frame_bytes(16, 16).unwrap();
+        fs::write(&tmp, vec![128_u8; fb]).unwrap();
+        let base = [
+            "bench_srsv2",
+            "--input",
+            tmp.to_str().unwrap(),
+            "--width",
+            "16",
+            "--height",
+            "16",
+            "--frames",
+            "1",
+            "--fps",
+            "30",
+            "--qp",
+            "28",
+            "--keyint",
+            "30",
+            "--motion-radius",
+            "4",
+            "--report-json",
+            "x.json",
+            "--report-md",
+            "x.md",
+        ];
+        let mut argv: Vec<String> = base.iter().map(|s| (*s).to_string()).collect();
+        argv.extend(["--coeff-layout".into(), "not-a-mode".into()]);
+        assert!(
+            Args::try_parse_from(&argv).is_err(),
+            "invalid coeff-layout must fail clap parse"
+        );
+        let mut argv: Vec<String> = base.iter().map(|s| (*s).to_string()).collect();
+        argv.extend(["--coeff-scan".into(), "diagonal".into()]);
+        assert!(
+            Args::try_parse_from(&argv).is_err(),
+            "invalid coeff-scan must fail clap parse"
+        );
         let _ = fs::remove_file(tmp);
     }
 
@@ -6909,6 +7014,88 @@ mod tests {
         );
         assert!(md.contains("| legacy | zigzag |"));
         assert!(md.contains("| compact | zigzag |"));
+        let js = serde_json::to_string(&BenchReport {
+            note: "Engineering measurement only; not a marketing claim.",
+            residual_note: "n",
+            command: "test".into(),
+            raw_bytes: 1,
+            width: 64,
+            height: 64,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            x265: None,
+            x265_bitrate_match: None,
+            table: vec![],
+            compare_residual_modes: None,
+            compare_residual_contexts: None,
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: None,
+            compare_partition_syntax: None,
+            compare_entropy_models: None,
+            entropy_model_compare_summary: None,
+            compare_coeff_layouts: Some(vec![
+                CoeffLayoutCompareRow {
+                    row_label: "legacy-zigzag".into(),
+                    coeff_layout_mode: "legacy".into(),
+                    coeff_scan_mode: "zigzag".into(),
+                    coeff_layout_bytes: 0,
+                    coeff_legacy_estimated_bytes: 0,
+                    coeff_layout_savings_bytes: 0,
+                    coeff_layout_savings_percent: 0.0,
+                    tx4x4_blocks: 0,
+                    tx8x8_blocks: 0,
+                    residual_bytes: 100,
+                    total_bytes: 500,
+                    residual_bytes_delta_vs_legacy_zigzag: None,
+                    psnr_y: 40.0,
+                    ssim_y: 0.99,
+                    encode_fps: 10.0,
+                    decode_fps: 10.0,
+                    ok: true,
+                    error: None,
+                },
+                CoeffLayoutCompareRow {
+                    row_label: "compact-zigzag".into(),
+                    coeff_layout_mode: "compact".into(),
+                    coeff_scan_mode: "zigzag".into(),
+                    coeff_layout_bytes: 0,
+                    coeff_legacy_estimated_bytes: 0,
+                    coeff_layout_savings_bytes: 0,
+                    coeff_layout_savings_percent: 0.0,
+                    tx4x4_blocks: 0,
+                    tx8x8_blocks: 0,
+                    residual_bytes: 0,
+                    total_bytes: 0,
+                    residual_bytes_delta_vs_legacy_zigzag: None,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    encode_fps: 0.0,
+                    decode_fps: 0.0,
+                    ok: false,
+                    error: Some("simulated compact failure".into()),
+                },
+            ]),
+            coeff_layout_compare_summary: Some(
+                "Residual-byte deltas vs legacy-zigzag baseline (100 B): compact-zigzag (failed)"
+                    .into(),
+            ),
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "test".into(),
+        })
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+        let arr = v["compare_coeff_layouts"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["ok"], true);
+        assert_eq!(arr[1]["ok"], false);
+        assert!(arr[1]["error"].is_string());
     }
 
     #[test]

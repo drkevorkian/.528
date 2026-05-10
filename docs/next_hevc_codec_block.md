@@ -8,17 +8,17 @@
 
 ## Decision record (Block 6 rubric)
 
-Evidence from gate run **2026-05-10** (corpus **64×64**, **8** frames, **QP 28**, **keyint 8**, **motion-radius 4**, seed **528**, git **b1a4994**). CompactV1 rows: **`coeff_layout_compare_summary`** and `reports/<tag>/compare_coeff_layouts.json`.
+Evidence from gate run **2026-05-10** (corpus **64×64**, **8** frames, **QP 28**, **keyint 8**, **motion-radius 4**, seed **528**, git **c4a2203**). CompactV1 rows: **`coeff_layout_compare_summary`** and `reports/<tag>/compare_coeff_layouts.json`.
 
 | Option | Choose if… | Verdict | Evidence |
 |--------|------------|---------|----------|
 | **A.** Integrate coefficient layout into B pictures + variable partitions | CompactV1 **reduces total bytes** | **No** | Compact-zigzag **larger** than legacy-zigzag on **all** clips: Δ total **+1649…+2921** B (`moving_square` **+2418**, `scrolling_bars` **+2921**, `checker` **+1649**, `scene_cut` **+2749**). |
-| **B.** Transform decision / coefficient grouping | CompactV1 **fails** total-byte objective | **Yes** | Totals regress everywhere; intra telemetry shows **~50–53%** estimated packaging savings vs legacy estimate on **rev32** blocks but **does not** reduce **full** bitstream size here. |
+| **B.** Transform decision / coefficient grouping | CompactV1 **fails** total-byte objective | **Yes** | Totals regress everywhere; encoder **`coeff_layout_savings_percent`** vs legacy estimate is **~1.4–39.7%** by clip on compact rows but **does not** reduce **full** bitstream size here. |
 | **C.** CTU64 encode path | Residual **no longer** dominates | **No** | **`scene_cut/SRSV2-pc-fixed16x16`**: **`residual`** **4058** / **4949** (**~82%**). |
 | **D.** Quarter-pel luma | Prediction-error story dominates **and** MV tiny | **No** | Same reference row: **`MV/header`** **294** vs **`residual`** **4058**. |
 | **E.** Bitrate-matched x265 sweep | Comparison **fairness** is primary | **Parallel** | Gate still reports large bitrate mismatch vs optional x265 reference (**relative gap ~0.475**). Does **not** replace **B**. |
 
-**Conclusion:** Implement **B** next — improve **how transform size / coefficient grouping is chosen** so coded residual can shrink **without** claiming **HEVC/x265** superiority.
+**Conclusion:** Implement **B** next — improve **how transform size / coefficient grouping is chosen** so coded residual can shrink **without** claiming **HEVC/H.265/x265** superiority.
 
 ---
 
@@ -44,7 +44,7 @@ BLOCK 7 GOAL:
 Improve transform-size decision and/or coefficient grouping so residual coding efficiency improves on fixed partitions — without H.265/x265 superiority claims.
 
 SOURCE:
-docs/windows_hevc_progress_results.md — Block 6 chose B after --compare-coeff-layouts showed larger totals for CompactV1 on every corpus clip.
+docs/windows_hevc_progress_results.md — Block 6 chose B after --compare-coeff-layouts showed larger totals for CompactV1 on every corpus clip (git c4a2203).
 
 WHY (data-backed):
 - CompactV1 compare harness increased total bytes (+1649…+2921) on all four clips; PSNR/SSIM unchanged; scan modes tied; telemetry residual deltas negative but totals grew.

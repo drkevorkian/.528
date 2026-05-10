@@ -45,10 +45,11 @@ pub struct ResidualEncodeStats {
     pub intra_coeff_scan_mode: Option<SrsV2CoeffScanMode>,
     pub intra_tx4x4_blocks: u64,
     pub intra_tx8x8_blocks: u64,
-    /// Sum of per-block compact coefficient payloads + block headers on rev32 intra (`pred` + resolved `scan` + `u16` len + body).
+    /// Sum of per-block compact coefficient payloads + headers: rev32 intra (`pred` + resolved `scan` + `u16` len + body),
+    /// plus rev33 fixed-grid **P** luma chunks (**`5`** bytes before body: layout tag + pred + scan + `u16` len).
     pub coeff_layout_bytes: u64,
-    /// Sum of [`crate::srsv2::transform_layout::estimate_coeff_layout_bytes`] (**Legacy**) per rev32 block,
-    /// plus **`1` byte per plane** (transform-kind tag; same plane header counted in [`Self::coeff_layout_bytes`]).
+    /// Sum of [`crate::srsv2::transform_layout::estimate_coeff_layout_bytes`] (**Legacy**) per compact block/chunk,
+    /// plus rev32 **`1` byte per plane** header (and per-MB transform tag when mixed).
     pub coeff_legacy_estimated_bytes: u64,
     /// Per-block `(legacy_estimate − compact_wire)` sum (may be negative when compact is larger).
     pub coeff_layout_savings_bytes: i64,
@@ -88,7 +89,7 @@ impl ResidualEncodeStats {
         };
     }
 
-    /// Recompute [`Self::coeff_layout_savings_percent`] after rev32 intra encode (uses [`Self::coeff_legacy_estimated_bytes`]).
+    /// Recompute [`Self::coeff_layout_savings_percent`] after rev32 intra and/or rev33 **P** compact encode (uses [`Self::coeff_legacy_estimated_bytes`]).
     pub fn finalize_coeff_layout_derived(&mut self) {
         self.coeff_layout_savings_percent = if self.coeff_legacy_estimated_bytes > 0 {
             100.0 * self.coeff_layout_savings_bytes as f64
@@ -295,11 +296,13 @@ pub enum SrsV2TransformDecisionMode {
     RdoFast,
 }
 
-/// Structured failures from [`SrsV2EncodeSettings::validate_coeff_layout_settings`].
+/// Structured failures from [`SrsV2EncodeSettings::validate_coeff_layout_settings`] and related layout hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrsV2CoeffLayoutSettingsError {
     /// [`SrsV2TransformDecisionMode::RdoFast`] requires [`SrsV2RdoMode::Fast`].
     RdoFastRequiresRdoModeFast,
+    /// [`SrsV2TransformSize::Tx16x16Candidate`] is wire/parser-only until a full encoder path exists.
+    Tx16x16TransformNotImplemented,
 }
 
 impl std::fmt::Display for SrsV2CoeffLayoutSettingsError {
@@ -308,11 +311,29 @@ impl std::fmt::Display for SrsV2CoeffLayoutSettingsError {
             Self::RdoFastRequiresRdoModeFast => {
                 write!(f, "transform_decision_mode RdoFast requires rdo_mode Fast",)
             }
+            Self::Tx16x16TransformNotImplemented => write!(
+                f,
+                "Tx16x16 transform size is not implemented for encode (use Tx4x4 or Tx8x8)"
+            ),
         }
     }
 }
 
 impl std::error::Error for SrsV2CoeffLayoutSettingsError {}
+
+impl SrsV2TransformSize {
+    /// Returns [`Ok`] for transform sizes the encoder may emit today (**Tx4×4**, **Tx8×8**).
+    ///
+    /// [`SrsV2TransformSize::Tx16x16Candidate`] remains unsupported for encode until fully implemented.
+    pub fn validate_supported_for_encode(self) -> Result<(), SrsV2CoeffLayoutSettingsError> {
+        match self {
+            Self::Tx4x4 | Self::Tx8x8 => Ok(()),
+            Self::Tx16x16Candidate => {
+                Err(SrsV2CoeffLayoutSettingsError::Tx16x16TransformNotImplemented)
+            }
+        }
+    }
+}
 
 impl From<SrsV2CoeffLayoutSettingsError> for SrsV2Error {
     fn from(e: SrsV2CoeffLayoutSettingsError) -> Self {
@@ -320,6 +341,11 @@ impl From<SrsV2CoeffLayoutSettingsError> for SrsV2Error {
             SrsV2CoeffLayoutSettingsError::RdoFastRequiresRdoModeFast => SrsV2Error::Unsupported(
                 "coeff_layout: transform_decision_mode RdoFast requires rdo_mode Fast",
             ),
+            SrsV2CoeffLayoutSettingsError::Tx16x16TransformNotImplemented => {
+                SrsV2Error::Unsupported(
+                    "coeff_layout: Tx16x16 transform size is not implemented for encode",
+                )
+            }
         }
     }
 }
@@ -640,8 +666,11 @@ impl SrsV2EncodeSettings {
 
     /// Validate coefficient layout settings (encoding entry points should call this).
     ///
-    /// Rejects incoherent combinations early; defaults preserve legacy output. **[`SrsV2TransformSize::Tx16x16Candidate`]**
-    /// remains wire-only / unsupported for encode — there is no settings knob for it here.
+    /// Rejects incoherent combinations early; defaults preserve legacy output.
+    ///
+    /// - **[`SrsV2CoeffLayoutMode::CompactV1`]** is **opt-in** (default remains **[`Legacy`]** — same bytes as before these settings existed).
+    /// - **[`SrsV2TransformSize::Tx16x16Candidate`]** is not encode-supported; use [`SrsV2TransformSize::validate_supported_for_encode`]
+    ///   when wiring partition/residual paths that select a concrete transform tag.
     pub fn validate_coeff_layout_settings(&self) -> Result<(), SrsV2Error> {
         if matches!(
             self.transform_decision_mode,
@@ -1192,5 +1221,32 @@ mod tests {
     fn coeff_layout_compact_v1_is_opt_in_not_default() {
         let d = SrsV2EncodeSettings::default();
         assert_ne!(d.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1);
+    }
+
+    #[test]
+    fn tx16x16_transform_size_rejected_for_encode_validation() {
+        assert!(matches!(
+            SrsV2TransformSize::Tx16x16Candidate.validate_supported_for_encode(),
+            Err(SrsV2CoeffLayoutSettingsError::Tx16x16TransformNotImplemented)
+        ));
+        assert!(SrsV2TransformSize::Tx8x8
+            .validate_supported_for_encode()
+            .is_ok());
+        assert!(SrsV2TransformSize::Tx4x4
+            .validate_supported_for_encode()
+            .is_ok());
+    }
+
+    #[test]
+    fn tx16x16_settings_error_maps_to_srsv2_error() {
+        use crate::srsv2::error::SrsV2Error;
+        let mapped: SrsV2Error =
+            SrsV2CoeffLayoutSettingsError::Tx16x16TransformNotImplemented.into();
+        assert!(matches!(
+            mapped,
+            SrsV2Error::Unsupported(
+                "coeff_layout: Tx16x16 transform size is not implemented for encode",
+            )
+        ));
     }
 }
