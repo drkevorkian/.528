@@ -32,9 +32,10 @@ use super::rdo::{
 };
 use super::residual_context_entropy::ResidualContextModel;
 use super::residual_entropy::{
-    decode_p_residual_chunk, decode_p_residual_chunk_compact_v33, decode_p_residual_chunk_strict_rev30,
-    encode_p_residual_chunk_compact_v33_wire, encode_p_residual_chunk_with_opts,
-    BlockResidualCoding, PResidualChunkEncodeOpts, PResidualChunkKind, ResidualPlane,
+    decode_p_residual_chunk, decode_p_residual_chunk_compact_v33,
+    decode_p_residual_chunk_strict_rev30, encode_p_residual_chunk_compact_v33_wire,
+    encode_p_residual_chunk_with_opts, BlockResidualCoding, PResidualChunkEncodeOpts,
+    PResidualChunkKind, ResidualPlane,
 };
 use super::residual_tokens::residual_token_model;
 use super::subpel::{
@@ -60,7 +61,8 @@ pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 17];
 pub const FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 23];
 /// **`P`** ContextV1 MV + strict residual ContextV1 (`FR2` rev **30**).
 pub const FRAME_PAYLOAD_MAGIC_P_RESIDUAL_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 30];
-/// Fixed-grid **`P`** with [`crate::srsv2::rate_control::SrsV2CoeffLayoutMode::CompactV1`] luma residual chunks (`FR2` rev **33**).
+/// Fixed-grid **`P`** with [`crate::srsv2::rate_control::SrsV2CoeffLayoutMode::CompactV1`] luma residual chunks (`FR2` rev **33**):
+/// [`crate::srsv2::residual_entropy::TAG_P_RESIDUAL_COMPACT_V1`] chunks use [`crate::srsv2::transform_layout`] scan + compact bitmap (**Tx8×8**).
 pub const FRAME_PAYLOAD_MAGIC_P_RESIDUAL_COMPACT_V1: [u8; 4] = [b'F', b'R', b'2', 33];
 
 /// One macroblock worth of P residuals (MV stored separately for compact modes).
@@ -617,8 +619,7 @@ pub fn encode_yuv420_p_payload(
     settings.validate_residual_context_inter_residual()?;
     settings.validate_coeff_layout_settings()?;
 
-    let p_coeff_compact_v1 =
-        matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1);
+    let p_coeff_compact_v1 = matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1);
     if p_coeff_compact_v1 {
         if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
             return Err(SrsV2Error::syntax(
@@ -1325,8 +1326,7 @@ pub fn decode_yuv420_p_payload(
                             luma_nz_grid[idx_blk] = nz_ac;
                             res
                         } else if rev33_compact_coeff {
-                            let (res, nz_ac) =
-                                decode_p_residual_chunk_compact_v33(chunk, eff_i)?;
+                            let (res, nz_ac) = decode_p_residual_chunk_compact_v33(chunk, eff_i)?;
                             luma_nz_grid[idx_blk] = nz_ac;
                             res
                         } else {
@@ -1394,7 +1394,7 @@ mod tests {
     use super::*;
     use crate::srsv2::color::{gray8_packed_to_yuv420p8_neutral, rgb888_full_to_yuv420_bt709};
     use crate::srsv2::frame_codec::{
-        decode_yuv420_srsv2_payload, encode_yuv420_intra_payload, encode_yuv420_inter_payload,
+        decode_yuv420_srsv2_payload, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
     };
     use crate::srsv2::model::{
         ChromaSiting, ColorPrimaries, ColorRange, MatrixCoefficients, SrsVideoProfile,

@@ -29,15 +29,14 @@ pub const FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 3];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 7];
 /// Intra adaptive residuals **strict** multi-context rANS (`FR2` rev **29**).
 pub const FRAME_PAYLOAD_MAGIC_INTRA_RESIDUAL_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 29];
-/// Intra with [`SrsV2CoeffLayoutMode::CompactV1`] coefficient bodies (`FR2` rev **32**).
+/// Intra with [`SrsV2CoeffLayoutMode::CompactV1`] (`FR2` rev **32**): per-plane **Tx8×8** tag + per **8×8** block
+/// prediction mode, **resolved** scan tag, compact bitmap + scan-ordered quantized coefficients ([`encode_plane_intra_compact_v32`]).
 pub const FRAME_PAYLOAD_MAGIC_INTRA_COMPACT_V1: [u8; 4] = [b'F', b'R', b'2', 32];
 /// Non-displayable reference refresh (`FR2` rev **12**, experimental).
 pub const FRAME_PAYLOAD_MAGIC_ALT_REF: [u8; 4] = [b'F', b'R', b'2', 12];
 
 fn intra_magic_matches(payload: &[u8]) -> bool {
-    payload.len() >= 4
-        && &payload[0..3] == b"FR2"
-        && matches!(payload[3], 1 | 3 | 7 | 29 | 32)
+    payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3 | 7 | 29 | 32)
 }
 
 fn intra_use_block_aq_wire(settings: &SrsV2EncodeSettings) -> bool {
@@ -844,7 +843,7 @@ mod roundtrip_tests {
     use crate::srsv2::rate_control::{
         ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode,
         SrsV2CoeffLayoutMode, SrsV2CoeffScanMode, SrsV2EncodeSettings, SrsV2EntropyModelMode,
-        SrsV2InterSyntaxMode, SrsV2ResidualContextMode, SrsV2TransformDecisionMode,
+        SrsV2InterSyntaxMode, SrsV2RdoMode, SrsV2ResidualContextMode, SrsV2TransformDecisionMode,
     };
     use crate::srsv2::reference_manager::SrsV2ReferenceManager;
 
@@ -947,7 +946,7 @@ mod roundtrip_tests {
     }
 
     #[test]
-    fn intra_encode_rejects_transform_decision_tx16x16() {
+    fn intra_encode_rejects_coeff_layout_rdo_fast_without_encoder_rdo_fast() {
         let seq = VideoSequenceHeaderV2 {
             width: 64,
             height: 64,
@@ -965,7 +964,8 @@ mod roundtrip_tests {
         let rgb = vec![128_u8; 64 * 64 * 3];
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).expect("yuv");
         let st = SrsV2EncodeSettings {
-            transform_decision_mode: SrsV2TransformDecisionMode::Tx16x16,
+            transform_decision_mode: SrsV2TransformDecisionMode::RdoFast,
+            rdo_mode: SrsV2RdoMode::Off,
             residual_entropy: ResidualEntropy::Explicit,
             ..Default::default()
         };
@@ -1845,7 +1845,10 @@ mod roundtrip_tests {
             stats.intra_coeff_layout_mode,
             Some(SrsV2CoeffLayoutMode::CompactV1)
         );
-        assert_eq!(stats.intra_coeff_scan_mode, Some(SrsV2CoeffScanMode::ZigZag));
+        assert_eq!(
+            stats.intra_coeff_scan_mode,
+            Some(SrsV2CoeffScanMode::ZigZag)
+        );
         assert!(stats.intra_tx8x8_blocks > 0);
         assert!(stats.coeff_layout_bytes > 0);
         assert!(stats.coeff_legacy_estimated_bytes > 0);
@@ -1872,8 +1875,7 @@ mod roundtrip_tests {
             coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
             ..Default::default()
         };
-        let mut payload =
-            encode_yuv420_intra_payload(&seq, &yuv, 0, 18, &st, None, None).unwrap();
+        let mut payload = encode_yuv420_intra_payload(&seq, &yuv, 0, 18, &st, None, None).unwrap();
         assert_eq!(payload[3], 32);
         let corrupt_at = payload.len().saturating_sub(20).max(12);
         payload[corrupt_at] ^= 0xFF;
@@ -1918,24 +1920,60 @@ mod roundtrip_tests {
     }
 
     #[test]
+    fn fr2_rev32_scan_mode_wire_roundtrip_grouped_low_first_matches_zigzag_reconstruction() {
+        let seq = seq64_intra();
+        let mut rgb = vec![70_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let i = (y * 64 + x) * 3;
+                let v = (40 + (x.wrapping_mul(3) ^ y.wrapping_mul(5)) % 50) as u8;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let qp = 20_u8;
+        let st_zz = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            ..Default::default()
+        };
+        let st_gl = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::GroupedLowFirst,
+            ..Default::default()
+        };
+        let pz = encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &st_zz, None, None).unwrap();
+        let pg = encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &st_gl, None, None).unwrap();
+        assert_eq!(pz[3], 32);
+        assert_eq!(pg[3], 32);
+        let dz = decode_yuv420_intra_payload(&seq, &pz).unwrap();
+        let dg = decode_yuv420_intra_payload(&seq, &pg).unwrap();
+        assert_eq!(dz.yuv.y.samples, dg.yuv.y.samples);
+        assert_eq!(dz.yuv.u.samples, dg.yuv.u.samples);
+        assert_eq!(dz.yuv.v.samples, dg.yuv.v.samples);
+    }
+
+    #[test]
     fn fr2_intra_revisions_1_3_7_29_still_decode_via_dispatcher() {
         let seq = seq64_intra();
         let rgb = vec![110_u8; 64 * 64 * 3];
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
         let qp = 23_u8;
         let payloads = [
+            encode_yuv420_intra_payload(&seq, &yuv, 1, qp, &explicit_only_settings(), None, None)
+                .unwrap(),
             encode_yuv420_intra_payload(
                 &seq,
                 &yuv,
-                1,
+                2,
                 qp,
-                &explicit_only_settings(),
+                &SrsV2EncodeSettings::default(),
                 None,
                 None,
             )
             .unwrap(),
-            encode_yuv420_intra_payload(&seq, &yuv, 2, qp, &SrsV2EncodeSettings::default(), None, None)
-                .unwrap(),
             encode_yuv420_intra_payload(
                 &seq,
                 &yuv,

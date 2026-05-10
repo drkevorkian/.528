@@ -45,10 +45,10 @@ pub struct ResidualEncodeStats {
     pub intra_coeff_scan_mode: Option<SrsV2CoeffScanMode>,
     pub intra_tx4x4_blocks: u64,
     pub intra_tx8x8_blocks: u64,
-    /// Sum of per-block compact coefficient payloads + block headers on rev32 intra (`pred` + `u16` len + body).
+    /// Sum of per-block compact coefficient payloads + block headers on rev32 intra (`pred` + resolved `scan` + `u16` len + body).
     pub coeff_layout_bytes: u64,
     /// Sum of [`crate::srsv2::transform_layout::estimate_coeff_layout_bytes`] (**Legacy**) per rev32 block,
-    /// plus **`2` bytes per plane** (same plane header counted in [`Self::coeff_layout_bytes`]).
+    /// plus **`1` byte per plane** (transform-kind tag; same plane header counted in [`Self::coeff_layout_bytes`]).
     pub coeff_legacy_estimated_bytes: u64,
     /// Per-block `(legacy_estimate − compact_wire)` sum (may be negative when compact is larger).
     pub coeff_layout_savings_bytes: i64,
@@ -56,7 +56,7 @@ pub struct ResidualEncodeStats {
     pub coeff_layout_savings_percent: f64,
     pub p_explicit_chunks: u64,
     pub p_rans_chunks: u64,
-    /// **`FR2` rev33** P luma 8×8 chunks using compact natural coefficient bodies ([`super::residual_entropy::TAG_P_RESIDUAL_COMPACT_V1`]).
+    /// **`FR2` rev33** P luma 8×8 chunks using [`super::residual_entropy::TAG_P_RESIDUAL_COMPACT_V1`] (compact bitmap + scan-ordered coeffs).
     pub p_compact_coeff_chunks: u64,
     /// Sum of on-wire bytes for [`Self::p_compact_coeff_chunks`] (chunk payload only, excluding outer `u32` length).
     pub p_compact_coeff_payload_bytes: u64,
@@ -281,13 +281,47 @@ pub enum SrsV2CoeffScanMode {
 }
 
 /// Transform-size **decision** policy for layout / future coefficient packaging (orthogonal to [`SrsV2TransformSizeMode`] on inter).
+///
+/// Encoder paths still read [`SrsV2TransformSizeMode`] for partitioned inter; this enum reserves **intra / layout**
+/// steering without changing emitted bytes until explicitly wired. **[`Legacy`]** matches historical baseline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2TransformDecisionMode {
-    /// Existing encoder behavior: [`SrsV2TransformSizeMode`] on partitioned inter; intra 8×8 baseline.
+    /// Historical baseline: deterministic intra/residual behavior unchanged from pre-settings wiring.
     #[default]
-    Auto,
-    /// Reserved — [`SrsV2TransformSize::Tx16x16Candidate`] has no encoder implementation.
-    Tx16x16,
+    Legacy,
+    /// Prefer **Tx8×8** on smooth blocks and **Tx4×4** on high-detail blocks using [`crate::srsv2::transform_layout`] heuristics when integrated.
+    Smooth8x8Detail4x4,
+    /// Align transform picks with fast encoder RDO — requires [`SrsV2RdoMode::Fast`].
+    RdoFast,
+}
+
+/// Structured failures from [`SrsV2EncodeSettings::validate_coeff_layout_settings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrsV2CoeffLayoutSettingsError {
+    /// [`SrsV2TransformDecisionMode::RdoFast`] requires [`SrsV2RdoMode::Fast`].
+    RdoFastRequiresRdoModeFast,
+}
+
+impl std::fmt::Display for SrsV2CoeffLayoutSettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RdoFastRequiresRdoModeFast => {
+                write!(f, "transform_decision_mode RdoFast requires rdo_mode Fast",)
+            }
+        }
+    }
+}
+
+impl std::error::Error for SrsV2CoeffLayoutSettingsError {}
+
+impl From<SrsV2CoeffLayoutSettingsError> for SrsV2Error {
+    fn from(e: SrsV2CoeffLayoutSettingsError) -> Self {
+        match e {
+            SrsV2CoeffLayoutSettingsError::RdoFastRequiresRdoModeFast => SrsV2Error::Unsupported(
+                "coeff_layout: transform_decision_mode RdoFast requires rdo_mode Fast",
+            ),
+        }
+    }
 }
 
 /// How **`AutoFast`** weighs **SAD** vs estimated side-information (`FR2` rev **19**+).
@@ -421,7 +455,7 @@ pub struct SrsV2EncodeSettings {
     pub coeff_layout_mode: SrsV2CoeffLayoutMode,
     /// Coefficient scan for layout (**default** [`SrsV2CoeffScanMode::ZigZag`]).
     pub coeff_scan_mode: SrsV2CoeffScanMode,
-    /// Transform decision for layout (**default** [`SrsV2TransformDecisionMode::Auto`]).
+    /// Transform decision for layout (**default** [`SrsV2TransformDecisionMode::Legacy`]).
     pub transform_decision_mode: SrsV2TransformDecisionMode,
 }
 
@@ -483,7 +517,7 @@ impl Default for SrsV2EncodeSettings {
 
             coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
             coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
-            transform_decision_mode: SrsV2TransformDecisionMode::Auto,
+            transform_decision_mode: SrsV2TransformDecisionMode::Legacy,
         }
     }
 }
@@ -606,17 +640,21 @@ impl SrsV2EncodeSettings {
 
     /// Validate coefficient layout settings (encoding entry points should call this).
     ///
-    /// Layout fields are **not** written to `FR2` yet; this rejects reserved / unsupported combinations early.
+    /// Rejects incoherent combinations early; defaults preserve legacy output. **[`SrsV2TransformSize::Tx16x16Candidate`]**
+    /// remains wire-only / unsupported for encode — there is no settings knob for it here.
     pub fn validate_coeff_layout_settings(&self) -> Result<(), SrsV2Error> {
-        match self.transform_decision_mode {
-            SrsV2TransformDecisionMode::Auto => {}
-            SrsV2TransformDecisionMode::Tx16x16 => {
-                return Err(SrsV2Error::Unsupported(
-                    "transform_decision_mode Tx16x16 is not implemented (no encoder path)",
-                ));
-            }
+        if matches!(
+            self.transform_decision_mode,
+            SrsV2TransformDecisionMode::RdoFast
+        ) && !matches!(self.rdo_mode, SrsV2RdoMode::Fast)
+        {
+            return Err(SrsV2CoeffLayoutSettingsError::RdoFastRequiresRdoModeFast.into());
         }
-        let _ = (self.coeff_layout_mode, self.coeff_scan_mode);
+        let _ = (
+            self.coeff_layout_mode,
+            self.coeff_scan_mode,
+            self.transform_decision_mode,
+        );
         Ok(())
     }
 
@@ -1081,11 +1119,14 @@ mod tests {
     }
 
     #[test]
-    fn coeff_layout_defaults_are_legacy_zigzag_auto_transform() {
+    fn coeff_layout_defaults_preserve_legacy_encoder_baseline() {
         let d = SrsV2EncodeSettings::default();
         assert_eq!(d.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
         assert_eq!(d.coeff_scan_mode, SrsV2CoeffScanMode::ZigZag);
-        assert_eq!(d.transform_decision_mode, SrsV2TransformDecisionMode::Auto);
+        assert_eq!(
+            d.transform_decision_mode,
+            SrsV2TransformDecisionMode::Legacy
+        );
         d.validate_coeff_layout_settings().unwrap();
     }
 
@@ -1100,15 +1141,50 @@ mod tests {
     }
 
     #[test]
-    fn coeff_layout_tx16x16_encode_setting_rejected() {
+    fn coeff_layout_rdo_fast_requires_rdo_mode_fast() {
         use crate::srsv2::error::SrsV2Error;
         let s = SrsV2EncodeSettings {
-            transform_decision_mode: SrsV2TransformDecisionMode::Tx16x16,
+            transform_decision_mode: SrsV2TransformDecisionMode::RdoFast,
+            rdo_mode: SrsV2RdoMode::Off,
             ..Default::default()
         };
         assert!(matches!(
             s.validate_coeff_layout_settings(),
-            Err(SrsV2Error::Unsupported(_))
+            Err(SrsV2Error::Unsupported(
+                "coeff_layout: transform_decision_mode RdoFast requires rdo_mode Fast",
+            ))
+        ));
+    }
+
+    #[test]
+    fn coeff_layout_rdo_fast_ok_when_rdo_mode_fast() {
+        let s = SrsV2EncodeSettings {
+            transform_decision_mode: SrsV2TransformDecisionMode::RdoFast,
+            rdo_mode: SrsV2RdoMode::Fast,
+            ..Default::default()
+        };
+        s.validate_coeff_layout_settings().unwrap();
+    }
+
+    #[test]
+    fn coeff_layout_smooth_detail_validates() {
+        let s = SrsV2EncodeSettings {
+            transform_decision_mode: SrsV2TransformDecisionMode::Smooth8x8Detail4x4,
+            ..Default::default()
+        };
+        s.validate_coeff_layout_settings().unwrap();
+    }
+
+    #[test]
+    fn coeff_layout_settings_error_maps_to_srsv2_error() {
+        use crate::srsv2::error::SrsV2Error;
+        let e = SrsV2CoeffLayoutSettingsError::RdoFastRequiresRdoModeFast;
+        let mapped: SrsV2Error = e.into();
+        assert!(matches!(
+            mapped,
+            SrsV2Error::Unsupported(
+                "coeff_layout: transform_decision_mode RdoFast requires rdo_mode Fast",
+            )
         ));
     }
 

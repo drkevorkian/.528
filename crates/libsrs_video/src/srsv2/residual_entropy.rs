@@ -18,11 +18,6 @@ use super::rate_control::{
     ResidualEncodeStats, ResidualEntropy, SrsV2CoeffScanMode, SrsV2EncodeSettings,
     SrsV2ResidualContextMode,
 };
-use super::transform_layout::{
-    choose_coeff_scan, decode_coeff_compact_v1_natural_body, encode_coeff_compact_v1_natural_body,
-    estimate_coeff_layout_bytes, SrsV2CoeffLayoutMode as TlCoeffLayoutMode, SrsV2CoeffScan,
-    SrsV2TransformKind, TransformLayoutError,
-};
 pub use super::residual_context_entropy::ResidualPlane;
 use super::residual_context_entropy::{
     decode_residual_context_v1_plane, encode_residual_context_v1_plane, ResidualContextModel,
@@ -31,12 +26,18 @@ use super::residual_tokens::{
     detokenize_ac, rans_decode_tokens, rans_encode_tokens, residual_token_model, tokenize_ac,
     MAX_SYMBOLS_PER_BLOCK,
 };
+use super::transform_layout::{
+    choose_coeff_scan, decode_coeff_compact_rev32_intra_block,
+    encode_coeff_compact_rev32_intra_block, estimate_coeff_layout_bytes,
+    SrsV2CoeffLayoutMode as TlCoeffLayoutMode, SrsV2CoeffScan, SrsV2TransformKind,
+    TransformLayoutError,
+};
 
 pub const TAG_EXPLICIT_AC: u8 = 0;
 pub const TAG_RANS_AC: u8 = 1;
 /// Multi-context static rANS residual (`SrsV2ResidualContextMode::ContextV1`).
 pub const TAG_CONTEXT_RANS_AC: u8 = 2;
-/// **`FR2` rev33** fixed-grid **P** 8×8 residual: compact natural-index bitmap + `i16` values ([`encode_p_residual_chunk_compact_v33_wire`]).
+/// **`FR2` rev33** fixed-grid **P** 8×8 residual: compact bitmap + scan-ordered `i16` values ([`encode_p_residual_chunk_compact_v33_wire`]).
 pub const TAG_P_RESIDUAL_COMPACT_V1: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +77,7 @@ impl Default for PResidualChunkEncodeOpts<'_> {
 pub enum PResidualChunkKind {
     LegacyTuple,
     Adaptive(BlockResidualCoding),
-    /// Natural-order compact coefficient body (`TAG_P_RESIDUAL_COMPACT_V1`); **`FR2` rev33** fixed **P** grid.
+    /// Scan-ordered compact coefficient body (`TAG_P_RESIDUAL_COMPACT_V1`); **`FR2` rev33** fixed **P** grid ([`crate::srsv2::transform_layout::encode_coeff_compact_rev32_intra_block`]).
     CompactCoeffV1,
 }
 
@@ -696,9 +697,7 @@ fn map_transform_layout_err(e: TransformLayoutError) -> SrsV2Error {
     match e {
         TransformLayoutError::Truncated => SrsV2Error::Truncated,
         TransformLayoutError::BadMagic => SrsV2Error::syntax("coeff layout: bad magic"),
-        TransformLayoutError::UnsupportedVersion(v) => {
-            SrsV2Error::UnsupportedVersion(v)
-        }
+        TransformLayoutError::UnsupportedVersion(v) => SrsV2Error::UnsupportedVersion(v),
         TransformLayoutError::InvalidCoefficientCount { .. } => {
             SrsV2Error::syntax("coeff layout: bad coefficient count")
         }
@@ -719,25 +718,24 @@ fn map_transform_layout_err(e: TransformLayoutError) -> SrsV2Error {
     }
 }
 
-/// Wire tag for [`SrsV2CoeffScanMode::Auto`] in **`FR2` rev32** plane headers.
-pub(crate) const REV32_COEFF_SCAN_MODE_AUTO_WIRE: u8 = 3;
-
-pub(crate) fn rev32_coeff_scan_mode_wire(mode: SrsV2CoeffScanMode) -> u8 {
-    match mode {
-        SrsV2CoeffScanMode::ZigZag => 0,
-        SrsV2CoeffScanMode::GroupedLowFirst => 1,
-        SrsV2CoeffScanMode::RunOptimized => 2,
-        SrsV2CoeffScanMode::Auto => REV32_COEFF_SCAN_MODE_AUTO_WIRE,
+/// Per **8×8** block resolved [`SrsV2CoeffScan`] on **`FR2` rev32** intra (`Auto` is never stored — encoder resolves per block).
+#[inline]
+fn rev32_intra_mb_scan_wire(scan: SrsV2CoeffScan) -> u8 {
+    match scan {
+        SrsV2CoeffScan::ZigZag => 0,
+        SrsV2CoeffScan::GroupedLowFirst => 1,
+        SrsV2CoeffScan::RunOptimized => 2,
     }
 }
 
-pub(crate) fn rev32_coeff_scan_mode_from_wire(b: u8) -> Result<SrsV2CoeffScanMode, SrsV2Error> {
+fn rev32_intra_mb_scan_from_wire(b: u8) -> Result<SrsV2CoeffScan, SrsV2Error> {
     match b {
-        0 => Ok(SrsV2CoeffScanMode::ZigZag),
-        1 => Ok(SrsV2CoeffScanMode::GroupedLowFirst),
-        2 => Ok(SrsV2CoeffScanMode::RunOptimized),
-        REV32_COEFF_SCAN_MODE_AUTO_WIRE => Ok(SrsV2CoeffScanMode::Auto),
-        _ => Err(SrsV2Error::syntax("FR2 rev32: bad coeff_scan_mode byte")),
+        0 => Ok(SrsV2CoeffScan::ZigZag),
+        1 => Ok(SrsV2CoeffScan::GroupedLowFirst),
+        2 => Ok(SrsV2CoeffScan::RunOptimized),
+        _ => Err(SrsV2Error::syntax(
+            "FR2 rev32 intra: bad per-block coeff_scan byte",
+        )),
     }
 }
 
@@ -755,20 +753,21 @@ fn resolve_intra_compact_scan(
     })
 }
 
-/// Encode one fixed-grid **`FR2` rev33** **P** 8×8 quantized coefficient block (natural DCT index order).
+/// Encode one fixed-grid **`FR2` rev33** **P** 8×8 quantized coefficient block (`transform_layout` compact).
 ///
-/// Wire: [`TAG_P_RESIDUAL_COMPACT_V1`] + [`PredMode::Dc`] + scan-settings byte + `u16` body length +
-/// [`encode_coeff_compact_v1_natural_body`].
+/// Wire: [`TAG_P_RESIDUAL_COMPACT_V1`] + [`PredMode::Dc`] + **resolved** scan byte (`0..=2`) + `u16` body length +
+/// [`encode_coeff_compact_rev32_intra_block`] (bitmap + values in scan order; [`SrsV2CoeffScanMode::Auto`] resolved per chunk).
 pub fn encode_p_residual_chunk_compact_v33_wire(
     qfreq: &[i16; 64],
     settings: &SrsV2EncodeSettings,
 ) -> Result<Vec<u8>, SrsV2Error> {
-    let _scan = resolve_intra_compact_scan(settings, qfreq)?;
+    let scan = resolve_intra_compact_scan(settings, qfreq)?;
     let mut out = Vec::with_capacity(4 + 8 + 64 * 2);
     out.push(TAG_P_RESIDUAL_COMPACT_V1);
     out.push(PredMode::Dc as u8);
-    out.push(rev32_coeff_scan_mode_wire(settings.coeff_scan_mode));
-    let body = encode_coeff_compact_v1_natural_body(qfreq);
+    out.push(rev32_intra_mb_scan_wire(scan));
+    let body = encode_coeff_compact_rev32_intra_block(qfreq, SrsV2TransformKind::Tx8x8, scan)
+        .map_err(map_transform_layout_err)?;
     let bl =
         u16::try_from(body.len()).map_err(|_| SrsV2Error::syntax("FR2 rev33 P compact length"))?;
     out.extend_from_slice(&bl.to_le_bytes());
@@ -794,7 +793,7 @@ pub fn decode_p_residual_chunk_compact_v33(
     let mode_b = read_u8(body, &mut cur)?;
     PredMode::from_u8(mode_b)?;
     let scan_b = read_u8(body, &mut cur)?;
-    rev32_coeff_scan_mode_from_wire(scan_b)?;
+    let scan = rev32_intra_mb_scan_from_wire(scan_b)?;
     let body_len = read_u16(body, &mut cur)? as usize;
     let end = cur
         .checked_add(body_len)
@@ -802,7 +801,9 @@ pub fn decode_p_residual_chunk_compact_v33(
     if end > body.len() {
         return Err(SrsV2Error::Truncated);
     }
-    let freq = decode_coeff_compact_v1_natural_body(&body[cur..end]).map_err(map_transform_layout_err)?;
+    let freq =
+        decode_coeff_compact_rev32_intra_block(&body[cur..end], SrsV2TransformKind::Tx8x8, scan)
+            .map_err(map_transform_layout_err)?;
     cur = end;
     if cur != body.len() {
         return Err(SrsV2Error::syntax("FR2 rev33 P residual trailing bytes"));
@@ -819,7 +820,10 @@ pub fn decode_p_residual_chunk_compact_v33(
     Ok((out, nz_ac))
 }
 
-/// Encode one luma/chroma plane for **`FR2` rev32** intra (`CompactV1` natural coefficient bodies).
+/// Encode one luma/chroma plane for **`FR2` rev32** intra (`CompactV1` bitmap + scan-ordered coefficients).
+///
+/// Plane header: transform-kind tag (**Tx8×8**). Each **8×8** macroblock: prediction mode + **resolved**
+/// scan tag + `u16` body length + [`encode_coeff_compact_rev32_intra_block`] payload.
 pub(crate) fn encode_plane_intra_compact_v32(
     plane: &VideoPlane<u8>,
     qp: i16,
@@ -832,11 +836,8 @@ pub(crate) fn encode_plane_intra_compact_v32(
         stats.intra_coeff_scan_mode = Some(settings.coeff_scan_mode);
     }
     out.push(kind_tag_wire(SrsV2TransformKind::Tx8x8));
-    out.push(rev32_coeff_scan_mode_wire(settings.coeff_scan_mode));
-    stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(2);
-    // Match the plane header bytes in [`ResidualEncodeStats::coeff_layout_bytes`] so totals compare
-    // with [`coeff_legacy_estimated_bytes`] (per-block legacy estimates only).
-    stats.coeff_legacy_estimated_bytes = stats.coeff_legacy_estimated_bytes.saturating_add(2);
+    stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(1);
+    stats.coeff_legacy_estimated_bytes = stats.coeff_legacy_estimated_bytes.saturating_add(1);
 
     let w = plane.width as usize;
     let h = plane.height as usize;
@@ -890,19 +891,23 @@ pub(crate) fn encode_plane_intra_compact_v32(
                 TlCoeffLayoutMode::Legacy,
             )
             .map_err(map_transform_layout_err)? as u64;
-            let body = encode_coeff_compact_v1_natural_body(&qfreq);
-            let block_wire = 1usize + 2 + body.len();
-            stats.coeff_legacy_estimated_bytes =
-                stats.coeff_legacy_estimated_bytes.saturating_add(legacy_est);
-            stats.coeff_layout_bytes = stats
-                .coeff_layout_bytes
-                .saturating_add(block_wire as u64);
-            stats.coeff_layout_savings_bytes =
-                stats.coeff_layout_savings_bytes.saturating_add(legacy_est as i64 - block_wire as i64);
+            let body =
+                encode_coeff_compact_rev32_intra_block(&qfreq, SrsV2TransformKind::Tx8x8, scan)
+                    .map_err(map_transform_layout_err)?;
+            let block_wire = 1usize + 1 + 2 + body.len();
+            stats.coeff_legacy_estimated_bytes = stats
+                .coeff_legacy_estimated_bytes
+                .saturating_add(legacy_est);
+            stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(block_wire as u64);
+            stats.coeff_layout_savings_bytes = stats
+                .coeff_layout_savings_bytes
+                .saturating_add(legacy_est as i64 - block_wire as i64);
             stats.intra_tx8x8_blocks = stats.intra_tx8x8_blocks.saturating_add(1);
 
             out.push(mode as u8);
-            let bl = u16::try_from(body.len()).map_err(|_| SrsV2Error::syntax("rev32 body length"))?;
+            out.push(rev32_intra_mb_scan_wire(scan));
+            let bl =
+                u16::try_from(body.len()).map_err(|_| SrsV2Error::syntax("rev32 body length"))?;
             out.extend_from_slice(&bl.to_le_bytes());
             out.extend_from_slice(&body);
 
@@ -946,8 +951,6 @@ pub(crate) fn decode_plane_intra_compact_v32(
             "FR2 rev32 intra expects Tx8x8 transform kind tag",
         ));
     }
-    let scan_b = read_u8(data, cursor)?;
-    let _scan_mode = rev32_coeff_scan_mode_from_wire(scan_b)?;
 
     let w = plane.width as usize;
     let h = plane.height as usize;
@@ -966,6 +969,8 @@ pub(crate) fn decode_plane_intra_compact_v32(
 
             let mode_b = read_u8(data, cursor)?;
             let mode = PredMode::from_u8(mode_b)?;
+            let scan_mb_b = read_u8(data, cursor)?;
+            let scan = rev32_intra_mb_scan_from_wire(scan_mb_b)?;
             let bl = read_u16(data, cursor)? as usize;
             let end = cursor
                 .checked_add(bl)
@@ -975,7 +980,9 @@ pub(crate) fn decode_plane_intra_compact_v32(
             }
             let body = &data[*cursor..end];
             *cursor = end;
-            let qfreq = decode_coeff_compact_v1_natural_body(body).map_err(map_transform_layout_err)?;
+            let qfreq =
+                decode_coeff_compact_rev32_intra_block(body, SrsV2TransformKind::Tx8x8, scan)
+                    .map_err(map_transform_layout_err)?;
             let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
             let recon_freq = dequantize(&qfreq, qp);
             let rpix = idct_8x8(&recon_freq);
@@ -1708,7 +1715,8 @@ mod residual_entropy_tests {
     use crate::srsv2::frame::VideoPlane;
     use crate::srsv2::intra_codec::{decode_plane_intra, encode_plane_intra, PredMode};
     use crate::srsv2::rate_control::{
-        ResidualEncodeStats, SrsV2EncodeSettings, SrsV2ResidualContextMode,
+        ResidualEncodeStats, SrsV2CoeffLayoutMode, SrsV2CoeffScanMode, SrsV2EncodeSettings,
+        SrsV2ResidualContextMode,
     };
 
     fn sparse_one_ac_qfreq() -> [i16; 64] {
@@ -1716,6 +1724,30 @@ mod residual_entropy_tests {
         blk[0] = 5;
         blk[ZIGZAG[1]] = 1;
         blk
+    }
+
+    #[test]
+    fn p_residual_compact_rev33_wire_scan_changes_bytes_not_spatial_residual() {
+        let qf = sparse_one_ac_qfreq();
+        let st_zz = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            ..Default::default()
+        };
+        let st_gl = SrsV2EncodeSettings {
+            coeff_scan_mode: SrsV2CoeffScanMode::GroupedLowFirst,
+            ..st_zz.clone()
+        };
+        let wz = encode_p_residual_chunk_compact_v33_wire(&qf, &st_zz).unwrap();
+        let wg = encode_p_residual_chunk_compact_v33_wire(&qf, &st_gl).unwrap();
+        assert_ne!(
+            wz, wg,
+            "different scans should reorder compact payload bytes"
+        );
+        let qp = 19_i16;
+        let (az, _) = decode_p_residual_chunk_compact_v33(&wz, qp).unwrap();
+        let (ag, _) = decode_p_residual_chunk_compact_v33(&wg, qp).unwrap();
+        assert_eq!(az, ag);
     }
 
     /// Dense AC=1 blocks blow up explicit tuples (63×3-byte pairs); static rANS usually wins.

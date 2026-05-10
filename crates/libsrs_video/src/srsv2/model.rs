@@ -131,7 +131,10 @@ impl FrameTypeV2 {
     pub fn from_srsv2_revision(rev: u8) -> Result<Self, super::error::SrsV2Error> {
         Ok(match rev {
             1 | 3 | 7 | 29 | 32 => Self::Intra,
-            2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 => Self::PredictedP,
+            // **33** — fixed-grid **P** with optional CompactV1 luma residual chunks (`coeff_layout_mode`).
+            2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 => {
+                Self::PredictedP
+            }
             10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26 | 31 => Self::BidirectionalB,
             12 => Self::AltRef,
             _ => {

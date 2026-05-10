@@ -1,15 +1,14 @@
 //! Transform size and coefficient **layout** decisions for SRSV2 (experimental).
 //!
-//! This module sits **above** [`crate::srsv2::dct`] (pure DCT math) and **before**
-//! [`crate::srsv2::residual_entropy`] (entropy coding). It does **not** define `FR2`
-//! payload bytes or alter encoder behavior until explicitly wired.
+//! This module owns **coefficient order and layout** choices. It sits **above**
+//! [`crate::srsv2::dct`] (DCT math only — no transforms implemented here) and **before**
+//! [`crate::srsv2::residual_entropy`] (entropy coding). Encoder wiring may call these helpers later;
+//! this block does not change emitted bitstreams by itself.
 //!
 //! ## Layout vs entropy
 //! - **Natural order** depends on [`SrsV2TransformKind`] (8×8 raster vs four 4×4 quadrants).
-//! - **Scan order** permutes coefficients for analysis / future entropy-friendly serialization.
-//! - [`SrsV2CoeffLayoutMode::CompactV1`] is an experimental container format (`S2TL` magic),
-//!   not an `FR2` revision (but fixed-grid **P** frames may embed natural-order compact bodies in
-//!   **`FR2` rev33** chunks via [`crate::srsv2::residual_entropy::encode_p_residual_chunk_compact_v33_wire`]).
+//! - **Scan order** permutes coefficients for analysis or future serialization.
+//! - [`SrsV2CoeffLayoutMode::CompactV1`] is an experimental `S2TL` container for sizing / tooling.
 
 use super::dct::{ZIGZAG, ZIGZAG_4X4};
 
@@ -70,7 +69,10 @@ pub enum TransformLayoutError {
     /// Enum tag out of range.
     InvalidDiscriminant(&'static str, u8),
     /// Declared nonzero count inconsistent with bitmap.
-    InconsistentNonzeroCount { bitmap_popcount: u32, payload_pairs: usize },
+    InconsistentNonzeroCount {
+        bitmap_popcount: u32,
+        payload_pairs: usize,
+    },
 }
 
 /// Resolved transform + scan for a block (no bitstream binding yet).
@@ -157,8 +159,8 @@ fn zigzag_perm(kind: SrsV2TransformKind) -> [usize; COEFFICIENTS_PER_LAYOUT_BLOC
             let mut s = 0usize;
             for q in 0..4 {
                 let base = q * 16;
-                for k in 0..16 {
-                    p[s] = base + ZIGZAG_4X4[k];
+                for &zz in ZIGZAG_4X4.iter() {
+                    p[s] = base + zz;
                     s += 1;
                 }
             }
@@ -185,8 +187,16 @@ fn grouped_low_first_perm(kind: SrsV2TransformKind) -> [usize; COEFFICIENTS_PER_
         SrsV2TransformKind::Tx8x8 => {
             let mut idxs: Vec<usize> = (0..64).collect();
             idxs.sort_by(|&a, &b| {
-                let da = if a == 0 { (0, 0, 0) } else { (1, manhattan_ac(a), a) };
-                let db = if b == 0 { (0, 0, 0) } else { (1, manhattan_ac(b), b) };
+                let da = if a == 0 {
+                    (0, 0, 0)
+                } else {
+                    (1, manhattan_ac(a), a)
+                };
+                let db = if b == 0 {
+                    (0, 0, 0)
+                } else {
+                    (1, manhattan_ac(b), b)
+                };
                 da.cmp(&db)
             });
             let mut p = [0usize; 64];
@@ -206,16 +216,8 @@ fn grouped_low_first_perm(kind: SrsV2TransformKind) -> [usize; COEFFICIENTS_PER_
                     let lb = b - base;
                     let (ra, ca) = (la / 4, la % 4);
                     let (rb, cb) = (lb / 4, lb % 4);
-                    let da = if la == 0 {
-                        (0, 0, 0)
-                    } else {
-                        (1, ra + ca, la)
-                    };
-                    let db = if lb == 0 {
-                        (0, 0, 0)
-                    } else {
-                        (1, rb + cb, lb)
-                    };
+                    let da = if la == 0 { (0, 0, 0) } else { (1, ra + ca, la) };
+                    let db = if lb == 0 { (0, 0, 0) } else { (1, rb + cb, lb) };
                     da.cmp(&db)
                 });
                 for nat in local {
@@ -249,10 +251,8 @@ fn run_optimized_perm(
         }
     }
     let mut p = [0usize; COEFFICIENTS_PER_LAYOUT_BLOCK];
-    let mut s = 0usize;
-    for nat in nonzero.into_iter().chain(zeros.into_iter()) {
+    for (s, nat) in nonzero.into_iter().chain(zeros.into_iter()).enumerate() {
         p[s] = nat;
-        s += 1;
     }
     Ok(p)
 }
@@ -357,7 +357,7 @@ fn legacy_byte_estimate(coeffs: &[i16]) -> usize {
             bits += 4 + mag as usize;
         }
     }
-    (bits + 7) / 8 + LEGACY_NOTIONAL_CONTAINER_BYTES
+    bits.div_ceil(8) + LEGACY_NOTIONAL_CONTAINER_BYTES
 }
 
 fn compact_v1_byte_estimate_natural(coeffs_natural: &[i16]) -> usize {
@@ -392,7 +392,10 @@ fn kind_from_tag(b: u8) -> Result<SrsV2TransformKind, TransformLayoutError> {
     match b {
         0 => Ok(SrsV2TransformKind::Tx4x4),
         1 => Ok(SrsV2TransformKind::Tx8x8),
-        _ => Err(TransformLayoutError::InvalidDiscriminant("transform_kind", b)),
+        _ => Err(TransformLayoutError::InvalidDiscriminant(
+            "transform_kind",
+            b,
+        )),
     }
 }
 
@@ -422,8 +425,12 @@ pub fn encode_coeff_layout_compact_v1(
 ) -> Result<Vec<u8>, TransformLayoutError> {
     expect_coeff_len(coeffs_natural, kind)?;
     let mut bitmap: u64 = 0;
-    for i in 0..COEFFICIENTS_PER_LAYOUT_BLOCK {
-        if coeffs_natural[i] != 0 {
+    for (i, &coeff) in coeffs_natural
+        .iter()
+        .enumerate()
+        .take(COEFFICIENTS_PER_LAYOUT_BLOCK)
+    {
+        if coeff != 0 {
             bitmap |= 1u64 << i;
         }
     }
@@ -436,9 +443,13 @@ pub fn encode_coeff_layout_compact_v1(
     out.push(1u8); // layout_mode tag = CompactV1
     out.extend_from_slice(&(COEFFICIENTS_PER_LAYOUT_BLOCK as u16).to_le_bytes());
     out.extend_from_slice(&bitmap.to_le_bytes());
-    for i in 0..COEFFICIENTS_PER_LAYOUT_BLOCK {
+    for (i, &coeff) in coeffs_natural
+        .iter()
+        .enumerate()
+        .take(COEFFICIENTS_PER_LAYOUT_BLOCK)
+    {
         if (bitmap >> i) & 1 != 0 {
-            out.extend_from_slice(&coeffs_natural[i].to_le_bytes());
+            out.extend_from_slice(&coeff.to_le_bytes());
         }
     }
     Ok(out)
@@ -483,9 +494,13 @@ pub fn decode_coeff_layout_compact_v1(
     }
     let mut natural = [0_i16; COEFFICIENTS_PER_LAYOUT_BLOCK];
     let mut cur = HDR + 8;
-    for i in 0..COEFFICIENTS_PER_LAYOUT_BLOCK {
+    for (i, slot) in natural
+        .iter_mut()
+        .enumerate()
+        .take(COEFFICIENTS_PER_LAYOUT_BLOCK)
+    {
         if (bitmap >> i) & 1 != 0 {
-            natural[i] = i16::from_le_bytes([buf[cur], buf[cur + 1]]);
+            *slot = i16::from_le_bytes([buf[cur], buf[cur + 1]]);
             cur += 2;
         }
     }
@@ -499,22 +514,30 @@ pub fn decode_coeff_layout_compact_v1(
 }
 
 /// Compact coefficient body only (**no** `S2TL` header): `u64` LE natural-index bitmap + nonzero `i16`
-/// values in ascending index order. Used by **`FR2` rev32** intra plane chunks.
+/// values in ascending natural index order. Callers may embed this blob in their own framing.
 pub fn encode_coeff_compact_v1_natural_body(
     coeffs: &[i16; COEFFICIENTS_PER_LAYOUT_BLOCK],
 ) -> Vec<u8> {
     let mut bitmap: u64 = 0;
-    for i in 0..COEFFICIENTS_PER_LAYOUT_BLOCK {
-        if coeffs[i] != 0 {
+    for (i, &coeff) in coeffs
+        .iter()
+        .enumerate()
+        .take(COEFFICIENTS_PER_LAYOUT_BLOCK)
+    {
+        if coeff != 0 {
             bitmap |= 1u64 << i;
         }
     }
     let pop = bitmap.count_ones() as usize;
     let mut out = Vec::with_capacity(8 + pop * 2);
     out.extend_from_slice(&bitmap.to_le_bytes());
-    for i in 0..COEFFICIENTS_PER_LAYOUT_BLOCK {
+    for (i, &coeff) in coeffs
+        .iter()
+        .enumerate()
+        .take(COEFFICIENTS_PER_LAYOUT_BLOCK)
+    {
         if (bitmap >> i) & 1 != 0 {
-            out.extend_from_slice(&coeffs[i].to_le_bytes());
+            out.extend_from_slice(&coeff.to_le_bytes());
         }
     }
     out
@@ -538,7 +561,95 @@ pub fn decode_coeff_compact_v1_natural_body(
     }
     let mut natural = [0_i16; COEFFICIENTS_PER_LAYOUT_BLOCK];
     let mut cur = 8usize;
-    for i in 0..COEFFICIENTS_PER_LAYOUT_BLOCK {
+    for (i, slot) in natural
+        .iter_mut()
+        .enumerate()
+        .take(COEFFICIENTS_PER_LAYOUT_BLOCK)
+    {
+        if (bitmap >> i) & 1 != 0 {
+            *slot = i16::from_le_bytes([buf[cur], buf[cur + 1]]);
+            cur += 2;
+        }
+    }
+    debug_assert_eq!(cur, buf.len());
+    Ok(natural)
+}
+
+/// Natural-index permutation for one block: `perm[s]` is the raster index visited at scan position `s`.
+///
+/// Used by **`FR2` rev32** intra to serialize nonzero coefficient **`i16`** values in scan traversal order
+/// (after the leading natural `u64` bitmap).
+pub fn block_natural_index_permutation_for_scan(
+    coeffs_natural: &[i16; COEFFICIENTS_PER_LAYOUT_BLOCK],
+    kind: SrsV2TransformKind,
+    scan: SrsV2CoeffScan,
+) -> Result<[usize; COEFFICIENTS_PER_LAYOUT_BLOCK], TransformLayoutError> {
+    scan_permutation(coeffs_natural.as_slice(), kind, scan)
+}
+
+/// **`FR2` rev32** intra and **rev33** fixed-grid **P** 8×8 residual payload: `u64` LE bitmap (natural nonzero
+/// positions) then nonzero coefficients in **scan order** (iterate `s = 0..64`, index `perm[s]`, emit when the bitmap bit is set).
+///
+/// [`decode_coeff_compact_rev32_intra_block`] recovers natural coefficients before inverse transform.
+pub fn encode_coeff_compact_rev32_intra_block(
+    coeffs_natural: &[i16; COEFFICIENTS_PER_LAYOUT_BLOCK],
+    kind: SrsV2TransformKind,
+    scan: SrsV2CoeffScan,
+) -> Result<Vec<u8>, TransformLayoutError> {
+    let perm = block_natural_index_permutation_for_scan(coeffs_natural, kind, scan)?;
+    let mut bitmap: u64 = 0;
+    for (i, &coeff) in coeffs_natural
+        .iter()
+        .enumerate()
+        .take(COEFFICIENTS_PER_LAYOUT_BLOCK)
+    {
+        if coeff != 0 {
+            bitmap |= 1u64 << i;
+        }
+    }
+    let pop = bitmap.count_ones() as usize;
+    let mut out = Vec::with_capacity(8 + pop * 2);
+    out.extend_from_slice(&bitmap.to_le_bytes());
+    for &i in perm.iter().take(COEFFICIENTS_PER_LAYOUT_BLOCK) {
+        if (bitmap >> i) & 1 != 0 {
+            out.extend_from_slice(&coeffs_natural[i].to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
+/// Decode [`encode_coeff_compact_rev32_intra_block`].
+pub fn decode_coeff_compact_rev32_intra_block(
+    buf: &[u8],
+    kind: SrsV2TransformKind,
+    scan: SrsV2CoeffScan,
+) -> Result<[i16; COEFFICIENTS_PER_LAYOUT_BLOCK], TransformLayoutError> {
+    if buf.len() < 8 {
+        return Err(TransformLayoutError::Truncated);
+    }
+    let bitmap = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    let pop = bitmap.count_ones() as usize;
+    let need = 8usize.saturating_add(pop.saturating_mul(2));
+    if buf.len() != need {
+        return Err(TransformLayoutError::InconsistentNonzeroCount {
+            bitmap_popcount: bitmap.count_ones(),
+            payload_pairs: buf.len().saturating_sub(8) / 2,
+        });
+    }
+    let mut pattern = [0_i16; COEFFICIENTS_PER_LAYOUT_BLOCK];
+    for (i, slot) in pattern
+        .iter_mut()
+        .enumerate()
+        .take(COEFFICIENTS_PER_LAYOUT_BLOCK)
+    {
+        if (bitmap >> i) & 1 != 0 {
+            *slot = 1;
+        }
+    }
+    let perm = scan_permutation(&pattern, kind, scan)?;
+    let mut natural = [0_i16; COEFFICIENTS_PER_LAYOUT_BLOCK];
+    let mut cur = 8usize;
+    for &i in perm.iter().take(COEFFICIENTS_PER_LAYOUT_BLOCK) {
         if (bitmap >> i) & 1 != 0 {
             natural[i] = i16::from_le_bytes([buf[cur], buf[cur + 1]]);
             cur += 2;
@@ -556,13 +667,10 @@ pub fn transform_layout_summary(
 ) -> Result<String, TransformLayoutError> {
     expect_coeff_len(coeffs_natural, kind)?;
     let nz = coeffs_natural.iter().filter(|&&c| c != 0).count();
-    let leg = estimate_coeff_layout_bytes(coeffs_natural, kind, scan, SrsV2CoeffLayoutMode::Legacy)?;
-    let cmp = estimate_coeff_layout_bytes(
-        coeffs_natural,
-        kind,
-        scan,
-        SrsV2CoeffLayoutMode::CompactV1,
-    )?;
+    let leg =
+        estimate_coeff_layout_bytes(coeffs_natural, kind, scan, SrsV2CoeffLayoutMode::Legacy)?;
+    let cmp =
+        estimate_coeff_layout_bytes(coeffs_natural, kind, scan, SrsV2CoeffLayoutMode::CompactV1)?;
     Ok(format!(
         "kind={kind:?} scan={scan:?} nonzero={nz}/{} legacy_est_B={leg} compact_v1_est_B={cmp}",
         COEFFICIENTS_PER_LAYOUT_BLOCK
@@ -583,17 +691,26 @@ mod tests {
     #[test]
     fn zigzag_roundtrip_tx8x8() {
         let mut c = [0_i16; 64];
-        for i in 0..64 {
-            c[i] = (i as i16).wrapping_mul(3).wrapping_sub(17);
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = (i as i16).wrapping_mul(3).wrapping_sub(17);
         }
         assert_roundtrip(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::ZigZag);
     }
 
     #[test]
+    fn zigzag_roundtrip_tx4x4() {
+        let mut c = [0_i16; 64];
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = (i as i16).wrapping_rem(31).wrapping_sub(11);
+        }
+        assert_roundtrip(&c, SrsV2TransformKind::Tx4x4, SrsV2CoeffScan::ZigZag);
+    }
+
+    #[test]
     fn grouped_low_first_roundtrip_tx8x8_and_tx4x4() {
         let mut c = [0_i16; 64];
-        for i in 0..64 {
-            c[i] = ((i * 13 + 7) % 101) as i16 - 50;
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = ((i * 13 + 7) % 101) as i16 - 50;
         }
         assert_roundtrip(
             &c,
@@ -686,11 +803,16 @@ mod tests {
     #[test]
     fn dense_noisy_no_panic() {
         let mut c = [0_i16; 64];
-        for i in 0..64 {
+        for (i, slot) in c.iter_mut().enumerate() {
             let x = (i as i64).wrapping_mul(1103515245).wrapping_add(12345);
-            c[i] = (x.rem_euclid(2001) - 1000) as i16;
+            *slot = (x.rem_euclid(2001) - 1000) as i16;
         }
-        let _ = reorder_coefficients_for_scan(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::RunOptimized).unwrap();
+        let _ = reorder_coefficients_for_scan(
+            &c,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::RunOptimized,
+        )
+        .unwrap();
         let _ = estimate_coeff_layout_bytes(
             &c,
             SrsV2TransformKind::Tx8x8,
@@ -712,10 +834,7 @@ mod tests {
             max_abs_coeff: 100,
             nonzero_count: 40,
         };
-        assert_eq!(
-            choose_transform_kind(&hi, &cfg),
-            SrsV2TransformKind::Tx4x4
-        );
+        assert_eq!(choose_transform_kind(&hi, &cfg), SrsV2TransformKind::Tx4x4);
     }
 
     #[test]
@@ -727,10 +846,7 @@ mod tests {
             max_abs_coeff: 5,
             nonzero_count: 4,
         };
-        assert_eq!(
-            choose_transform_kind(&lo, &cfg),
-            SrsV2TransformKind::Tx8x8
-        );
+        assert_eq!(choose_transform_kind(&lo, &cfg), SrsV2TransformKind::Tx8x8);
     }
 
     #[test]
@@ -766,8 +882,12 @@ mod tests {
     #[test]
     fn deterministic_compact_encode() {
         let c = [13_i16; 64];
-        let a = encode_coeff_layout_compact_v1(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::ZigZag).unwrap();
-        let b = encode_coeff_layout_compact_v1(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::ZigZag).unwrap();
+        let a =
+            encode_coeff_layout_compact_v1(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::ZigZag)
+                .unwrap();
+        let b =
+            encode_coeff_layout_compact_v1(&c, SrsV2TransformKind::Tx8x8, SrsV2CoeffScan::ZigZag)
+                .unwrap();
         assert_eq!(a, b);
     }
 
@@ -792,10 +912,52 @@ mod tests {
     #[test]
     fn compact_v1_natural_body_roundtrip() {
         let mut c = [0_i16; 64];
-        for i in 0..64 {
-            c[i] = ((i as i16 * 17).wrapping_rem(91)).wrapping_sub(40);
+        for (i, slot) in c.iter_mut().enumerate() {
+            *slot = ((i as i16 * 17).wrapping_rem(91)).wrapping_sub(40);
         }
         let b = encode_coeff_compact_v1_natural_body(&c);
         assert_eq!(decode_coeff_compact_v1_natural_body(&b).unwrap(), c);
+    }
+
+    #[test]
+    fn rev32_intra_compact_scan_body_roundtrip_zigzag() {
+        let mut c = [0_i16; 64];
+        c[0] = 11;
+        c[ZIGZAG[5]] = -3;
+        c[40] = 7;
+        let blob = encode_coeff_compact_rev32_intra_block(
+            &c,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::ZigZag,
+        )
+        .unwrap();
+        let out = decode_coeff_compact_rev32_intra_block(
+            &blob,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::ZigZag,
+        )
+        .unwrap();
+        assert_eq!(out, c);
+    }
+
+    #[test]
+    fn rev32_intra_compact_scan_body_roundtrip_run_optimized() {
+        let mut c = [0_i16; 64];
+        c[0] = 100;
+        c[ZIGZAG[10]] = -7;
+        c[45] = 3;
+        let blob = encode_coeff_compact_rev32_intra_block(
+            &c,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::RunOptimized,
+        )
+        .unwrap();
+        let out = decode_coeff_compact_rev32_intra_block(
+            &blob,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::RunOptimized,
+        )
+        .unwrap();
+        assert_eq!(out, c);
     }
 }

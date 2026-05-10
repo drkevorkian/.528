@@ -1,6 +1,8 @@
 //! Experimental **`FR2` rev 19 / 20 / 25 / 27 / 28** — P-frame variable inter partitions + transform tagging
 //! (`FR2` rev **19** compact MV, **20**/**25** entropy MV, **27** compact map v2, **28** entropy map v2 + explicit MV entropy byte).
 //!
+//! **`FR2` rev **33** (P luma [`SrsV2CoeffLayoutMode::CompactV1`](crate::srsv2::rate_control::SrsV2CoeffLayoutMode)) is only emitted from the fixed **16×16** grid path in [`crate::srsv2::p_frame_codec`] — not here.
+//!
 //! **`FR2` rev 21 / 22** (**B**) are reserved; see [`crate::srsv2::b_frame_codec`].
 
 use libsrs_bitio::RansModel;

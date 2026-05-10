@@ -96,13 +96,12 @@ pub use partition_syntax_v2::{
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
-    SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode,
-    SrsV2CoeffLayoutMode, SrsV2CoeffScanMode, SrsV2EncodeSettings, SrsV2EntropyModelMode,
-    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode,
-    SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode,
-    SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
-    SrsV2ResidualContextMode, SrsV2SubpelMode, SrsV2TransformDecisionMode, SrsV2TransformSize,
-    SrsV2TransformSizeMode,
+    SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2CoeffLayoutMode,
+    SrsV2CoeffLayoutSettingsError, SrsV2CoeffScanMode, SrsV2EncodeSettings, SrsV2EntropyModelMode,
+    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
+    SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2RateControlError,
+    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ResidualContextMode,
+    SrsV2SubpelMode, SrsV2TransformDecisionMode, SrsV2TransformSize, SrsV2TransformSizeMode,
 };
 pub use rdo::{
     autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost, b_blend_rdo_score,

@@ -22,12 +22,11 @@ use libsrs_video::{
     encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
     PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
     SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2CoeffLayoutMode,
-    SrsV2CoeffScanMode, SrsV2EncodeSettings,
-    SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode,
-    SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
-    SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2RateControlMode, SrsV2RateController,
-    SrsV2RdoMode, SrsV2ReferenceManager, SrsV2SubpelMode, SrsV2TransformSizeMode,
-    VideoSequenceHeaderV2, YuvFrame,
+    SrsV2CoeffScanMode, SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode,
+    SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
+    SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode,
+    SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager,
+    SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::hevc_compare;
 use quality_metrics::x265_bitrate_match;
@@ -119,16 +118,20 @@ struct Args {
     #[arg(long, default_value_t = false)]
     compare_residual_contexts: bool,
 
-    /// Intra / **P** coefficient packaging telemetry: **`legacy`** (default) or **`compact`** (**CompactV1**: intra **`FR2` rev32**, fixed-grid **P** **`FR2` rev33** when inter syntax allows).
-    #[arg(long, default_value = "legacy")]
+    /// **`--coeff-layout`**: intra / **P** coefficient packaging — **`legacy`** (default) or **`compact`** (**CompactV1**: intra **`FR2` rev32**, fixed-grid **P** **`FR2` rev33** when inter syntax allows).
+    #[arg(long = "coeff-layout", visible_alias = "coeff_layout", default_value = "legacy")]
     coeff_layout: String,
 
-    /// Coefficient scan for compact layout: **`zigzag`** (default), **`grouped-low-first`**, **`run-optimized`**, or **`auto`**.
-    #[arg(long, default_value = "zigzag")]
+    /// **`--coeff-scan`**: scan for compact layout — **`zigzag`** (default), **`grouped-low-first`**, **`run-optimized`**, or **`auto`**.
+    #[arg(long = "coeff-scan", visible_alias = "coeff_scan", default_value = "zigzag")]
     coeff_scan: String,
 
-    /// Five-row harness (**legacy-zigzag**, then four compact scans). Normalizes **`--residual-entropy auto`**, **`--residual-context off`**, **`--inter-partition fixed16x16`**, **`--block-aq off`**, and upgrades **`--inter-syntax raw`** to **`compact`** so rev33 **P** coefficients are valid. No FFmpeg.
-    #[arg(long, default_value_t = false)]
+    /// **`--compare-coeff-layouts`**: five-row harness — **`legacy-zigzag`**, **`compact-zigzag`**, **`compact-grouped-low-first`**, **`compact-run-optimized`**, **`compact-auto`**. Normalizes **`--residual-entropy auto`**, **`--residual-context off`**, **`--inter-partition fixed16x16`**, **`--block-aq off`**, upgrades **`--inter-syntax raw`** → **`compact`** for rev33 **P**. No FFmpeg; engineering measurement only (not a superiority claim vs other codecs).
+    #[arg(
+        long = "compare-coeff-layouts",
+        visible_alias = "compare_coeff_layouts",
+        default_value_t = false
+    )]
     compare_coeff_layouts: bool,
 
     #[arg(long, default_value_t = false)]
@@ -1397,9 +1400,7 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         );
     }
     if args.compare_coeff_layouts && (args.sweep || args.sweep_quality_bitrate) {
-        bail!(
-            "--compare-coeff-layouts cannot be combined with --sweep or --sweep-quality-bitrate"
-        );
+        bail!("--compare-coeff-layouts cannot be combined with --sweep or --sweep-quality-bitrate");
     }
     if args.compare_residual_contexts && args.compare_residual_modes {
         bail!("--compare-residual-contexts cannot be combined with --compare-residual-modes");
@@ -1554,10 +1555,8 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     parse_partition_syntax_mode(&args.partition_syntax)?;
     parse_coeff_layout_mode(&args.coeff_layout)?;
     parse_coeff_scan_mode(&args.coeff_scan)?;
-    if args.compare_coeff_layouts {
-        if args.bframes > 0 {
-            bail!("--compare-coeff-layouts requires --bframes 0 in this slice");
-        }
+    if args.compare_coeff_layouts && args.bframes > 0 {
+        bail!("--compare-coeff-layouts requires --bframes 0 in this slice");
     }
     Ok(())
 }
@@ -4112,7 +4111,11 @@ fn run_compare_coeff_layouts_report(
     expected_frame: usize,
 ) -> Result<BenchReport> {
     let spec: [(&str, SrsV2CoeffLayoutMode, SrsV2CoeffScanMode); 5] = [
-        ("legacy-zigzag", SrsV2CoeffLayoutMode::Legacy, SrsV2CoeffScanMode::ZigZag),
+        (
+            "legacy-zigzag",
+            SrsV2CoeffLayoutMode::Legacy,
+            SrsV2CoeffScanMode::ZigZag,
+        ),
         (
             "compact-zigzag",
             SrsV2CoeffLayoutMode::CompactV1,
@@ -5943,13 +5946,42 @@ fn to_markdown(r: &BenchReport) -> String {
     if let Some(rows) = &r.compare_coeff_layouts {
         out.push_str("\n## Coefficient layout comparison (`--compare-coeff-layouts`)\n\n");
         out.push_str(
-            "_Fixed five-row order on one clip; compact telemetry reflects **FR2 rev32** intra where enabled and **rev33** fixed-grid **P** residuals where applicable. **`residual_bytes_delta_vs_legacy_zigzag`** is total residual-byte delta vs the first row. Engineering measurement only — not a superiority claim vs other codecs._\n\n",
+            "_Fixed five-row order on one clip; compact telemetry reflects **FR2 rev32** intra where enabled and **rev33** fixed-grid **P** residuals where applicable. **Savings** uses encoder coefficient-layout telemetry (`coeff_layout_savings_percent` / legacy estimate vs compact wire where populated). Engineering measurement only — not a superiority claim vs **HEVC** or other codecs._\n\n",
         );
         if let Some(s) = &r.coeff_layout_compare_summary {
             out.push_str(&format!("**Summary:** {s}\n\n"));
         }
+        out.push_str("### Summary table\n\n");
+        out.push_str("| Coeff layout | Scan | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y |\n");
+        out.push_str("|---|---|---:|---:|---:|---:|---:|\n");
+        for e in rows {
+            let (tot_s, res_s, sav_s, psnr_s, ssim_s) = if e.ok {
+                (
+                    format!("{}", e.total_bytes),
+                    format!("{}", e.residual_bytes),
+                    format!("{:.2}%", e.coeff_layout_savings_percent),
+                    format!("{:.2}", e.psnr_y),
+                    format!("{:.4}", e.ssim_y),
+                )
+            } else {
+                (
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                )
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                e.coeff_layout_mode, e.coeff_scan_mode, tot_s, res_s, sav_s, psnr_s, ssim_s,
+            ));
+        }
+        out.push_str("\n### Full telemetry\n\n");
         out.push_str("| Row | Layout | Scan | Coeff bytes | Legacy est. | Savings B | Savings % | Tx4×4 | Tx8×8 | Residual B | Δ res. | Total B | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS | Status |\n");
-        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        out.push_str(
+            "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
+        );
         for e in rows {
             let status = if e.ok {
                 "ok".to_string()
@@ -6704,7 +6736,9 @@ mod tests {
         assert!(
             rows.iter().all(|r| r.ok),
             "{:?}",
-            rows.iter().find(|r| !r.ok).map(|r| (&r.row_label, &r.error))
+            rows.iter()
+                .find(|r| !r.ok)
+                .map(|r| (&r.row_label, &r.error))
         );
         let summary = report
             .coeff_layout_compare_summary
@@ -6732,6 +6766,12 @@ mod tests {
         assert!(js.contains("compare_coeff_layouts"));
         let md = to_markdown(&report);
         assert!(md.contains("Coefficient layout comparison"));
+        assert!(
+            md.contains("| Coeff layout | Scan | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y |"),
+            "{md}"
+        );
+        assert!(md.contains("### Summary table"));
+        assert!(md.contains("### Full telemetry"));
         assert!(md.contains("| Row | Layout | Scan |"));
         assert!(report.x264.is_none());
         assert!(report.x265.is_none());
@@ -6744,10 +6784,8 @@ mod tests {
 
     #[test]
     fn coeff_layout_cli_defaults_match_encoder_defaults() {
-        let tmp = std::env::temp_dir().join(format!(
-            "bench-coeff-default-{}.yuv",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("bench-coeff-default-{}.yuv", std::process::id()));
         let fb = yuv420_frame_bytes(16, 16).unwrap();
         fs::write(&tmp, vec![128_u8; fb]).unwrap();
         let args = parse_test_args(&tmp, 16, 16, 1, &[]);
@@ -6865,6 +6903,12 @@ mod tests {
             "{md}"
         );
         assert!(md.contains("Residual-byte deltas vs legacy-zigzag baseline"));
+        assert!(
+            md.contains("| Coeff layout | Scan | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y |"),
+            "{md}"
+        );
+        assert!(md.contains("| legacy | zigzag |"));
+        assert!(md.contains("| compact | zigzag |"));
     }
 
     #[test]
