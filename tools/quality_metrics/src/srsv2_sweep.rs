@@ -429,6 +429,8 @@ fn build_settings_for_case(
         .map_err(|e| SweepError::Other(format!("entropy_model_inter: {e}")))?;
     s.validate_partition_syntax_inter()
         .map_err(|e| SweepError::Other(format!("partition_syntax_inter: {e}")))?;
+    s.validate_coeff_layout_settings()
+        .map_err(|e| SweepError::Other(format!("coeff_layout: {e}")))?;
     Ok(s)
 }
 

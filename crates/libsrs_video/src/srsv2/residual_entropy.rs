@@ -15,12 +15,18 @@ use super::intra_codec::{
 };
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::rate_control::{
-    ResidualEncodeStats, ResidualEntropy, SrsV2EncodeSettings, SrsV2ResidualContextMode,
+    ResidualEncodeStats, ResidualEntropy, SrsV2CoeffScanMode, SrsV2EncodeSettings,
+    SrsV2ResidualContextMode,
 };
+use super::transform_layout::{
+    choose_coeff_scan, decode_coeff_compact_v1_natural_body, encode_coeff_compact_v1_natural_body,
+    estimate_coeff_layout_bytes, SrsV2CoeffLayoutMode as TlCoeffLayoutMode, SrsV2CoeffScan,
+    SrsV2TransformKind, TransformLayoutError,
+};
+pub use super::residual_context_entropy::ResidualPlane;
 use super::residual_context_entropy::{
     decode_residual_context_v1_plane, encode_residual_context_v1_plane, ResidualContextModel,
 };
-pub use super::residual_context_entropy::ResidualPlane;
 use super::residual_tokens::{
     detokenize_ac, rans_decode_tokens, rans_encode_tokens, residual_token_model, tokenize_ac,
     MAX_SYMBOLS_PER_BLOCK,
@@ -30,6 +36,8 @@ pub const TAG_EXPLICIT_AC: u8 = 0;
 pub const TAG_RANS_AC: u8 = 1;
 /// Multi-context static rANS residual (`SrsV2ResidualContextMode::ContextV1`).
 pub const TAG_CONTEXT_RANS_AC: u8 = 2;
+/// **`FR2` rev33** fixed-grid **P** 8×8 residual: compact natural-index bitmap + `i16` values ([`encode_p_residual_chunk_compact_v33_wire`]).
+pub const TAG_P_RESIDUAL_COMPACT_V1: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockResidualCoding {
@@ -68,6 +76,8 @@ impl Default for PResidualChunkEncodeOpts<'_> {
 pub enum PResidualChunkKind {
     LegacyTuple,
     Adaptive(BlockResidualCoding),
+    /// Natural-order compact coefficient body (`TAG_P_RESIDUAL_COMPACT_V1`); **`FR2` rev33** fixed **P** grid.
+    CompactCoeffV1,
 }
 
 pub(crate) fn write_explicit_ac_only(
@@ -216,7 +226,8 @@ fn record_residual_context_v1_tail_stats(
         .residual_static_bytes_estimate
         .saturating_add(static_est as u64);
     if ctx_wire > static_est {
-        stats.residual_context_failed_blocks = stats.residual_context_failed_blocks.saturating_add(1);
+        stats.residual_context_failed_blocks =
+            stats.residual_context_failed_blocks.saturating_add(1);
     }
     let save = static_est.saturating_sub(ctx_wire);
     stats.residual_context_savings_bytes = stats
@@ -248,15 +259,14 @@ fn pick_auto_three_way_fixed(
     rans_choice: &Option<(usize, Vec<u8>)>,
     context_blob: Option<&Vec<u8>>,
 ) -> BlockResidualCoding {
-    fn better(candidate: (usize, u8, BlockResidualCoding), best: (usize, u8, BlockResidualCoding)) -> bool {
+    fn better(
+        candidate: (usize, u8, BlockResidualCoding),
+        best: (usize, u8, BlockResidualCoding),
+    ) -> bool {
         candidate.0 < best.0 || (candidate.0 == best.0 && candidate.1 < best.1)
     }
 
-    let mut best = (
-        explicit_full,
-        0_u8,
-        BlockResidualCoding::ExplicitTuples,
-    );
+    let mut best = (explicit_full, 0_u8, BlockResidualCoding::ExplicitTuples);
     if let Some((_, enc)) = rans_choice {
         let rfull = rans_wire_len(enc.len());
         let cand = (rfull, 1_u8, BlockResidualCoding::RansV1);
@@ -281,15 +291,14 @@ fn pick_auto_three_way_rev7(
     rans_choice: &Option<(usize, Vec<u8>)>,
     context_blob: Option<&Vec<u8>>,
 ) -> BlockResidualCoding {
-    fn better(candidate: (usize, u8, BlockResidualCoding), best: (usize, u8, BlockResidualCoding)) -> bool {
+    fn better(
+        candidate: (usize, u8, BlockResidualCoding),
+        best: (usize, u8, BlockResidualCoding),
+    ) -> bool {
         candidate.0 < best.0 || (candidate.0 == best.0 && candidate.1 < best.1)
     }
 
-    let mut best = (
-        explicit_full,
-        0_u8,
-        BlockResidualCoding::ExplicitTuples,
-    );
+    let mut best = (explicit_full, 0_u8, BlockResidualCoding::ExplicitTuples);
     if let Some((_, enc)) = rans_choice {
         let rfull = rans_wire_len_rev7(enc.len());
         let cand = (rfull, 1_u8, BlockResidualCoding::RansV1);
@@ -361,7 +370,12 @@ pub(crate) fn encode_intra_block_residual(
                 if strict_fr2_context_v1_residual_only {
                     BlockResidualCoding::ContextRansV1
                 } else {
-                    pick_auto_three_way_fixed(freq, explicit_full, &rans_choice, context_blob.as_ref())
+                    pick_auto_three_way_fixed(
+                        freq,
+                        explicit_full,
+                        &rans_choice,
+                        context_blob.as_ref(),
+                    )
                 }
             } else {
                 match &rans_choice {
@@ -559,7 +573,12 @@ pub(crate) fn encode_intra_block_residual_rev7(
                 if strict_fr2_context_v1_residual_only {
                     BlockResidualCoding::ContextRansV1
                 } else {
-                    pick_auto_three_way_rev7(freq, explicit_full, &rans_choice, context_blob.as_ref())
+                    pick_auto_three_way_rev7(
+                        freq,
+                        explicit_full,
+                        &rans_choice,
+                        context_blob.as_ref(),
+                    )
                 }
             } else {
                 match &rans_choice {
@@ -673,6 +692,316 @@ pub(crate) fn decode_intra_block_residual_rev7(
     }
 }
 
+fn map_transform_layout_err(e: TransformLayoutError) -> SrsV2Error {
+    match e {
+        TransformLayoutError::Truncated => SrsV2Error::Truncated,
+        TransformLayoutError::BadMagic => SrsV2Error::syntax("coeff layout: bad magic"),
+        TransformLayoutError::UnsupportedVersion(v) => {
+            SrsV2Error::UnsupportedVersion(v)
+        }
+        TransformLayoutError::InvalidCoefficientCount { .. } => {
+            SrsV2Error::syntax("coeff layout: bad coefficient count")
+        }
+        TransformLayoutError::InvalidDiscriminant(field, _v) => {
+            if field == "transform_kind" {
+                SrsV2Error::syntax("coeff layout: bad transform_kind tag")
+            } else if field == "coeff_scan" {
+                SrsV2Error::syntax("coeff layout: bad coeff_scan tag")
+            } else if field == "coeff_layout_mode" {
+                SrsV2Error::syntax("coeff layout: bad coeff_layout_mode tag")
+            } else {
+                SrsV2Error::syntax("coeff layout: bad discriminant")
+            }
+        }
+        TransformLayoutError::InconsistentNonzeroCount { .. } => {
+            SrsV2Error::syntax("coeff compact: bitmap does not match payload")
+        }
+    }
+}
+
+/// Wire tag for [`SrsV2CoeffScanMode::Auto`] in **`FR2` rev32** plane headers.
+pub(crate) const REV32_COEFF_SCAN_MODE_AUTO_WIRE: u8 = 3;
+
+pub(crate) fn rev32_coeff_scan_mode_wire(mode: SrsV2CoeffScanMode) -> u8 {
+    match mode {
+        SrsV2CoeffScanMode::ZigZag => 0,
+        SrsV2CoeffScanMode::GroupedLowFirst => 1,
+        SrsV2CoeffScanMode::RunOptimized => 2,
+        SrsV2CoeffScanMode::Auto => REV32_COEFF_SCAN_MODE_AUTO_WIRE,
+    }
+}
+
+pub(crate) fn rev32_coeff_scan_mode_from_wire(b: u8) -> Result<SrsV2CoeffScanMode, SrsV2Error> {
+    match b {
+        0 => Ok(SrsV2CoeffScanMode::ZigZag),
+        1 => Ok(SrsV2CoeffScanMode::GroupedLowFirst),
+        2 => Ok(SrsV2CoeffScanMode::RunOptimized),
+        REV32_COEFF_SCAN_MODE_AUTO_WIRE => Ok(SrsV2CoeffScanMode::Auto),
+        _ => Err(SrsV2Error::syntax("FR2 rev32: bad coeff_scan_mode byte")),
+    }
+}
+
+fn resolve_intra_compact_scan(
+    settings: &SrsV2EncodeSettings,
+    qfreq: &[i16; 64],
+) -> Result<SrsV2CoeffScan, SrsV2Error> {
+    Ok(match settings.coeff_scan_mode {
+        SrsV2CoeffScanMode::ZigZag => SrsV2CoeffScan::ZigZag,
+        SrsV2CoeffScanMode::GroupedLowFirst => SrsV2CoeffScan::GroupedLowFirst,
+        SrsV2CoeffScanMode::RunOptimized => SrsV2CoeffScan::RunOptimized,
+        SrsV2CoeffScanMode::Auto => {
+            choose_coeff_scan(SrsV2TransformKind::Tx8x8, qfreq).map_err(map_transform_layout_err)?
+        }
+    })
+}
+
+/// Encode one fixed-grid **`FR2` rev33** **P** 8×8 quantized coefficient block (natural DCT index order).
+///
+/// Wire: [`TAG_P_RESIDUAL_COMPACT_V1`] + [`PredMode::Dc`] + scan-settings byte + `u16` body length +
+/// [`encode_coeff_compact_v1_natural_body`].
+pub fn encode_p_residual_chunk_compact_v33_wire(
+    qfreq: &[i16; 64],
+    settings: &SrsV2EncodeSettings,
+) -> Result<Vec<u8>, SrsV2Error> {
+    let _scan = resolve_intra_compact_scan(settings, qfreq)?;
+    let mut out = Vec::with_capacity(4 + 8 + 64 * 2);
+    out.push(TAG_P_RESIDUAL_COMPACT_V1);
+    out.push(PredMode::Dc as u8);
+    out.push(rev32_coeff_scan_mode_wire(settings.coeff_scan_mode));
+    let body = encode_coeff_compact_v1_natural_body(qfreq);
+    let bl =
+        u16::try_from(body.len()).map_err(|_| SrsV2Error::syntax("FR2 rev33 P compact length"))?;
+    out.extend_from_slice(&bl.to_le_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Decode [`encode_p_residual_chunk_compact_v33_wire`] (full chunk including layout tag).
+///
+/// Returns spatial-domain 8×8 residual samples (after inverse quantize + **`8×8`** IDCT) and **nonzero-AC**
+/// in the quantized spectrum (for optional neighbor bookkeeping).
+pub fn decode_p_residual_chunk_compact_v33(
+    chunk: &[u8],
+    qp: i16,
+) -> Result<([[i16; 8]; 8], bool), SrsV2Error> {
+    if chunk.first().copied() != Some(TAG_P_RESIDUAL_COMPACT_V1) {
+        return Err(SrsV2Error::syntax(
+            "FR2 rev33 P residual requires compact layout tag",
+        ));
+    }
+    let body = &chunk[1..];
+    let mut cur = 0usize;
+    let mode_b = read_u8(body, &mut cur)?;
+    PredMode::from_u8(mode_b)?;
+    let scan_b = read_u8(body, &mut cur)?;
+    rev32_coeff_scan_mode_from_wire(scan_b)?;
+    let body_len = read_u16(body, &mut cur)? as usize;
+    let end = cur
+        .checked_add(body_len)
+        .ok_or(SrsV2Error::Overflow("FR2 rev33 compact body"))?;
+    if end > body.len() {
+        return Err(SrsV2Error::Truncated);
+    }
+    let freq = decode_coeff_compact_v1_natural_body(&body[cur..end]).map_err(map_transform_layout_err)?;
+    cur = end;
+    if cur != body.len() {
+        return Err(SrsV2Error::syntax("FR2 rev33 P residual trailing bytes"));
+    }
+    let nz_ac = freq.iter().skip(1).any(|&v| v != 0);
+    let recon_freq = dequantize(&freq, qp);
+    let rpix = idct_8x8(&recon_freq);
+    let mut out = [[0_i16; 8]; 8];
+    for r in 0..8 {
+        for c in 0..8 {
+            out[r][c] = rpix[r * 8 + c];
+        }
+    }
+    Ok((out, nz_ac))
+}
+
+/// Encode one luma/chroma plane for **`FR2` rev32** intra (`CompactV1` natural coefficient bodies).
+pub(crate) fn encode_plane_intra_compact_v32(
+    plane: &VideoPlane<u8>,
+    qp: i16,
+    settings: &SrsV2EncodeSettings,
+    stats: &mut ResidualEncodeStats,
+    out: &mut Vec<u8>,
+) -> Result<(), SrsV2Error> {
+    if stats.intra_coeff_layout_mode.is_none() {
+        stats.intra_coeff_layout_mode = Some(settings.coeff_layout_mode);
+        stats.intra_coeff_scan_mode = Some(settings.coeff_scan_mode);
+    }
+    out.push(kind_tag_wire(SrsV2TransformKind::Tx8x8));
+    out.push(rev32_coeff_scan_mode_wire(settings.coeff_scan_mode));
+    stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(2);
+    // Match the plane header bytes in [`ResidualEncodeStats::coeff_layout_bytes`] so totals compare
+    // with [`coeff_legacy_estimated_bytes`] (per-block legacy estimates only).
+    stats.coeff_legacy_estimated_bytes = stats.coeff_legacy_estimated_bytes.saturating_add(2);
+
+    let w = plane.width as usize;
+    let h = plane.height as usize;
+    let stride = plane.stride;
+    let pw = (w + 7) & !7;
+    let ph = (h + 7) & !7;
+    let mut rec = vec![128_u8; pw.saturating_mul(ph)];
+    let bw = pw / 8;
+    let bh = ph / 8;
+    let mut prev_row_nz = vec![false; bw.max(1)];
+    for by in 0..bh {
+        let mut left_nz = false;
+        for (bx, prev_slot) in prev_row_nz.iter_mut().enumerate().take(bw) {
+            let above_nz = if by == 0 { false } else { *prev_slot };
+            let _ = (left_nz, above_nz);
+
+            let mut orig = [[0_i16; 8]; 8];
+            for (r, row) in orig.iter_mut().enumerate() {
+                for (c, cell) in row.iter_mut().enumerate() {
+                    let x = bx * 8 + c;
+                    let y = by * 8 + r;
+                    let v = if x < w && y < h {
+                        plane.samples[y * stride + x] as i16
+                    } else {
+                        128
+                    };
+                    *cell = v;
+                }
+            }
+            let mode = pick_mode(&rec, pw, pw, ph, bx, by, &orig);
+            let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
+            let mut diff = [[0_i16; 8]; 8];
+            for r in 0..8 {
+                for c in 0..8 {
+                    diff[r][c] = orig[r][c] - pred[r][c];
+                }
+            }
+            let mut blk = [0_i16; 64];
+            for r in 0..8 {
+                for c in 0..8 {
+                    blk[r * 8 + c] = diff[r][c];
+                }
+            }
+            let freq = fdct_8x8(&blk);
+            let qfreq = quantize(&freq, qp);
+            let scan = resolve_intra_compact_scan(settings, &qfreq)?;
+            let legacy_est = estimate_coeff_layout_bytes(
+                &qfreq,
+                SrsV2TransformKind::Tx8x8,
+                scan,
+                TlCoeffLayoutMode::Legacy,
+            )
+            .map_err(map_transform_layout_err)? as u64;
+            let body = encode_coeff_compact_v1_natural_body(&qfreq);
+            let block_wire = 1usize + 2 + body.len();
+            stats.coeff_legacy_estimated_bytes =
+                stats.coeff_legacy_estimated_bytes.saturating_add(legacy_est);
+            stats.coeff_layout_bytes = stats
+                .coeff_layout_bytes
+                .saturating_add(block_wire as u64);
+            stats.coeff_layout_savings_bytes =
+                stats.coeff_layout_savings_bytes.saturating_add(legacy_est as i64 - block_wire as i64);
+            stats.intra_tx8x8_blocks = stats.intra_tx8x8_blocks.saturating_add(1);
+
+            out.push(mode as u8);
+            let bl = u16::try_from(body.len()).map_err(|_| SrsV2Error::syntax("rev32 body length"))?;
+            out.extend_from_slice(&bl.to_le_bytes());
+            out.extend_from_slice(&body);
+
+            let nz_ac = qfreq.iter().skip(1).any(|&v| v != 0);
+            left_nz = nz_ac;
+            *prev_slot = nz_ac;
+            let recon_freq = dequantize(&qfreq, qp);
+            let rpix = idct_8x8(&recon_freq);
+            for r in 0..8 {
+                for c in 0..8 {
+                    let x = bx * 8 + c;
+                    let y = by * 8 + r;
+                    let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
+                    if x < pw && y < ph {
+                        rec[y * pw + x] = pv as u8;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn kind_tag_wire(k: SrsV2TransformKind) -> u8 {
+    match k {
+        SrsV2TransformKind::Tx4x4 => 0,
+        SrsV2TransformKind::Tx8x8 => 1,
+    }
+}
+
+/// Decode [`encode_plane_intra_compact_v32`] plane blob.
+pub(crate) fn decode_plane_intra_compact_v32(
+    data: &[u8],
+    cursor: &mut usize,
+    plane: &mut VideoPlane<u8>,
+    qp: i16,
+) -> Result<(), SrsV2Error> {
+    let kind_b = read_u8(data, cursor)?;
+    if kind_b != kind_tag_wire(SrsV2TransformKind::Tx8x8) {
+        return Err(SrsV2Error::syntax(
+            "FR2 rev32 intra expects Tx8x8 transform kind tag",
+        ));
+    }
+    let scan_b = read_u8(data, cursor)?;
+    let _scan_mode = rev32_coeff_scan_mode_from_wire(scan_b)?;
+
+    let w = plane.width as usize;
+    let h = plane.height as usize;
+    let stride = plane.stride;
+    let pw = (w + 7) & !7;
+    let ph = (h + 7) & !7;
+    let mut rec = vec![128_u8; pw.saturating_mul(ph)];
+    let bw = pw / 8;
+    let bh = ph / 8;
+    let mut prev_row_nz = vec![false; bw.max(1)];
+    for by in 0..bh {
+        let mut left_nz = false;
+        for (bx, prev_slot) in prev_row_nz.iter_mut().enumerate().take(bw) {
+            let above_nz = if by == 0 { false } else { *prev_slot };
+            let _ = (left_nz, above_nz);
+
+            let mode_b = read_u8(data, cursor)?;
+            let mode = PredMode::from_u8(mode_b)?;
+            let bl = read_u16(data, cursor)? as usize;
+            let end = cursor
+                .checked_add(bl)
+                .ok_or(SrsV2Error::Overflow("rev32 block body"))?;
+            if end > data.len() {
+                return Err(SrsV2Error::Truncated);
+            }
+            let body = &data[*cursor..end];
+            *cursor = end;
+            let qfreq = decode_coeff_compact_v1_natural_body(body).map_err(map_transform_layout_err)?;
+            let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
+            let recon_freq = dequantize(&qfreq, qp);
+            let rpix = idct_8x8(&recon_freq);
+            let nz_ac = qfreq.iter().skip(1).any(|&v| v != 0);
+            left_nz = nz_ac;
+            *prev_slot = nz_ac;
+            for r in 0..8 {
+                for c in 0..8 {
+                    let x = bx * 8 + c;
+                    let y = by * 8 + r;
+                    let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
+                    if x < pw && y < ph {
+                        rec[y * pw + x] = pv as u8;
+                    }
+                }
+            }
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            plane.samples[y * stride + x] = rec[y * pw + x];
+        }
+    }
+    Ok(())
+}
+
 /// Per-plane counters for folding into [`crate::srsv2::adaptive_quant::SrsV2BlockAqWireStats`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct PlaneBlockAqSummary {
@@ -723,11 +1052,7 @@ pub(crate) fn encode_plane_intra_entropy(
     for by in 0..bh {
         let mut left_nz = false;
         for (bx, prev_slot) in prev_row_nz.iter_mut().enumerate().take(bw) {
-            let above_nz = if by == 0 {
-                false
-            } else {
-                *prev_slot
-            };
+            let above_nz = if by == 0 { false } else { *prev_slot };
             let mut orig = [[0_i16; 8]; 8];
             for (r, row) in orig.iter_mut().enumerate() {
                 for (c, cell) in row.iter_mut().enumerate() {
@@ -843,11 +1168,7 @@ pub(crate) fn encode_plane_intra_entropy_block_aq(
     for by in 0..bh {
         let mut left_nz = false;
         for (bx, prev_slot) in prev_row_nz.iter_mut().enumerate().take(bw) {
-            let above_nz = if by == 0 {
-                false
-            } else {
-                *prev_slot
-            };
+            let above_nz = if by == 0 { false } else { *prev_slot };
             let idx = by * bw + bx;
             let block_var = vars[idx];
             let qp_delta = choose_block_qp_delta(
@@ -963,28 +1284,14 @@ pub(crate) fn decode_plane_intra_entropy(
     for by in 0..bh {
         let mut left_nz = false;
         for (bx, prev_slot) in prev_row_nz.iter_mut().enumerate().take(bw) {
-            let above_nz = if by == 0 {
-                false
-            } else {
-                *prev_slot
-            };
+            let above_nz = if by == 0 { false } else { *prev_slot };
             let (mode, freq) = if strict_fr2_rev29_context_v1 {
                 decode_intra_block_residual_strict_context_v1(
-                    data,
-                    cursor,
-                    &ctx_model,
-                    plane_kind,
-                    left_nz,
-                    above_nz,
+                    data, cursor, &ctx_model, plane_kind, left_nz, above_nz,
                 )?
             } else {
                 decode_intra_block_residual(
-                    data,
-                    cursor,
-                    &ctx_model,
-                    plane_kind,
-                    left_nz,
-                    above_nz,
+                    data, cursor, &ctx_model, plane_kind, left_nz, above_nz,
                 )?
             };
             let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
@@ -1036,18 +1343,9 @@ pub(crate) fn decode_plane_intra_entropy_block_aq(
     for by in 0..bh {
         let mut left_nz = false;
         for (bx, prev_slot) in prev_row_nz.iter_mut().enumerate().take(bw) {
-            let above_nz = if by == 0 {
-                false
-            } else {
-                *prev_slot
-            };
+            let above_nz = if by == 0 { false } else { *prev_slot };
             let (mode, qp_delta, freq) = decode_intra_block_residual_rev7(
-                data,
-                cursor,
-                &ctx_model,
-                plane_kind,
-                left_nz,
-                above_nz,
+                data, cursor, &ctx_model, plane_kind, left_nz, above_nz,
             )?;
             let eff_qp = apply_qp_delta_clamped(base_qp, qp_delta, clip_min, clip_max);
             let qp_i = eff_qp.max(1) as i16;
@@ -1105,7 +1403,10 @@ pub fn encode_p_residual_chunk_with_opts<'a>(
     legacy.extend_from_slice(&qfreq[0].to_le_bytes());
     write_explicit_ac_only(qfreq, &mut legacy)?;
 
-    if matches!(opts.residual_context_mode, SrsV2ResidualContextMode::ContextV1) {
+    if matches!(
+        opts.residual_context_mode,
+        SrsV2ResidualContextMode::ContextV1
+    ) {
         if opts.context_model.is_none() {
             return Err(SrsV2Error::syntax(
                 "encode_p_residual_chunk_with_opts: ContextV1 requires context_model",
@@ -1148,7 +1449,10 @@ pub fn encode_p_residual_chunk_with_opts<'a>(
         }
         ResidualEntropy::Auto => {
             let strict_rev30 = opts.strict_fr2_rev30_residual
-                && matches!(opts.residual_context_mode, SrsV2ResidualContextMode::ContextV1);
+                && matches!(
+                    opts.residual_context_mode,
+                    SrsV2ResidualContextMode::ContextV1
+                );
             if strict_rev30 {
                 let mut adaptive = Vec::new();
                 let kind = encode_intra_block_residual(
@@ -1296,6 +1600,10 @@ pub fn decode_p_residual_chunk_with_neighbors(
         return Err(SrsV2Error::Truncated);
     }
     let layout = chunk[0];
+    if layout == TAG_P_RESIDUAL_COMPACT_V1 {
+        let (spatial, _) = decode_p_residual_chunk_compact_v33(chunk, qp)?;
+        return Ok(spatial);
+    }
     let body = &chunk[1..];
     let mut cur = 0usize;
     let ctx_model = ResidualContextModel::new();
@@ -1553,7 +1861,8 @@ mod residual_entropy_tests {
         let mut c = 0usize;
         let dec_m = ResidualContextModel::new();
         let (_m, f2) =
-            decode_intra_block_residual(&out, &mut c, &dec_m, ResidualPlane::Y, false, false).unwrap();
+            decode_intra_block_residual(&out, &mut c, &dec_m, ResidualPlane::Y, false, false)
+                .unwrap();
         assert_eq!(f2, qf);
     }
 

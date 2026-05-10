@@ -8,8 +8,9 @@ use super::limits::{
 
 /// Experimental residual coefficient context entropy (`TAG_CONTEXT_RANS_AC` in intra plane payloads and **P** luma chunks).
 ///
-/// **Intra** uses **`FR2` rev29** when combined with adaptive residual entropy; **P** uses **rev30** under
-/// [`SrsV2EncodeSettings::validate_residual_context_inter_residual`]. **B** encode rejects ContextV1 until **rev31**
+/// **Intra** uses **`FR2` rev29** when combined with adaptive residual entropy. **P** uses **`FR2` rev30** for strict
+/// residual ContextV1 under [`SrsV2EncodeSettings::validate_residual_context_inter_residual`]; fixed-grid **P** with
+/// [`SrsV2CoeffLayoutMode::CompactV1`] (no residual ContextV1) emits **`FR2` rev33**. **B** encode rejects ContextV1 until **rev31**
 /// ([`SrsV2EncodeSettings::validate_residual_context_b_frame`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2ResidualContextMode {
@@ -38,8 +39,27 @@ pub struct ResidualEncodeStats {
     pub intra_rans_blocks: u64,
     /// Intra blocks coded with [`SrsV2ResidualContextMode::ContextV1`] (`TAG_CONTEXT_RANS_AC`).
     pub intra_context_residual_blocks: u64,
+    /// Populated when **`FR2` rev32** intra CompactV1 ran on this encode call.
+    pub intra_coeff_layout_mode: Option<SrsV2CoeffLayoutMode>,
+    /// Settings scan mode recorded for rev32 telemetry (`Auto` = wire tag **3**).
+    pub intra_coeff_scan_mode: Option<SrsV2CoeffScanMode>,
+    pub intra_tx4x4_blocks: u64,
+    pub intra_tx8x8_blocks: u64,
+    /// Sum of per-block compact coefficient payloads + block headers on rev32 intra (`pred` + `u16` len + body).
+    pub coeff_layout_bytes: u64,
+    /// Sum of [`crate::srsv2::transform_layout::estimate_coeff_layout_bytes`] (**Legacy**) per rev32 block,
+    /// plus **`2` bytes per plane** (same plane header counted in [`Self::coeff_layout_bytes`]).
+    pub coeff_legacy_estimated_bytes: u64,
+    /// Per-block `(legacy_estimate − compact_wire)` sum (may be negative when compact is larger).
+    pub coeff_layout_savings_bytes: i64,
+    /// `100 * coeff_layout_savings_bytes / coeff_legacy_estimated_bytes`, or `0` if estimate is zero.
+    pub coeff_layout_savings_percent: f64,
     pub p_explicit_chunks: u64,
     pub p_rans_chunks: u64,
+    /// **`FR2` rev33** P luma 8×8 chunks using compact natural coefficient bodies ([`super::residual_entropy::TAG_P_RESIDUAL_COMPACT_V1`]).
+    pub p_compact_coeff_chunks: u64,
+    /// Sum of on-wire bytes for [`Self::p_compact_coeff_chunks`] (chunk payload only, excluding outer `u32` length).
+    pub p_compact_coeff_payload_bytes: u64,
 
     /// True when [`SrsV2ResidualContextMode::ContextV1`] was enabled for this encode call (intra and/or P).
     pub residual_context_enabled: bool,
@@ -63,6 +83,16 @@ impl ResidualEncodeStats {
         self.residual_context_savings_percent = if self.residual_static_bytes_estimate > 0 {
             100.0 * self.residual_context_savings_bytes as f64
                 / self.residual_static_bytes_estimate as f64
+        } else {
+            0.0
+        };
+    }
+
+    /// Recompute [`Self::coeff_layout_savings_percent`] after rev32 intra encode (uses [`Self::coeff_legacy_estimated_bytes`]).
+    pub fn finalize_coeff_layout_derived(&mut self) {
+        self.coeff_layout_savings_percent = if self.coeff_legacy_estimated_bytes > 0 {
+            100.0 * self.coeff_layout_savings_bytes as f64
+                / self.coeff_legacy_estimated_bytes as f64
         } else {
             0.0
         };
@@ -227,6 +257,39 @@ pub enum SrsV2TransformSizeMode {
     Force8x8,
 }
 
+/// Coefficient **layout** container for optional telemetry / future wire (`transform_layout` module).
+///
+/// Does **not** alter `FR2` payloads until explicitly integrated; defaults match legacy encoder paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2CoeffLayoutMode {
+    /// Legacy scanned coefficient ordering assumptions (current behavior).
+    #[default]
+    Legacy,
+    /// Experimental sparse bitmap layout (`S2TL`); opt-in only.
+    CompactV1,
+}
+
+/// Scan order hint for coefficient layout (paired with [`SrsV2CoeffLayoutMode`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2CoeffScanMode {
+    #[default]
+    ZigZag,
+    GroupedLowFirst,
+    RunOptimized,
+    /// Per-block heuristic when wired to [`crate::srsv2::transform_layout::choose_coeff_scan`].
+    Auto,
+}
+
+/// Transform-size **decision** policy for layout / future coefficient packaging (orthogonal to [`SrsV2TransformSizeMode`] on inter).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2TransformDecisionMode {
+    /// Existing encoder behavior: [`SrsV2TransformSizeMode`] on partitioned inter; intra 8×8 baseline.
+    #[default]
+    Auto,
+    /// Reserved — [`SrsV2TransformSize::Tx16x16Candidate`] has no encoder implementation.
+    Tx16x16,
+}
+
 /// How **`AutoFast`** weighs **SAD** vs estimated side-information (`FR2` rev **19**+).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2PartitionCostModel {
@@ -353,6 +416,13 @@ pub struct SrsV2EncodeSettings {
     pub entropy_model_mode: SrsV2EntropyModelMode,
     /// Fixed-point bias (**256 ≈ 1 “byte”**) added to partition **RDO** byte estimates (`FR2` rev19+ tools).
     pub rdo_partition_byte_bias: i16,
+
+    /// Coefficient layout telemetry / future wire (**default** [`SrsV2CoeffLayoutMode::Legacy`] — no output change).
+    pub coeff_layout_mode: SrsV2CoeffLayoutMode,
+    /// Coefficient scan for layout (**default** [`SrsV2CoeffScanMode::ZigZag`]).
+    pub coeff_scan_mode: SrsV2CoeffScanMode,
+    /// Transform decision for layout (**default** [`SrsV2TransformDecisionMode::Auto`]).
+    pub transform_decision_mode: SrsV2TransformDecisionMode,
 }
 
 impl Default for SrsV2EncodeSettings {
@@ -410,6 +480,10 @@ impl Default for SrsV2EncodeSettings {
 
             entropy_model_mode: SrsV2EntropyModelMode::StaticV1,
             rdo_partition_byte_bias: 0,
+
+            coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            transform_decision_mode: SrsV2TransformDecisionMode::Auto,
         }
     }
 }
@@ -528,6 +602,22 @@ impl SrsV2EncodeSettings {
                 }
             }
         }
+    }
+
+    /// Validate coefficient layout settings (encoding entry points should call this).
+    ///
+    /// Layout fields are **not** written to `FR2` yet; this rejects reserved / unsupported combinations early.
+    pub fn validate_coeff_layout_settings(&self) -> Result<(), SrsV2Error> {
+        match self.transform_decision_mode {
+            SrsV2TransformDecisionMode::Auto => {}
+            SrsV2TransformDecisionMode::Tx16x16 => {
+                return Err(SrsV2Error::Unsupported(
+                    "transform_decision_mode Tx16x16 is not implemented (no encoder path)",
+                ));
+            }
+        }
+        let _ = (self.coeff_layout_mode, self.coeff_scan_mode);
+        Ok(())
     }
 
     /// Search radius bounded for hostile-input-safe encode (`≤ MAX_MOTION_SEARCH_RADIUS`).
@@ -988,5 +1078,43 @@ mod tests {
         assert!(SrsV2EncodeSettings::default()
             .validate_residual_context_b_frame()
             .is_ok());
+    }
+
+    #[test]
+    fn coeff_layout_defaults_are_legacy_zigzag_auto_transform() {
+        let d = SrsV2EncodeSettings::default();
+        assert_eq!(d.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
+        assert_eq!(d.coeff_scan_mode, SrsV2CoeffScanMode::ZigZag);
+        assert_eq!(d.transform_decision_mode, SrsV2TransformDecisionMode::Auto);
+        d.validate_coeff_layout_settings().unwrap();
+    }
+
+    #[test]
+    fn coeff_layout_compact_v1_allows_auto_scan_for_rev32() {
+        let s = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::Auto,
+            ..Default::default()
+        };
+        s.validate_coeff_layout_settings().unwrap();
+    }
+
+    #[test]
+    fn coeff_layout_tx16x16_encode_setting_rejected() {
+        use crate::srsv2::error::SrsV2Error;
+        let s = SrsV2EncodeSettings {
+            transform_decision_mode: SrsV2TransformDecisionMode::Tx16x16,
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate_coeff_layout_settings(),
+            Err(SrsV2Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn coeff_layout_compact_v1_is_opt_in_not_default() {
+        let d = SrsV2EncodeSettings::default();
+        assert_ne!(d.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1);
     }
 }

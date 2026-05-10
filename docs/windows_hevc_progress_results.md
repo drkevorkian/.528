@@ -4,13 +4,14 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 
 ## Run
 
-- Date: 2026-05-09 16:16:05 -06:00
+- Date: 2026-05-10 10:16:21 -06:00
 - Output root: `var\bench\windows_hevc_progress\`
 - Seed: 528; fps: 30; QP: 28
 - Corpus: `moving-square`, `scrolling-bars`, `checker`, `scene-cut` (64x64, 8 frames)
 - FFmpeg available: **True**; libx264: **True**; libx265: **True**
-- Commands: `var\bench\windows_hevc_progress\commands_run.txt` (includes `--compare-residual-contexts` per clip)
+- Commands: `var\bench\windows_hevc_progress\commands_run.txt` (includes `--compare-residual-contexts` per clip; **post-gate** `--compare-coeff-layouts` lines appended)
 - Residual-context tables: `reports\<tag>\compare_residual_contexts.{json,md}`
+- Coefficient-layout compare: `reports\<tag>\compare_coeff_layouts.{json,md}` (`bench_srsv2 --compare-coeff-layouts`, same WxHxframes/QP/keyint/motion as gate)
 
 ## Required Results
 
@@ -79,6 +80,27 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 5. **Which clip regressed most (total bytes)?** **`checker`** (**+10108** bytes).
 6. **Is residual still the largest bottleneck?** **Yes** on `scene_cut/SRSV2-pc-fixed16x16`: **`residual`** **4058** / **4949** (**~82%**).
 
+### Coefficient layout CompactV1 (`bench_srsv2 --compare-coeff-layouts`)
+
+Harness holds **`--residual-entropy auto`**, **`--residual-context off`**, **`--inter-partition fixed16x16`**, **`--block-aq off`**, and upgrades **`--inter-syntax raw`→`compact`** so **FR2 rev33** fixed-grid **P** coefficients are valid. Row order: **legacy-zigzag**, then four **compact** scans (zigzag / grouped-low-first / run-optimized / auto).
+
+| Clip | legacy-zigzag total B | legacy-zigzag `residual_bytes` | compact total B (all scans tied) | compact `residual_bytes` | Δ total (compact−legacy) | PSNR-Y | SSIM-Y |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `moving_square` | 6566 | 6251 | 8891 | 1130 | **+2325** | 14.8952 | 0.619397 |
+| `scrolling_bars` | 8973 | 8658 | 11801 | 1132 | **+2828** | 14.6554 | 0.557608 |
+| `checker` | 16761 | 16446 | 18317 | 1190 | **+1556** | 10.5063 | 0.131160 |
+| `scene_cut` | 4949 | 4634 | 7605 | 1100 | **+2656** | 13.3004 | 0.693524 |
+
+Intra **CompactV1** telemetry on compact rows reports **`coeff_layout_savings_percent`** ≈ **53.6–56.4%** vs legacy estimate on the **rev32** intra plane packaging — but **full clip totals still grew**, so packaging savings did not overcome other bytes on these clips.
+
+**Coefficient-layout compare — direct answers**
+
+1. **Did CompactV1 reduce residual bytes (telemetry)?** The printed **`residual_bytes`** field **drops** on compact rows because **FR2 rev32/33** paths change how intra/**P** coefficient volume is attributed vs legacy intra + **P** chunks — **not** a strict apples-to-apples “same buckets” comparison.
+2. **Did CompactV1 reduce total bytes?** **No.** Δ total **+1556…+2828** on **every** clip (table above).
+3. **Did it preserve PSNR/SSIM?** **Yes** — all five rows match per clip at shown precision.
+4. **Which scan mode won most often?** **None — four-way tie:** zigzag, grouped-low-first, run-optimized, and auto produced **identical** `total_bytes` / `residual_bytes` on **all** clips in this gate.
+5. **Is residual still the biggest bottleneck?** **Yes** on the same reference partition-cost row: **`scene_cut/SRSV2-pc-fixed16x16`** → **`residual`** **4058** / **4949** (**~82%**).
+
 ### Did AutoFast RDO beat fixed16x16 anywhere?
 
 **No: AutoFast RDO did not beat fixed16x16 on total bytes in this gate.**
@@ -130,11 +152,11 @@ Winner: **`residual`** with **4058** bytes.
 
 ## Next Feature
 
-Exactly one next feature: **B. transform-size selection / coefficient layout improvements**.
+Exactly one next feature: **B. transform-size decision improvements / new transform grouping**.
 
-Reason from this run: --compare-residual-contexts increased totals on every corpus clip while residual remains the largest bucket; next lever is transform/coefficient layout (not an H.265 superiority claim).
+Reason from this gate: **`--compare-coeff-layouts`** shows **CompactV1** scan/layout variants **increase total bytes on every corpus clip** while **PSNR-Y / SSIM-Y** are unchanged; **scan modes tied**. Residual still **~82%** of **`scene_cut/SRSV2-pc-fixed16x16`** payload. Per Block 6 rubric: **do not** choose **A** (expand CompactV1 to B/variable partitions) when CompactV1 fails the **total-byte** objective here; prioritize **transform-size / grouping** next. **Not C/D** (residual still dominates; MV/header secondary). **E** remains optional for fairness only.
 
-Allowed planning labels: **A** CTU64 encode path; **B** transform-size / coefficient layout; **C** context-adaptive residual training (only if residual ContextV1 wins totals); **D** quarter-pel luma motion; **E** bitrate-matched x265 sweep (fairness).
+Allowed planning labels (Block 6 rubric): **A** integrate coefficient layout into B frames + variable partitions (if CompactV1 helps totals); **B** transform-size decision / new transform grouping (if CompactV1 fails); **C** CTU64 encode path (if residual no longer dominates); **D** quarter-pel luma (if prediction error dominates); **E** bitrate-matched x265 sweep (if comparison fairness dominates).
 
 ## Notes
 

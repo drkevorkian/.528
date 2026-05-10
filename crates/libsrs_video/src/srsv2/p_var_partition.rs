@@ -978,6 +978,7 @@ fn encode_residual_subblocks_for_pu(
                     PResidualChunkKind::Adaptive(BlockResidualCoding::ContextRansV1) => {
                         s.p_rans_chunks += 1;
                     }
+                    PResidualChunkKind::CompactCoeffV1 => {}
                 }
             }
             push_chunk(chunk, stats, ms, block_wire_acc)?;
@@ -1031,6 +1032,7 @@ pub fn encode_yuv420_p_payload_var_partition(
     }
     settings.validate_entropy_model_inter()?;
     settings.validate_residual_context_inter_residual()?;
+    settings.validate_coeff_layout_settings()?;
     let w = seq.width;
     let h = seq.height;
     let mb_cols = w / 16;

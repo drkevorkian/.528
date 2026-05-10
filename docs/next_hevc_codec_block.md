@@ -1,32 +1,38 @@
 # Next HEVC-Class Codec Implementation Block
 
-**Source gate:** [`windows_hevc_progress_results.md`](windows_hevc_progress_results.md) (Windows HEVC progress gate + **`bench_srsv2 --compare-residual-contexts`** on the full corpus; engineering measurement only).
+**Source gate:** [`windows_hevc_progress_results.md`](windows_hevc_progress_results.md) — Windows HEVC progress baseline (`tools/windows_hevc_progress_baseline.ps1`) plus **`bench_srsv2 --compare-coeff-layouts`** on **`moving_square`**, **`scrolling_bars`**, **`checker`**, **`scene_cut`** (engineering measurement only).
 
-**Selected feature (exactly one):** **B. transform-size selection / coefficient layout improvements**
+**Selected feature (exactly one):** **B. transform-size decision improvements / new transform grouping**
 
 ---
 
 ## Decision record (Block 6 rubric)
 
-Evidence from gate run **2026-05-09** (corpus **64×64**, **8** frames, **QP 28**, seed **528**) and residual-context compare rows documented in the results file.
+Evidence from gate run **2026-05-10** (corpus **64×64**, **8** frames, **QP 28**, **keyint 8**, **motion-radius 4**, seed **528**, commit **3380d33**). CompactV1 rows: **`coeff_layout_compare_summary`** and `reports/<tag>/compare_coeff_layouts.json`.
 
-| Option | Choose if… | Verdict | Evidence from report |
-|--------|------------|---------|---------------------|
-| **A.** Context-adaptive residual training / richer coefficient contexts | Residual **ContextV1** helps (**total** or clearly isolated coefficient bytes down) | **No** | **`--compare-residual-contexts`**: **`context`** row **larger** total than **`off`** on **all** clips (**Δ** **+4113…+10108**). Caveat: rows mix **`raw`→`entropy`** inter + MV/partition stack with residual context—not a pure coefficient A/B. |
-| **B.** Transform-size selection / coefficient layout | Residual ContextV1 **fails** byte objective | **Yes** | Totals **regress** everywhere in that compare; **residual** still **~82%** of **`SRSV2-pc-fixed16x16`** bytes on **`scene_cut`** (**4058** / **4949**). Next step attacks **coefficient packaging**, not MV entropy tables. |
-| **C.** CTU64 encode path | Residual **no longer** dominates | **No** | Bottleneck table unchanged—**`residual`** still wins the partition-cost breakdown. |
-| **D.** Quarter-pel luma | Prediction-error story dominates **and** MV tiny | **No** | **`MV/header`** **294** vs **`residual`** **4058** on the same reference row—MV is not the named blocker. |
-| **E.** Bitrate-matched x265 sweep | Comparison **fairness** is the **primary** blocker | **Parallel** | Report still shows **large** bitrate mismatch vs optional x265 row (**relative gap ~0.475**). Run **E** for **measurement fairness**; **B** remains the **codec** implementation choice. |
+| Option | Choose if… | Verdict | Evidence |
+|--------|------------|---------|----------|
+| **A.** Coefficient layout → **B** frames + variable partitions | CompactV1 **reduces total bytes** | **No** | Compact rows **larger** than legacy-zigzag on **all** clips: Δ total **+1556…+2828** B (`moving_square` **+2325**, `scrolling_bars` **+2828**, `checker` **+1556**, `scene_cut` **+2656**). |
+| **B.** Transform-size decision / transform grouping | CompactV1 **fails** total-byte objective | **Yes** | Totals regress everywhere; intra telemetry shows **~54–56%** estimated packaging savings on **rev32** blocks but **does not** overcome full-bitstream cost here. |
+| **C.** CTU64 encode path | Residual **no longer** dominates | **No** | **`scene_cut/SRSV2-pc-fixed16x16`**: **`residual`** **4058** / **4949** (**~82%**). |
+| **D.** Quarter-pel luma | Prediction-error story dominates **and** MV tiny | **No** | Same reference row: **`MV/header`** **294** vs **`residual`** **4058**. |
+| **E.** Bitrate-matched x265 sweep | Comparison **fairness** is primary | **Parallel** | Gate still reports large bitrate mismatch vs optional x265 reference (**relative gap ~0.475**). Does **not** replace **B**. |
 
-**Conclusion:** Implement **B** next: improve **transform decision / coefficient layout** so residual energy is coded more efficiently **without** asserting **HEVC** parity or that SRSV2 “beats” **x265**.
+**Conclusion:** Implement **B** next — improve **how transform size / grouping is chosen** so coded residual can shrink **without** claiming **HEVC/x265** superiority.
 
 ---
 
 ## Numbers pinned to this decision
 
-- **MV entropy ContextV1 vs StaticV1** (entropy-model compare): still **+1…+5** bytes on totals—no MV-context win.
-- **Residual coefficient ContextV1** (`--compare-residual-contexts`): **total bytes up** on **`moving_square`**, **`scrolling_bars`**, **`checker`**, **`scene_cut`**; **PSNR-Y / SSIM-Y** matched at printed precision across paired rows.
-- **Largest bottleneck row (unchanged reference):** `scene_cut` **`SRSV2-pc-fixed16x16`** → **`residual`** **4058** (**~82%** of **4949**).
+| Clip | legacy-zigzag total | compact total (all scans tied) | Δ total | PSNR-Y / SSIM-Y (all rows) |
+|------|--------------------:|-------------------------------:|--------:|----------------------------|
+| `moving_square` | 6566 | 8891 | +2325 | unchanged |
+| `scrolling_bars` | 8973 | 11801 | +2828 | unchanged |
+| `checker` | 16761 | 18317 | +1556 | unchanged |
+| `scene_cut` | 4949 | 7605 | +2656 | unchanged |
+
+- **Scan modes:** **four-way tie** (zigzag = grouped-low-first = run-optimized = auto) on every clip for **total_bytes**.
+- **Residual bottleneck (unchanged reference):** `scene_cut` **`SRSV2-pc-fixed16x16`** — **`residual`** **4058** (**~82%** of **4949**).
 
 ---
 
@@ -34,35 +40,29 @@ Evidence from gate run **2026-05-09** (corpus **64×64**, **8** frames, **QP 28*
 
 ````text
 BLOCK 7 GOAL:
-Improve transform-size selection and/or coefficient layout so residual payload shrinks on fixed partitions without codec superiority claims.
+Improve transform-size decision and/or transform grouping so residual coding efficiency improves on fixed partitions — without H.265/x265 superiority claims.
 
 SOURCE:
-docs/windows_hevc_progress_results.md — selected feature B from measured gates.
+docs/windows_hevc_progress_results.md — Block 6 chose B after --compare-coeff-layouts showed larger totals for CompactV1 on every corpus clip.
 
 WHY (data-backed):
-- compare-residual-contexts totals regressed on every corpus clip (see results doc).
-- Residual bucket still dominates SRSV2-pc-fixed16x16 (~82% on scene_cut).
-- MV/header bucket remains secondary; QP motion ContextV1 already showed no total-byte win.
+- CompactV1 compare harness increased total bytes (+1556…+2828) on all four clips; PSNR/SSIM unchanged; scan modes tied.
+- Residual bucket still ~82% on scene_cut/SRSV2-pc-fixed16x16.
 
 NON-GOALS:
 - No claim that SRSV2 beats H.265/HEVC/x265.
-- Do not conflate MV entropy ContextV1 with coefficient residual ContextV1 without holding inter syntax constant in benchmarks.
-
-SUGGESTED WORK AREAS (pick minimal integrating path):
-- libsrs_video SRSv2 transform decision surfaces tied to partition mode
-- Coefficient scan/grouping and FR2 payload layout where experimental rev allows
-- Bench: add/hold an apples-to-apples compare (fixed --inter-syntax entropy --entropy-model context --inter-partition fixed16x16) when isolating coefficient changes
+- Do not expand CompactV1 into B/variable partitions until total-byte wins are demonstrated (option A bar).
 
 MEASUREMENT:
-- Re-run tools/windows_hevc_progress_baseline.ps1 and residual-context compares after changes
+- Re-run tools/windows_hevc_progress_baseline.ps1 and bench_srsv2 --compare-coeff-layouts after changes
 - Refresh docs/windows_hevc_progress_results.md
 
 PARALLEL OPTIONAL:
-- Bitrate-matched x265 tooling sweep (fairness only)
+- Bitrate-matched x265 sweep (fairness only; option E)
 ````
 
 ---
 
-## Relation to option **E** (bitrate-matched x265)
+## Relation to option **E**
 
-Fair external comparison still benefits from **bitrate alignment**. That does **not** replace in-tree **transform/coefficient** work chosen here.
+Fair external comparison still benefits from **bitrate alignment**; it does **not** replace in-tree **transform-size / grouping** work (**B**).

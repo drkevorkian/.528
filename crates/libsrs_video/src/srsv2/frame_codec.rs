@@ -14,12 +14,14 @@ use super::model::{PixelFormat, VideoSequenceHeaderV2};
 use super::motion_search::SrsV2MotionEncodeStats;
 use super::p_frame_codec;
 use super::rate_control::{
-    ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode, SrsV2EncodeSettings,
+    ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode, SrsV2CoeffLayoutMode,
+    SrsV2EncodeSettings, SrsV2ResidualContextMode,
 };
 use super::reference_manager::SrsV2ReferenceManager;
 use super::residual_entropy::{
-    decode_plane_intra_entropy, decode_plane_intra_entropy_block_aq, encode_plane_intra_entropy,
-    encode_plane_intra_entropy_block_aq, ResidualPlane,
+    decode_plane_intra_compact_v32, decode_plane_intra_entropy,
+    decode_plane_intra_entropy_block_aq, encode_plane_intra_compact_v32,
+    encode_plane_intra_entropy, encode_plane_intra_entropy_block_aq, ResidualPlane,
 };
 
 pub const FRAME_PAYLOAD_MAGIC: [u8; 4] = [b'F', b'R', b'2', 1];
@@ -27,11 +29,15 @@ pub const FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 3];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 7];
 /// Intra adaptive residuals **strict** multi-context rANS (`FR2` rev **29**).
 pub const FRAME_PAYLOAD_MAGIC_INTRA_RESIDUAL_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 29];
+/// Intra with [`SrsV2CoeffLayoutMode::CompactV1`] coefficient bodies (`FR2` rev **32**).
+pub const FRAME_PAYLOAD_MAGIC_INTRA_COMPACT_V1: [u8; 4] = [b'F', b'R', b'2', 32];
 /// Non-displayable reference refresh (`FR2` rev **12**, experimental).
 pub const FRAME_PAYLOAD_MAGIC_ALT_REF: [u8; 4] = [b'F', b'R', b'2', 12];
 
 fn intra_magic_matches(payload: &[u8]) -> bool {
-    payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3 | 7 | 29)
+    payload.len() >= 4
+        && &payload[0..3] == b"FR2"
+        && matches!(payload[3], 1 | 3 | 7 | 29 | 32)
 }
 
 fn intra_use_block_aq_wire(settings: &SrsV2EncodeSettings) -> bool {
@@ -57,6 +63,27 @@ pub fn encode_yuv420_intra_payload(
         ));
     }
     settings.validate_residual_context_mode()?;
+    settings.validate_coeff_layout_settings()?;
+    if matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1) {
+        if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
+            return Err(SrsV2Error::syntax(
+                "FR2 rev32 intra CompactV1 requires residual_entropy Auto or Rans",
+            ));
+        }
+        if intra_use_block_aq_wire(settings) {
+            return Err(SrsV2Error::syntax(
+                "FR2 rev32 intra CompactV1 is incompatible with block AQ (FR2 rev7)",
+            ));
+        }
+        if matches!(
+            settings.residual_context_mode,
+            SrsV2ResidualContextMode::ContextV1,
+        ) {
+            return Err(SrsV2Error::syntax(
+                "FR2 rev32 intra CompactV1 is incompatible with residual_context_mode ContextV1",
+            ));
+        }
+    }
     if matches!(settings.block_aq_mode, SrsV2BlockAqMode::BlockDelta)
         && matches!(settings.residual_entropy, ResidualEntropy::Explicit)
     {
@@ -66,11 +93,13 @@ pub fn encode_yuv420_intra_payload(
     }
     let (eff_qp, mut aq_st) = resolve_frame_adaptive_qp(qp, yuv, settings)?;
     let mut out = Vec::new();
-    let magic = if intra_use_block_aq_wire(settings) {
+    let magic = if matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1) {
+        FRAME_PAYLOAD_MAGIC_INTRA_COMPACT_V1
+    } else if intra_use_block_aq_wire(settings) {
         FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ
     } else if matches!(
         settings.residual_context_mode,
-        crate::srsv2::rate_control::SrsV2ResidualContextMode::ContextV1,
+        SrsV2ResidualContextMode::ContextV1,
     ) && matches!(
         settings.residual_entropy,
         ResidualEntropy::Auto | ResidualEntropy::Rans,
@@ -111,11 +140,16 @@ pub fn encode_yuv420_intra_payload(
             let acc: &mut ResidualEncodeStats = stats.unwrap_or(&mut noop);
             if matches!(
                 settings.residual_context_mode,
-                crate::srsv2::rate_control::SrsV2ResidualContextMode::ContextV1
+                SrsV2ResidualContextMode::ContextV1
             ) {
                 acc.residual_context_enabled = true;
             }
-            if intra_use_block_aq_wire(settings) {
+            if magic == FRAME_PAYLOAD_MAGIC_INTRA_COMPACT_V1 {
+                encode_plane_intra_compact_v32(&yuv.y, qp_i, settings, acc, &mut yb)?;
+                encode_plane_intra_compact_v32(&yuv.u, qp_i, settings, acc, &mut ub)?;
+                encode_plane_intra_compact_v32(&yuv.v, qp_i, settings, acc, &mut vb)?;
+                acc.finalize_coeff_layout_derived();
+            } else if intra_use_block_aq_wire(settings) {
                 let sy = encode_plane_intra_entropy_block_aq(
                     &yuv.y,
                     eff_qp,
@@ -345,17 +379,38 @@ pub fn decode_yuv420_intra_payload(
         }
         3 => {
             let mut c = 0usize;
-            decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i, ResidualPlane::Y, false)?;
+            decode_plane_intra_entropy(
+                y_data,
+                &mut c,
+                &mut y_plane,
+                qp_i,
+                ResidualPlane::Y,
+                false,
+            )?;
             if c != y_data.len() {
                 return Err(SrsV2Error::syntax("y plane trailing bits"));
             }
             c = 0;
-            decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i, ResidualPlane::U, false)?;
+            decode_plane_intra_entropy(
+                u_data,
+                &mut c,
+                &mut u_plane,
+                qp_i,
+                ResidualPlane::U,
+                false,
+            )?;
             if c != u_data.len() {
                 return Err(SrsV2Error::syntax("u plane trailing bits"));
             }
             c = 0;
-            decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i, ResidualPlane::V, false)?;
+            decode_plane_intra_entropy(
+                v_data,
+                &mut c,
+                &mut v_plane,
+                qp_i,
+                ResidualPlane::V,
+                false,
+            )?;
             if c != v_data.len() {
                 return Err(SrsV2Error::syntax("v plane trailing bits"));
             }
@@ -418,6 +473,23 @@ pub fn decode_yuv420_intra_payload(
                 return Err(SrsV2Error::syntax("v plane trailing bits"));
             }
         }
+        32 => {
+            let mut c = 0usize;
+            decode_plane_intra_compact_v32(y_data, &mut c, &mut y_plane, qp_i)?;
+            if c != y_data.len() {
+                return Err(SrsV2Error::syntax("y plane trailing bits"));
+            }
+            c = 0;
+            decode_plane_intra_compact_v32(u_data, &mut c, &mut u_plane, qp_i)?;
+            if c != u_data.len() {
+                return Err(SrsV2Error::syntax("u plane trailing bits"));
+            }
+            c = 0;
+            decode_plane_intra_compact_v32(v_data, &mut c, &mut v_plane, qp_i)?;
+            if c != v_data.len() {
+                return Err(SrsV2Error::syntax("v plane trailing bits"));
+            }
+        }
         _ => return Err(SrsV2Error::BadMagic),
     }
 
@@ -460,6 +532,7 @@ pub fn encode_yuv420_inter_payload(
         return encode_yuv420_intra_payload(seq, cur, frame_index, qp, settings, stats, aq_out);
     }
     settings.validate_residual_context_inter_residual()?;
+    settings.validate_coeff_layout_settings()?;
     let (eff_qp, aq_st) = resolve_frame_adaptive_qp(qp, cur, settings)?;
     let block_wire = if let Some(a) = aq_out {
         *a = aq_st;
@@ -668,14 +741,14 @@ pub fn decode_yuv420_srsv2_payload_managed(
     }
     let rev = payload[3];
     let mut dec = match rev {
-        1 | 3 | 7 | 29 => {
+        1 | 3 | 7 | 29 | 32 => {
             let d = decode_yuv420_intra_payload(seq, payload)?;
             if seq.max_ref_frames > 0 {
                 manager.replace_after_keyframe(d.frame_index, d.yuv.clone());
             }
             d
         }
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 => {
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 => {
             let reference = manager
                 .primary_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -715,17 +788,14 @@ pub fn decode_yuv420_srsv2_payload(
     if payload.len() < 4 {
         return Err(SrsV2Error::Truncated);
     }
-    if matches!(
-        payload[3],
-        10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 31
-    ) {
+    if matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 31) {
         return Err(SrsV2Error::Unsupported(
             "multi-reference SRSV2 payloads require decode_yuv420_srsv2_payload_managed",
         ));
     }
     let mut dec = match payload[3] {
-        1 | 3 | 7 | 29 => decode_yuv420_intra_payload(seq, payload)?,
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 => {
+        1 | 3 | 7 | 29 | 32 => decode_yuv420_intra_payload(seq, payload)?,
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 => {
             let reference = ref_slot
                 .as_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -773,7 +843,8 @@ mod roundtrip_tests {
     };
     use crate::srsv2::rate_control::{
         ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode,
-        SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterSyntaxMode, SrsV2ResidualContextMode,
+        SrsV2CoeffLayoutMode, SrsV2CoeffScanMode, SrsV2EncodeSettings, SrsV2EntropyModelMode,
+        SrsV2InterSyntaxMode, SrsV2ResidualContextMode, SrsV2TransformDecisionMode,
     };
     use crate::srsv2::reference_manager::SrsV2ReferenceManager;
 
@@ -847,6 +918,58 @@ mod roundtrip_tests {
         assert_eq!(dec.width, 64);
         assert_eq!(dec.height, 64);
         assert_eq!(dec.yuv.y.samples.len(), yuv.y.samples.len());
+    }
+
+    /// Legacy **`FR2` rev 1** explicit intra still decodes after coeff-layout settings exist (defaults unchanged).
+    #[test]
+    fn fr2_rev1_explicit_intra_decodes_with_default_coeff_layout_fields() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).expect("yuv");
+        let st = explicit_only_settings();
+        assert_eq!(st.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
+        let payload = encode_yuv420_intra_payload(&seq, &yuv, 7, 22, &st, None, None).expect("enc");
+        assert_eq!(payload[3], 1, "explicit residual uses FR2 revision byte 1");
+        decode_yuv420_intra_payload(&seq, &payload).expect("dec");
+    }
+
+    #[test]
+    fn intra_encode_rejects_transform_decision_tx16x16() {
+        let seq = VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        };
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).expect("yuv");
+        let st = SrsV2EncodeSettings {
+            transform_decision_mode: SrsV2TransformDecisionMode::Tx16x16,
+            residual_entropy: ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        assert!(encode_yuv420_intra_payload(&seq, &yuv, 0, 22, &st, None, None).is_err());
     }
 
     #[test]
@@ -1230,16 +1353,9 @@ mod roundtrip_tests {
             ..Default::default()
         };
         let mut stats = ResidualEncodeStats::default();
-        let _payload = encode_yuv420_intra_payload(
-            &seq,
-            &yuv,
-            0,
-            21,
-            &st_ctx,
-            Some(&mut stats),
-            None,
-        )
-        .unwrap();
+        let _payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, 21, &st_ctx, Some(&mut stats), None)
+                .unwrap();
         assert!(stats.residual_context_enabled);
         assert!(stats.residual_context_blocks > 0);
         assert!(stats.residual_context_bytes > 0);
@@ -1438,18 +1554,9 @@ mod roundtrip_tests {
         let rgb = vec![101_u8; 64 * 64 * 3];
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
         let mut slot = Some(yuv.clone());
-        let p = encode_yuv420_inter_payload(
-            &seq,
-            &yuv,
-            slot.as_ref(),
-            1,
-            26,
-            &st,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let p =
+            encode_yuv420_inter_payload(&seq, &yuv, slot.as_ref(), 1, 26, &st, None, None, None)
+                .unwrap();
         assert_eq!(p[3], 30);
         decode_yuv420_srsv2_payload(&seq, &p, &mut slot).unwrap();
     }
@@ -1481,18 +1588,9 @@ mod roundtrip_tests {
         let rgb = vec![102_u8; 64 * 64 * 3];
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
         let mut slot = Some(yuv.clone());
-        let p = encode_yuv420_inter_payload(
-            &seq,
-            &yuv,
-            slot.as_ref(),
-            1,
-            26,
-            &st,
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let p =
+            encode_yuv420_inter_payload(&seq, &yuv, slot.as_ref(), 1, 26, &st, None, None, None)
+                .unwrap();
         assert_eq!(p[3], 30);
         let mut bad = p.clone();
         bad.truncate(bad.len().saturating_sub(20));
@@ -1560,20 +1658,18 @@ mod roundtrip_tests {
             keyframe_interval: 30,
             ..Default::default()
         };
-        assert!(
-            encode_yuv420_inter_payload(
-                &seq,
-                &yuv,
-                slot.as_ref(),
-                1,
-                24,
-                &st_bad,
-                None,
-                None,
-                None
-            )
-            .is_err()
-        );
+        assert!(encode_yuv420_inter_payload(
+            &seq,
+            &yuv,
+            slot.as_ref(),
+            1,
+            24,
+            &st_bad,
+            None,
+            None,
+            None
+        )
+        .is_err());
     }
 
     #[test]
@@ -1712,6 +1808,221 @@ mod roundtrip_tests {
         let qp_delta_off = y_off + 1 + 2 + 1;
         payload[qp_delta_off] = 25_u8;
         assert!(decode_yuv420_intra_payload(&seq, &payload).is_err());
+    }
+
+    fn seq64_intra() -> VideoSequenceHeaderV2 {
+        VideoSequenceHeaderV2 {
+            width: 64,
+            height: 64,
+            profile: SrsVideoProfile::Main,
+            pixel_format: PixelFormat::Yuv420p8,
+            color_primaries: ColorPrimaries::Bt709,
+            transfer: TransferFunction::Sdr,
+            matrix: MatrixCoefficients::Bt709,
+            chroma_siting: ChromaSiting::Center,
+            range: ColorRange::Limited,
+            disable_loop_filter: true,
+            deblock_strength: 0,
+            max_ref_frames: 0,
+        }
+    }
+
+    #[test]
+    fn fr2_rev32_intra_roundtrip_and_stats() {
+        let seq = seq64_intra();
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            ..Default::default()
+        };
+        let mut stats = ResidualEncodeStats::default();
+        let payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 3, 20, &st, Some(&mut stats), None).unwrap();
+        assert_eq!(payload[3], 32);
+        assert_eq!(
+            stats.intra_coeff_layout_mode,
+            Some(SrsV2CoeffLayoutMode::CompactV1)
+        );
+        assert_eq!(stats.intra_coeff_scan_mode, Some(SrsV2CoeffScanMode::ZigZag));
+        assert!(stats.intra_tx8x8_blocks > 0);
+        assert!(stats.coeff_layout_bytes > 0);
+        assert!(stats.coeff_legacy_estimated_bytes > 0);
+        let dec = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        assert_eq!(dec.frame_index, 3);
+        assert_eq!(dec.yuv.y.samples.len(), yuv.y.samples.len());
+    }
+
+    #[test]
+    fn fr2_rev32_malformed_compact_body_fails_decode() {
+        let seq = seq64_intra();
+        let mut rgb = vec![0_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let i = (y * 64 + x) * 3;
+                let v = ((x.wrapping_mul(17)) ^ (y.wrapping_mul(31))) as u8;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            ..Default::default()
+        };
+        let mut payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, 18, &st, None, None).unwrap();
+        assert_eq!(payload[3], 32);
+        let corrupt_at = payload.len().saturating_sub(20).max(12);
+        payload[corrupt_at] ^= 0xFF;
+        assert!(decode_yuv420_intra_payload(&seq, &payload).is_err());
+    }
+
+    #[test]
+    fn fr2_rev32_decoded_pixels_match_legacy_auto_intra_path() {
+        let seq = seq64_intra();
+        let mut rgb = vec![90_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let i = (y * 64 + x) * 3;
+                let v = (30 + (x + y) % 40) as u8;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let qp = 21_u8;
+        let st_legacy = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
+            ..Default::default()
+        };
+        let st_compact = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            ..Default::default()
+        };
+        let pl_legacy =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &st_legacy, None, None).unwrap();
+        assert_eq!(pl_legacy[3], 3);
+        let pl_compact =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, qp, &st_compact, None, None).unwrap();
+        assert_eq!(pl_compact[3], 32);
+        let dec_l = decode_yuv420_intra_payload(&seq, &pl_legacy).unwrap();
+        let dec_c = decode_yuv420_intra_payload(&seq, &pl_compact).unwrap();
+        assert_eq!(dec_l.yuv.y.samples, dec_c.yuv.y.samples);
+        assert_eq!(dec_l.yuv.u.samples, dec_c.yuv.u.samples);
+        assert_eq!(dec_l.yuv.v.samples, dec_c.yuv.v.samples);
+    }
+
+    #[test]
+    fn fr2_intra_revisions_1_3_7_29_still_decode_via_dispatcher() {
+        let seq = seq64_intra();
+        let rgb = vec![110_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let qp = 23_u8;
+        let payloads = [
+            encode_yuv420_intra_payload(
+                &seq,
+                &yuv,
+                1,
+                qp,
+                &explicit_only_settings(),
+                None,
+                None,
+            )
+            .unwrap(),
+            encode_yuv420_intra_payload(&seq, &yuv, 2, qp, &SrsV2EncodeSettings::default(), None, None)
+                .unwrap(),
+            encode_yuv420_intra_payload(
+                &seq,
+                &yuv,
+                3,
+                qp,
+                &SrsV2EncodeSettings {
+                    block_aq_mode: SrsV2BlockAqMode::BlockDelta,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap(),
+            encode_yuv420_intra_payload(
+                &seq,
+                &yuv,
+                4,
+                qp,
+                &SrsV2EncodeSettings {
+                    residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap(),
+        ];
+        assert_eq!(payloads[0][3], 1);
+        assert_eq!(payloads[1][3], 3);
+        assert_eq!(payloads[2][3], 7);
+        assert_eq!(payloads[3][3], 29);
+        let mut slot = None::<YuvFrame>;
+        for pl in &payloads {
+            decode_yuv420_srsv2_payload(&seq, pl, &mut slot).unwrap();
+        }
+    }
+
+    #[test]
+    fn fr2_rev32_flat_frame_compact_wire_not_above_legacy_estimate() {
+        let seq = seq64_intra();
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            ..Default::default()
+        };
+        let mut stats = ResidualEncodeStats::default();
+        encode_yuv420_intra_payload(&seq, &yuv, 0, 26, &st, Some(&mut stats), None).unwrap();
+        assert!(
+            stats.coeff_layout_bytes <= stats.coeff_legacy_estimated_bytes,
+            "flat gray: compact wire ({}) should not exceed legacy estimate ({})",
+            stats.coeff_layout_bytes,
+            stats.coeff_legacy_estimated_bytes
+        );
+        assert!(stats.coeff_layout_savings_bytes >= 0);
+    }
+
+    #[test]
+    fn fr2_rev32_dense_noise_can_exceed_legacy_estimate_and_reports_negative_savings() {
+        let seq = seq64_intra();
+        let mut rgb = vec![0_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let i = (y * 64 + x) * 3;
+                let v = ((x.wrapping_mul(131)) ^ (y.wrapping_mul(97))) as u8;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            ..Default::default()
+        };
+        let mut stats = ResidualEncodeStats::default();
+        encode_yuv420_intra_payload(&seq, &yuv, 0, 14, &st, Some(&mut stats), None).unwrap();
+        assert!(
+            stats.coeff_layout_bytes > stats.coeff_legacy_estimated_bytes,
+            "expected noisy pattern to inflate compact wire vs legacy estimate (layout {} est {})",
+            stats.coeff_layout_bytes,
+            stats.coeff_legacy_estimated_bytes
+        );
+        assert!(stats.coeff_layout_savings_bytes < 0);
+        assert!(stats.coeff_layout_savings_percent < 0.0);
     }
 
     #[test]

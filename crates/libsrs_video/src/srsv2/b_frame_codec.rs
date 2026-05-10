@@ -1032,6 +1032,7 @@ pub fn encode_yuv420_b_payload_mb_blend(
     }
     settings.validate_entropy_model_inter()?;
     settings.validate_residual_context_b_frame()?;
+    settings.validate_coeff_layout_settings()?;
     let w = seq.width;
     let h = seq.height;
     let qp_i = qp.max(1) as i16;
@@ -1218,7 +1219,10 @@ pub fn decode_yuv420_b_payload(
         return Err(SrsV2Error::Truncated);
     }
     if &payload[0..3] != b"FR2"
-        || !matches!(payload[3], 10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26 | 31)
+        || !matches!(
+            payload[3],
+            10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26 | 31
+        )
     {
         return Err(SrsV2Error::BadMagic);
     }

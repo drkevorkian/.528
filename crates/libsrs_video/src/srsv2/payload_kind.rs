@@ -30,9 +30,9 @@ pub fn classify_srsv2_payload(payload: &[u8]) -> Result<Srsv2PayloadKind, SrsV2E
         return Err(SrsV2Error::BadMagic);
     }
     Ok(match payload[3] {
-        1 | 3 | 7 | 29 => Srsv2PayloadKind::Intra,
+        1 | 3 | 7 | 29 | 32 => Srsv2PayloadKind::Intra,
         2 | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 13 | 14 | 15 | 16 | 17 | 18 | 19 | 20 | 21 | 22 | 23
-        | 24 | 25 | 26 | 27 | 28 | 30 | 31 => Srsv2PayloadKind::Predicted,
+        | 24 | 25 | 26 | 27 | 28 | 30 | 31 | 33 => Srsv2PayloadKind::Predicted,
         12 => Srsv2PayloadKind::AltRef,
         _ => Srsv2PayloadKind::Unknown,
     })
@@ -215,9 +215,25 @@ mod classify_tests {
     }
 
     #[test]
+    fn fr2_rev32_is_intra_kind() {
+        assert_eq!(
+            classify_srsv2_payload(&[b'F', b'R', b'2', 32]).unwrap(),
+            Srsv2PayloadKind::Intra
+        );
+    }
+
+    #[test]
     fn fr2_rev30_is_predicted_kind() {
         assert_eq!(
             classify_srsv2_payload(&[b'F', b'R', b'2', 30]).unwrap(),
+            Srsv2PayloadKind::Predicted
+        );
+    }
+
+    #[test]
+    fn fr2_rev33_is_predicted_kind() {
+        assert_eq!(
+            classify_srsv2_payload(&[b'F', b'R', b'2', 33]).unwrap(),
             Srsv2PayloadKind::Predicted
         );
     }

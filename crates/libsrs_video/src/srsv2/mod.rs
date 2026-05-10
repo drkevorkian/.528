@@ -31,10 +31,11 @@ pub mod rate_control;
 pub mod rdo;
 pub mod reference;
 pub mod reference_manager;
-pub mod residual_entropy;
 pub mod residual_context_entropy;
+pub mod residual_entropy;
 pub mod residual_tokens;
 pub mod subpel;
+pub mod transform_layout;
 
 pub use adaptive_quant::{
     accumulate_block_aq_wire_plane, resolve_frame_adaptive_qp, validate_adaptive_quant_settings,
@@ -66,7 +67,7 @@ pub use frame_codec::{
     apply_reconstruction_filter_if_enabled, decode_yuv420_alt_ref_payload,
     decode_yuv420_intra_payload, decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
     encode_yuv420_alt_ref_payload, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
-    FRAME_PAYLOAD_MAGIC_ALT_REF,
+    FRAME_PAYLOAD_MAGIC_ALT_REF, FRAME_PAYLOAD_MAGIC_INTRA_COMPACT_V1,
 };
 pub use model::{
     decode_sequence_header_v2, encode_sequence_header_v2, frame_type_from_srsv2_revision,
@@ -77,7 +78,9 @@ pub use model::{
 pub use motion_search::{
     SrsV2InterMvBenchStats, SrsV2MotionEncodeStats, SrsV2PartitionEncodeStats, SrsV2RdoBenchStats,
 };
-pub use p_frame_codec::FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1;
+pub use p_frame_codec::{
+    FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1, FRAME_PAYLOAD_MAGIC_P_RESIDUAL_COMPACT_V1,
+};
 pub use p_var_partition::{
     FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR, FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_CTX_V1,
     FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_VAR_V2, FRAME_PAYLOAD_MAGIC_P_VAR_PARTITION,
@@ -93,12 +96,13 @@ pub use partition_syntax_v2::{
 pub use payload_kind::{classify_srsv2_payload, Srsv2PayloadKind};
 pub use rate_control::{
     target_payload_bytes, PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy,
-    SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
-    SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode,
-    SrsV2ResidualContextMode,
+    SrsV2AdaptiveQuantizationMode, SrsV2BMotionSearchMode, SrsV2BlockAqMode,
+    SrsV2CoeffLayoutMode, SrsV2CoeffScanMode, SrsV2EncodeSettings, SrsV2EntropyModelMode,
+    SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode,
     SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode,
     SrsV2RateControlError, SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode,
-    SrsV2SubpelMode, SrsV2TransformSize, SrsV2TransformSizeMode,
+    SrsV2ResidualContextMode, SrsV2SubpelMode, SrsV2TransformDecisionMode, SrsV2TransformSize,
+    SrsV2TransformSizeMode,
 };
 pub use rdo::{
     autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost, b_blend_rdo_score,

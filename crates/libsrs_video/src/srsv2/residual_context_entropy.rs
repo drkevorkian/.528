@@ -27,8 +27,8 @@ use thiserror::Error;
 
 use super::dct::ZIGZAG;
 use super::residual_tokens::{
-    detokenize_ac, residual_symbol_count, sym_eob, tokenize_ac, zigzag_signed,
-    AC_POSITIONS, MAX_SYMBOLS_PER_BLOCK,
+    detokenize_ac, residual_symbol_count, sym_eob, tokenize_ac, zigzag_signed, AC_POSITIONS,
+    MAX_SYMBOLS_PER_BLOCK,
 };
 
 // --- public stable API -------------------------------------------------------
@@ -530,16 +530,12 @@ fn decode_plane_inner(
     }
 
     let decode_budget = payload.len().saturating_mul(32).max(4096);
-    let syms = rans_decode_symbols_multi_context(
-        &model.slots,
-        payload,
-        num_syms,
-        contexts,
-        decode_budget,
-    )
-    .map_err(map_bitio)?;
+    let syms =
+        rans_decode_symbols_multi_context(&model.slots, payload, num_syms, contexts, decode_budget)
+            .map_err(map_bitio)?;
 
-    detokenize_ac(&syms, out).map_err(|e| ResidualContextEntropyError::Detokenize(format!("{e:?}")))?;
+    detokenize_ac(&syms, out)
+        .map_err(|e| ResidualContextEntropyError::Detokenize(format!("{e:?}")))?;
     out[0] = dc_save;
 
     let expected_tok = tokenize_ac(out).map_err(map_tokenize)?;
@@ -689,10 +685,19 @@ mod tests {
         assert!(blob.len() > 2);
         blob[2] = NUM_CONTEXT_SLOTS as u8;
         let mut out = q;
-        let err = decode_residual_context_v1_block(&model, ResidualPlane::Y, false, false, &blob, &mut out)
-            .unwrap_err();
+        let err = decode_residual_context_v1_block(
+            &model,
+            ResidualPlane::Y,
+            false,
+            false,
+            &blob,
+            &mut out,
+        )
+        .unwrap_err();
         match err {
-            ResidualContextEntropyError::InvalidContextSlot(s, _) => assert_eq!(s, NUM_CONTEXT_SLOTS as u8),
+            ResidualContextEntropyError::InvalidContextSlot(s, _) => {
+                assert_eq!(s, NUM_CONTEXT_SLOTS as u8)
+            }
             e => panic!("unexpected {e:?}"),
         }
     }
@@ -707,9 +712,15 @@ mod tests {
         assert!(blob.len() > 8);
         blob.truncate(blob.len().saturating_sub(3));
         let mut out = q;
-        assert!(
-            decode_residual_context_v1_block(&model, ResidualPlane::Y, false, false, &blob, &mut out).is_err()
-        );
+        assert!(decode_residual_context_v1_block(
+            &model,
+            ResidualPlane::Y,
+            false,
+            false,
+            &blob,
+            &mut out
+        )
+        .is_err());
     }
 
     #[test]
@@ -743,9 +754,15 @@ mod tests {
             encode_residual_context_v1_block(&model, ResidualPlane::Y, false, false, &q).unwrap();
         blob.push(0xAB);
         let mut out = q;
-        assert!(
-            decode_residual_context_v1_block(&model, ResidualPlane::Y, false, false, &blob, &mut out).is_err()
-        );
+        assert!(decode_residual_context_v1_block(
+            &model,
+            ResidualPlane::Y,
+            false,
+            false,
+            &blob,
+            &mut out
+        )
+        .is_err());
     }
 
     #[test]
@@ -754,8 +771,10 @@ mod tests {
         let mut q = [0_i16; 64];
         q[ZIGZAG[5]] = -20;
         q[ZIGZAG[30]] = 11;
-        let (a, _) = encode_residual_context_v1_block(&model, ResidualPlane::V, true, false, &q).unwrap();
-        let (b, _) = encode_residual_context_v1_block(&model, ResidualPlane::V, true, false, &q).unwrap();
+        let (a, _) =
+            encode_residual_context_v1_block(&model, ResidualPlane::V, true, false, &q).unwrap();
+        let (b, _) =
+            encode_residual_context_v1_block(&model, ResidualPlane::V, true, false, &q).unwrap();
         assert_eq!(a, b);
     }
 
@@ -767,8 +786,15 @@ mod tests {
         let (blob, _) =
             encode_residual_context_v1_block(&model, ResidualPlane::Y, false, false, &q).unwrap();
         let mut out = q;
-        let err = decode_residual_context_v1_block(&model, ResidualPlane::Y, true, false, &blob, &mut out)
-            .unwrap_err();
+        let err = decode_residual_context_v1_block(
+            &model,
+            ResidualPlane::Y,
+            true,
+            false,
+            &blob,
+            &mut out,
+        )
+        .unwrap_err();
         match err {
             ResidualContextEntropyError::Entropy(msg) => {
                 assert!(msg.contains("mismatch"));

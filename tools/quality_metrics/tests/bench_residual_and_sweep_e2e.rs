@@ -303,9 +303,9 @@ fn compare_residual_contexts_two_rows_on_golden_without_ffmpeg() {
     assert!(arr[0]["ok"].as_bool() == Some(true));
     assert!(arr[1]["ok"].as_bool() == Some(true));
     let md = fs::read_to_string(&report_md).unwrap();
-    assert!(
-        md.contains("| Residual mode | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y | Status |")
-    );
+    assert!(md.contains(
+        "| Residual mode | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y | Status |"
+    ));
 }
 
 #[test]

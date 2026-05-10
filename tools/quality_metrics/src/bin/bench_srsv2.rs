@@ -12,16 +12,17 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser};
 use libsrs_video::srsv2::ctu64::{ctu_grid_stats, CtuSize};
 use libsrs_video::srsv2::frame::VideoPlane;
+use libsrs_video::srsv2::rate_control::SrsV2ResidualContextMode;
 use libsrs_video::srsv2::validate_adaptive_quant_settings;
 use libsrs_video::srsv2::{
     decode_mv_share_groups_v2, decode_partition_map_v2, total_pu_slots_for_modes,
 };
-use libsrs_video::srsv2::rate_control::SrsV2ResidualContextMode;
 use libsrs_video::{
     decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
     encode_yuv420_b_payload_mb_blend, encode_yuv420_inter_payload, BFrameEncodeStats, PixelFormat,
     PreviousFrameRcStats, ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode,
-    SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2EncodeSettings,
+    SrsV2AqEncodeStats, SrsV2BMotionSearchMode, SrsV2BlockAqMode, SrsV2CoeffLayoutMode,
+    SrsV2CoeffScanMode, SrsV2EncodeSettings,
     SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2LoopFilterMode,
     SrsV2MotionEncodeStats, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
     SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2RateControlMode, SrsV2RateController,
@@ -117,6 +118,18 @@ struct Args {
     /// Run baseline (**`--residual-context off`**) then **ContextV1** residual entropy (two rows). **P** path upgrades the context row to the rev30 stack when needed. Failed context encode does not abort the baseline row. No FFmpeg.
     #[arg(long, default_value_t = false)]
     compare_residual_contexts: bool,
+
+    /// Intra / **P** coefficient packaging telemetry: **`legacy`** (default) or **`compact`** (**CompactV1**: intra **`FR2` rev32**, fixed-grid **P** **`FR2` rev33** when inter syntax allows).
+    #[arg(long, default_value = "legacy")]
+    coeff_layout: String,
+
+    /// Coefficient scan for compact layout: **`zigzag`** (default), **`grouped-low-first`**, **`run-optimized`**, or **`auto`**.
+    #[arg(long, default_value = "zigzag")]
+    coeff_scan: String,
+
+    /// Five-row harness (**legacy-zigzag**, then four compact scans). Normalizes **`--residual-entropy auto`**, **`--residual-context off`**, **`--inter-partition fixed16x16`**, **`--block-aq off`**, and upgrades **`--inter-syntax raw`** to **`compact`** so rev33 **P** coefficients are valid. No FFmpeg.
+    #[arg(long, default_value_t = false)]
+    compare_coeff_layouts: bool,
 
     #[arg(long, default_value_t = false)]
     sweep: bool,
@@ -456,6 +469,12 @@ struct Fr2RevisionCounts {
     rev29: u32,
     #[serde(default)]
     rev30: u32,
+    #[serde(default)]
+    rev31: u32,
+    #[serde(default)]
+    rev32: u32,
+    #[serde(default)]
+    rev33: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -935,6 +954,34 @@ struct PartitionSyntaxCompareRow {
     error: Option<String>,
 }
 
+/// One row from **`--compare-coeff-layouts`** (fixed order; intra compact telemetry + clip metrics).
+#[derive(Debug, Clone, Serialize)]
+struct CoeffLayoutCompareRow {
+    /// Row id: `legacy-zigzag`, `compact-zigzag`, …
+    row_label: String,
+    coeff_layout_mode: String,
+    coeff_scan_mode: String,
+    coeff_layout_bytes: u64,
+    coeff_legacy_estimated_bytes: u64,
+    coeff_layout_savings_bytes: i64,
+    coeff_layout_savings_percent: f64,
+    tx4x4_blocks: u64,
+    tx8x8_blocks: u64,
+    residual_bytes: u64,
+    total_bytes: u64,
+    /// `residual_bytes − baseline` when baseline (**legacy-zigzag**) succeeded; omitted otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    residual_bytes_delta_vs_legacy_zigzag: Option<i64>,
+    psnr_y: f64,
+    ssim_y: f64,
+    encode_fps: f64,
+    decode_fps: f64,
+    #[serde(default)]
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SweepRunReport {
     qp: u8,
@@ -989,6 +1036,10 @@ struct BenchReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     entropy_model_compare_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    compare_coeff_layouts: Option<Vec<CoeffLayoutCompareRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coeff_layout_compare_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     match_x264_bitrate_note: Option<String>,
     git_commit: Option<String>,
     os: String,
@@ -1010,6 +1061,44 @@ fn parse_residual_entropy(s: &str) -> Result<ResidualEntropy> {
         "rans" => Ok(ResidualEntropy::Rans),
         _ => Err(anyhow!(
             "--residual-entropy must be auto, explicit, or rans (got {s})"
+        )),
+    }
+}
+
+fn coeff_layout_mode_cli_label(m: SrsV2CoeffLayoutMode) -> &'static str {
+    match m {
+        SrsV2CoeffLayoutMode::Legacy => "legacy",
+        SrsV2CoeffLayoutMode::CompactV1 => "compact",
+    }
+}
+
+fn coeff_scan_mode_cli_label(m: SrsV2CoeffScanMode) -> &'static str {
+    match m {
+        SrsV2CoeffScanMode::ZigZag => "zigzag",
+        SrsV2CoeffScanMode::GroupedLowFirst => "grouped-low-first",
+        SrsV2CoeffScanMode::RunOptimized => "run-optimized",
+        SrsV2CoeffScanMode::Auto => "auto",
+    }
+}
+
+fn parse_coeff_layout_mode(s: &str) -> Result<SrsV2CoeffLayoutMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "legacy" => Ok(SrsV2CoeffLayoutMode::Legacy),
+        "compact" => Ok(SrsV2CoeffLayoutMode::CompactV1),
+        _ => Err(anyhow!(
+            "--coeff-layout must be legacy or compact (got {s})"
+        )),
+    }
+}
+
+fn parse_coeff_scan_mode(s: &str) -> Result<SrsV2CoeffScanMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "zigzag" => Ok(SrsV2CoeffScanMode::ZigZag),
+        "grouped-low-first" => Ok(SrsV2CoeffScanMode::GroupedLowFirst),
+        "run-optimized" => Ok(SrsV2CoeffScanMode::RunOptimized),
+        "auto" => Ok(SrsV2CoeffScanMode::Auto),
+        _ => Err(anyhow!(
+            "--coeff-scan must be zigzag, grouped-low-first, run-optimized, or auto (got {s})"
         )),
     }
 }
@@ -1048,13 +1137,13 @@ fn apply_residual_context_v1_inter_stack_for_predicted_p(args: &mut Args) {
     args.inter_partition = "fixed16x16".to_string();
 }
 
-/// Sum Y/U/V plane chunk payloads for **FR2** intra **1**/**3**/**7**/**29** (coefficient-plane byte volume).
+/// Sum Y/U/V plane chunk payloads for **FR2** intra **1**/**3**/**7**/**29**/**32** (coefficient-plane byte volume).
 fn intra_plane_chunks_payload_sum(pl: &[u8]) -> Option<u64> {
     if pl.len() < 4 || &pl[0..3] != b"FR2" {
         return None;
     }
     let rev = pl[3];
-    if !matches!(rev, 1 | 3 | 7 | 29) {
+    if !matches!(rev, 1 | 3 | 7 | 29 | 32) {
         return None;
     }
     let mut cur = 4usize;
@@ -1208,6 +1297,7 @@ fn validate_args(args: &Args) -> Result<()> {
             || args.sweep_quality_bitrate
             || args.compare_residual_modes
             || args.compare_residual_contexts
+            || args.compare_coeff_layouts
             || args.compare_b_modes
             || args.compare_inter_syntax
             || args.compare_rdo
@@ -1306,8 +1396,16 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             "--compare-residual-contexts cannot be combined with --sweep or --sweep-quality-bitrate"
         );
     }
+    if args.compare_coeff_layouts && (args.sweep || args.sweep_quality_bitrate) {
+        bail!(
+            "--compare-coeff-layouts cannot be combined with --sweep or --sweep-quality-bitrate"
+        );
+    }
     if args.compare_residual_contexts && args.compare_residual_modes {
         bail!("--compare-residual-contexts cannot be combined with --compare-residual-modes");
+    }
+    if args.compare_coeff_layouts && args.compare_residual_modes {
+        bail!("--compare-coeff-layouts cannot be combined with --compare-residual-modes");
     }
     if args.sweep && args.sweep_quality_bitrate {
         bail!("--sweep and --sweep-quality-bitrate are mutually exclusive");
@@ -1318,11 +1416,15 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         + args.compare_partition_costs as u8
         + args.compare_partition_syntax as u8
         + args.compare_entropy_models as u8
-        + args.compare_residual_contexts as u8;
+        + args.compare_residual_contexts as u8
+        + args.compare_coeff_layouts as u8;
     if compare_pass_count > 1 {
         bail!(
-            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, and --compare-residual-contexts are mutually exclusive"
+            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, --compare-residual-contexts, and --compare-coeff-layouts are mutually exclusive"
         );
+    }
+    if args.compare_residual_contexts && args.compare_coeff_layouts {
+        bail!("--compare-residual-contexts cannot be combined with --compare-coeff-layouts");
     }
     if (args.compare_inter_syntax
         || args.compare_rdo
@@ -1334,17 +1436,19 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             || args.sweep_quality_bitrate
             || args.compare_residual_modes
             || args.compare_residual_contexts
+            || args.compare_coeff_layouts
             || args.compare_b_modes)
     {
-        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, or --compare-b-modes");
+        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, or --compare-b-modes");
     }
     if args.compare_b_modes
         && (args.sweep
             || args.compare_residual_modes
             || args.compare_residual_contexts
+            || args.compare_coeff_layouts
             || args.sweep_quality_bitrate)
     {
-        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, or --compare-residual-contexts");
+        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, or --compare-coeff-layouts");
     }
     if args.compare_b_modes {
         if args.reference_frames < 2 {
@@ -1405,15 +1509,13 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     if matches!(rctx_mode, SrsV2ResidualContextMode::ContextV1)
         && !args.compare_residual_contexts
         && clip_has_inter_predicted_frames(args)
-    {
-        if inter_syn != SrsV2InterSyntaxMode::EntropyV1
+        && (inter_syn != SrsV2InterSyntaxMode::EntropyV1
             || entropy_model != SrsV2EntropyModelMode::ContextV1
-            || inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16
-        {
-            bail!(
-                "--residual-context context with predicted P frames requires `--inter-syntax entropy`, `--entropy-model context`, and `--inter-partition fixed16x16` (FR2 rev30 stack)"
-            );
-        }
+            || inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16)
+    {
+        bail!(
+            "--residual-context context with predicted P frames requires `--inter-syntax entropy`, `--entropy-model context`, and `--inter-partition fixed16x16` (FR2 rev30 stack)"
+        );
     }
     if args.bframes > 1 {
         bail!(
@@ -1434,9 +1536,10 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         if args.sweep
             || args.compare_residual_modes
             || args.compare_residual_contexts
+            || args.compare_coeff_layouts
             || args.sweep_quality_bitrate
         {
-            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, or --compare-residual-contexts");
+            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, or --compare-coeff-layouts");
         }
     }
     if args.sweep_quality_bitrate {
@@ -1449,6 +1552,13 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     parse_partition_cost_model(&args.partition_cost_model)?;
     parse_partition_map_encoding(&args.partition_map_encoding)?;
     parse_partition_syntax_mode(&args.partition_syntax)?;
+    parse_coeff_layout_mode(&args.coeff_layout)?;
+    parse_coeff_scan_mode(&args.coeff_scan)?;
+    if args.compare_coeff_layouts {
+        if args.bframes > 0 {
+            bail!("--compare-coeff-layouts requires --bframes 0 in this slice");
+        }
+    }
     Ok(())
 }
 
@@ -1676,6 +1786,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let partition_syntax_mode = parse_partition_syntax_mode(&args.partition_syntax)?;
     let entropy_model_mode = parse_entropy_model(&args.entropy_model)?;
     let residual_context_mode = parse_residual_context_mode(&args.residual_context)?;
+    let coeff_layout_mode = parse_coeff_layout_mode(&args.coeff_layout)?;
+    let coeff_scan_mode = parse_coeff_scan_mode(&args.coeff_scan)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -1712,6 +1824,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         partition_map_encoding,
         partition_syntax_mode,
         entropy_model_mode,
+        coeff_layout_mode,
+        coeff_scan_mode,
         ..Default::default()
     };
     s.validate_residual_context_mode()
@@ -1723,6 +1837,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         .map_err(|e| anyhow!("MV entropy configuration: {e}"))?;
     s.validate_partition_syntax_inter()
         .map_err(|e| anyhow!("partition syntax configuration: {e}"))?;
+    s.validate_coeff_layout_settings()
+        .map_err(|e| anyhow!("coeff layout settings: {e}"))?;
     Ok(s)
 }
 
@@ -1889,6 +2005,9 @@ fn fr2_revision_counts(payloads: &[Vec<u8>]) -> Fr2RevisionCounts {
             28 => c.rev28 += 1,
             29 => c.rev29 += 1,
             30 => c.rev30 += 1,
+            31 => c.rev31 += 1,
+            32 => c.rev32 += 1,
+            33 => c.rev33 += 1,
             _ => {}
         }
     }
@@ -2400,6 +2519,8 @@ fn run_compare_partition_syntax_report(
         compare_partition_syntax: Some(compare_rows),
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3046,6 +3167,8 @@ fn run_srsv2_numbers(
             settings_leg.residual_entropy = ResidualEntropy::Explicit;
             settings_leg.residual_context_mode = SrsV2ResidualContextMode::Off;
             settings_leg.block_aq_mode = SrsV2BlockAqMode::Off;
+            // Explicit tuple baseline must stay on legacy coefficient packaging (CompactV1 forbids Explicit).
+            settings_leg.coeff_layout_mode = SrsV2CoeffLayoutMode::Legacy;
             let mut sum = 0_u64;
             let mut slot = None::<YuvFrame>;
             for fi in 0..args.frames {
@@ -3216,8 +3339,8 @@ fn pass_to_details(
         .sum();
     for pl in &p.payloads {
         match pl.get(3).copied() {
-            Some(1 | 3 | 7 | 29) => i_bytes.push(pl.len() as u64),
-            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25) => {
+            Some(1 | 3 | 7 | 29 | 32) => i_bytes.push(pl.len() as u64),
+            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 33) => {
                 p_bytes.push(pl.len() as u64)
             }
             Some(10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26) => b_bytes.push(pl.len() as u64),
@@ -3251,8 +3374,7 @@ fn pass_to_details(
     .unwrap_or_else(|_| ctu_grid_stats(args.width, args.height, CtuSize::Ctu16).unwrap());
     let mut enc_agg = p.enc_stats.clone();
     enc_agg.finalize_residual_context_derived();
-    let residual_bytes_total =
-        intra_plane_chunks_sum.saturating_add(m.residual_payload_bytes_p);
+    let residual_bytes_total = intra_plane_chunks_sum.saturating_add(m.residual_payload_bytes_p);
     let frames_f = args.frames.max(1) as f64;
     Srsv2Details {
         frames: args.frames,
@@ -3574,6 +3696,8 @@ fn run_compare_b_modes_report(
         compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3665,6 +3789,8 @@ fn run_single_report(
         compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3809,6 +3935,8 @@ fn run_compare_residual_report(
         compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3955,6 +4083,258 @@ fn run_compare_residual_contexts_report(
         compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
+        match_x264_bitrate_note: None,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
+}
+
+fn normalize_coeff_layout_compare_args(a: &mut Args) -> Result<()> {
+    if a.bframes > 0 {
+        bail!("--compare-coeff-layouts requires --bframes 0 in this slice");
+    }
+    a.residual_entropy = "auto".to_string();
+    a.residual_context = "off".to_string();
+    a.inter_partition = "fixed16x16".to_string();
+    a.block_aq = "off".to_string();
+    let syn = parse_inter_syntax_mode(&a.inter_syntax)?;
+    if syn == SrsV2InterSyntaxMode::RawLegacy {
+        a.inter_syntax = "compact".to_string();
+    }
+    Ok(())
+}
+
+fn run_compare_coeff_layouts_report(
+    args: &Args,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    let spec: [(&str, SrsV2CoeffLayoutMode, SrsV2CoeffScanMode); 5] = [
+        ("legacy-zigzag", SrsV2CoeffLayoutMode::Legacy, SrsV2CoeffScanMode::ZigZag),
+        (
+            "compact-zigzag",
+            SrsV2CoeffLayoutMode::CompactV1,
+            SrsV2CoeffScanMode::ZigZag,
+        ),
+        (
+            "compact-grouped-low-first",
+            SrsV2CoeffLayoutMode::CompactV1,
+            SrsV2CoeffScanMode::GroupedLowFirst,
+        ),
+        (
+            "compact-run-optimized",
+            SrsV2CoeffLayoutMode::CompactV1,
+            SrsV2CoeffScanMode::RunOptimized,
+        ),
+        (
+            "compact-auto",
+            SrsV2CoeffLayoutMode::CompactV1,
+            SrsV2CoeffScanMode::Auto,
+        ),
+    ];
+
+    let mut compare_rows = Vec::new();
+    let mut table = Vec::new();
+    let mut primary_details: Option<Srsv2Details> = None;
+    let mut baseline_residual: Option<u64> = None;
+
+    for &(label, layout_m, scan_m) in &spec {
+        let mut a = args.clone();
+        normalize_coeff_layout_compare_args(&mut a)?;
+        a.coeff_layout = coeff_layout_mode_cli_label(layout_m).to_string();
+        a.coeff_scan = coeff_scan_mode_cli_label(scan_m).to_string();
+
+        let re = parse_residual_entropy(&a.residual_entropy)?;
+        let res_entropy_str = match re {
+            ResidualEntropy::Explicit => "explicit",
+            ResidualEntropy::Auto => "auto",
+            ResidualEntropy::Rans => "rans",
+        };
+
+        let settings = match build_settings(&a, re) {
+            Ok(s) => s,
+            Err(e) => {
+                compare_rows.push(CoeffLayoutCompareRow {
+                    row_label: label.to_string(),
+                    coeff_layout_mode: coeff_layout_mode_cli_label(layout_m).to_string(),
+                    coeff_scan_mode: coeff_scan_mode_cli_label(scan_m).to_string(),
+                    coeff_layout_bytes: 0,
+                    coeff_legacy_estimated_bytes: 0,
+                    coeff_layout_savings_bytes: 0,
+                    coeff_layout_savings_percent: 0.0,
+                    tx4x4_blocks: 0,
+                    tx8x8_blocks: 0,
+                    residual_bytes: 0,
+                    total_bytes: 0,
+                    residual_bytes_delta_vs_legacy_zigzag: None,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    encode_fps: 0.0,
+                    decode_fps: 0.0,
+                    ok: false,
+                    error: Some(format!("settings: {e:#}")),
+                });
+                table.push(CodecRow {
+                    codec: label.to_string(),
+                    error: Some(format!("settings: {e:#}")),
+                    bytes: 0,
+                    ratio: 0.0,
+                    bitrate_bps: 0.0,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    enc_fps: 0.0,
+                    dec_fps: 0.0,
+                });
+                continue;
+            }
+        };
+
+        let seq = build_seq_header(&a, &settings);
+
+        match run_srsv2_pass(&a, &seq, raw, &settings, expected_frame) {
+            Ok(numbers) => {
+                let mut enc_agg = numbers.enc_stats.clone();
+                enc_agg.finalize_residual_context_derived();
+                enc_agg.finalize_coeff_layout_derived();
+                let row_codec = pass_to_row(&a, label, &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, &seq, &settings, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details =
+                    pass_to_details(&a, &seq, &settings, res_entropy_str, &numbers, deblock);
+                if primary_details.is_none() {
+                    primary_details = Some(details.clone());
+                }
+                let tx4 = numbers
+                    .enc_stats
+                    .intra_tx4x4_blocks
+                    .saturating_add(numbers.motion_agg.transform_4x4_count);
+                let tx8 = numbers
+                    .enc_stats
+                    .intra_tx8x8_blocks
+                    .saturating_add(numbers.motion_agg.transform_8x8_count);
+                let residual_delta = if label == "legacy-zigzag" {
+                    None
+                } else {
+                    baseline_residual.map(|b| details.residual_bytes as i64 - b as i64)
+                };
+                if label == "legacy-zigzag" {
+                    baseline_residual = Some(details.residual_bytes);
+                }
+                compare_rows.push(CoeffLayoutCompareRow {
+                    row_label: label.to_string(),
+                    coeff_layout_mode: coeff_layout_mode_cli_label(layout_m).to_string(),
+                    coeff_scan_mode: coeff_scan_mode_cli_label(scan_m).to_string(),
+                    coeff_layout_bytes: enc_agg.coeff_layout_bytes,
+                    coeff_legacy_estimated_bytes: enc_agg.coeff_legacy_estimated_bytes,
+                    coeff_layout_savings_bytes: enc_agg.coeff_layout_savings_bytes,
+                    coeff_layout_savings_percent: enc_agg.coeff_layout_savings_percent,
+                    tx4x4_blocks: tx4,
+                    tx8x8_blocks: tx8,
+                    residual_bytes: details.residual_bytes,
+                    total_bytes: details.total_bytes,
+                    residual_bytes_delta_vs_legacy_zigzag: residual_delta,
+                    psnr_y: row_codec.psnr_y,
+                    ssim_y: row_codec.ssim_y,
+                    encode_fps: row_codec.enc_fps,
+                    decode_fps: row_codec.dec_fps,
+                    ok: true,
+                    error: None,
+                });
+                table.push(row_codec);
+            }
+            Err(e) => {
+                compare_rows.push(CoeffLayoutCompareRow {
+                    row_label: label.to_string(),
+                    coeff_layout_mode: coeff_layout_mode_cli_label(layout_m).to_string(),
+                    coeff_scan_mode: coeff_scan_mode_cli_label(scan_m).to_string(),
+                    coeff_layout_bytes: 0,
+                    coeff_legacy_estimated_bytes: 0,
+                    coeff_layout_savings_bytes: 0,
+                    coeff_layout_savings_percent: 0.0,
+                    tx4x4_blocks: 0,
+                    tx8x8_blocks: 0,
+                    residual_bytes: 0,
+                    total_bytes: 0,
+                    residual_bytes_delta_vs_legacy_zigzag: None,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    encode_fps: 0.0,
+                    decode_fps: 0.0,
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                });
+                table.push(CodecRow {
+                    codec: label.to_string(),
+                    error: Some(format!("{e:#}")),
+                    bytes: 0,
+                    ratio: 0.0,
+                    bitrate_bps: 0.0,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    enc_fps: 0.0,
+                    dec_fps: 0.0,
+                });
+            }
+        }
+    }
+
+    let coeff_layout_compare_summary = match baseline_residual {
+        Some(b) => {
+            let mut parts = Vec::new();
+            for r in &compare_rows {
+                if r.row_label == "legacy-zigzag" {
+                    continue;
+                }
+                if r.ok {
+                    let d = r.residual_bytes as i64 - b as i64;
+                    parts.push(format!("{} Δ_residual={:+} B", r.row_label, d));
+                } else {
+                    parts.push(format!("{} (failed)", r.row_label));
+                }
+            }
+            Some(format!(
+                "Residual-byte deltas vs legacy-zigzag baseline ({b} B): {}",
+                parts.join("; ")
+            ))
+        }
+        None => Some(
+            "Residual-byte deltas vs legacy-zigzag baseline: unavailable (baseline row failed)."
+                .to_string(),
+        ),
+    };
+
+    let srsv2 = primary_details.unwrap_or_default();
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "`--compare-coeff-layouts` measures intra **CompactV1** telemetry (**FR2 rev32**) and fixed-grid **P** coefficient packaging where enabled (**rev33**); residual-byte deltas are vs the first-row baseline on the same clip. Engineering measurement only.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2,
+        x264: None,
+        x265: None,
+        x265_bitrate_match: None,
+        table,
+        compare_residual_modes: None,
+        compare_residual_contexts: None,
+        sweep: None,
+        compare_b_modes: None,
+        compare_inter_syntax: None,
+        compare_rdo: None,
+        compare_partitions: None,
+        compare_partition_costs: None,
+        compare_partition_syntax: None,
+        compare_entropy_models: None,
+        entropy_model_compare_summary: None,
+        compare_coeff_layouts: Some(compare_rows),
+        coeff_layout_compare_summary,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4091,6 +4471,8 @@ fn run_compare_inter_syntax_report(
         compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4223,6 +4605,8 @@ fn run_compare_rdo_report(
         compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4360,6 +4744,8 @@ fn run_compare_partitions_report(
         compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4520,6 +4906,8 @@ fn run_compare_partition_costs_report(
         compare_partition_syntax: None,
         compare_entropy_models: None,
         entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4768,6 +5156,8 @@ fn run_compare_entropy_models_report(
         compare_partition_syntax: None,
         compare_entropy_models: Some(entries),
         entropy_model_compare_summary,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -5050,6 +5440,20 @@ fn main() -> Result<()> {
 
     if args.compare_residual_contexts {
         let report = run_compare_residual_contexts_report(&args, &raw, expected_frame)?;
+        if let Some(p) = args.report_json.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        if let Some(p) = args.report_md.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        fs::write(&args.report_json, serde_json::to_string_pretty(&report)?)?;
+        fs::write(&args.report_md, to_markdown(&report))?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if args.compare_coeff_layouts {
+        let report = run_compare_coeff_layouts_report(&args, &raw, expected_frame)?;
         if let Some(p) = args.report_json.parent() {
             fs::create_dir_all(p).ok();
         }
@@ -5531,6 +5935,59 @@ fn to_markdown(r: &BenchReport) -> String {
                 savings,
                 e.row.psnr_y,
                 e.row.ssim_y,
+                status.replace('|', "/"),
+            ));
+        }
+    }
+
+    if let Some(rows) = &r.compare_coeff_layouts {
+        out.push_str("\n## Coefficient layout comparison (`--compare-coeff-layouts`)\n\n");
+        out.push_str(
+            "_Fixed five-row order on one clip; compact telemetry reflects **FR2 rev32** intra where enabled and **rev33** fixed-grid **P** residuals where applicable. **`residual_bytes_delta_vs_legacy_zigzag`** is total residual-byte delta vs the first row. Engineering measurement only — not a superiority claim vs other codecs._\n\n",
+        );
+        if let Some(s) = &r.coeff_layout_compare_summary {
+            out.push_str(&format!("**Summary:** {s}\n\n"));
+        }
+        out.push_str("| Row | Layout | Scan | Coeff bytes | Legacy est. | Savings B | Savings % | Tx4×4 | Tx8×8 | Residual B | Δ res. | Total B | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS | Status |\n");
+        out.push_str("|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+        for e in rows {
+            let status = if e.ok {
+                "ok".to_string()
+            } else {
+                e.error
+                    .as_deref()
+                    .map(|s| {
+                        let t = s.trim();
+                        if t.len() > 80 {
+                            format!("{}…", &t[..80])
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "error".to_string())
+            };
+            let delta_str = e
+                .residual_bytes_delta_vs_legacy_zigzag
+                .map(|d| format!("{d:+}"))
+                .unwrap_or_else(|| "—".to_string());
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {:.2} | {} | {} | {} | {} | {} | {:.2} | {:.4} | {:.2} | {:.2} | {} |\n",
+                e.row_label,
+                e.coeff_layout_mode,
+                e.coeff_scan_mode,
+                e.coeff_layout_bytes,
+                e.coeff_legacy_estimated_bytes,
+                e.coeff_layout_savings_bytes,
+                e.coeff_layout_savings_percent,
+                e.tx4x4_blocks,
+                e.tx8x8_blocks,
+                e.residual_bytes,
+                delta_str,
+                e.total_bytes,
+                e.psnr_y,
+                e.ssim_y,
+                e.encode_fps,
+                e.decode_fps,
                 status.replace('|', "/"),
             ));
         }
@@ -6225,8 +6682,189 @@ mod tests {
         assert_eq!(rows[0].details.residual_context_mode, "off");
         assert_eq!(rows[1].details.residual_context_mode, "context");
         let md = to_markdown(&report);
-        assert!(md.contains("| Residual mode | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y | Status |"));
+        assert!(md.contains(
+            "| Residual mode | Total bytes | Residual bytes | Savings | PSNR-Y | SSIM-Y | Status |"
+        ));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_coeff_layouts_emits_five_rows_json_markdown_and_residual_delta_summary() {
+        let (path, raw, fb) = write_test_yuv("coeff_layout_cmp", 64, 64, 4);
+        let args = parse_test_args(&path, 64, 64, 4, &["--compare-coeff-layouts"]);
+        validate_args(&args).unwrap();
+        let report = run_compare_coeff_layouts_report(&args, &raw, fb).unwrap();
+        let rows = report.compare_coeff_layouts.as_ref().unwrap();
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].row_label, "legacy-zigzag");
+        assert_eq!(rows[1].row_label, "compact-zigzag");
+        assert_eq!(rows[2].row_label, "compact-grouped-low-first");
+        assert_eq!(rows[3].row_label, "compact-run-optimized");
+        assert_eq!(rows[4].row_label, "compact-auto");
+        assert!(
+            rows.iter().all(|r| r.ok),
+            "{:?}",
+            rows.iter().find(|r| !r.ok).map(|r| (&r.row_label, &r.error))
+        );
+        let summary = report
+            .coeff_layout_compare_summary
+            .as_ref()
+            .expect("summary");
+        assert!(summary.contains("Δ_residual"), "{summary}");
+        let js = serde_json::to_string(&report).unwrap();
+        for key in [
+            "coeff_layout_bytes",
+            "coeff_legacy_estimated_bytes",
+            "coeff_layout_savings_bytes",
+            "coeff_layout_savings_percent",
+            "tx4x4_blocks",
+            "tx8x8_blocks",
+            "residual_bytes",
+            "total_bytes",
+            "residual_bytes_delta_vs_legacy_zigzag",
+            "psnr_y",
+            "ssim_y",
+            "encode_fps",
+            "decode_fps",
+        ] {
+            assert!(js.contains(key), "missing {key} in {js}");
+        }
+        assert!(js.contains("compare_coeff_layouts"));
+        let md = to_markdown(&report);
+        assert!(md.contains("Coefficient layout comparison"));
+        assert!(md.contains("| Row | Layout | Scan |"));
+        assert!(report.x264.is_none());
+        assert!(report.x265.is_none());
+        let re = parse_residual_entropy(&args.residual_entropy).unwrap();
+        let s = build_settings(&args, re).unwrap();
+        assert_eq!(s.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
+        assert_eq!(s.coeff_scan_mode, SrsV2CoeffScanMode::ZigZag);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn coeff_layout_cli_defaults_match_encoder_defaults() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bench-coeff-default-{}.yuv",
+            std::process::id()
+        ));
+        let fb = yuv420_frame_bytes(16, 16).unwrap();
+        fs::write(&tmp, vec![128_u8; fb]).unwrap();
+        let args = parse_test_args(&tmp, 16, 16, 1, &[]);
+        validate_args(&args).unwrap();
+        assert_eq!(args.coeff_layout, "legacy");
+        assert_eq!(args.coeff_scan, "zigzag");
+        let re = parse_residual_entropy(&args.residual_entropy).unwrap();
+        let s = build_settings(&args, re).unwrap();
+        assert_eq!(s.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
+        assert_eq!(s.coeff_scan_mode, SrsV2CoeffScanMode::ZigZag);
+        let _ = fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn compact_coeff_layout_single_pass_encodes_without_external_codecs() {
+        let report = run_ctu_report(
+            64,
+            64,
+            2,
+            &[
+                "--inter-syntax",
+                "compact",
+                "--coeff-layout",
+                "compact",
+                "--coeff-scan",
+                "auto",
+            ],
+        );
+        assert!(report.srsv2.total_bytes > 0);
+        assert!(report.x264.is_none());
+        assert!(report.x265.is_none());
+    }
+
+    #[test]
+    fn compare_coeff_layouts_second_row_failure_keeps_first_row_in_markdown() {
+        let md = to_markdown(&BenchReport {
+            note: "Engineering measurement only; not a marketing claim.",
+            residual_note: "n",
+            command: "test".into(),
+            raw_bytes: 1,
+            width: 64,
+            height: 64,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            x265: None,
+            x265_bitrate_match: None,
+            table: vec![],
+            compare_residual_modes: None,
+            compare_residual_contexts: None,
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: None,
+            compare_partition_syntax: None,
+            compare_entropy_models: None,
+            entropy_model_compare_summary: None,
+            compare_coeff_layouts: Some(vec![
+                CoeffLayoutCompareRow {
+                    row_label: "legacy-zigzag".into(),
+                    coeff_layout_mode: "legacy".into(),
+                    coeff_scan_mode: "zigzag".into(),
+                    coeff_layout_bytes: 0,
+                    coeff_legacy_estimated_bytes: 0,
+                    coeff_layout_savings_bytes: 0,
+                    coeff_layout_savings_percent: 0.0,
+                    tx4x4_blocks: 0,
+                    tx8x8_blocks: 0,
+                    residual_bytes: 100,
+                    total_bytes: 500,
+                    residual_bytes_delta_vs_legacy_zigzag: None,
+                    psnr_y: 40.0,
+                    ssim_y: 0.99,
+                    encode_fps: 10.0,
+                    decode_fps: 10.0,
+                    ok: true,
+                    error: None,
+                },
+                CoeffLayoutCompareRow {
+                    row_label: "compact-zigzag".into(),
+                    coeff_layout_mode: "compact".into(),
+                    coeff_scan_mode: "zigzag".into(),
+                    coeff_layout_bytes: 0,
+                    coeff_legacy_estimated_bytes: 0,
+                    coeff_layout_savings_bytes: 0,
+                    coeff_layout_savings_percent: 0.0,
+                    tx4x4_blocks: 0,
+                    tx8x8_blocks: 0,
+                    residual_bytes: 0,
+                    total_bytes: 0,
+                    residual_bytes_delta_vs_legacy_zigzag: None,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    encode_fps: 0.0,
+                    decode_fps: 0.0,
+                    ok: false,
+                    error: Some("simulated compact failure".into()),
+                },
+            ]),
+            coeff_layout_compare_summary: Some(
+                "Residual-byte deltas vs legacy-zigzag baseline (100 B): compact-zigzag (failed)"
+                    .into(),
+            ),
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "test".into(),
+        });
+        assert!(md.contains("legacy-zigzag"));
+        assert!(md.contains("compact-zigzag"));
+        assert!(
+            md.contains("simulated compact failure") || md.contains("simulated compact"),
+            "{md}"
+        );
+        assert!(md.contains("Residual-byte deltas vs legacy-zigzag baseline"));
     }
 
     #[test]
@@ -6303,6 +6941,8 @@ mod tests {
             compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "test".into(),
@@ -6401,6 +7041,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6496,6 +7139,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6590,6 +7236,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6686,6 +7335,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6782,6 +7434,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6880,6 +7535,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -6992,6 +7650,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7095,6 +7756,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7215,6 +7879,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7318,6 +7985,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7426,6 +8096,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7568,6 +8241,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7826,6 +8502,8 @@ mod tests {
             compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -8070,6 +8748,8 @@ mod tests {
             compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -8104,6 +8784,8 @@ mod tests {
             compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -8139,6 +8821,8 @@ mod tests {
             compare_partition_syntax: None,
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -8174,6 +8858,8 @@ mod tests {
             compare_partition_syntax: Some(vec![]),
             compare_entropy_models: None,
             entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -8218,6 +8904,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8506,6 +9195,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8600,6 +9292,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8696,6 +9391,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: true,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8810,6 +9508,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8994,6 +9695,8 @@ mod tests {
             compare_partition_syntax: None,
             compare_entropy_models: Some(rows),
             entropy_model_compare_summary: summary,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "x".into(),
@@ -9059,6 +9762,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9153,6 +9859,9 @@ mod tests {
             compare_residual_modes: false,
             residual_context: "off".to_string(),
             compare_residual_contexts: false,
+            coeff_layout: "legacy".to_string(),
+            coeff_scan: "zigzag".to_string(),
+            compare_coeff_layouts: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
