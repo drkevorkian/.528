@@ -93,6 +93,15 @@ pub struct ResidualEncodeStats {
     pub transform_grouping_savings_bytes: i64,
     /// `100 * transform_grouping_savings_bytes / legacy_transform_estimated_bytes`, or **`0`** if legacy estimate is zero.
     pub transform_grouping_savings_percent: f64,
+
+    /// Sum of static **rANS AC blob** lengths (**excluding** tag/symbol-count wrappers) for blocks where v1 tokenization fits (**[`super::residual_tokens`]** range).
+    ///
+    /// Paired with [`Self::residual_token_v2_ac_body_bytes`] on the **same** subset (**[`Self::residual_token_compare_block_count`]** blocks).
+    pub residual_token_v1_rans_ac_body_bytes: u64,
+    /// Experimental [`super::residual_token_v2`] simulated AC payload sizes on that subset.
+    pub residual_token_v2_ac_body_bytes: u64,
+    /// Blocks counted toward residual-token v1 vs v2 simulation (**subset where legacy rANS symbols fit**).
+    pub residual_token_compare_block_count: u64,
 }
 
 impl ResidualEncodeStats {
@@ -630,10 +639,7 @@ impl SrsV2EncodeSettings {
                 SrsV2TransformGroupingMode::Legacy8x8
             )
         ) || matches!(
-            (
-                self.transform_decision_mode,
-                self.transform_grouping_mode,
-            ),
+            (self.transform_decision_mode, self.transform_grouping_mode,),
             (
                 SrsV2TransformDecisionMode::ResidualAware | SrsV2TransformDecisionMode::RdoFast,
                 SrsV2TransformGroupingMode::Four4x4 | SrsV2TransformGroupingMode::AutoByResidual,
@@ -755,7 +761,9 @@ impl SrsV2EncodeSettings {
             return Err(SrsV2CoeffLayoutSettingsError::RdoFastRequiresRdoModeFast.into());
         }
         if !self.transform_grouping_matches_decision_mode() {
-            return Err(SrsV2CoeffLayoutSettingsError::InconsistentTransformGroupingAndDecision.into());
+            return Err(
+                SrsV2CoeffLayoutSettingsError::InconsistentTransformGroupingAndDecision.into(),
+            );
         }
         let _ = (
             self.coeff_layout_mode,

@@ -18,10 +18,20 @@
 //! **Safety:** candidate lists are **hard-capped** ([`MAX_RDO_CANDIDATES`]); [`bounded_candidate_push`]
 //! and choosers return [`crate::srsv2::error::SrsV2Error`] when exceeded.
 
+use super::dct::{fdct_8x8, idct_8x8};
 use super::error::SrsV2Error;
 use super::inter_mv::{predict_mv_qpel, pu_count_partition_wire, signed_varint_wire_bytes};
+use super::intra_codec::{
+    dequantize, idct_residual_tx4x4_from_qfreq, quantize, quantize_residual_tx4x4_natural,
+};
 use super::motion_search::SrsV2RdoBenchStats;
-use super::rate_control::{SrsV2InterSyntaxMode, SrsV2RdoMode};
+use super::rate_control::{
+    SrsV2CoeffScanMode, SrsV2EncodeSettings, SrsV2InterSyntaxMode, SrsV2RdoMode,
+};
+use super::transform_layout::{
+    choose_coeff_scan, estimate_four4x4_cost, estimate_single8x8_cost, GroupingWireCostBreakdown,
+    SrsV2CoeffScan, SrsV2TransformKind, TransformLayoutError,
+};
 
 /// Maximum partition / inter-mode candidates evaluated in one RDO decision site.
 pub const MAX_RDO_CANDIDATES: usize = 16;
@@ -482,9 +492,225 @@ pub fn rdo_fast_enabled(mode: SrsV2RdoMode) -> bool {
     matches!(mode, SrsV2RdoMode::Fast)
 }
 
+/// Candidates evaluated by [`choose_grouping_rdo_fast`] (**Single8×8** vs **Four4×4**).
+pub const GROUPING_RDO_FAST_CANDIDATES: u32 = 2;
+
+fn map_grouping_tl_err(e: TransformLayoutError) -> SrsV2Error {
+    match e {
+        TransformLayoutError::Truncated => SrsV2Error::Truncated,
+        _ => SrsV2Error::syntax("FR2 grouping RDO: transform_layout error"),
+    }
+}
+
+#[inline]
+fn resolve_grouping_scan(
+    settings: &SrsV2EncodeSettings,
+    kind: SrsV2TransformKind,
+    qfreq: &[i16; 64],
+) -> Result<SrsV2CoeffScan, SrsV2Error> {
+    Ok(match settings.coeff_scan_mode {
+        SrsV2CoeffScanMode::ZigZag => SrsV2CoeffScan::ZigZag,
+        SrsV2CoeffScanMode::GroupedLowFirst => SrsV2CoeffScan::GroupedLowFirst,
+        SrsV2CoeffScanMode::RunOptimized => SrsV2CoeffScan::RunOptimized,
+        SrsV2CoeffScanMode::Auto => {
+            choose_coeff_scan(kind, qfreq.as_slice()).map_err(map_grouping_tl_err)?
+        }
+    })
+}
+
+#[inline]
+fn sse_residual_vs_flat_recon(diff: &[[i16; 8]; 8], recon_flat: &[i16; 64]) -> u32 {
+    let mut acc = 0u64;
+    for r in 0..8 {
+        for c in 0..8 {
+            let e = diff[r][c] as i32 - recon_flat[r * 8 + c] as i32;
+            acc = acc.saturating_add((e as i64 * e as i64) as u64);
+        }
+    }
+    u32::try_from(acc.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
+}
+
+#[inline]
+fn sse_residual_vs_spatial_recon(diff: &[[i16; 8]; 8], recon: &[[i16; 8]; 8]) -> u32 {
+    let mut acc = 0u64;
+    for r in 0..8 {
+        for c in 0..8 {
+            let e = diff[r][c] as i32 - recon[r][c] as i32;
+            acc = acc.saturating_add((e as i64 * e as i64) as u64);
+        }
+    }
+    u32::try_from(acc.min(u64::from(u32::MAX))).unwrap_or(u32::MAX)
+}
+
+/// Outcome of [`choose_grouping_rdo_fast`] — [`telemetry`] is a single-line encoder-facing summary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupingRdoFastDecision {
+    pub kind: SrsV2TransformKind,
+    pub telemetry: String,
+    pub candidates_evaluated: u32,
+    pub score_single8x8: i128,
+    pub score_four4x4: i128,
+    pub distortion_single8x8: u32,
+    pub distortion_four4x4: u32,
+    pub rate_single8x8: i64,
+    pub rate_four4x4: i64,
+    pub breakdown_single8x8: GroupingWireCostBreakdown,
+    pub breakdown_four4x4: GroupingWireCostBreakdown,
+}
+
+/// Fast transform-grouping **RDO**: quantize **both** transforms from the same spatial residual,
+/// score `D + λ·R` with [`rdo_score`] using [`GroupingWireCostBreakdown::total_rdo_rate_bytes`].
+///
+/// Always evaluates exactly [`GROUPING_RDO_FAST_CANDIDATES`] alternatives; ties prefer **Tx8×8**.
+pub fn choose_grouping_rdo_fast(
+    settings: &SrsV2EncodeSettings,
+    diff_spatial: &[[i16; 8]; 8],
+    qp: i16,
+    lambda_fp: i64,
+) -> Result<GroupingRdoFastDecision, SrsV2Error> {
+    let mut diff_flat = [0_i16; 64];
+    for r in 0..8 {
+        for c in 0..8 {
+            diff_flat[r * 8 + c] = diff_spatial[r][c];
+        }
+    }
+    let q8 = quantize(&fdct_8x8(&diff_flat), qp);
+    let q4 = quantize_residual_tx4x4_natural(diff_spatial, qp);
+    let scan8 = resolve_grouping_scan(settings, SrsV2TransformKind::Tx8x8, &q8)?;
+    let scan4 = resolve_grouping_scan(settings, SrsV2TransformKind::Tx4x4, &q4)?;
+    let breakdown_single8x8 = estimate_single8x8_cost(&q8, scan8).map_err(map_grouping_tl_err)?;
+    let breakdown_four4x4 = estimate_four4x4_cost(&q4, scan4).map_err(map_grouping_tl_err)?;
+    let rate_single8x8 = breakdown_single8x8.total_rdo_rate_bytes();
+    let rate_four4x4 = breakdown_four4x4.total_rdo_rate_bytes();
+    let recon8 = idct_8x8(&dequantize(&q8, qp));
+    let recon4 = idct_residual_tx4x4_from_qfreq(&q4, qp);
+    let distortion_single8x8 = sse_residual_vs_flat_recon(diff_spatial, &recon8);
+    let distortion_four4x4 = sse_residual_vs_spatial_recon(diff_spatial, &recon4);
+    let score_single8x8 = rdo_score(distortion_single8x8, lambda_fp, rate_single8x8);
+    let score_four4x4 = rdo_score(distortion_four4x4, lambda_fp, rate_four4x4);
+    let pick_four = score_four4x4 < score_single8x8;
+    let kind = if pick_four {
+        SrsV2TransformKind::Tx4x4
+    } else {
+        SrsV2TransformKind::Tx8x8
+    };
+    let telemetry = format!(
+        "grouping_rdo_fast qp={qp} lambda_fp={lambda_fp} pick={kind:?} \
+         D8={distortion_single8x8} D4={distortion_four4x4} R8={rate_single8x8} R4={rate_four4x4} \
+         S8={score_single8x8} S4={score_four4x4} scan8={scan8:?} scan4={scan4:?}"
+    );
+    Ok(GroupingRdoFastDecision {
+        kind,
+        telemetry,
+        candidates_evaluated: GROUPING_RDO_FAST_CANDIDATES,
+        score_single8x8,
+        score_four4x4,
+        distortion_single8x8,
+        distortion_four4x4,
+        rate_single8x8,
+        rate_four4x4,
+        breakdown_single8x8,
+        breakdown_four4x4,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::srsv2::rate_control::{SrsV2CoeffScanMode, SrsV2EncodeSettings};
+
+    fn settings_zigzag_scan() -> SrsV2EncodeSettings {
+        let mut s = SrsV2EncodeSettings::default();
+        s.coeff_scan_mode = SrsV2CoeffScanMode::ZigZag;
+        s
+    }
+
+    #[test]
+    fn grouping_rdo_smooth_residual_prefers_single8x8() {
+        let settings = settings_zigzag_scan();
+        let mut diff = [[0_i16; 8]; 8];
+        for r in 0..8 {
+            for c in 0..8 {
+                diff[r][c] = 2;
+            }
+        }
+        let d = choose_grouping_rdo_fast(&settings, &diff, 16, 256).unwrap();
+        assert_eq!(d.kind, SrsV2TransformKind::Tx8x8);
+        assert!(d.telemetry.contains("pick="));
+    }
+
+    #[test]
+    fn grouping_rdo_sparse_localized_can_choose_four4x4() {
+        let settings = settings_zigzag_scan();
+        let mut diff = [[0_i16; 8]; 8];
+        diff[2][3] = 7200;
+        let d = choose_grouping_rdo_fast(&settings, &diff, 22, 160).unwrap();
+        assert_eq!(d.kind, SrsV2TransformKind::Tx4x4);
+    }
+
+    #[test]
+    fn grouping_rdo_noisy_dense_high_lambda_prefers_single8x8() {
+        use crate::srsv2::transform_layout::{
+            choose_transform_grouping, SrsV2TransformGrouping, TransformDecisionConfig,
+        };
+        let cfg = TransformDecisionConfig::default();
+        let settings = settings_zigzag_scan();
+        let mut diff = [[0_i16; 8]; 8];
+        for r in 0..8 {
+            for c in 0..8 {
+                diff[r][c] = if (r + c) % 2 == 0 { 96 } else { -96 };
+            }
+        }
+        assert_eq!(
+            choose_transform_grouping(SrsV2TransformGrouping::AutoByResidual, &diff, &cfg),
+            SrsV2TransformKind::Tx4x4,
+            "precondition: spatial heuristic would steer AutoByResidual toward Four4×4"
+        );
+        let d = choose_grouping_rdo_fast(&settings, &diff, 12, 120_000_000).unwrap();
+        assert_eq!(
+            d.kind,
+            SrsV2TransformKind::Tx8x8,
+            "λ·rate must dominate so Four4×4 is not chosen on rate-heavy dense checkerboard"
+        );
+    }
+
+    #[test]
+    fn grouping_rdo_all_zero_single8x8() {
+        let settings = settings_zigzag_scan();
+        let diff = [[0_i16; 8]; 8];
+        let d = choose_grouping_rdo_fast(&settings, &diff, 16, 1024).unwrap();
+        assert_eq!(d.kind, SrsV2TransformKind::Tx8x8);
+    }
+
+    #[test]
+    fn grouping_rdo_dc_only_single8x8() {
+        let settings = settings_zigzag_scan();
+        let diff = [[42_i16; 8]; 8];
+        let d = choose_grouping_rdo_fast(&settings, &diff, 16, 512).unwrap();
+        assert_eq!(d.kind, SrsV2TransformKind::Tx8x8);
+    }
+
+    #[test]
+    fn grouping_rdo_scores_deterministic() {
+        let settings = settings_zigzag_scan();
+        let mut diff = [[0_i16; 8]; 8];
+        diff[3][3] = 100;
+        diff[3][4] = -80;
+        let a = choose_grouping_rdo_fast(&settings, &diff, 14, 400).unwrap();
+        let b = choose_grouping_rdo_fast(&settings, &diff, 14, 400).unwrap();
+        assert_eq!(a.score_single8x8, b.score_single8x8);
+        assert_eq!(a.score_four4x4, b.score_four4x4);
+        assert_eq!(a.kind, b.kind);
+    }
+
+    #[test]
+    fn grouping_rdo_candidate_count_bounded() {
+        let settings = settings_zigzag_scan();
+        let diff = [[7_i16; 8]; 8];
+        let d = choose_grouping_rdo_fast(&settings, &diff, 16, 256).unwrap();
+        assert_eq!(d.candidates_evaluated, GROUPING_RDO_FAST_CANDIDATES);
+        assert_eq!(GROUPING_RDO_FAST_CANDIDATES, 2);
+    }
 
     #[test]
     fn rdo_score_matches_lambda_scaling() {

@@ -24,8 +24,7 @@ use super::motion_search::{pick_mv, sad_16x16, sample_u8_plane, SrsV2MotionEncod
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode,
     SrsV2CoeffLayoutMode, SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode,
-    SrsV2InterSyntaxMode, SrsV2ResidualContextMode, SrsV2SubpelMode,
-    SrsV2TransformGroupingMode,
+    SrsV2InterSyntaxMode, SrsV2ResidualContextMode, SrsV2SubpelMode, SrsV2TransformGroupingMode,
 };
 use super::rdo::{
     choose_best_inter_mode_candidate, estimate_mv_delta_wire_bytes,
@@ -243,8 +242,11 @@ fn encode_p_subblock_residual_chunk(
 
     if matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1) {
         if settings.transform_grouping_mode == SrsV2TransformGroupingMode::Legacy8x8 {
-            let wire =
-                encode_p_residual_chunk_compact_v33_wire(qf_tx8x8, settings, residual_encode_stats)?;
+            let wire = encode_p_residual_chunk_compact_v33_wire(
+                qf_tx8x8,
+                settings,
+                residual_encode_stats,
+            )?;
             let nz_ac = qf_tx8x8.iter().skip(1).any(|&v| v != 0);
             luma_nz_grid[idx_b] = nz_ac;
             return Ok((wire, PResidualChunkKind::CompactCoeffV1));
@@ -1186,11 +1188,7 @@ pub fn decode_yuv420_p_payload(
 
     let (use_qpel, block_aq_wire, entropy_chunks, inter_entropy_mv) = if inter_compact {
         let flags = read_u8(payload, &mut cur)?;
-        let allowed_mask = if matches!(rev, 33 | 35) {
-            0xFu8
-        } else {
-            0x7u8
-        };
+        let allowed_mask = if matches!(rev, 33 | 35) { 0xFu8 } else { 0x7u8 };
         if flags & !allowed_mask != 0 {
             return Err(SrsV2Error::syntax("unknown P inter compact flags"));
         }
@@ -1443,10 +1441,12 @@ mod tests {
         TransferFunction,
     };
     use crate::srsv2::rate_control::{
-        ResidualEncodeStats, SrsV2CoeffLayoutMode, SrsV2EncodeSettings, SrsV2InterSyntaxMode,
-        SrsV2MotionSearchMode, SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformDecisionMode,
-        SrsV2TransformGroupingMode,
+        ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode, SrsV2CoeffLayoutMode,
+        SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode, SrsV2InterSyntaxMode,
+        SrsV2MotionSearchMode, SrsV2PartitionSyntaxMode, SrsV2RdoMode, SrsV2ResidualContextMode,
+        SrsV2SubpelMode, SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
     };
+    use crate::srsv2::residual_entropy::TAG_P_RESIDUAL_TRANSFORM_GROUP_V35;
 
     fn seq_inter(w: u32, h: u32) -> VideoSequenceHeaderV2 {
         VideoSequenceHeaderV2 {
@@ -1463,6 +1463,88 @@ mod tests {
             deblock_strength: 0,
             max_ref_frames: 1,
         }
+    }
+
+    /// Advance past **`CompactV1`** inter header fields through the **MV grid** (or MV entropy blob),
+    /// matching [`decode_yuv420_p_payload`] for fixed-grid revisions.
+    fn compact_inter_payload_cursor_after_mv_grid(
+        payload: &[u8],
+        rev: u8,
+        mb_cols: u32,
+        mb_rows: u32,
+    ) -> usize {
+        assert!(payload.len() >= 10, "need magic + frame_index + qp + flags");
+        assert_eq!(&payload[0..3], b"FR2");
+        assert_eq!(payload[3], rev);
+        let mut cur = 10usize;
+        let flags = payload[9];
+        let block_aq_wire = flags & P_INTER_FLAG_BLOCK_AQ != 0;
+        if block_aq_wire {
+            cur += 2;
+        }
+        let use_qpel = flags & P_INTER_FLAG_SUBPEL != 0;
+        let inter_entropy_mv = if matches!(rev, 33 | 35) {
+            flags & P_INTER_FLAG_ENTROPY_MV != 0
+        } else {
+            matches!(rev, 17 | 23 | 30)
+        };
+        if inter_entropy_mv {
+            let _sym_count = read_u32(payload, &mut cur).unwrap() as usize;
+            let blob_len = read_u32(payload, &mut cur).unwrap() as usize;
+            cur = cur.checked_add(blob_len).expect("mv blob");
+            assert!(cur <= payload.len(), "MV entropy blob exceeds payload");
+        } else {
+            decode_mv_grid_compact(payload, &mut cur, mb_cols, mb_rows, |mx, my| {
+                if use_qpel {
+                    validate_mv_qpel_halfgrid(mx, my)
+                } else if mx % 4 != 0 || my % 4 != 0 {
+                    Err(SrsV2Error::syntax("P MV not on integer pel grid"))
+                } else {
+                    validate_mv((mx / 4) as i16, (my / 4) as i16)
+                }
+            })
+            .expect("MV compact grid");
+        }
+        cur
+    }
+
+    fn first_compact_rev35_residual_grouping_scan_offsets(
+        payload: &[u8],
+        mb_cols: u32,
+        mb_rows: u32,
+    ) -> Option<(usize, usize)> {
+        if payload.get(3).copied()? != 35 {
+            return None;
+        }
+        let flags = *payload.get(9)?;
+        let block_aq_wire = flags & P_INTER_FLAG_BLOCK_AQ != 0;
+        let mut cur = compact_inter_payload_cursor_after_mv_grid(payload, 35, mb_cols, mb_rows);
+        for _ in 0..mb_rows {
+            for _ in 0..mb_cols {
+                let pattern = *payload.get(cur)?;
+                cur += 1;
+                for si in 0..4 {
+                    let skip = (pattern & (1 << si)) != 0;
+                    if skip {
+                        continue;
+                    }
+                    if block_aq_wire {
+                        cur += 1;
+                    }
+                    let chunk_len = read_u32(payload, &mut cur).ok()? as usize;
+                    let chunk_start = cur;
+                    let chunk_end = chunk_start.checked_add(chunk_len)?;
+                    if chunk_end > payload.len() {
+                        return None;
+                    }
+                    if payload.get(chunk_start).copied()? == TAG_P_RESIDUAL_TRANSFORM_GROUP_V35 {
+                        return Some((chunk_start + 1, chunk_start + 2));
+                    }
+                    cur = chunk_end;
+                }
+            }
+        }
+        None
     }
 
     #[test]
@@ -2530,6 +2612,100 @@ mod tests {
     }
 
     #[test]
+    fn fr2_rev35_malformed_grouping_tag_fails_decode() {
+        let seq = seq_inter(32, 32);
+        let mut rgb1 = vec![40_u8; 32 * 32 * 3];
+        for y in 0..32usize {
+            for x in 0..32usize {
+                let i = (y * 32 + x) * 3;
+                let v = ((x.wrapping_mul(11)) ^ (y.wrapping_mul(17))) as u8;
+                rgb1[i] = v;
+                rgb1[i + 1] = v;
+                rgb1[i + 2] = v;
+            }
+        }
+        let rgb0 = vec![55_u8; 32 * 32 * 3];
+        let y0 = rgb888_full_to_yuv420_bt709(&rgb0, 32, 32, ColorRange::Limited).unwrap();
+        let y1 = rgb888_full_to_yuv420_bt709(&rgb1, 32, 32, ColorRange::Limited).unwrap();
+        let st_key = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
+            keyframe_interval: 30,
+            motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
+            ..Default::default()
+        };
+        let st_p = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            keyframe_interval: 30,
+            motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
+            enable_skip_blocks: false,
+            ..Default::default()
+        };
+        let intra =
+            encode_yuv420_inter_payload(&seq, &y0, None, 0, 24, &st_key, None, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let ref_y = slot.clone().unwrap();
+        let mut p =
+            encode_yuv420_inter_payload(&seq, &y1, slot.as_ref(), 1, 24, &st_p, None, None, None)
+                .unwrap();
+        assert_eq!(p[3], 35);
+        let (g_off, _) = first_compact_rev35_residual_grouping_scan_offsets(&p, 2, 2)
+            .expect("expected at least one rev35 transform-group residual chunk");
+        p[g_off] = 99;
+        assert!(decode_yuv420_p_payload(&seq, &p, &ref_y).is_err());
+    }
+
+    #[test]
+    fn fr2_rev35_malformed_scan_tag_fails_decode() {
+        let seq = seq_inter(32, 32);
+        let mut rgb1 = vec![40_u8; 32 * 32 * 3];
+        for y in 0..32usize {
+            for x in 0..32usize {
+                let i = (y * 32 + x) * 3;
+                let v = ((x.wrapping_mul(11)) ^ (y.wrapping_mul(17))) as u8;
+                rgb1[i] = v;
+                rgb1[i + 1] = v;
+                rgb1[i + 2] = v;
+            }
+        }
+        let rgb0 = vec![55_u8; 32 * 32 * 3];
+        let y0 = rgb888_full_to_yuv420_bt709(&rgb0, 32, 32, ColorRange::Limited).unwrap();
+        let y1 = rgb888_full_to_yuv420_bt709(&rgb1, 32, 32, ColorRange::Limited).unwrap();
+        let st_key = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
+            keyframe_interval: 30,
+            motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
+            ..Default::default()
+        };
+        let st_p = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            keyframe_interval: 30,
+            motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
+            enable_skip_blocks: false,
+            ..Default::default()
+        };
+        let intra =
+            encode_yuv420_inter_payload(&seq, &y0, None, 0, 24, &st_key, None, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let ref_y = slot.clone().unwrap();
+        let mut p =
+            encode_yuv420_inter_payload(&seq, &y1, slot.as_ref(), 1, 24, &st_p, None, None, None)
+                .unwrap();
+        assert_eq!(p[3], 35);
+        let (_, s_off) = first_compact_rev35_residual_grouping_scan_offsets(&p, 2, 2)
+            .expect("expected at least one rev35 transform-group residual chunk");
+        p[s_off] = 99;
+        assert!(decode_yuv420_p_payload(&seq, &p, &ref_y).is_err());
+    }
+
+    #[test]
     fn fr2_rev33_p_entropy_inter_syntax_roundtrip() {
         let seq = seq_inter(48, 48);
         let rgb0 = vec![90_u8; 48 * 48 * 3];
@@ -2664,6 +2840,203 @@ mod tests {
         .unwrap();
         assert_eq!(p[3], 15);
         decode_yuv420_p_payload(&seq, &p, &slot.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fr2_legacy_p_wire_revisions_decode_matrix_block1() {
+        let seq = seq_inter(32, 32);
+        let rgb0 = vec![70_u8; 32 * 32 * 3];
+        let rgb1 = vec![95_u8; 32 * 32 * 3];
+        let y0 = rgb888_full_to_yuv420_bt709(&rgb0, 32, 32, ColorRange::Limited).unwrap();
+        let y1 = rgb888_full_to_yuv420_bt709(&rgb1, 32, 32, ColorRange::Limited).unwrap();
+        let qp = 22_u8;
+        let keyframe_interval = 30_u32;
+        let motion_none = SrsV2MotionSearchMode::None;
+
+        let intra_st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
+            keyframe_interval,
+            motion_search_mode: motion_none,
+            ..Default::default()
+        };
+        let intra =
+            encode_yuv420_inter_payload(&seq, &y0, None, 0, qp, &intra_st, None, None, None)
+                .unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let ref_y = slot.unwrap();
+
+        let check = |expect_rev: u8, st: SrsV2EncodeSettings| {
+            let p =
+                encode_yuv420_inter_payload(&seq, &y1, Some(&ref_y), 1, qp, &st, None, None, None)
+                    .unwrap();
+            assert_eq!(
+                p[3], expect_rev,
+                "unexpected revision byte for legacy matrix row"
+            );
+            decode_yuv420_p_payload(&seq, &p, &ref_y).unwrap();
+        };
+
+        check(
+            2,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Explicit,
+                inter_syntax_mode: SrsV2InterSyntaxMode::RawLegacy,
+                subpel_mode: SrsV2SubpelMode::Off,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            4,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Auto,
+                inter_syntax_mode: SrsV2InterSyntaxMode::RawLegacy,
+                subpel_mode: SrsV2SubpelMode::Off,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            5,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Explicit,
+                inter_syntax_mode: SrsV2InterSyntaxMode::RawLegacy,
+                subpel_mode: SrsV2SubpelMode::HalfPel,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            6,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Auto,
+                inter_syntax_mode: SrsV2InterSyntaxMode::RawLegacy,
+                subpel_mode: SrsV2SubpelMode::HalfPel,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            8,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Auto,
+                inter_syntax_mode: SrsV2InterSyntaxMode::RawLegacy,
+                subpel_mode: SrsV2SubpelMode::Off,
+                block_aq_mode: SrsV2BlockAqMode::BlockDelta,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            9,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Auto,
+                inter_syntax_mode: SrsV2InterSyntaxMode::RawLegacy,
+                subpel_mode: SrsV2SubpelMode::HalfPel,
+                block_aq_mode: SrsV2BlockAqMode::BlockDelta,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            15,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Explicit,
+                inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            17,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Explicit,
+                inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            19,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Explicit,
+                inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+                inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            20,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Explicit,
+                inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+                entropy_model_mode: SrsV2EntropyModelMode::StaticV1,
+                inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            25,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Auto,
+                inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+                entropy_model_mode: SrsV2EntropyModelMode::ContextV1,
+                inter_partition_mode: SrsV2InterPartitionMode::Split8x8,
+                partition_syntax_mode: SrsV2PartitionSyntaxMode::V1Legacy,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            30,
+            SrsV2EncodeSettings {
+                residual_entropy: ResidualEntropy::Rans,
+                residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+                inter_syntax_mode: SrsV2InterSyntaxMode::EntropyV1,
+                entropy_model_mode: SrsV2EntropyModelMode::ContextV1,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
+        check(
+            33,
+            SrsV2EncodeSettings {
+                coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+                inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+                residual_entropy: ResidualEntropy::Auto,
+                motion_search_mode: motion_none,
+                enable_skip_blocks: false,
+                keyframe_interval,
+                ..Default::default()
+            },
+        );
     }
 
     #[test]

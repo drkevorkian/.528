@@ -15,6 +15,9 @@
 //!   residual samples only (Laplacian / quadrant-variance proxies — **no DCT** in this module).
 //! - Quantized spectral coefficients, once produced elsewhere, pair with [`choose_transform_and_scan`]
 //!   and [`estimate_transform_grouping_bytes`] for scan + sizing telemetry.
+//! - Rev34 MB framing estimates: [`estimate_single8x8_cost`], [`estimate_four4x4_cost`],
+//!   [`compare_single8x8_vs_four4x4`] (dual-quant wire proxies); coefficient-only footprint compare:
+//!   [`compare_coeff_layout_single_vs_four4x4`].
 
 use super::dct::{ZIGZAG, ZIGZAG_4X4};
 
@@ -161,6 +164,52 @@ pub struct SingleVsFourByteEstimate {
     pub prefers: SrsV2TransformGrouping,
 }
 
+/// Fixed **`FR2` rev34** intra macroblock prefix before the compact coefficient body:
+/// **`grouping` + `scan` + `pred` + `u16` body length**.
+pub const REV34_INTRA_MB_PREFIX_BYTES: usize = 5;
+
+/// Nominal extra side bytes modeled per **4×4** quadrant for [`SrsV2TransformKind::Tx4x4`] so Four4×4 must pay for itself.
+pub const FOUR4X4_PER_SUBBLOCK_SIDE_BYTES: usize = 1;
+
+/// Byte accounting for one transform-grouping candidate on rev34-style intra MB framing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupingWireCostBreakdown {
+    pub grouping_tag_bytes: usize,
+    pub scan_tag_bytes: usize,
+    pub pred_byte_bytes: usize,
+    pub body_length_field_bytes: usize,
+    pub compact_coeff_body_bytes: usize,
+    pub legacy_residual_entropy_estimate_bytes: usize,
+    pub per_subblock_overhead_bytes: usize,
+}
+
+impl GroupingWireCostBreakdown {
+    /// Sum of all buckets for λ·rate (compact wire + legacy entropy proxy + explicit subblock overhead).
+    #[must_use]
+    pub fn total_rdo_rate_bytes(&self) -> i64 {
+        let sum = self
+            .grouping_tag_bytes
+            .saturating_add(self.scan_tag_bytes)
+            .saturating_add(self.pred_byte_bytes)
+            .saturating_add(self.body_length_field_bytes)
+            .saturating_add(self.compact_coeff_body_bytes)
+            .saturating_add(self.per_subblock_overhead_bytes)
+            .saturating_add(self.legacy_residual_entropy_estimate_bytes);
+        i64::try_from(sum).unwrap_or(i64::MAX)
+    }
+}
+
+/// Rev34-style wire comparison between **already quantized** Tx8×8 vs Tx4×4 candidates (distinct scans allowed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingleVsFourRev34Compare {
+    pub breakdown_tx8: GroupingWireCostBreakdown,
+    pub breakdown_tx4: GroupingWireCostBreakdown,
+    pub rate_tx8: i64,
+    pub rate_tx4: i64,
+    /// Rate ties prefer [`SrsV2TransformGrouping::Single8x8`].
+    pub prefers: SrsV2TransformGrouping,
+}
+
 impl TransformGroupingStats {
     /// Recompute [`Self::estimated_savings_percent`] from accumulated byte totals.
     pub fn finalize_estimated_savings_percent(&mut self) {
@@ -186,7 +235,9 @@ pub fn fr2_rev34_grouping_wire_from_transform_kind(kind: SrsV2TransformKind) -> 
 }
 
 /// Decode rev34 grouping tag → [`SrsV2TransformKind`] (same numeric mapping as rev32 mixed transform byte).
-pub fn fr2_rev34_transform_kind_from_grouping_wire(b: u8) -> Result<SrsV2TransformKind, TransformLayoutError> {
+pub fn fr2_rev34_transform_kind_from_grouping_wire(
+    b: u8,
+) -> Result<SrsV2TransformKind, TransformLayoutError> {
     match b {
         FR2_REV34_INTRA_GROUPING_FOUR4X4 => Ok(SrsV2TransformKind::Tx4x4),
         FR2_REV34_INTRA_GROUPING_SINGLE8X8 => Ok(SrsV2TransformKind::Tx8x8),
@@ -204,7 +255,9 @@ pub fn fr2_rev35_p_grouping_wire_from_transform_kind(kind: SrsV2TransformKind) -
 }
 
 /// Decode rev35 **P** grouping tag → [`SrsV2TransformKind`] (distinct error field from intra rev34 for clearer diagnostics).
-pub fn fr2_rev35_p_transform_kind_from_grouping_wire(b: u8) -> Result<SrsV2TransformKind, TransformLayoutError> {
+pub fn fr2_rev35_p_transform_kind_from_grouping_wire(
+    b: u8,
+) -> Result<SrsV2TransformKind, TransformLayoutError> {
     match b {
         FR2_REV34_INTRA_GROUPING_FOUR4X4 => Ok(SrsV2TransformKind::Tx4x4),
         FR2_REV34_INTRA_GROUPING_SINGLE8X8 => Ok(SrsV2TransformKind::Tx8x8),
@@ -524,9 +577,7 @@ pub fn classify_residual_block(spatial: &[[i16; 8]; 8]) -> ResidualBlockClass {
         return ResidualBlockClass::Zero;
     }
     let v0 = spatial[0][0];
-    let constant = spatial
-        .iter()
-        .all(|row| row.iter().all(|&v| v == v0));
+    let constant = spatial.iter().all(|row| row.iter().all(|&v| v == v0));
     if constant {
         return ResidualBlockClass::DcOnly;
     }
@@ -577,18 +628,11 @@ pub fn estimate_transform_grouping_bytes(
     scan: SrsV2CoeffScan,
 ) -> Result<TransformGroupingStats, TransformLayoutError> {
     expect_coeff_len(coeffs_natural, kind)?;
-    let leg = estimate_coeff_layout_bytes(
-        coeffs_natural,
-        kind,
-        scan,
-        SrsV2CoeffLayoutMode::Legacy,
-    )? as u64;
-    let grp = estimate_coeff_layout_bytes(
-        coeffs_natural,
-        kind,
-        scan,
-        SrsV2CoeffLayoutMode::CompactV1,
-    )? as u64;
+    let leg = estimate_coeff_layout_bytes(coeffs_natural, kind, scan, SrsV2CoeffLayoutMode::Legacy)?
+        as u64;
+    let grp =
+        estimate_coeff_layout_bytes(coeffs_natural, kind, scan, SrsV2CoeffLayoutMode::CompactV1)?
+            as u64;
     let savings = leg as i64 - grp as i64;
     let pct = if leg > 0 {
         100.0 * savings as f64 / leg as f64
@@ -615,8 +659,8 @@ pub fn estimate_transform_grouping_bytes(
     Ok(stats)
 }
 
-/// Compare heuristic byte footprint for **Tx8×8** vs **Tx4×4** interpretations of the same natural `64` coeffs.
-pub fn compare_single8x8_vs_four4x4(
+/// Compare heuristic byte footprint for **Tx8×8** vs **Tx4×4** interpretations of the **same** natural `64` coeffs.
+pub fn compare_coeff_layout_single_vs_four4x4(
     coeffs_natural: &[i16],
     scan: SrsV2CoeffScan,
     mode: SrsV2CoeffLayoutMode,
@@ -634,6 +678,68 @@ pub fn compare_single8x8_vs_four4x4(
     Ok(SingleVsFourByteEstimate {
         bytes_single_8x8,
         bytes_four_4x4,
+        prefers,
+    })
+}
+
+fn estimate_rev34_mb_grouping_breakdown(
+    qfreq: &[i16; COEFFICIENTS_PER_LAYOUT_BLOCK],
+    kind: SrsV2TransformKind,
+    scan: SrsV2CoeffScan,
+) -> Result<GroupingWireCostBreakdown, TransformLayoutError> {
+    let body = encode_coeff_compact_rev32_intra_block(qfreq, kind, scan)?;
+    let legacy =
+        estimate_coeff_layout_bytes(qfreq.as_slice(), kind, scan, SrsV2CoeffLayoutMode::Legacy)?;
+    Ok(GroupingWireCostBreakdown {
+        grouping_tag_bytes: 1,
+        scan_tag_bytes: 1,
+        pred_byte_bytes: 1,
+        body_length_field_bytes: 2,
+        compact_coeff_body_bytes: body.len(),
+        legacy_residual_entropy_estimate_bytes: legacy,
+        per_subblock_overhead_bytes: 0,
+    })
+}
+
+/// Rev34-style rate estimate for **Single8×8** (`grouping`/`scan`/`pred`/length + compact body + legacy proxy).
+pub fn estimate_single8x8_cost(
+    qfreq: &[i16; COEFFICIENTS_PER_LAYOUT_BLOCK],
+    scan: SrsV2CoeffScan,
+) -> Result<GroupingWireCostBreakdown, TransformLayoutError> {
+    estimate_rev34_mb_grouping_breakdown(qfreq, SrsV2TransformKind::Tx8x8, scan)
+}
+
+/// Same as [`estimate_single8x8_cost`] for **Four4×4**, including [`FOUR4X4_PER_SUBBLOCK_SIDE_BYTES`] × 4 overhead.
+pub fn estimate_four4x4_cost(
+    qfreq: &[i16; COEFFICIENTS_PER_LAYOUT_BLOCK],
+    scan: SrsV2CoeffScan,
+) -> Result<GroupingWireCostBreakdown, TransformLayoutError> {
+    let mut b = estimate_rev34_mb_grouping_breakdown(qfreq, SrsV2TransformKind::Tx4x4, scan)?;
+    b.per_subblock_overhead_bytes = FOUR4X4_PER_SUBBLOCK_SIDE_BYTES.saturating_mul(4);
+    Ok(b)
+}
+
+/// Compare rev34 intra MB **rate proxies** for dual-quant candidates (distinct quantized spectra + scans).
+pub fn compare_single8x8_vs_four4x4(
+    q_tx8: &[i16; COEFFICIENTS_PER_LAYOUT_BLOCK],
+    scan8: SrsV2CoeffScan,
+    q_tx4: &[i16; COEFFICIENTS_PER_LAYOUT_BLOCK],
+    scan4: SrsV2CoeffScan,
+) -> Result<SingleVsFourRev34Compare, TransformLayoutError> {
+    let breakdown_tx8 = estimate_single8x8_cost(q_tx8, scan8)?;
+    let breakdown_tx4 = estimate_four4x4_cost(q_tx4, scan4)?;
+    let rate_tx8 = breakdown_tx8.total_rdo_rate_bytes();
+    let rate_tx4 = breakdown_tx4.total_rdo_rate_bytes();
+    let prefers = if rate_tx4 < rate_tx8 {
+        SrsV2TransformGrouping::Four4x4
+    } else {
+        SrsV2TransformGrouping::Single8x8
+    };
+    Ok(SingleVsFourRev34Compare {
+        breakdown_tx8,
+        breakdown_tx4,
+        rate_tx8,
+        rate_tx4,
         prefers,
     })
 }
@@ -1352,9 +1458,9 @@ mod tests {
     /// Localized checkerboard in quadrant 0 only → high quadrant variance × scale drives Tx4×4.
     fn spatial_localized_high_detail() -> [[i16; 8]; 8] {
         let mut b = [[0_i16; 8]; 8];
-        for r in 0..4 {
-            for c in 0..4 {
-                b[r][c] = if (r + c) % 2 == 0 { 40 } else { -40 };
+        for (r, row) in b.iter_mut().enumerate().take(4) {
+            for (c, cell) in row.iter_mut().enumerate().take(4) {
+                *cell = if (r + c) % 2 == 0 { 40 } else { -40 };
             }
         }
         b
@@ -1408,7 +1514,10 @@ mod tests {
     #[test]
     fn estimate_grouping_dc_only_tiny() {
         let spatial = [[11_i16; 8]; 8];
-        assert_eq!(classify_residual_block(&spatial), ResidualBlockClass::DcOnly);
+        assert_eq!(
+            classify_residual_block(&spatial),
+            ResidualBlockClass::DcOnly
+        );
         let mut coeffs = [0_i16; 64];
         coeffs[0] = -77;
         let st = estimate_transform_grouping_bytes(
@@ -1430,7 +1539,10 @@ mod tests {
         raster[10] = 2;
         raster[20] = -1;
         let spatial = spatial_flat_from_raster(&raster);
-        assert_eq!(classify_residual_block(&spatial), ResidualBlockClass::Sparse);
+        assert_eq!(
+            classify_residual_block(&spatial),
+            ResidualBlockClass::Sparse
+        );
         let mut coeffs = [0_i16; 64];
         coeffs[0] = 10;
         for &zi in ZIGZAG.iter().skip(3).take(5) {
@@ -1490,7 +1602,7 @@ mod tests {
     #[test]
     fn compare_single_vs_four_tie_prefers_single8x8() {
         let z = [0_i16; 64];
-        let est = compare_single8x8_vs_four4x4(
+        let est = compare_coeff_layout_single_vs_four4x4(
             &z,
             SrsV2CoeffScan::ZigZag,
             SrsV2CoeffLayoutMode::Legacy,
@@ -1498,6 +1610,31 @@ mod tests {
         .unwrap();
         assert_eq!(est.bytes_single_8x8, est.bytes_four_4x4);
         assert_eq!(est.prefers, SrsV2TransformGrouping::Single8x8);
+    }
+
+    #[test]
+    fn rev34_wire_estimates_sum_tags_body_legacy_and_four_overhead() {
+        let z = [0_i16; 64];
+        let s = estimate_single8x8_cost(&z, SrsV2CoeffScan::ZigZag).unwrap();
+        assert_eq!(
+            s.grouping_tag_bytes + s.scan_tag_bytes + s.pred_byte_bytes + s.body_length_field_bytes,
+            REV34_INTRA_MB_PREFIX_BYTES
+        );
+        let f = estimate_four4x4_cost(&z, SrsV2CoeffScan::ZigZag).unwrap();
+        assert_eq!(
+            f.per_subblock_overhead_bytes,
+            FOUR4X4_PER_SUBBLOCK_SIDE_BYTES * 4
+        );
+        let q8 = z;
+        let q4 = z;
+        let cmp =
+            compare_single8x8_vs_four4x4(&q8, SrsV2CoeffScan::ZigZag, &q4, SrsV2CoeffScan::ZigZag)
+                .unwrap();
+        assert_eq!(cmp.prefers, SrsV2TransformGrouping::Single8x8);
+        assert!(
+            cmp.rate_tx4 > cmp.rate_tx8,
+            "Four4×4 includes per-subblock overhead even when coefficients match"
+        );
     }
 
     #[test]
@@ -1531,7 +1668,8 @@ mod tests {
             SrsV2TransformKind::Tx4x4
         );
         assert_eq!(
-            fr2_rev34_transform_kind_from_grouping_wire(FR2_REV34_INTRA_GROUPING_SINGLE8X8).unwrap(),
+            fr2_rev34_transform_kind_from_grouping_wire(FR2_REV34_INTRA_GROUPING_SINGLE8X8)
+                .unwrap(),
             SrsV2TransformKind::Tx8x8
         );
         assert!(fr2_rev34_transform_kind_from_grouping_wire(2).is_err());
@@ -1544,7 +1682,8 @@ mod tests {
             FR2_REV34_INTRA_GROUPING_FOUR4X4
         );
         assert_eq!(
-            fr2_rev35_p_transform_kind_from_grouping_wire(FR2_REV34_INTRA_GROUPING_SINGLE8X8).unwrap(),
+            fr2_rev35_p_transform_kind_from_grouping_wire(FR2_REV34_INTRA_GROUPING_SINGLE8X8)
+                .unwrap(),
             SrsV2TransformKind::Tx8x8
         );
         assert!(fr2_rev35_p_transform_kind_from_grouping_wire(7).is_err());

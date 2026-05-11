@@ -11,8 +11,6 @@ pub mod color;
 pub mod context_inter_entropy;
 /// CTU-style 16/32/64 superblock grid planning only; no bitstream syntax or `FR2` revision.
 pub mod ctu64;
-/// Superchunk-style **128×128** … **1024×1024** region grid for 4K+ planning; geometry only (no wire syntax).
-pub mod superchunk;
 mod dct;
 pub mod deblock;
 pub mod error;
@@ -35,8 +33,11 @@ pub mod reference;
 pub mod reference_manager;
 pub mod residual_context_entropy;
 pub mod residual_entropy;
+pub mod residual_token_v2;
 pub mod residual_tokens;
 pub mod subpel;
+/// Superchunk-style **128×128** … **1024×1024** region grid for 4K+ planning; geometry only (no wire syntax).
+pub mod superchunk;
 pub mod transform_layout;
 
 pub use adaptive_quant::{
@@ -111,12 +112,12 @@ pub use rate_control::{
 pub use rdo::{
     autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost, b_blend_rdo_score,
     bounded_candidate_push, choose_best_inter_mode_candidate, choose_best_partition_candidate,
-    choose_min_partition_by_precomputed_scores, estimate_inter_header_bytes,
-    estimate_mv_delta_wire_bytes, estimate_partition_candidate_bytes,
+    choose_grouping_rdo_fast, choose_min_partition_by_precomputed_scores,
+    estimate_inter_header_bytes, estimate_mv_delta_wire_bytes, estimate_partition_candidate_bytes,
     p_subblock_skip_residual_is_rdo_cheaper, partition_header_aware_rdo_score,
     partition_header_aware_score, partition_rdo_fast_score, rdo_fast_enabled, rdo_score,
-    score_candidate, RdoCandidate, RdoCost, RdoDecision, RdoModeDecisionStats, RdoStats,
-    MAX_RDO_CANDIDATES,
+    score_candidate, GroupingRdoFastDecision, RdoCandidate, RdoCost, RdoDecision,
+    RdoModeDecisionStats, RdoStats, GROUPING_RDO_FAST_CANDIDATES, MAX_RDO_CANDIDATES,
 };
 pub use reference::ReferenceFrameBuffer;
 pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2ReferenceSlot};
@@ -124,6 +125,12 @@ pub use reference_manager::{SrsV2ReferenceKind, SrsV2ReferenceManager, SrsV2Refe
 pub use gpu_traits::{
     ColorConvertBackend, CpuVideoAccelerator, GpuVideoAccelerator, MotionSearchBackend,
     QuantBackend, TransformBackend,
+};
+
+pub use residual_token_v2::{
+    decode_ac_payload as residual_token_v2_decode_ac_payload,
+    encode_ac_payload as residual_token_v2_encode_ac_payload,
+    MAX_ABS_AC_COEFF as RESIDUAL_TOKEN_V2_MAX_ABS_AC_COEFF,
 };
 
 /// Elementary `.srsv2` file writer/reader (fixed 64-byte sequence header + framed payloads).

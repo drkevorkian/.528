@@ -4,15 +4,17 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 
 ## Run
 
-- Date: 2026-05-10 13:43:30 -06:00 (baseline); **`--compare-coeff-layouts`** finished ~13:44 -06:00
+- Date: 2026-05-10 13:43:30 -06:00 (baseline); **`--compare-coeff-layouts`** finished ~13:44 -06:00; **`--compare-transform-grouping`** (Block 4) recorded **2026-05-08** with git **7ed0cba**
 - Output root: `var\bench\windows_hevc_progress\`
 - Seed: 528; fps: 30; QP: 28
 - Corpus: `moving-square`, `scrolling-bars`, `checker`, `scene-cut` (64×64, 8 frames)
+- Gate knobs (Block 4): **keyint 8**, **motion-radius 4**, **`--residual-entropy auto`**, harness normalizes to **compact** inter + **fixed16×16** + **coeff-layout compact** / zigzag (see `bench_srsv2` `--compare-transform-grouping`).
 - FFmpeg available: **True**; libx264: **True**; libx265: **True**
-- Commands: `var\bench\windows_hevc_progress\commands_run.txt` (baseline per clip + **`--compare-coeff-layouts`** lines appended)
-- Git (coeff-layout JSON): **c4a2203**
+- Commands: `var\bench\windows_hevc_progress\commands_run.txt` (coeff-layout lines from earlier baseline + Block 4 gen/bench lines)
+- Git (coeff-layout JSON): **c4a2203**; Git (transform-grouping JSON): **7ed0cba**
 - Residual-context tables: `reports\<tag>\compare_residual_contexts.{json,md}`
 - Coefficient-layout compare: `reports\<tag>\compare_coeff_layouts.{json,md}` (`bench_srsv2 --compare-coeff-layouts`, same WxH×frames / QP **28** / keyint **8** / motion-radius **4** as gate)
+- Transform-grouping compare: `reports\<tag>\compare_transform_grouping.{json,md}` (`bench_srsv2 --compare-transform-grouping`)
 
 ## Required Results
 
@@ -24,6 +26,32 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 - Optional x265 result: status=ok, bytes=3561, bitrate=106830, PSNR-Y=100, SSIM-Y=1
 
 ## Questions Answered
+
+### Transform grouping (`bench_srsv2 --compare-transform-grouping`)
+
+Rows (fixed order): **`legacy8x8`**, **`four4x4`** (residual-aware decision), **`auto-residual-aware`**, **`auto-rdo-fast`** (`--rdo fast`). **Total bytes** = full SRSV2 clip payload; **`residual_bytes`** = encoder telemetry bucket (see note).
+
+**Fairness note:** On **`legacy8x8`**, telemetry **`residual_bytes`** counts compact rev33 **P** residual bytes as in earlier gates. On **mixed transform-grouping** rows, the same field is often reported as **0** in this harness while **`transform_grouping_bytes`** carries rev34/rev35 grouping + coefficient packaging — **do not** interpret **`residual_bytes`** alone as comparable across rows; use **`total_bytes`** for clip size.
+
+| Clip | legacy8x8 total / `residual_bytes` | four4x4 total / `residual_bytes` | auto-residual-aware total / `residual_bytes` | auto-rdo-fast total / `residual_bytes` | PSNR-Y (L8 / F4 / ARA / ARDO) | SSIM-Y (L8 / F4 / ARA / ARDO) | Winner (min **total**) |
+| --- | ---: | ---: | ---: | ---: | --- | --- | --- |
+| `moving_square` | 8984 / 1223 | 8176 / 0 | 8662 / 0 | 8276 / 0 | 14.895 / 14.987 / 14.897 / 14.962 | 0.6194 / 0.6526 / 0.6218 / 0.6454 | **`four4x4`** (8176 B) |
+| `scrolling_bars` | 11894 / 1225 | 13586 / 0 | 12724 / 0 | 12752 / 0 | 14.655 / 14.679 / 14.667 / 14.755 | 0.5576 / 0.5820 / 0.5581 / 0.5762 | **`legacy8x8`** (11894 B) |
+| `checker` | 18410 / 1283 | 13838 / 0 | 18954 / 0 | 14100 / 0 | 10.506 / 10.624 / 10.506 / 10.502 | 0.1312 / 0.1299 / 0.1312 / 0.1328 | **`four4x4`** (13838 B) |
+| `scene_cut` | 7698 / 1193 | 8942 / 0 | 8072 / 0 | 8362 / 0 | 13.300 / 13.404 / 13.300 / 13.412 | 0.6935 / 0.7141 / 0.6935 / 0.7099 | **`legacy8x8`** (7698 B) |
+
+**Summaries from JSON (`transform_grouping_compare_summary`):**
+
+- `moving_square`: four4x4 **−808** B vs legacy; auto-residual-aware **−322** B; auto-rdo-fast **−708** B (all vs **8984** B baseline).
+- `scrolling_bars`: four4x4 **+1692** B; auto-residual-aware **+830** B; auto-rdo-fast **+858** B (vs **11894** B).
+- `checker`: four4x4 **−4572** B; auto-residual-aware **+544** B; auto-rdo-fast **−4310** B (vs **18410** B).
+- `scene_cut`: four4x4 **+1244** B; auto-residual-aware **+374** B; auto-rdo-fast **+664** B (vs **7698** B).
+
+**Direct answers**
+
+1. **Did `four4x4` always win on total bytes?** **No** — it wins on **`moving_square`** and **`checker`**, loses on **`scrolling_bars`** and **`scene_cut`** vs **`legacy8x8`**.
+2. **Did `auto-rdo-fast` beat legacy everywhere?** **No** — smaller totals than legacy on **`moving_square`** and **`checker`**, larger on **`scrolling_bars`** and **`scene_cut`**.
+3. **Quality vs legacy at printed precision?** **PSNR-Y / SSIM-Y change by row** (see table); not identical across modes.
 
 ### Did Partition Syntax V2 reduce adaptive partition overhead?
 
@@ -153,9 +181,9 @@ Winner: **`residual`** with **4058** bytes.
 
 ## Next Feature
 
-Exactly one next feature: **B. transform-size selection / coefficient grouping improvements**.
+See **`docs/next_hevc_codec_block.md`** — Block 4 transform-grouping numbers narrow the next execution target (**motion-heavy clips still favor `legacy8x8` on totals**).
 
-Reason from this run: **`--compare-coeff-layouts`** shows CompactV1 **increases** total bytes on **all four** clips despite favorable encoder **`coeff_layout_savings_percent`** on some clips; residual remains the dominant bucket on **`scene_cut/SRSV2-pc-fixed16x16`**. Next lever is **transform / coefficient grouping decisions**, not expanding CompactV1 surface (**not** an H.265 superiority claim).
+Reason (historical): **`--compare-coeff-layouts`** showed CompactV1 **increases** total bytes on **all four** clips; **`--compare-transform-grouping`** (Block 4) shows **mixed** totals vs **`legacy8x8`** (**engineering measurement only**).
 
 Allowed planning labels: **A** CTU64 encode path; **B** transform-size / coefficient layout; **C** context-adaptive residual training (only if residual ContextV1 wins totals); **D** quarter-pel luma motion; **E** bitrate-matched x265 sweep (fairness).
 

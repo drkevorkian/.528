@@ -171,6 +171,22 @@ struct Args {
     )]
     compare_transform_grouping: bool,
 
+    /// Like **`--compare-transform-grouping`**, then repeats the same four rows with **`--inter-partition split8x8`** (compact inter). Emits **`compare_transform_grouping_split8x8`** + summary in JSON/Markdown. **`--bframes 0`** only; mutually exclusive with **`--compare-transform-grouping`** (use one or the other).
+    #[arg(
+        long = "compare-transform-grouping-with-partitions",
+        visible_alias = "compare_transform_grouping_with_partitions",
+        default_value_t = false
+    )]
+    compare_transform_grouping_with_partitions: bool,
+
+    /// When set, include **`residual_token_v2`** vs legacy static **rANS** AC-blob simulation in JSON/Markdown (Telemetry only; not on **`FR2`** wire).
+    #[arg(
+        long = "compare-residual-token-v2",
+        visible_alias = "compare_residual_token_v2",
+        default_value_t = false
+    )]
+    compare_residual_token_v2: bool,
+
     #[arg(long, default_value_t = false)]
     sweep: bool,
 
@@ -792,6 +808,17 @@ struct Srsv2Details {
     residual_context_savings_percent: f64,
     #[serde(default)]
     residual_context_failed_blocks: u64,
+    /// Simulated static **rANS** AC **blob** byte sum (subset: blocks where v1 tokenization fits).
+    #[serde(default)]
+    residual_token_v1_rans_ac_body_bytes: u64,
+    /// Simulated [`libsrs_video::srsv2::residual_token_v2`] AC payload byte sum (same block subset).
+    #[serde(default)]
+    residual_token_v2_ac_body_bytes: u64,
+    #[serde(default)]
+    residual_token_compare_block_count: u64,
+    /// Present when **`--compare-residual-token-v2`** and at least one comparable block exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    residual_token_compare_summary: Option<String>,
     /// Sum of encoded frame payload sizes (display-order bench aggregate).
     #[serde(default)]
     total_bytes: u64,
@@ -895,6 +922,10 @@ impl Default for Srsv2Details {
             residual_context_savings_bytes: 0,
             residual_context_savings_percent: 0.0,
             residual_context_failed_blocks: 0,
+            residual_token_v1_rans_ac_body_bytes: 0,
+            residual_token_v2_ac_body_bytes: 0,
+            residual_token_compare_block_count: 0,
+            residual_token_compare_summary: None,
             total_bytes: 0,
             residual_bytes: 0,
             encode_fps: 0.0,
@@ -1035,6 +1066,9 @@ struct TransformGroupingCompareRow {
     transform_grouping_savings_bytes: i64,
     transform_grouping_savings_percent: f64,
     residual_bytes: u64,
+    /// `residual_bytes − legacy8x8 baseline` when baseline row succeeded; omitted on baseline / failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    residual_bytes_delta_vs_legacy8x8: Option<i64>,
     total_bytes: u64,
     psnr_y: f64,
     ssim_y: f64,
@@ -1107,6 +1141,11 @@ struct BenchReport {
     compare_transform_grouping: Option<Vec<TransformGroupingCompareRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transform_grouping_compare_summary: Option<String>,
+    /// Present when **`--compare-transform-grouping-with-partitions`**: same four grouping rows under **`split8x8`** inter partition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_transform_grouping_split8x8: Option<Vec<TransformGroupingCompareRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transform_grouping_compare_summary_split8x8: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     match_x264_bitrate_note: Option<String>,
     git_commit: Option<String>,
@@ -1220,15 +1259,11 @@ fn parse_transform_decision_mode(s: &str) -> Result<SrsV2TransformDecisionMode> 
 }
 
 fn parse_transform_grouping_cli_flag(s: &str) -> Result<String> {
-    Ok(
-        transform_grouping_cli_label(parse_transform_grouping_mode(s)?).to_string(),
-    )
+    Ok(transform_grouping_cli_label(parse_transform_grouping_mode(s)?).to_string())
 }
 
 fn parse_transform_decision_cli_flag(s: &str) -> Result<String> {
-    Ok(
-        transform_decision_cli_label(parse_transform_decision_mode(s)?).to_string(),
-    )
+    Ok(transform_decision_cli_label(parse_transform_decision_mode(s)?).to_string())
 }
 
 fn parse_residual_context_mode(s: &str) -> Result<SrsV2ResidualContextMode> {
@@ -1427,6 +1462,8 @@ fn validate_args(args: &Args) -> Result<()> {
             || args.compare_residual_contexts
             || args.compare_coeff_layouts
             || args.compare_transform_grouping
+            || args.compare_transform_grouping_with_partitions
+            || args.compare_residual_token_v2
             || args.compare_b_modes
             || args.compare_inter_syntax
             || args.compare_rdo
@@ -1533,6 +1570,17 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             "--compare-transform-grouping cannot be combined with --sweep or --sweep-quality-bitrate"
         );
     }
+    if args.compare_transform_grouping_with_partitions && (args.sweep || args.sweep_quality_bitrate)
+    {
+        bail!(
+            "--compare-transform-grouping-with-partitions cannot be combined with --sweep or --sweep-quality-bitrate"
+        );
+    }
+    if args.compare_residual_token_v2 && (args.sweep || args.sweep_quality_bitrate) {
+        bail!(
+            "--compare-residual-token-v2 cannot be combined with --sweep or --sweep-quality-bitrate"
+        );
+    }
     if args.compare_residual_contexts && args.compare_residual_modes {
         bail!("--compare-residual-contexts cannot be combined with --compare-residual-modes");
     }
@@ -1550,10 +1598,11 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         + args.compare_entropy_models as u8
         + args.compare_residual_contexts as u8
         + args.compare_coeff_layouts as u8
-        + args.compare_transform_grouping as u8;
+        + args.compare_transform_grouping as u8
+        + args.compare_transform_grouping_with_partitions as u8;
     if compare_pass_count > 1 {
         bail!(
-            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, --compare-residual-contexts, --compare-coeff-layouts, and --compare-transform-grouping are mutually exclusive"
+            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, and --compare-transform-grouping-with-partitions are mutually exclusive"
         );
     }
     if args.compare_residual_contexts && args.compare_coeff_layouts {
@@ -1562,8 +1611,17 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     if args.compare_residual_contexts && args.compare_transform_grouping {
         bail!("--compare-residual-contexts cannot be combined with --compare-transform-grouping");
     }
+    if args.compare_residual_contexts && args.compare_transform_grouping_with_partitions {
+        bail!("--compare-residual-contexts cannot be combined with --compare-transform-grouping-with-partitions");
+    }
     if args.compare_coeff_layouts && args.compare_transform_grouping {
         bail!("--compare-coeff-layouts cannot be combined with --compare-transform-grouping");
+    }
+    if args.compare_coeff_layouts && args.compare_transform_grouping_with_partitions {
+        bail!("--compare-coeff-layouts cannot be combined with --compare-transform-grouping-with-partitions");
+    }
+    if args.compare_transform_grouping && args.compare_transform_grouping_with_partitions {
+        bail!("--compare-transform-grouping cannot be combined with --compare-transform-grouping-with-partitions");
     }
     if (args.compare_inter_syntax
         || args.compare_rdo
@@ -1577,9 +1635,10 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             || args.compare_residual_contexts
             || args.compare_coeff_layouts
             || args.compare_transform_grouping
+            || args.compare_transform_grouping_with_partitions
             || args.compare_b_modes)
     {
-        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, or --compare-b-modes");
+        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, --compare-transform-grouping-with-partitions, or --compare-b-modes");
     }
     if args.compare_b_modes
         && (args.sweep
@@ -1587,9 +1646,10 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             || args.compare_residual_contexts
             || args.compare_coeff_layouts
             || args.compare_transform_grouping
+            || args.compare_transform_grouping_with_partitions
             || args.sweep_quality_bitrate)
     {
-        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, or --compare-transform-grouping");
+        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, or --compare-transform-grouping-with-partitions");
     }
     if args.compare_b_modes {
         if args.reference_frames < 2 {
@@ -1679,9 +1739,10 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             || args.compare_residual_contexts
             || args.compare_coeff_layouts
             || args.compare_transform_grouping
+            || args.compare_transform_grouping_with_partitions
             || args.sweep_quality_bitrate
         {
-            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, or --compare-transform-grouping");
+            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, or --compare-transform-grouping-with-partitions");
         }
     }
     if args.sweep_quality_bitrate {
@@ -1703,6 +1764,9 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     }
     if args.compare_transform_grouping && args.bframes > 0 {
         bail!("--compare-transform-grouping requires --bframes 0 in this slice");
+    }
+    if args.compare_transform_grouping_with_partitions && args.bframes > 0 {
+        bail!("--compare-transform-grouping-with-partitions requires --bframes 0 in this slice");
     }
     Ok(())
 }
@@ -2672,6 +2736,8 @@ fn run_compare_partition_syntax_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3525,6 +3591,19 @@ fn pass_to_details(
     .unwrap_or_else(|_| ctu_grid_stats(args.width, args.height, CtuSize::Ctu16).unwrap());
     let mut enc_agg = p.enc_stats.clone();
     enc_agg.finalize_residual_context_derived();
+    let residual_token_compare_summary = if args.compare_residual_token_v2
+        && p.enc_stats.residual_token_compare_block_count > 0
+    {
+        let n = p.enc_stats.residual_token_compare_block_count;
+        let v1 = p.enc_stats.residual_token_v1_rans_ac_body_bytes;
+        let v2 = p.enc_stats.residual_token_v2_ac_body_bytes;
+        let d = v1 as i128 - v2 as i128;
+        Some(format!(
+            "Simulated **AC-only** payloads on **n={n}** 8×8 blocks where legacy rANS tokenization fits: **v1** rANS blob sum = **{v1}** B, **v2** packed = **{v2}** B, **Δ (v1−v2)** = **{d:+}** B. Not on **FR2** wire; engineering measurement only."
+        ))
+    } else {
+        None
+    };
     let residual_bytes_total = intra_plane_chunks_sum.saturating_add(m.residual_payload_bytes_p);
     let frames_f = args.frames.max(1) as f64;
     Srsv2Details {
@@ -3613,6 +3692,10 @@ fn pass_to_details(
         residual_context_savings_bytes: enc_agg.residual_context_savings_bytes,
         residual_context_savings_percent: enc_agg.residual_context_savings_percent,
         residual_context_failed_blocks: enc_agg.residual_context_failed_blocks,
+        residual_token_v1_rans_ac_body_bytes: p.enc_stats.residual_token_v1_rans_ac_body_bytes,
+        residual_token_v2_ac_body_bytes: p.enc_stats.residual_token_v2_ac_body_bytes,
+        residual_token_compare_block_count: p.enc_stats.residual_token_compare_block_count,
+        residual_token_compare_summary,
         total_bytes: enc_bytes,
         residual_bytes: residual_bytes_total,
         encode_fps: frames_f / p.enc_secs.max(1e-12),
@@ -3851,6 +3934,8 @@ fn run_compare_b_modes_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3946,6 +4031,8 @@ fn run_single_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4094,6 +4181,8 @@ fn run_compare_residual_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4244,6 +4333,8 @@ fn run_compare_residual_contexts_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4500,19 +4591,21 @@ fn run_compare_coeff_layouts_report(
         coeff_layout_compare_summary,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
 }
 
-fn normalize_transform_grouping_compare_args(a: &mut Args) -> Result<()> {
+fn normalize_transform_grouping_compare_args(a: &mut Args, inter_partition: &str) -> Result<()> {
     if a.bframes > 0 {
-        bail!("--compare-transform-grouping requires --bframes 0 in this slice");
+        bail!("transform grouping compare modes require --bframes 0 in this slice");
     }
     a.residual_entropy = "auto".to_string();
     a.residual_context = "off".to_string();
-    a.inter_partition = "fixed16x16".to_string();
+    a.inter_partition = inter_partition.to_string();
     a.block_aq = "off".to_string();
     a.coeff_layout = "compact".to_string();
     a.coeff_scan = "zigzag".to_string();
@@ -4527,6 +4620,7 @@ fn run_compare_transform_grouping_report(
     args: &Args,
     raw: &[u8],
     expected_frame: usize,
+    inter_partition: &str,
 ) -> Result<BenchReport> {
     type RowSpec<'a> = (
         &'a str,
@@ -4565,10 +4659,11 @@ fn run_compare_transform_grouping_report(
     let mut table: Vec<CodecRow> = Vec::new();
     let mut primary_details: Option<Srsv2Details> = None;
     let mut baseline_total: Option<u64> = None;
+    let mut baseline_residual: Option<u64> = None;
 
     for &(label, tg, td, force_rdo_fast) in &spec {
         let mut a = args.clone();
-        if let Err(e) = normalize_transform_grouping_compare_args(&mut a) {
+        if let Err(e) = normalize_transform_grouping_compare_args(&mut a, inter_partition) {
             compare_rows.push(TransformGroupingCompareRow {
                 row_label: label.to_string(),
                 transform_grouping_mode: transform_grouping_cli_label(tg).to_string(),
@@ -4580,6 +4675,7 @@ fn run_compare_transform_grouping_report(
                 transform_grouping_savings_bytes: 0,
                 transform_grouping_savings_percent: 0.0,
                 residual_bytes: 0,
+                residual_bytes_delta_vs_legacy8x8: None,
                 total_bytes: 0,
                 psnr_y: 0.0,
                 ssim_y: 0.0,
@@ -4628,6 +4724,7 @@ fn run_compare_transform_grouping_report(
                     transform_grouping_savings_bytes: 0,
                     transform_grouping_savings_percent: 0.0,
                     residual_bytes: 0,
+                    residual_bytes_delta_vs_legacy8x8: None,
                     total_bytes: 0,
                     psnr_y: 0.0,
                     ssim_y: 0.0,
@@ -4670,7 +4767,13 @@ fn run_compare_transform_grouping_report(
                 }
                 if label == "legacy8x8" {
                     baseline_total = Some(details.total_bytes);
+                    baseline_residual = Some(details.residual_bytes);
                 }
+                let residual_bytes_delta_vs_legacy8x8 = if label == "legacy8x8" {
+                    None
+                } else {
+                    baseline_residual.map(|b| details.residual_bytes as i64 - b as i64)
+                };
                 compare_rows.push(TransformGroupingCompareRow {
                     row_label: label.to_string(),
                     transform_grouping_mode: transform_grouping_cli_label(tg).to_string(),
@@ -4682,6 +4785,7 @@ fn run_compare_transform_grouping_report(
                     transform_grouping_savings_bytes: enc_agg.transform_grouping_savings_bytes,
                     transform_grouping_savings_percent: enc_agg.transform_grouping_savings_percent,
                     residual_bytes: details.residual_bytes,
+                    residual_bytes_delta_vs_legacy8x8,
                     total_bytes: details.total_bytes,
                     psnr_y: row_codec.psnr_y,
                     ssim_y: row_codec.ssim_y,
@@ -4704,6 +4808,7 @@ fn run_compare_transform_grouping_report(
                     transform_grouping_savings_bytes: 0,
                     transform_grouping_savings_percent: 0.0,
                     residual_bytes: 0,
+                    residual_bytes_delta_vs_legacy8x8: None,
                     total_bytes: 0,
                     psnr_y: 0.0,
                     ssim_y: 0.0,
@@ -4747,7 +4852,8 @@ fn run_compare_transform_grouping_report(
             ))
         }
         None => Some(
-            "Total-byte deltas vs legacy8x8 baseline: unavailable (baseline row failed).".to_string(),
+            "Total-byte deltas vs legacy8x8 baseline: unavailable (baseline row failed)."
+                .to_string(),
         ),
     };
 
@@ -4782,10 +4888,25 @@ fn run_compare_transform_grouping_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: Some(compare_rows),
         transform_grouping_compare_summary,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
     })
+}
+
+fn run_compare_transform_grouping_with_partitions_report(
+    args: &Args,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    let mut merged =
+        run_compare_transform_grouping_report(args, raw, expected_frame, "fixed16x16")?;
+    let split = run_compare_transform_grouping_report(args, raw, expected_frame, "split8x8")?;
+    merged.compare_transform_grouping_split8x8 = split.compare_transform_grouping;
+    merged.transform_grouping_compare_summary_split8x8 = split.transform_grouping_compare_summary;
+    Ok(merged)
 }
 
 fn run_compare_inter_syntax_report(
@@ -4922,6 +5043,8 @@ fn run_compare_inter_syntax_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -5058,6 +5181,8 @@ fn run_compare_rdo_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -5199,6 +5324,8 @@ fn run_compare_partitions_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -5363,6 +5490,8 @@ fn run_compare_partition_costs_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -5615,6 +5744,8 @@ fn run_compare_entropy_models_report(
         coeff_layout_compare_summary: None,
         compare_transform_grouping: None,
         transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -5924,7 +6055,23 @@ fn main() -> Result<()> {
     }
 
     if args.compare_transform_grouping {
-        let report = run_compare_transform_grouping_report(&args, &raw, expected_frame)?;
+        let report =
+            run_compare_transform_grouping_report(&args, &raw, expected_frame, "fixed16x16")?;
+        if let Some(p) = args.report_json.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        if let Some(p) = args.report_md.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        fs::write(&args.report_json, serde_json::to_string_pretty(&report)?)?;
+        fs::write(&args.report_md, to_markdown(&report))?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if args.compare_transform_grouping_with_partitions {
+        let report =
+            run_compare_transform_grouping_with_partitions_report(&args, &raw, expected_frame)?;
         if let Some(p) = args.report_json.parent() {
             fs::create_dir_all(p).ok();
         }
@@ -6326,6 +6473,130 @@ fn run_x265_compare(
     Ok((row, rep))
 }
 
+fn append_transform_grouping_compare_tables_md(
+    out: &mut String,
+    rows: &[TransformGroupingCompareRow],
+    section_heading: &str,
+    intro_note: &str,
+    summary: Option<&str>,
+) {
+    out.push_str(section_heading);
+    out.push_str(intro_note);
+    if let Some(s) = summary {
+        out.push_str(&format!("**Summary:** {s}\n\n"));
+    }
+    out.push_str("### Summary table\n\n");
+    out.push_str(
+        "| Row | transform_grouping_mode | transform_decision_mode | single_8x8_blocks | four_4x4_blocks | transform_grouping_bytes | legacy_transform_estimated_bytes | transform_grouping_savings_bytes | transform_grouping_savings_percent | residual_bytes | residual_bytes_Δ_vs_legacy8x8 | total_bytes | PSNR-Y | SSIM-Y | encode_fps | decode_fps |\n",
+    );
+    out.push_str(
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n",
+    );
+    for e in rows {
+        let (s8, f4, gb, le, sav_b, sav_pct, res, dres, tot, psnr_s, ssim_s, efps, dfps) = if e.ok {
+            let dres = e
+                .residual_bytes_delta_vs_legacy8x8
+                .map(|d| format!("{d:+}"))
+                .unwrap_or_else(|| "—".to_string());
+            (
+                format!("{}", e.single_8x8_blocks),
+                format!("{}", e.four_4x4_blocks),
+                format!("{}", e.transform_grouping_bytes),
+                format!("{}", e.legacy_transform_estimated_bytes),
+                format!("{}", e.transform_grouping_savings_bytes),
+                format!("{:.2}", e.transform_grouping_savings_percent),
+                format!("{}", e.residual_bytes),
+                dres,
+                format!("{}", e.total_bytes),
+                format!("{:.2}", e.psnr_y),
+                format!("{:.4}", e.ssim_y),
+                format!("{:.2}", e.encode_fps),
+                format!("{:.2}", e.decode_fps),
+            )
+        } else {
+            (
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+                "—".to_string(),
+            )
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            e.row_label,
+            e.transform_grouping_mode,
+            e.transform_decision_mode,
+            s8,
+            f4,
+            gb,
+            le,
+            sav_b,
+            sav_pct,
+            res,
+            dres,
+            tot,
+            psnr_s,
+            ssim_s,
+            efps,
+            dfps,
+        ));
+    }
+    out.push_str("\n### Full telemetry\n\n");
+    out.push_str("| Row | Single 8×8 | Four 4×4 | Grouping B | Legacy est. | Savings B | Savings % | Residual B | Δ res | Total B | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS | Status |\n");
+    out.push_str("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n");
+    for e in rows {
+        let status = if e.ok {
+            "ok".to_string()
+        } else {
+            e.error
+                .as_deref()
+                .map(|s| {
+                    let t = s.trim();
+                    if t.len() > 80 {
+                        format!("{}…", &t[..80])
+                    } else {
+                        t.to_string()
+                    }
+                })
+                .unwrap_or_else(|| "error".to_string())
+        };
+        let dres = if e.ok {
+            e.residual_bytes_delta_vs_legacy8x8
+                .map(|d| format!("{d:+}"))
+                .unwrap_or_else(|| "—".to_string())
+        } else {
+            "—".to_string()
+        };
+        out.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {:.2} | {} | {} | {} | {:.2} | {:.4} | {:.2} | {:.2} | {} |\n",
+            e.row_label,
+            e.single_8x8_blocks,
+            e.four_4x4_blocks,
+            e.transform_grouping_bytes,
+            e.legacy_transform_estimated_bytes,
+            e.transform_grouping_savings_bytes,
+            e.transform_grouping_savings_percent,
+            e.residual_bytes,
+            dres,
+            e.total_bytes,
+            e.psnr_y,
+            e.ssim_y,
+            e.encode_fps,
+            e.decode_fps,
+            status.replace('|', "/"),
+        ));
+    }
+}
+
 fn to_markdown(r: &BenchReport) -> String {
     let mut out = String::new();
     out.push_str("# SRSV2 benchmark report\n\n");
@@ -6336,6 +6607,11 @@ fn to_markdown(r: &BenchReport) -> String {
     out.push_str(&format!("**Command:** `{}`\n\n", r.command));
     out.push_str("_Engineering measurement only; not a marketing claim._\n\n");
     out.push_str(&format!("_{}_\n\n", r.residual_note));
+    if let Some(s) = &r.srsv2.residual_token_compare_summary {
+        out.push_str("## Residual token v2 (simulated AC payloads)\n\n");
+        out.push_str(s);
+        out.push_str("\n\n");
+    }
     out.push_str(
         "| Codec | Bytes | Ratio | Bitrate (bps) | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS |\n",
     );
@@ -6496,96 +6772,23 @@ fn to_markdown(r: &BenchReport) -> String {
     }
 
     if let Some(rows) = &r.compare_transform_grouping {
-        out.push_str("\n## Transform grouping comparison (`--compare-transform-grouping`)\n\n");
-        out.push_str(
+        append_transform_grouping_compare_tables_md(
+            &mut out,
+            rows,
+            "\n## Transform grouping comparison (`--compare-transform-grouping`)\n\n",
             "_Fixed four-row order: **`legacy8x8`**, **`four4x4`**, **`auto-residual-aware`**, **`auto-rdo-fast`**. Telemetry reflects **FR2** rev34 intra / rev35 **P** when non-legacy grouping is active; use **`transform_grouping_savings_percent`** with **total** / **residual** bytes. Engineering measurement only — not a superiority claim vs **HEVC**/**H.265** or other codecs._\n\n",
+            r.transform_grouping_compare_summary.as_deref(),
         );
-        if let Some(s) = &r.transform_grouping_compare_summary {
-            out.push_str(&format!("**Summary:** {s}\n\n"));
-        }
-        out.push_str("### Summary table\n\n");
-        out.push_str(
-            "| Row | Grouping | Decision | Grouping B | Legacy est. | Savings B | Savings % | Total B | Residual B | PSNR-Y | SSIM-Y |\n",
+    }
+
+    if let Some(rows) = &r.compare_transform_grouping_split8x8 {
+        append_transform_grouping_compare_tables_md(
+            &mut out,
+            rows,
+            "\n## Transform grouping comparison — **`split8×8`** (`--compare-transform-grouping-with-partitions`)\n\n",
+            "_Same four **`transform-grouping`** / **`transform-decision`** rows as **`--compare-transform-grouping`**, run with **`--inter-partition split8x8`** (compact inter). Telemetry reflects **FR2** rev34 intra / rev35 **P** when non-legacy grouping is active; use **`transform_grouping_savings_percent`** with **total** / **residual** bytes. Engineering measurement only — not a superiority claim vs **HEVC**/**H.265** or other codecs._\n\n",
+            r.transform_grouping_compare_summary_split8x8.as_deref(),
         );
-        out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
-        for e in rows {
-            let (gb, le, sav_b, sav_pct, tot, res, psnr_s, ssim_s) = if e.ok {
-                (
-                    format!("{}", e.transform_grouping_bytes),
-                    format!("{}", e.legacy_transform_estimated_bytes),
-                    format!("{}", e.transform_grouping_savings_bytes),
-                    format!("{:.2}", e.transform_grouping_savings_percent),
-                    format!("{}", e.total_bytes),
-                    format!("{}", e.residual_bytes),
-                    format!("{:.2}", e.psnr_y),
-                    format!("{:.4}", e.ssim_y),
-                )
-            } else {
-                (
-                    "—".to_string(),
-                    "—".to_string(),
-                    "—".to_string(),
-                    "—".to_string(),
-                    "—".to_string(),
-                    "—".to_string(),
-                    "—".to_string(),
-                    "—".to_string(),
-                )
-            };
-            out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
-                e.row_label,
-                e.transform_grouping_mode,
-                e.transform_decision_mode,
-                gb,
-                le,
-                sav_b,
-                sav_pct,
-                tot,
-                res,
-                psnr_s,
-                ssim_s,
-            ));
-        }
-        out.push_str("\n### Full telemetry\n\n");
-        out.push_str("| Row | Single 8×8 | Four 4×4 | Grouping B | Legacy est. | Savings B | Savings % | Residual B | Total B | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS | Status |\n");
-        out.push_str(
-            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
-        );
-        for e in rows {
-            let status = if e.ok {
-                "ok".to_string()
-            } else {
-                e.error
-                    .as_deref()
-                    .map(|s| {
-                        let t = s.trim();
-                        if t.len() > 80 {
-                            format!("{}…", &t[..80])
-                        } else {
-                            t.to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| "error".to_string())
-            };
-            out.push_str(&format!(
-                "| {} | {} | {} | {} | {} | {} | {:.2} | {} | {} | {:.2} | {:.4} | {:.2} | {:.2} | {} |\n",
-                e.row_label,
-                e.single_8x8_blocks,
-                e.four_4x4_blocks,
-                e.transform_grouping_bytes,
-                e.legacy_transform_estimated_bytes,
-                e.transform_grouping_savings_bytes,
-                e.transform_grouping_savings_percent,
-                e.residual_bytes,
-                e.total_bytes,
-                e.psnr_y,
-                e.ssim_y,
-                e.encode_fps,
-                e.decode_fps,
-                status.replace('|', "/"),
-            ));
-        }
     }
 
     if let Some(rows) = &r.compare_b_modes {
@@ -7389,7 +7592,7 @@ mod tests {
         let (path, raw, fb) = write_test_yuv("tg_cmp", 64, 64, 4);
         let args = parse_test_args(&path, 64, 64, 4, &["--compare-transform-grouping"]);
         validate_args(&args).unwrap();
-        let report = run_compare_transform_grouping_report(&args, &raw, fb).unwrap();
+        let report = run_compare_transform_grouping_report(&args, &raw, fb, "fixed16x16").unwrap();
         let rows = report
             .compare_transform_grouping
             .as_ref()
@@ -7410,7 +7613,10 @@ mod tests {
             .transform_grouping_compare_summary
             .as_ref()
             .expect("summary");
-        assert!(summary.contains("Δ_total") || summary.contains("baseline"), "{summary}");
+        assert!(
+            summary.contains("Δ_total") || summary.contains("baseline"),
+            "{summary}"
+        );
         let js = serde_json::to_string(&report).unwrap();
         for key in [
             "transform_grouping_mode",
@@ -7425,8 +7631,17 @@ mod tests {
             "total_bytes",
             "psnr_y",
             "ssim_y",
+            "encode_fps",
+            "decode_fps",
         ] {
             assert!(js.contains(key), "missing {key} in {js}");
+        }
+        let baseline_ok = rows.first().is_some_and(|r| r.ok);
+        if baseline_ok {
+            assert!(
+                js.contains("residual_bytes_delta_vs_legacy8x8"),
+                "when baseline succeeds, non-baseline rows serialize residual delta key: {js}"
+            );
         }
         assert!(js.contains("compare_transform_grouping"));
         let v: serde_json::Value = serde_json::from_str(&js).unwrap();
@@ -7449,6 +7664,8 @@ mod tests {
             "total_bytes",
             "psnr_y",
             "ssim_y",
+            "encode_fps",
+            "decode_fps",
             "ok",
         ];
         for (i, row) in rows_json.iter().enumerate() {
@@ -7458,11 +7675,92 @@ mod tests {
             for k in required_row_keys {
                 assert!(obj.contains_key(k), "row {i} missing {k}: {obj:?}");
             }
+            let ok = obj.get("ok").and_then(|v| v.as_bool()) == Some(true);
+            if i == 0 {
+                assert!(
+                    !obj.contains_key("residual_bytes_delta_vs_legacy8x8"),
+                    "baseline row should omit residual delta: {obj:?}"
+                );
+            } else if ok && baseline_ok {
+                assert!(
+                    obj.contains_key("residual_bytes_delta_vs_legacy8x8"),
+                    "row {i} missing residual_bytes_delta_vs_legacy8x8: {obj:?}"
+                );
+            }
         }
         let md = to_markdown(&report);
         assert!(md.contains("Transform grouping comparison"));
         assert!(md.contains("legacy8x8"));
         assert!(md.contains("PSNR-Y"));
+        assert!(
+            md.contains("residual_bytes_Δ_vs_legacy8x8") || md.contains("Δ res"),
+            "{md}"
+        );
+        assert!(report.x264.is_none());
+        assert!(report.x265.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compare_transform_grouping_with_partitions_emits_fixed_and_split_rows_json_markdown() {
+        let (path, raw, fb) = write_test_yuv("tg_cmp_part", 64, 64, 4);
+        let args = parse_test_args(
+            &path,
+            64,
+            64,
+            4,
+            &["--compare-transform-grouping-with-partitions"],
+        );
+        validate_args(&args).unwrap();
+        let report =
+            run_compare_transform_grouping_with_partitions_report(&args, &raw, fb).unwrap();
+        let fixed = report
+            .compare_transform_grouping
+            .as_ref()
+            .expect("compare_transform_grouping");
+        let split = report
+            .compare_transform_grouping_split8x8
+            .as_ref()
+            .expect("compare_transform_grouping_split8x8");
+        assert_eq!(fixed.len(), 4);
+        assert_eq!(split.len(), 4);
+        assert_eq!(fixed[0].row_label, "legacy8x8");
+        assert_eq!(split[0].row_label, "legacy8x8");
+        report
+            .transform_grouping_compare_summary
+            .as_ref()
+            .expect("fixed summary");
+        report
+            .transform_grouping_compare_summary_split8x8
+            .as_ref()
+            .expect("split summary");
+        let js = serde_json::to_string(&report).unwrap();
+        assert!(js.contains("compare_transform_grouping_split8x8"), "{js}");
+        assert!(
+            js.contains("transform_grouping_compare_summary_split8x8"),
+            "{js}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+        assert_eq!(
+            v["compare_transform_grouping"].as_array().map(|a| a.len()),
+            Some(4)
+        );
+        assert_eq!(
+            v["compare_transform_grouping_split8x8"]
+                .as_array()
+                .map(|a| a.len()),
+            Some(4)
+        );
+        let md = to_markdown(&report);
+        assert!(
+            md.contains("split8×8") || md.contains("split8x8"),
+            "markdown should name split partition section: {md}"
+        );
+        assert!(
+            md.contains("compare-transform-grouping-with-partitions")
+                || md.contains("compare_transform_grouping_with_partitions"),
+            "{md}"
+        );
         assert!(report.x264.is_none());
         assert!(report.x265.is_none());
         let _ = fs::remove_file(path);
@@ -7514,11 +7812,7 @@ mod tests {
 
     #[test]
     fn compare_transform_grouping_second_row_failure_keeps_first_row_in_markdown() {
-        fn tg_row(
-            label: &str,
-            ok: bool,
-            err: Option<&str>,
-        ) -> TransformGroupingCompareRow {
+        fn tg_row(label: &str, ok: bool, err: Option<&str>) -> TransformGroupingCompareRow {
             TransformGroupingCompareRow {
                 row_label: label.to_string(),
                 transform_grouping_mode: "x".into(),
@@ -7530,6 +7824,7 @@ mod tests {
                 transform_grouping_savings_bytes: 0,
                 transform_grouping_savings_percent: 0.0,
                 residual_bytes: if ok { 10 } else { 0 },
+                residual_bytes_delta_vs_legacy8x8: None,
                 total_bytes: if ok { 100 } else { 0 },
                 psnr_y: if ok { 40.0 } else { 0.0 },
                 ssim_y: if ok { 0.99 } else { 0.0 },
@@ -7573,6 +7868,8 @@ mod tests {
             transform_grouping_compare_summary: Some(
                 "Total-byte deltas vs legacy8x8 baseline (100 B): four4x4 (failed)".into(),
             ),
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "test".into(),
@@ -7583,8 +7880,13 @@ mod tests {
             md.contains("simulated four4x4 failure") || md.contains("simulated four4x4"),
             "{md}"
         );
+        assert!(
+            md.contains("Δ res") || md.contains("residual_bytes_Δ"),
+            "markdown should surface residual delta column: {md}"
+        );
     }
 
+    /// **`--transform-grouping`** defaults to **`legacy8x8`** and **`--transform-decision`** to **`legacy`** (encoder defaults unchanged).
     #[test]
     fn coeff_layout_cli_defaults_match_encoder_defaults() {
         let tmp =
@@ -7601,8 +7903,14 @@ mod tests {
         assert_eq!(s.coeff_scan_mode, SrsV2CoeffScanMode::ZigZag);
         assert_eq!(args.transform_grouping, "legacy8x8");
         assert_eq!(args.transform_decision, "legacy");
-        assert_eq!(s.transform_grouping_mode, SrsV2TransformGroupingMode::Legacy8x8);
-        assert_eq!(s.transform_decision_mode, SrsV2TransformDecisionMode::Legacy);
+        assert_eq!(
+            s.transform_grouping_mode,
+            SrsV2TransformGroupingMode::Legacy8x8
+        );
+        assert_eq!(
+            s.transform_decision_mode,
+            SrsV2TransformDecisionMode::Legacy
+        );
         let _ = fs::remove_file(tmp);
     }
 
@@ -7744,6 +8052,8 @@ mod tests {
             ),
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "test".into(),
@@ -7834,6 +8144,8 @@ mod tests {
             ),
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "test".into(),
@@ -7925,6 +8237,8 @@ mod tests {
             coeff_layout_compare_summary: None,
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "test".into(),
@@ -8029,6 +8343,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8130,6 +8446,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8230,6 +8548,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8332,6 +8652,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8434,6 +8756,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8538,6 +8862,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8656,6 +8982,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8765,6 +9093,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8891,6 +9221,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9000,6 +9332,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9114,6 +9448,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9262,6 +9598,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9489,6 +9827,10 @@ mod tests {
                 residual_context_savings_bytes: 0,
                 residual_context_savings_percent: 0.0,
                 residual_context_failed_blocks: 0,
+                residual_token_v1_rans_ac_body_bytes: 0,
+                residual_token_v2_ac_body_bytes: 0,
+                residual_token_compare_block_count: 0,
+                residual_token_compare_summary: None,
                 total_bytes: 0,
                 residual_bytes: 0,
                 encode_fps: 0.0,
@@ -9524,6 +9866,8 @@ mod tests {
             coeff_layout_compare_summary: None,
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9640,6 +9984,10 @@ mod tests {
                 residual_context_savings_bytes: 0,
                 residual_context_savings_percent: 0.0,
                 residual_context_failed_blocks: 0,
+                residual_token_v1_rans_ac_body_bytes: 0,
+                residual_token_v2_ac_body_bytes: 0,
+                residual_token_compare_block_count: 0,
+                residual_token_compare_summary: None,
                 total_bytes: 0,
                 residual_bytes: 0,
                 encode_fps: 0.0,
@@ -9751,6 +10099,10 @@ mod tests {
                     residual_context_savings_bytes: 0,
                     residual_context_savings_percent: 0.0,
                     residual_context_failed_blocks: 0,
+                    residual_token_v1_rans_ac_body_bytes: 0,
+                    residual_token_v2_ac_body_bytes: 0,
+                    residual_token_compare_block_count: 0,
+                    residual_token_compare_summary: None,
                     total_bytes: 0,
                     residual_bytes: 0,
                     encode_fps: 0.0,
@@ -9772,6 +10124,8 @@ mod tests {
             coeff_layout_compare_summary: None,
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9810,6 +10164,8 @@ mod tests {
             coeff_layout_compare_summary: None,
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9849,6 +10205,8 @@ mod tests {
             coeff_layout_compare_summary: None,
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9888,6 +10246,8 @@ mod tests {
             coeff_layout_compare_summary: None,
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9938,6 +10298,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -10182,6 +10544,10 @@ mod tests {
                     residual_context_savings_bytes: 0,
                     residual_context_savings_percent: 0.0,
                     residual_context_failed_blocks: 0,
+                    residual_token_v1_rans_ac_body_bytes: 0,
+                    residual_token_v2_ac_body_bytes: 0,
+                    residual_token_compare_block_count: 0,
+                    residual_token_compare_summary: None,
                     total_bytes: 0,
                     residual_bytes: 0,
                     encode_fps: 0.0,
@@ -10232,6 +10598,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -10332,6 +10700,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -10434,6 +10804,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: true,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -10554,6 +10926,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -10742,6 +11116,8 @@ mod tests {
             coeff_layout_compare_summary: None,
             compare_transform_grouping: None,
             transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "x".into(),
@@ -10813,6 +11189,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -10913,6 +11291,8 @@ mod tests {
             transform_grouping: "legacy8x8".to_string(),
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
+            compare_transform_grouping_with_partitions: false,
+            compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,

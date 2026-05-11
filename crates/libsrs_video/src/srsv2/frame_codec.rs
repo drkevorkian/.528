@@ -44,9 +44,7 @@ pub const FRAME_PAYLOAD_MAGIC_INTRA_TRANSFORM_GROUP_V34: [u8; 4] = [b'F', b'R', 
 pub const FRAME_PAYLOAD_MAGIC_ALT_REF: [u8; 4] = [b'F', b'R', b'2', 12];
 
 fn intra_magic_matches(payload: &[u8]) -> bool {
-    payload.len() >= 4
-        && &payload[0..3] == b"FR2"
-        && matches!(payload[3], 1 | 3 | 7 | 29 | 32 | 34)
+    payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3 | 7 | 29 | 32 | 34)
 }
 
 fn intra_use_block_aq_wire(settings: &SrsV2EncodeSettings) -> bool {
@@ -1999,7 +1997,7 @@ mod roundtrip_tests {
     }
 
     #[test]
-    fn fr2_intra_revisions_1_3_7_29_still_decode_via_dispatcher() {
+    fn fr2_intra_revisions_1_3_7_29_32_still_decode_via_dispatcher() {
         let seq = seq64_intra();
         let rgb = vec![110_u8; 64 * 64 * 3];
         let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
@@ -2050,8 +2048,7 @@ mod roundtrip_tests {
                 qp,
                 &SrsV2EncodeSettings {
                     coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
-                    transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
-                    transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+                    coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
                     ..Default::default()
                 },
                 None,
@@ -2063,7 +2060,7 @@ mod roundtrip_tests {
         assert_eq!(payloads[1][3], 3);
         assert_eq!(payloads[2][3], 7);
         assert_eq!(payloads[3][3], 29);
-        assert_eq!(payloads[4][3], 34);
+        assert_eq!(payloads[4][3], 32);
         let mut slot = None::<YuvFrame>;
         for pl in &payloads {
             decode_yuv420_srsv2_payload(&seq, pl, &mut slot).unwrap();
@@ -2258,6 +2255,44 @@ mod roundtrip_tests {
         let mut payload = encode_yuv420_intra_payload(&seq, &yuv, 0, 20, &st, None, None).unwrap();
         const FIRST_MB_SCAN_OFF: usize = 4 + 4 + 1 + 4 + 1 + 1;
         payload[FIRST_MB_SCAN_OFF] = 99;
+        assert!(decode_yuv420_intra_payload(&seq, &payload).is_err());
+    }
+
+    #[test]
+    fn fr2_rev34_truncated_first_mb_compact_body_fails_decode() {
+        let seq = seq64_intra();
+        let mut rgb = vec![0_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let v = if ((x ^ y) & 1) == 0 { 20_u8 } else { 235_u8 };
+                let i = (y * 64 + x) * 3;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            ..Default::default()
+        };
+        let mut payload = encode_yuv420_intra_payload(&seq, &yuv, 0, 20, &st, None, None).unwrap();
+        assert_eq!(payload[3], 34);
+        // After `y_len` (`4+4+1+4`): plane tag + grouping + scan + pred (`+4`) → first MB `u16` body length.
+        const FIRST_MB_BODY_LEN_OFF: usize = 4 + 4 + 1 + 4 + 4;
+        let body_len = u16::from_le_bytes([
+            payload[FIRST_MB_BODY_LEN_OFF],
+            payload[FIRST_MB_BODY_LEN_OFF + 1],
+        ]);
+        assert!(
+            body_len > 0,
+            "expected nonzero compact body for checkerboard"
+        );
+        let inflated = body_len.saturating_add(800);
+        payload[FIRST_MB_BODY_LEN_OFF..FIRST_MB_BODY_LEN_OFF + 2]
+            .copy_from_slice(&inflated.to_le_bytes());
         assert!(decode_yuv420_intra_payload(&seq, &payload).is_err());
     }
 

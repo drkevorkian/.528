@@ -509,7 +509,9 @@ mod frame_type_revision_tests {
                 FrameTypeV2::Intra
             );
         }
-        for rev in [2u8, 4, 5, 6, 8, 9, 15, 17, 19, 20, 23, 25, 27, 28, 30, 33, 35] {
+        for rev in [
+            2u8, 4, 5, 6, 8, 9, 15, 17, 19, 20, 23, 25, 27, 28, 30, 33, 35,
+        ] {
             assert_eq!(
                 frame_type_from_srsv2_revision(rev).unwrap(),
                 FrameTypeV2::PredictedP

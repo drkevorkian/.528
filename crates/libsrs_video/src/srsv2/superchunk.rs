@@ -83,7 +83,11 @@ pub struct SuperchunkGrid {
 
 impl SuperchunkGrid {
     /// Build a hostile-input-checked superchunk grid (same checks as [`validate_superchunk_grid`]).
-    pub fn new(width: u32, height: u32, size: SrsV2SuperchunkSize) -> Result<Self, SuperchunkError> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        size: SrsV2SuperchunkSize,
+    ) -> Result<Self, SuperchunkError> {
         validate_frame_dimensions(width, height)?;
         let edge = size.edge_luma();
         let cols = div_ceil_u32(width, edge)?;
@@ -121,7 +125,10 @@ impl SuperchunkGrid {
         self.addresses()
     }
 
-    pub fn address_for_index(&self, raster_index: u32) -> Result<SuperchunkAddress, SuperchunkError> {
+    pub fn address_for_index(
+        &self,
+        raster_index: u32,
+    ) -> Result<SuperchunkAddress, SuperchunkError> {
         if raster_index >= self.count {
             return Err(SuperchunkError::IndexOutOfRange {
                 index: raster_index,
@@ -145,7 +152,10 @@ impl SuperchunkGrid {
         })
     }
 
-    pub fn bounds_for_address(&self, addr: SuperchunkAddress) -> Result<SuperchunkBounds, SuperchunkError> {
+    pub fn bounds_for_address(
+        &self,
+        addr: SuperchunkAddress,
+    ) -> Result<SuperchunkBounds, SuperchunkError> {
         if addr.x_sc >= self.cols || addr.y_sc >= self.rows || addr.raster_index >= self.count {
             return Err(SuperchunkError::AddressOutOfRange);
         }
@@ -218,8 +228,9 @@ fn map_ctu_err(e: ctu64::CtuError) -> SuperchunkError {
             SuperchunkError::LumaSamplesTooLarge { samples, max }
         }
         ctu64::CtuError::GridTooLarge => SuperchunkError::GridTooLarge,
-        ctu64::CtuError::CtuIndexOutOfRange { .. }
-        | ctu64::CtuError::CtuAddressOutOfRange => SuperchunkError::GridTooLarge,
+        ctu64::CtuError::CtuIndexOutOfRange { .. } | ctu64::CtuError::CtuAddressOutOfRange => {
+            SuperchunkError::GridTooLarge
+        }
     }
 }
 
@@ -402,14 +413,8 @@ mod tests {
         let full = g.bounds(i).unwrap();
         assert_chroma_inside_plane(&g, &full);
 
-        assert_eq!(
-            superchunk_luma_bounds(&g, i).unwrap(),
-            full.luma
-        );
-        assert_eq!(
-            superchunk_chroma_bounds_yuv420(&g, i).unwrap(),
-            full.chroma
-        );
+        assert_eq!(superchunk_luma_bounds(&g, i).unwrap(), full.luma);
+        assert_eq!(superchunk_chroma_bounds_yuv420(&g, i).unwrap(), full.chroma);
 
         for addr in g.iter() {
             let b = g.bounds(addr.raster_index).unwrap();
@@ -423,7 +428,10 @@ mod tests {
         let n = g.count() as usize;
         let mut seen = vec![false; n];
         for addr in g.iter() {
-            assert!(!std::mem::replace(&mut seen[addr.raster_index as usize], true));
+            assert!(!std::mem::replace(
+                &mut seen[addr.raster_index as usize],
+                true
+            ));
         }
         assert!(seen.iter().all(|&x| x));
     }

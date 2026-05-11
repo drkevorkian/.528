@@ -2,7 +2,7 @@
 
 #![allow(clippy::needless_range_loop)]
 
-use super::dct::{fdct_8x8, idct_8x8, ZIGZAG};
+use super::dct::{fdct_4x4, fdct_8x8, idct_4x4, idct_8x8, ZIGZAG};
 use super::error::SrsV2Error;
 use super::frame::VideoPlane;
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
@@ -181,6 +181,48 @@ pub(crate) fn dequantize_4x4(block: &[i16; 16], qp: i16) -> [i16; 16] {
         o[i] = (block[i] as i32 * q as i32).clamp(-32768, 32767) as i16;
     }
     o
+}
+
+/// Four separate **4×4** DCTs over quadrants; coefficients stored quadrant-major (`64` samples).
+pub(crate) fn quantize_residual_tx4x4_natural(diff: &[[i16; 8]; 8], qp: i16) -> [i16; 64] {
+    let mut qfreq = [0_i16; 64];
+    let quads = [(0usize, 0usize), (0, 4), (4, 0), (4, 4)];
+    for (qi, &(r0, c0)) in quads.iter().enumerate() {
+        let mut patch = [0_i16; 16];
+        for r in 0..4 {
+            for c in 0..4 {
+                patch[r * 4 + c] = diff[r0 + r][c0 + c];
+            }
+        }
+        let f = fdct_4x4(&patch);
+        let q = quantize_4x4(&f, qp);
+        for r in 0..4 {
+            for c in 0..4 {
+                qfreq[qi * 16 + r * 4 + c] = q[r * 4 + c];
+            }
+        }
+    }
+    qfreq
+}
+
+/// Inverse of [`quantize_residual_tx4x4_natural`] — spatial residual from quantized spectrum.
+pub(crate) fn idct_residual_tx4x4_from_qfreq(qfreq: &[i16; 64], qp: i16) -> [[i16; 8]; 8] {
+    let mut out = [[0_i16; 8]; 8];
+    let quads = [(0usize, 0usize), (0, 4), (4, 0), (4, 4)];
+    for (qi, &(r0, c0)) in quads.iter().enumerate() {
+        let mut q = [0_i16; 16];
+        for i in 0..16 {
+            q[i] = qfreq[qi * 16 + i];
+        }
+        let dq = dequantize_4x4(&q, qp);
+        let rpix = idct_4x4(&dq);
+        for r in 0..4 {
+            for c in 0..4 {
+                out[r0 + r][c0 + c] = rpix[r * 4 + c];
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn encode_plane_intra(

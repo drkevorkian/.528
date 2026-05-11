@@ -7,21 +7,25 @@ use super::block_aq::{
     apply_qp_delta_clamped, choose_block_qp_delta, collect_plane_block_variances,
     validate_qp_clip_range, validate_wire_qp_delta,
 };
-use super::dct::{fdct_4x4, fdct_8x8, idct_4x4, idct_8x8, ZIGZAG, ZIGZAG_4X4};
+use super::dct::{fdct_8x8, idct_4x4, idct_8x8, ZIGZAG, ZIGZAG_4X4};
 use super::error::SrsV2Error;
 use super::frame::VideoPlane;
 use super::intra_codec::{
-    dequantize, dequantize_4x4, pick_mode, predict_block, quantize, quantize_4x4, PredMode,
+    dequantize, dequantize_4x4, idct_residual_tx4x4_from_qfreq, pick_mode, predict_block, quantize,
+    quantize_residual_tx4x4_natural, PredMode,
 };
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::rate_control::{
-    ResidualEncodeStats, ResidualEntropy, SrsV2CoeffScanMode, SrsV2EncodeSettings,
-    SrsV2ResidualContextMode, SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
+    rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2CoeffScanMode,
+    SrsV2EncodeSettings, SrsV2ResidualContextMode, SrsV2TransformDecisionMode,
+    SrsV2TransformGroupingMode,
 };
+use super::rdo::choose_grouping_rdo_fast;
 pub use super::residual_context_entropy::ResidualPlane;
 use super::residual_context_entropy::{
     decode_residual_context_v1_plane, encode_residual_context_v1_plane, ResidualContextModel,
 };
+use super::residual_token_v2;
 use super::residual_tokens::{
     detokenize_ac, rans_decode_tokens, rans_encode_tokens, residual_token_model, tokenize_ac,
     MAX_SYMBOLS_PER_BLOCK,
@@ -335,12 +339,29 @@ pub(crate) fn encode_intra_block_residual(
     above_nz: bool,
     // When true with ContextV1: only TAG_CONTEXT_RANS_AC (`FR2` rev29 / rev30 strict residual wire).
     strict_fr2_context_v1_residual_only: bool,
-    context_residual_stats: Option<&mut ResidualEncodeStats>,
+    mut context_residual_stats: Option<&mut ResidualEncodeStats>,
     out: &mut Vec<u8>,
 ) -> Result<BlockResidualCoding, SrsV2Error> {
     let use_ctx = matches!(residual_ctx_mode, SrsV2ResidualContextMode::ContextV1);
     let explicit_full = explicit_wire_len(freq);
     let rans_choice = try_rans_payload(freq, model)?;
+    if let (Some(st), Some((_, enc))) = (context_residual_stats.as_mut(), rans_choice.as_ref()) {
+        st.residual_token_v1_rans_ac_body_bytes = st
+            .residual_token_v1_rans_ac_body_bytes
+            .saturating_add(enc.len() as u64);
+        let plane_b = match plane {
+            ResidualPlane::Y => 0u8,
+            ResidualPlane::U => 1u8,
+            ResidualPlane::V => 2u8,
+        };
+        if let Ok(v2) = residual_token_v2::encode_ac_payload(freq, plane_b) {
+            st.residual_token_v2_ac_body_bytes = st
+                .residual_token_v2_ac_body_bytes
+                .saturating_add(v2.len() as u64);
+            st.residual_token_compare_block_count =
+                st.residual_token_compare_block_count.saturating_add(1);
+        }
+    }
     let context_blob: Option<Vec<u8>> = if use_ctx {
         let m = ctx_model.ok_or_else(|| {
             SrsV2Error::syntax("internal: ContextV1 residual requires ResidualContextModel")
@@ -537,13 +558,30 @@ pub(crate) fn encode_intra_block_residual_rev7(
     left_nz: bool,
     above_nz: bool,
     strict_fr2_context_v1_residual_only: bool,
-    context_residual_stats: Option<&mut ResidualEncodeStats>,
+    mut context_residual_stats: Option<&mut ResidualEncodeStats>,
     out: &mut Vec<u8>,
 ) -> Result<BlockResidualCoding, SrsV2Error> {
     validate_wire_qp_delta(qp_delta)?;
     let use_ctx = matches!(residual_ctx_mode, SrsV2ResidualContextMode::ContextV1);
     let explicit_full = explicit_wire_len_rev7(freq);
     let rans_choice = try_rans_payload(freq, model)?;
+    if let (Some(st), Some((_, enc))) = (context_residual_stats.as_mut(), rans_choice.as_ref()) {
+        st.residual_token_v1_rans_ac_body_bytes = st
+            .residual_token_v1_rans_ac_body_bytes
+            .saturating_add(enc.len() as u64);
+        let plane_b = match plane {
+            ResidualPlane::Y => 0u8,
+            ResidualPlane::U => 1u8,
+            ResidualPlane::V => 2u8,
+        };
+        if let Ok(v2) = residual_token_v2::encode_ac_payload(freq, plane_b) {
+            st.residual_token_v2_ac_body_bytes = st
+                .residual_token_v2_ac_body_bytes
+                .saturating_add(v2.len() as u64);
+            st.residual_token_compare_block_count =
+                st.residual_token_compare_block_count.saturating_add(1);
+        }
+    }
     let context_blob: Option<Vec<u8>> = if use_ctx {
         let m = ctx_model.ok_or_else(|| {
             SrsV2Error::syntax("internal: ContextV1 residual requires ResidualContextModel")
@@ -795,80 +833,47 @@ fn intra_compact_pick_transform_kind(
     settings: &SrsV2EncodeSettings,
     orig: &[[i16; 8]; 8],
     diff_flat: &[i16; 64],
+    diff_spatial: &[[i16; 8]; 8],
+    qp: i16,
 ) -> SrsV2TransformKind {
     match settings.transform_grouping_mode {
         SrsV2TransformGroupingMode::Legacy8x8 => SrsV2TransformKind::Tx8x8,
         SrsV2TransformGroupingMode::Four4x4 => SrsV2TransformKind::Tx4x4,
-        SrsV2TransformGroupingMode::AutoByResidual => {
-            match settings.transform_decision_mode {
-                SrsV2TransformDecisionMode::Legacy => SrsV2TransformKind::Tx8x8,
-                SrsV2TransformDecisionMode::ResidualAware | SrsV2TransformDecisionMode::RdoFast => {
-                    let mut sum = 0.0f64;
-                    let mut sum2 = 0.0f64;
-                    for row in orig.iter() {
-                        for &cell in row.iter() {
-                            let v = cell as f64;
-                            sum += v;
-                            sum2 += v * v;
-                        }
+        SrsV2TransformGroupingMode::AutoByResidual => match settings.transform_decision_mode {
+            SrsV2TransformDecisionMode::Legacy => SrsV2TransformKind::Tx8x8,
+            SrsV2TransformDecisionMode::ResidualAware => {
+                let mut sum = 0.0f64;
+                let mut sum2 = 0.0f64;
+                for row in orig.iter() {
+                    for &cell in row.iter() {
+                        let v = cell as f64;
+                        sum += v;
+                        sum2 += v * v;
                     }
-                    let mean = sum / 64.0;
-                    let spatial_variance = (sum2 / 64.0 - mean * mean).max(0.0);
-                    let freq = fdct_8x8(diff_flat);
-                    let hf_energy: f64 = freq.iter().skip(1).map(|c| (*c as f64).abs()).sum();
-                    let max_abs = diff_flat.iter().map(|c| c.abs()).max().unwrap_or(0);
-                    let nz = diff_flat.iter().filter(|&&c| c != 0).count();
-                    let inp = TransformDecisionInput {
-                        spatial_variance,
-                        hf_energy,
-                        max_abs_coeff: max_abs,
-                        nonzero_count: nz,
-                    };
-                    choose_transform_kind(&inp, &TransformDecisionConfig::default())
                 }
+                let mean = sum / 64.0;
+                let spatial_variance = (sum2 / 64.0 - mean * mean).max(0.0);
+                let freq = fdct_8x8(diff_flat);
+                let hf_energy: f64 = freq.iter().skip(1).map(|c| (*c as f64).abs()).sum();
+                let max_abs = diff_flat.iter().map(|c| c.abs()).max().unwrap_or(0);
+                let nz = diff_flat.iter().filter(|&&c| c != 0).count();
+                let inp = TransformDecisionInput {
+                    spatial_variance,
+                    hf_energy,
+                    max_abs_coeff: max_abs,
+                    nonzero_count: nz,
+                };
+                choose_transform_kind(&inp, &TransformDecisionConfig::default())
             }
-        }
+            SrsV2TransformDecisionMode::RdoFast => {
+                let qp_u8 = qp.clamp(1, 255) as u8;
+                let lambda_fp = rdo_lambda_effective(settings, qp_u8);
+                choose_grouping_rdo_fast(settings, diff_spatial, qp, lambda_fp)
+                    .map(|d| d.kind)
+                    .unwrap_or(SrsV2TransformKind::Tx8x8)
+            }
+        },
     }
-}
-
-fn quantize_residual_tx4x4_natural(diff: &[[i16; 8]; 8], qp: i16) -> [i16; 64] {
-    let mut qfreq = [0_i16; 64];
-    let quads = [(0usize, 0usize), (0, 4), (4, 0), (4, 4)];
-    for (qi, &(r0, c0)) in quads.iter().enumerate() {
-        let mut patch = [0_i16; 16];
-        for r in 0..4 {
-            for c in 0..4 {
-                patch[r * 4 + c] = diff[r0 + r][c0 + c];
-            }
-        }
-        let f = fdct_4x4(&patch);
-        let q = quantize_4x4(&f, qp);
-        for r in 0..4 {
-            for c in 0..4 {
-                qfreq[qi * 16 + r * 4 + c] = q[r * 4 + c];
-            }
-        }
-    }
-    qfreq
-}
-
-fn idct_residual_tx4x4_from_qfreq(qfreq: &[i16; 64], qp: i16) -> [[i16; 8]; 8] {
-    let mut out = [[0_i16; 8]; 8];
-    let quads = [(0usize, 0usize), (0, 4), (4, 0), (4, 4)];
-    for (qi, &(r0, c0)) in quads.iter().enumerate() {
-        let mut q = [0_i16; 16];
-        for i in 0..16 {
-            q[i] = qfreq[qi * 16 + i];
-        }
-        let dq = dequantize_4x4(&q, qp);
-        let rpix = idct_4x4(&dq);
-        for r in 0..4 {
-            for c in 0..4 {
-                out[r0 + r][c0 + c] = rpix[r * 4 + c];
-            }
-        }
-    }
-    out
 }
 
 /// Encode one fixed-grid **`FR2` rev33** **P** 8×8 quantized coefficient block (`transform_layout` compact).
@@ -986,7 +991,8 @@ pub fn encode_p_residual_chunk_compact_v35_wire(
             diff_flat[r * 8 + c] = spatial_residual[r][c];
         }
     }
-    let kind = intra_compact_pick_transform_kind(settings, cur_pixels, &diff_flat);
+    let kind =
+        intra_compact_pick_transform_kind(settings, cur_pixels, &diff_flat, spatial_residual, qp);
     let qfreq = match kind {
         SrsV2TransformKind::Tx8x8 => {
             let freq = fdct_8x8(&diff_flat);
@@ -1012,13 +1018,8 @@ pub fn encode_p_residual_chunk_compact_v35_wire(
             stats.intra_transform_grouping_mode = Some(settings.transform_grouping_mode);
             stats.intra_transform_decision_mode = Some(settings.transform_decision_mode);
         }
-        let legacy_est = estimate_coeff_layout_bytes(
-            &qfreq,
-            kind,
-            scan,
-            TlCoeffLayoutMode::Legacy,
-        )
-        .map_err(map_transform_layout_err)? as u64;
+        let legacy_est = estimate_coeff_layout_bytes(&qfreq, kind, scan, TlCoeffLayoutMode::Legacy)
+            .map_err(map_transform_layout_err)? as u64;
         let block_wire = 6usize.saturating_add(body.len());
         stats.coeff_legacy_estimated_bytes = stats
             .coeff_legacy_estimated_bytes
@@ -1087,9 +1088,8 @@ pub fn decode_p_residual_chunk_compact_v35(
     if end > body.len() {
         return Err(SrsV2Error::Truncated);
     }
-    let freq =
-        decode_coeff_compact_rev32_intra_block(&body[cur..end], kind, scan)
-            .map_err(map_transform_layout_err)?;
+    let freq = decode_coeff_compact_rev32_intra_block(&body[cur..end], kind, scan)
+        .map_err(map_transform_layout_err)?;
     cur = end;
     if cur != body.len() {
         return Err(SrsV2Error::syntax("FR2 rev35 P residual trailing bytes"));
@@ -1190,7 +1190,7 @@ pub(crate) fn encode_plane_intra_compact_v32(
                 }
             }
             let kind = if mixed_mb {
-                intra_compact_pick_transform_kind(settings, &orig, &blk)
+                intra_compact_pick_transform_kind(settings, &orig, &blk, &diff, qp)
             } else {
                 SrsV2TransformKind::Tx8x8
             };
@@ -1348,7 +1348,7 @@ pub(crate) fn encode_plane_intra_compact_v34(
                     blk[r * 8 + c] = diff[r][c];
                 }
             }
-            let kind = intra_compact_pick_transform_kind(settings, &orig, &blk);
+            let kind = intra_compact_pick_transform_kind(settings, &orig, &blk, &diff, qp);
 
             let qfreq = match kind {
                 SrsV2TransformKind::Tx8x8 => {
