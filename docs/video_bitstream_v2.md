@@ -71,7 +71,11 @@ This table is the **authoritative** mapping between **on-wire `FR2` byte 4** (th
 | **28** | `0x1C` | **StaticV1** or **ContextV1** MV rANS (map **v2**) | **P** (variable partition) | Same as rev **27** for map/MV-share; after optional AQ clip bytes, **`u8` entropy selector**: **0** = StaticV1 rANS, **1** = ContextV1; then **`sym_count` / `blob_len` / blob** as rev **20**/**25** | `V2RleMvShare` + `EntropyV1` + chosen `SrsV2EntropyModelMode` |
 | **29** | `0x1D` | — | **Intra** | Same top-level layout as **rev 3**; plane blocks **must** use residual tag **`TAG_CONTEXT_RANS_AC` (2)** only — decode rejects explicit tuples and static single-model rANS tags | `residual_context_mode = ContextV1` without block AQ (**rev 7** still used for ContextV1 + block `qp_delta`) |
 | **30** | `0x1E` | **ContextV1** MV rANS | **P** (fixed **16×16**) | Same header/framing as **rev 23**; non-skipped **8×8** residuals use adaptive wrapper **`1`** with inner **`TAG_CONTEXT_RANS_AC` only** | `EntropyV1` + **`ContextV1`** MV + **`residual_context_mode = ContextV1`** |
+| **33** | `0x21` | **Compact** MV / **EntropyV1** MV | **P** (fixed **16×16**) | Same compact **P** header as **rev 15** (`flags`, optional AQ clips, MV bytes or MV rANS); each non-skipped **8×8** luma sub-block: optional **`qp_delta`**, **`u32` LE** chunk length, chunk bytes with leading tag **`2`** (**`TAG_P_RESIDUAL_COMPACT_V1`**): **`pred`** (**Dc** placeholder), **`scan`**, **`u16`** len, compact bitmap + coeffs (**Tx8×8** only) | `CompactV1` + **`transform_grouping_mode == Legacy8x8`** |
+| **35** | `0x23` | **Compact** MV / **EntropyV1** MV | **P** (fixed **16×16**) | Same top-level layout as **rev 33**; non-skipped chunks use tag **`4`** (**`TAG_P_RESIDUAL_TRANSFORM_GROUP_V35`**): **`grouping`** (**`0`** Four4×4, **`1`** Single8×8), **`scan`**, **`pred`**, **`u16`** len, compact body ([`encode_p_residual_chunk_compact_v35_wire`](../../crates/libsrs_video/src/srsv2/residual_entropy.rs)) | `CompactV1` + **`transform_grouping_mode ≠ Legacy8x8`** |
 | **31** | `0x1F` | *Reserved* | **B** | **Not implemented:** `decode_yuv420_b_payload` returns **`Unsupported`** — reserved for future **B** residual ContextV1 | — |
+| **32** | `0x20` | — | **Intra** | Same header as **rev 3** (`frame_index`, `base_qp`, three length-prefixed Y/U/V planes); **`SrsV2CoeffLayoutMode::CompactV1`** with **`transform_grouping_mode == Legacy8x8`**. Per plane: layout **`1`** = all **8×8** transform; **`2`** = mixed — each **8×8** MB optionally carries transform **`0`**/**`1`** then **`pred`**, **`scan`**, **`u16`** body length, compact coefficient body (`encode_plane_intra_compact_v32`) | Default grouping stays **Legacy8x8** → encoder still emits **rev 32**, not **rev 34** |
+| **34** | `0x22` | — | **Intra** | Same top-level header as **rev 32**; emitted **only** when **`CompactV1`** and **`transform_grouping_mode ≠ Legacy8x8`**. Per plane: schema **`1`**, then each **8×8** MB: **`grouping`** (**`0`** Four4×4, **`1`** Single8×8), **`scan`**, **`pred`**, **`u16`** len, compact body (`encode_plane_intra_compact_v34`). Decode maps coefficients back to **natural** order before inverse DCT | **`Four4x4`**, **`AutoByResidual`**, etc. with **`CompactV1`** |
 
 **Policy statements (non-normative but required for project honesty):**
 
@@ -83,6 +87,58 @@ This table is the **authoritative** mapping between **on-wire `FR2` byte 4** (th
 ### Revision 29 — intra strict residual ContextV1 (`FR2\x1D`) — **opt-in**
 
 Same **`frame_index`**, **`base_qp`**, and three length-prefixed Y/U/V blobs as **rev 3**. Each **8×8** block uses prediction **mode**, **DC**, then residual tag **`TAG_CONTEXT_RANS_AC`** with the bounded multi-context rANS blob (**rev 3**-style length framing). Tags **`TAG_EXPLICIT_AC`** and **`TAG_RANS_AC`** are **malformed** for **rev 29** decoders.
+
+### Revision 32 — intra compact coefficient layout (`FR2\x20`) — **opt-in**
+
+**Magic** `FR2` + byte **`32` (`0x20`)**. Same frame header as **rev 1**/**rev 3**: **`frame_index`** (`u32` LE), **`base_qp`** (`u8`), then three **`u32` LE** plane lengths and plane bytes.
+
+**Selection:** Encoders emit **rev 32** when **`SrsV2CoeffLayoutMode::CompactV1`** is on and **`SrsV2TransformGroupingMode::Legacy8x8`** (default). If grouping is **not** legacy, the encoder uses **rev 34** instead (see below); **rev 32** remains the stable path for existing defaults.
+
+**Per plane (luma or chroma):** One-byte **plane layout tag**:
+
+- **`1`**: uniform **Single8×8** — every **8×8** MB uses one **8×8** transform; no per-MB transform prefix.
+- **`2`**: **mixed** — each **8×8** MB begins with **transform** **`0`** = four **4×4** transforms, **`1`** = single **8×8** (same numeric mapping as **rev 34** grouping).
+
+Then for each **8×8** MB in raster order:
+
+- When the plane tag is **`2`**, **`transform`** (`u8`) (**Four4×4** vs **Single8×8**).
+- **`pred`** (`u8`) — intra prediction mode for the **8×8** region.
+- **`scan`** (`u8`) — resolved coefficient scan; legal values match **rev 32**/**rev 34** compact intra (**`0`** ZigZag, **`1`** GroupedLowFirst, **`2`** RunOptimized); others are **malformed**.
+- **`body_len`** (`u16` LE) — length of the following compact coefficient blob.
+- **`body`** — sparse bitmap + scan-ordered quantized **`i16`** coefficients ([`encode_coeff_compact_rev32_intra_block`](../../crates/libsrs_video/src/srsv2/transform_layout.rs)); decoder expands to **natural** layout before **inverse** transform.
+
+### Revision 34 — intra compact layout + explicit transform grouping (`FR2\x22`) — **opt-in**
+
+**Magic** `FR2` + byte **`34` (`0x22`)**. Same **`frame_index`**, **`base_qp`**, and three length-prefixed planes as **rev 32**.
+
+**Emission rule:** **Only** when **`SrsV2CoeffLayoutMode::CompactV1`** **and** **`SrsV2TransformGroupingMode` ≠ `Legacy8x8`**. Otherwise the encoder stays on **rev 32** for backward-compatible defaults.
+
+**Per plane:** **`1`** byte **plane schema** (**`1`** = version **1**; other values rejected).
+
+For each **8×8** MB:
+
+1. **`grouping`** (`u8`): **`0`** = **Four4×4** (four **4×4** transforms), **`1`** = **Single8×8**. Any other value is **malformed** (decode fails safely).
+2. **`scan`** (`u8`) — same alphabet as **rev 32** compact intra per-MB scan.
+3. **`pred`** (`u8`) — intra prediction mode.
+4. **`body_len`** (`u16` LE), **`body`** — same compact coefficient encoding as **rev 32**.
+
+Decoders **must** decode coefficients with the declared **`grouping`** and **`scan`**, restore **natural-order** quants, then run the matching inverse transform (**8×8** IDCT or four **4×4** IDCTs). **Rev 34** is **intra** only; **P** transform grouping uses **rev 35** (below).
+
+### Revision 33 — fixed-grid **P** compact luma residuals (`FR2\x21`) — **opt-in**
+
+**Magic** `FR2` + byte **`33` (`0x21`)**. Same **`frame_index`**, **`base_qp`**, **`flags`** (subpel, block AQ, entropy residuals; **`entropy`** residual flag **must** be set), optional AQ clip bytes, compact MV grid or **`sym_count` / `blob_len` / MV blob** as **rev 15**/**17**/**23**, then per **16×16** macroblock: **`mv`**, **`skip_pattern`** (**4** bits), then for each non-skipped **8×8** luma region optional **`qp_delta`** and **`u32` LE** chunk length and chunk bytes.
+
+**Residual chunk:** first byte **`2`** (**`TAG_P_RESIDUAL_COMPACT_V1`**), then **`pred`** (`u8`), **`scan`** (`u8`), **`body_len`** (`u16` LE), **`body`** — compact coefficient encoding with **single **8×8** transform** only.
+
+**Emission:** **`SrsV2CoeffLayoutMode::CompactV1`**, **`SrsV2TransformGroupingMode::Legacy8x8`** (default), **`inter_partition_mode::Fixed16x16`**, **`inter_syntax_mode::CompactV1`** or **`EntropyV1`** with **`StaticV1`** MV entropy when compact coeffs + entropy MV path.
+
+### Revision 35 — fixed-grid **P** compact residuals + transform grouping (`FR2\x23`) — **opt-in**
+
+**Magic** `FR2` + byte **`35` (`0x23`)**. Same macroblock grid, MV syntax, skip pattern, and **`u32` LE** outer chunk framing as **rev 33**.
+
+**Residual chunk:** first byte **`4`** (**`TAG_P_RESIDUAL_TRANSFORM_GROUP_V35`**), then **`grouping`** (`u8`: **`0`** Four4×4, **`1`** Single8×8), **`scan`** (`u8`), **`pred`** (`u8`), **`body_len`** (`u16` LE), **`body`**. Malformed **`grouping`** or **`scan`** values are rejected on decode.
+
+**Emission:** Same encoder constraints as **rev 33**, except **`transform_grouping_mode` ≠ `Legacy8x8`** (e.g. **`Four4x4`** or **`AutoByResidual`** with **`ResidualAware`**/**`RdoFast`**). Default **`Legacy8x8`** keeps **rev 33** unchanged.
 
 ### Revision 30 — **P** ContextV1 MV + strict residual ContextV1 (`FR2\x1E`) — **opt-in**
 

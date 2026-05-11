@@ -16,7 +16,7 @@ use super::intra_codec::{
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::rate_control::{
     ResidualEncodeStats, ResidualEntropy, SrsV2CoeffScanMode, SrsV2EncodeSettings,
-    SrsV2ResidualContextMode, SrsV2TransformDecisionMode,
+    SrsV2ResidualContextMode, SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
 };
 pub use super::residual_context_entropy::ResidualPlane;
 use super::residual_context_entropy::{
@@ -29,6 +29,8 @@ use super::residual_tokens::{
 use super::transform_layout::{
     choose_coeff_scan, choose_transform_kind, decode_coeff_compact_rev32_intra_block,
     encode_coeff_compact_rev32_intra_block, estimate_coeff_layout_bytes,
+    fr2_rev34_grouping_wire_from_transform_kind, fr2_rev34_transform_kind_from_grouping_wire,
+    fr2_rev35_p_grouping_wire_from_transform_kind, fr2_rev35_p_transform_kind_from_grouping_wire,
     SrsV2CoeffLayoutMode as TlCoeffLayoutMode, SrsV2CoeffScan, SrsV2TransformKind,
     TransformDecisionConfig, TransformDecisionInput, TransformLayoutError,
 };
@@ -39,6 +41,8 @@ pub const TAG_RANS_AC: u8 = 1;
 pub const TAG_CONTEXT_RANS_AC: u8 = 2;
 /// **`FR2` rev33** fixed-grid **P** 8×8 residual: compact bitmap + scan-ordered `i16` values ([`encode_p_residual_chunk_compact_v33_wire`]).
 pub const TAG_P_RESIDUAL_COMPACT_V1: u8 = 2;
+/// **`FR2` rev35** fixed-grid **P** 8×8 residual: explicit transform grouping + scan + compact body ([`encode_p_residual_chunk_compact_v35_wire`]).
+pub const TAG_P_RESIDUAL_TRANSFORM_GROUP_V35: u8 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockResidualCoding {
@@ -708,6 +712,10 @@ fn map_transform_layout_err(e: TransformLayoutError) -> SrsV2Error {
                 SrsV2Error::syntax("coeff layout: bad coeff_scan tag")
             } else if field == "coeff_layout_mode" {
                 SrsV2Error::syntax("coeff layout: bad coeff_layout_mode tag")
+            } else if field == "fr2_rev34_intra_grouping" {
+                SrsV2Error::syntax("FR2 rev34 intra: bad grouping tag")
+            } else if field == "fr2_rev35_p_grouping" {
+                SrsV2Error::syntax("FR2 rev35 P: bad grouping tag")
             } else {
                 SrsV2Error::syntax("coeff layout: bad discriminant")
             }
@@ -734,7 +742,7 @@ fn rev32_intra_mb_scan_from_wire(b: u8) -> Result<SrsV2CoeffScan, SrsV2Error> {
         1 => Ok(SrsV2CoeffScan::GroupedLowFirst),
         2 => Ok(SrsV2CoeffScan::RunOptimized),
         _ => Err(SrsV2Error::syntax(
-            "FR2 rev32 intra: bad per-block coeff_scan byte",
+            "FR2 rev32/rev34 intra: bad per-block coeff_scan byte",
         )),
     }
 }
@@ -759,6 +767,9 @@ fn resolve_intra_compact_scan(
 const REV32_INTRA_PLANE_ALL_TX8: u8 = 1;
 const REV32_INTRA_PLANE_MIXED_TRANSFORM: u8 = 2;
 
+/// Plane header for **`FR2` rev34** intra transform grouping (**`1`** = explicit per-MB grouping + scan + pred + compact body).
+const REV34_INTRA_PLANE_V1: u8 = 1;
+
 fn rev32_mb_transform_from_wire(b: u8) -> Result<SrsV2TransformKind, SrsV2Error> {
     match b {
         0 => Ok(SrsV2TransformKind::Tx4x4),
@@ -770,10 +781,14 @@ fn rev32_mb_transform_from_wire(b: u8) -> Result<SrsV2TransformKind, SrsV2Error>
 }
 
 fn rev32_intra_use_mixed_mb_transform(settings: &SrsV2EncodeSettings) -> bool {
-    matches!(
-        settings.transform_decision_mode,
-        SrsV2TransformDecisionMode::Smooth8x8Detail4x4 | SrsV2TransformDecisionMode::RdoFast
-    )
+    match settings.transform_grouping_mode {
+        SrsV2TransformGroupingMode::Legacy8x8 => false,
+        SrsV2TransformGroupingMode::Four4x4 => true,
+        SrsV2TransformGroupingMode::AutoByResidual => matches!(
+            settings.transform_decision_mode,
+            SrsV2TransformDecisionMode::ResidualAware | SrsV2TransformDecisionMode::RdoFast
+        ),
+    }
 }
 
 fn intra_compact_pick_transform_kind(
@@ -781,31 +796,37 @@ fn intra_compact_pick_transform_kind(
     orig: &[[i16; 8]; 8],
     diff_flat: &[i16; 64],
 ) -> SrsV2TransformKind {
-    match settings.transform_decision_mode {
-        SrsV2TransformDecisionMode::Legacy => SrsV2TransformKind::Tx8x8,
-        SrsV2TransformDecisionMode::Smooth8x8Detail4x4 | SrsV2TransformDecisionMode::RdoFast => {
-            let mut sum = 0.0f64;
-            let mut sum2 = 0.0f64;
-            for row in orig.iter() {
-                for &cell in row.iter() {
-                    let v = cell as f64;
-                    sum += v;
-                    sum2 += v * v;
+    match settings.transform_grouping_mode {
+        SrsV2TransformGroupingMode::Legacy8x8 => SrsV2TransformKind::Tx8x8,
+        SrsV2TransformGroupingMode::Four4x4 => SrsV2TransformKind::Tx4x4,
+        SrsV2TransformGroupingMode::AutoByResidual => {
+            match settings.transform_decision_mode {
+                SrsV2TransformDecisionMode::Legacy => SrsV2TransformKind::Tx8x8,
+                SrsV2TransformDecisionMode::ResidualAware | SrsV2TransformDecisionMode::RdoFast => {
+                    let mut sum = 0.0f64;
+                    let mut sum2 = 0.0f64;
+                    for row in orig.iter() {
+                        for &cell in row.iter() {
+                            let v = cell as f64;
+                            sum += v;
+                            sum2 += v * v;
+                        }
+                    }
+                    let mean = sum / 64.0;
+                    let spatial_variance = (sum2 / 64.0 - mean * mean).max(0.0);
+                    let freq = fdct_8x8(diff_flat);
+                    let hf_energy: f64 = freq.iter().skip(1).map(|c| (*c as f64).abs()).sum();
+                    let max_abs = diff_flat.iter().map(|c| c.abs()).max().unwrap_or(0);
+                    let nz = diff_flat.iter().filter(|&&c| c != 0).count();
+                    let inp = TransformDecisionInput {
+                        spatial_variance,
+                        hf_energy,
+                        max_abs_coeff: max_abs,
+                        nonzero_count: nz,
+                    };
+                    choose_transform_kind(&inp, &TransformDecisionConfig::default())
                 }
             }
-            let mean = sum / 64.0;
-            let spatial_variance = (sum2 / 64.0 - mean * mean).max(0.0);
-            let freq = fdct_8x8(diff_flat);
-            let hf_energy: f64 = freq.iter().skip(1).map(|c| (*c as f64).abs()).sum();
-            let max_abs = diff_flat.iter().map(|c| c.abs()).max().unwrap_or(0);
-            let nz = diff_flat.iter().filter(|&&c| c != 0).count();
-            let inp = TransformDecisionInput {
-                spatial_variance,
-                hf_energy,
-                max_abs_coeff: max_abs,
-                nonzero_count: nz,
-            };
-            choose_transform_kind(&inp, &TransformDecisionConfig::default())
         }
     }
 }
@@ -887,12 +908,10 @@ pub fn encode_p_residual_chunk_compact_v33_wire(
         stats.coeff_legacy_estimated_bytes = stats
             .coeff_legacy_estimated_bytes
             .saturating_add(legacy_est);
-        stats.coeff_layout_bytes = stats
-            .coeff_layout_bytes
-            .saturating_add(block_wire as u64);
-        stats.coeff_layout_savings_bytes = stats.coeff_layout_savings_bytes.saturating_add(
-            legacy_est as i64 - block_wire as i64,
-        );
+        stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(block_wire as u64);
+        stats.coeff_layout_savings_bytes = stats
+            .coeff_layout_savings_bytes
+            .saturating_add(legacy_est as i64 - block_wire as i64);
         stats.p_compact_coeff_chunks = stats.p_compact_coeff_chunks.saturating_add(1);
         stats.p_compact_coeff_payload_bytes = stats
             .p_compact_coeff_payload_bytes
@@ -946,11 +965,165 @@ pub fn decode_p_residual_chunk_compact_v33(
     Ok((out, nz_ac))
 }
 
+/// Encode one fixed-grid **`FR2` rev35** **P** 8×8 quantized residual block with explicit **transform grouping** + **scan**.
+///
+/// Wire: [`TAG_P_RESIDUAL_TRANSFORM_GROUP_V35`] + **`grouping`** (`0` Four4×4, `1` Single8×8) + **`scan`** (`0..=2`) +
+/// [`PredMode::Dc`] placeholder + `u16` body length + [`encode_coeff_compact_rev32_intra_block`] payload.
+///
+/// Uses the same spatial **`AutoByResidual`** / **`Four4×4`** decision policy as intra compact ([`intra_compact_pick_transform_kind`]).
+///
+/// Returns the chunk bytes and **nonzero-AC** in the quantized spectrum (for luma neighbor bookkeeping).
+pub fn encode_p_residual_chunk_compact_v35_wire(
+    cur_pixels: &[[i16; 8]; 8],
+    spatial_residual: &[[i16; 8]; 8],
+    qp: i16,
+    settings: &SrsV2EncodeSettings,
+    residual_encode_stats: Option<&mut ResidualEncodeStats>,
+) -> Result<(Vec<u8>, bool), SrsV2Error> {
+    let mut diff_flat = [0_i16; 64];
+    for r in 0..8 {
+        for c in 0..8 {
+            diff_flat[r * 8 + c] = spatial_residual[r][c];
+        }
+    }
+    let kind = intra_compact_pick_transform_kind(settings, cur_pixels, &diff_flat);
+    let qfreq = match kind {
+        SrsV2TransformKind::Tx8x8 => {
+            let freq = fdct_8x8(&diff_flat);
+            quantize(&freq, qp)
+        }
+        SrsV2TransformKind::Tx4x4 => quantize_residual_tx4x4_natural(spatial_residual, qp),
+    };
+    let scan = resolve_intra_compact_scan(settings, kind, &qfreq)?;
+    let mut out = Vec::with_capacity(8 + 64 * 2);
+    out.push(TAG_P_RESIDUAL_TRANSFORM_GROUP_V35);
+    out.push(fr2_rev35_p_grouping_wire_from_transform_kind(kind));
+    out.push(rev32_intra_mb_scan_wire(scan));
+    out.push(PredMode::Dc as u8);
+    let body = encode_coeff_compact_rev32_intra_block(&qfreq, kind, scan)
+        .map_err(map_transform_layout_err)?;
+    let bl =
+        u16::try_from(body.len()).map_err(|_| SrsV2Error::syntax("FR2 rev35 P compact length"))?;
+    out.extend_from_slice(&bl.to_le_bytes());
+    out.extend_from_slice(&body);
+
+    if let Some(stats) = residual_encode_stats {
+        if stats.intra_transform_grouping_mode.is_none() {
+            stats.intra_transform_grouping_mode = Some(settings.transform_grouping_mode);
+            stats.intra_transform_decision_mode = Some(settings.transform_decision_mode);
+        }
+        let legacy_est = estimate_coeff_layout_bytes(
+            &qfreq,
+            kind,
+            scan,
+            TlCoeffLayoutMode::Legacy,
+        )
+        .map_err(map_transform_layout_err)? as u64;
+        let block_wire = 6usize.saturating_add(body.len());
+        stats.coeff_legacy_estimated_bytes = stats
+            .coeff_legacy_estimated_bytes
+            .saturating_add(legacy_est);
+        stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(block_wire as u64);
+        stats.coeff_layout_savings_bytes = stats
+            .coeff_layout_savings_bytes
+            .saturating_add(legacy_est as i64 - block_wire as i64);
+        stats.legacy_transform_estimated_bytes = stats
+            .legacy_transform_estimated_bytes
+            .saturating_add(legacy_est);
+        stats.transform_grouping_bytes = stats
+            .transform_grouping_bytes
+            .saturating_add(block_wire as u64);
+        stats.transform_grouping_savings_bytes = stats
+            .transform_grouping_savings_bytes
+            .saturating_add(legacy_est as i64 - block_wire as i64);
+        match kind {
+            SrsV2TransformKind::Tx8x8 => {
+                stats.intra_tx8x8_blocks = stats.intra_tx8x8_blocks.saturating_add(1);
+                stats.single_8x8_blocks = stats.single_8x8_blocks.saturating_add(1);
+            }
+            SrsV2TransformKind::Tx4x4 => {
+                stats.intra_tx4x4_blocks = stats.intra_tx4x4_blocks.saturating_add(1);
+                stats.four_4x4_blocks = stats.four_4x4_blocks.saturating_add(1);
+            }
+        }
+        stats.p_compact_coeff_chunks = stats.p_compact_coeff_chunks.saturating_add(1);
+        stats.p_compact_coeff_payload_bytes = stats
+            .p_compact_coeff_payload_bytes
+            .saturating_add(out.len() as u64);
+    }
+    let nz_ac = match kind {
+        SrsV2TransformKind::Tx8x8 => qfreq.iter().skip(1).any(|&v| v != 0),
+        SrsV2TransformKind::Tx4x4 => qfreq
+            .iter()
+            .enumerate()
+            .any(|(i, &v)| v != 0 && (i % 16) != 0),
+    };
+    Ok((out, nz_ac))
+}
+
+/// Decode [`encode_p_residual_chunk_compact_v35_wire`] (full chunk including layout tag).
+pub fn decode_p_residual_chunk_compact_v35(
+    chunk: &[u8],
+    qp: i16,
+) -> Result<([[i16; 8]; 8], bool), SrsV2Error> {
+    if chunk.first().copied() != Some(TAG_P_RESIDUAL_TRANSFORM_GROUP_V35) {
+        return Err(SrsV2Error::syntax(
+            "FR2 rev35 P residual requires transform-group compact layout tag",
+        ));
+    }
+    let body = &chunk[1..];
+    let mut cur = 0usize;
+    let grouping_b = read_u8(body, &mut cur)?;
+    let kind = fr2_rev35_p_transform_kind_from_grouping_wire(grouping_b)
+        .map_err(map_transform_layout_err)?;
+    let scan_b = read_u8(body, &mut cur)?;
+    let scan = rev32_intra_mb_scan_from_wire(scan_b)?;
+    let mode_b = read_u8(body, &mut cur)?;
+    PredMode::from_u8(mode_b)?;
+    let body_len = read_u16(body, &mut cur)? as usize;
+    let end = cur
+        .checked_add(body_len)
+        .ok_or(SrsV2Error::Overflow("FR2 rev35 P compact body"))?;
+    if end > body.len() {
+        return Err(SrsV2Error::Truncated);
+    }
+    let freq =
+        decode_coeff_compact_rev32_intra_block(&body[cur..end], kind, scan)
+            .map_err(map_transform_layout_err)?;
+    cur = end;
+    if cur != body.len() {
+        return Err(SrsV2Error::syntax("FR2 rev35 P residual trailing bytes"));
+    }
+    let nz_ac = match kind {
+        SrsV2TransformKind::Tx8x8 => freq.iter().skip(1).any(|&v| v != 0),
+        SrsV2TransformKind::Tx4x4 => freq
+            .iter()
+            .enumerate()
+            .any(|(i, &v)| v != 0 && (i % 16) != 0),
+    };
+    let out = match kind {
+        SrsV2TransformKind::Tx8x8 => {
+            let recon_freq = dequantize(&freq, qp);
+            let rpix = idct_8x8(&recon_freq);
+            let mut o = [[0_i16; 8]; 8];
+            for r in 0..8 {
+                for c in 0..8 {
+                    o[r][c] = rpix[r * 8 + c];
+                }
+            }
+            o
+        }
+        SrsV2TransformKind::Tx4x4 => idct_residual_tx4x4_from_qfreq(&freq, qp),
+    };
+    Ok((out, nz_ac))
+}
+
 /// Encode one luma/chroma plane for **`FR2` rev32** intra (`CompactV1` bitmap + scan-ordered coefficients).
 ///
-/// Plane header: **`1`** = uniform **Tx8×8** MBs (default [`SrsV2TransformDecisionMode::Legacy`]).
-/// **`2`** = per-MB **`transform_kind`** byte (`0` **Tx4×4**, `1` **Tx8×8**) when the transform decision mode is
-/// [`SrsV2TransformDecisionMode::Smooth8x8Detail4x4`] or [`SrsV2TransformDecisionMode::RdoFast`].
+/// Plane header: **`1`** = uniform **Tx8×8** MBs (default [`SrsV2TransformGroupingMode::Legacy8x8`]).
+/// **`2`** = per-MB **`transform_kind`** byte (`0` **Tx4×4**, `1` **Tx8×8**) when [`SrsV2EncodeSettings::transform_grouping_mode`]
+/// is [`SrsV2TransformGroupingMode::Four4x4`] or [`SrsV2TransformGroupingMode::AutoByResidual`] with
+/// [`SrsV2TransformDecisionMode::ResidualAware`] / [`SrsV2TransformDecisionMode::RdoFast`].
 /// Each **8×8** macroblock: optional transform tag + prediction mode + **resolved**
 /// scan tag + `u16` body length + [`encode_coeff_compact_rev32_intra_block`] payload.
 pub(crate) fn encode_plane_intra_compact_v32(
@@ -1108,6 +1281,168 @@ pub(crate) fn encode_plane_intra_compact_v32(
     Ok(())
 }
 
+/// Encode one luma/chroma plane for **`FR2` rev34** intra — explicit **transform grouping** + **scan** + prediction + compact coefficients ([`encode_coeff_compact_rev32_intra_block`]).
+///
+/// Plane: **`1`** byte schema **`1`**, then each **8×8** MB: **`grouping`** (`0` **Four4×4**, `1` **Single8×8**),
+/// **`scan`** (`0..=2`), **`pred`**, **`u16`** body length, compact bitmap + scan-ordered **`i16`** values (natural indices via bitmap).
+pub(crate) fn encode_plane_intra_compact_v34(
+    plane: &VideoPlane<u8>,
+    qp: i16,
+    settings: &SrsV2EncodeSettings,
+    stats: &mut ResidualEncodeStats,
+    out: &mut Vec<u8>,
+) -> Result<(), SrsV2Error> {
+    if stats.intra_coeff_layout_mode.is_none() {
+        stats.intra_coeff_layout_mode = Some(settings.coeff_layout_mode);
+        stats.intra_coeff_scan_mode = Some(settings.coeff_scan_mode);
+    }
+    if stats.intra_transform_grouping_mode.is_none() {
+        stats.intra_transform_grouping_mode = Some(settings.transform_grouping_mode);
+        stats.intra_transform_decision_mode = Some(settings.transform_decision_mode);
+    }
+
+    out.push(REV34_INTRA_PLANE_V1);
+    stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(1);
+    stats.coeff_legacy_estimated_bytes = stats.coeff_legacy_estimated_bytes.saturating_add(1);
+    stats.transform_grouping_bytes = stats.transform_grouping_bytes.saturating_add(1);
+
+    let w = plane.width as usize;
+    let h = plane.height as usize;
+    let stride = plane.stride;
+    let pw = (w + 7) & !7;
+    let ph = (h + 7) & !7;
+    let mut rec = vec![128_u8; pw.saturating_mul(ph)];
+    let bw = pw / 8;
+    let bh = ph / 8;
+    let mut prev_row_nz = vec![false; bw.max(1)];
+    for by in 0..bh {
+        let mut left_nz = false;
+        for (bx, prev_slot) in prev_row_nz.iter_mut().enumerate().take(bw) {
+            let above_nz = if by == 0 { false } else { *prev_slot };
+            let _ = (left_nz, above_nz);
+
+            let mut orig = [[0_i16; 8]; 8];
+            for (r, row) in orig.iter_mut().enumerate() {
+                for (c, cell) in row.iter_mut().enumerate() {
+                    let x = bx * 8 + c;
+                    let y = by * 8 + r;
+                    let v = if x < w && y < h {
+                        plane.samples[y * stride + x] as i16
+                    } else {
+                        128
+                    };
+                    *cell = v;
+                }
+            }
+            let mode = pick_mode(&rec, pw, pw, ph, bx, by, &orig);
+            let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
+            let mut diff = [[0_i16; 8]; 8];
+            for r in 0..8 {
+                for c in 0..8 {
+                    diff[r][c] = orig[r][c] - pred[r][c];
+                }
+            }
+            let mut blk = [0_i16; 64];
+            for r in 0..8 {
+                for c in 0..8 {
+                    blk[r * 8 + c] = diff[r][c];
+                }
+            }
+            let kind = intra_compact_pick_transform_kind(settings, &orig, &blk);
+
+            let qfreq = match kind {
+                SrsV2TransformKind::Tx8x8 => {
+                    let freq = fdct_8x8(&blk);
+                    quantize(&freq, qp)
+                }
+                SrsV2TransformKind::Tx4x4 => quantize_residual_tx4x4_natural(&diff, qp),
+            };
+
+            let scan = resolve_intra_compact_scan(settings, kind, &qfreq)?;
+            let legacy_est =
+                estimate_coeff_layout_bytes(&qfreq, kind, scan, TlCoeffLayoutMode::Legacy)
+                    .map_err(map_transform_layout_err)? as u64;
+            let body = encode_coeff_compact_rev32_intra_block(&qfreq, kind, scan)
+                .map_err(map_transform_layout_err)?;
+            let block_wire = 1usize + 1 + 1 + 2 + body.len();
+            stats.coeff_legacy_estimated_bytes = stats
+                .coeff_legacy_estimated_bytes
+                .saturating_add(legacy_est);
+            stats.coeff_layout_bytes = stats.coeff_layout_bytes.saturating_add(block_wire as u64);
+            stats.coeff_layout_savings_bytes = stats
+                .coeff_layout_savings_bytes
+                .saturating_add(legacy_est as i64 - block_wire as i64);
+            stats.legacy_transform_estimated_bytes = stats
+                .legacy_transform_estimated_bytes
+                .saturating_add(legacy_est);
+            stats.transform_grouping_bytes = stats
+                .transform_grouping_bytes
+                .saturating_add(block_wire as u64);
+            stats.transform_grouping_savings_bytes = stats
+                .transform_grouping_savings_bytes
+                .saturating_add(legacy_est as i64 - block_wire as i64);
+            match kind {
+                SrsV2TransformKind::Tx8x8 => {
+                    stats.intra_tx8x8_blocks = stats.intra_tx8x8_blocks.saturating_add(1);
+                    stats.single_8x8_blocks = stats.single_8x8_blocks.saturating_add(1);
+                }
+                SrsV2TransformKind::Tx4x4 => {
+                    stats.intra_tx4x4_blocks = stats.intra_tx4x4_blocks.saturating_add(1);
+                    stats.four_4x4_blocks = stats.four_4x4_blocks.saturating_add(1);
+                }
+            }
+
+            out.push(fr2_rev34_grouping_wire_from_transform_kind(kind));
+            out.push(rev32_intra_mb_scan_wire(scan));
+            out.push(mode as u8);
+            let bl =
+                u16::try_from(body.len()).map_err(|_| SrsV2Error::syntax("rev34 body length"))?;
+            out.extend_from_slice(&bl.to_le_bytes());
+            out.extend_from_slice(&body);
+
+            let nz_ac = match kind {
+                SrsV2TransformKind::Tx8x8 => qfreq.iter().skip(1).any(|&v| v != 0),
+                SrsV2TransformKind::Tx4x4 => qfreq
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &v)| v != 0 && (i % 16) != 0),
+            };
+            left_nz = nz_ac;
+            *prev_slot = nz_ac;
+            match kind {
+                SrsV2TransformKind::Tx8x8 => {
+                    let recon_freq = dequantize(&qfreq, qp);
+                    let rpix = idct_8x8(&recon_freq);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            let y = by * 8 + r;
+                            let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
+                            if x < pw && y < ph {
+                                rec[y * pw + x] = pv as u8;
+                            }
+                        }
+                    }
+                }
+                SrsV2TransformKind::Tx4x4 => {
+                    let residual = idct_residual_tx4x4_from_qfreq(&qfreq, qp);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            let y = by * 8 + r;
+                            let pv = (pred[r][c] as i32 + residual[r][c] as i32).clamp(0, 255);
+                            if x < pw && y < ph {
+                                rec[y * pw + x] = pv as u8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn kind_tag_wire(k: SrsV2TransformKind) -> u8 {
     match k {
         SrsV2TransformKind::Tx4x4 => 0,
@@ -1162,6 +1497,102 @@ pub(crate) fn decode_plane_intra_compact_v32(
             let end = cursor
                 .checked_add(bl)
                 .ok_or(SrsV2Error::Overflow("rev32 block body"))?;
+            if end > data.len() {
+                return Err(SrsV2Error::Truncated);
+            }
+            let body = &data[*cursor..end];
+            *cursor = end;
+            let qfreq = decode_coeff_compact_rev32_intra_block(body, kind, scan)
+                .map_err(map_transform_layout_err)?;
+            let pred = predict_block(mode, &rec, pw, pw, ph, bx, by);
+            let nz_ac = match kind {
+                SrsV2TransformKind::Tx8x8 => qfreq.iter().skip(1).any(|&v| v != 0),
+                SrsV2TransformKind::Tx4x4 => qfreq
+                    .iter()
+                    .enumerate()
+                    .any(|(i, &v)| v != 0 && (i % 16) != 0),
+            };
+            left_nz = nz_ac;
+            *prev_slot = nz_ac;
+            match kind {
+                SrsV2TransformKind::Tx8x8 => {
+                    let recon_freq = dequantize(&qfreq, qp);
+                    let rpix = idct_8x8(&recon_freq);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            let y = by * 8 + r;
+                            let pv = (pred[r][c] as i32 + rpix[r * 8 + c] as i32).clamp(0, 255);
+                            if x < pw && y < ph {
+                                rec[y * pw + x] = pv as u8;
+                            }
+                        }
+                    }
+                }
+                SrsV2TransformKind::Tx4x4 => {
+                    let residual = idct_residual_tx4x4_from_qfreq(&qfreq, qp);
+                    for r in 0..8 {
+                        for c in 0..8 {
+                            let x = bx * 8 + c;
+                            let y = by * 8 + r;
+                            let pv = (pred[r][c] as i32 + residual[r][c] as i32).clamp(0, 255);
+                            if x < pw && y < ph {
+                                rec[y * pw + x] = pv as u8;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            plane.samples[y * stride + x] = rec[y * pw + x];
+        }
+    }
+    Ok(())
+}
+
+/// Decode [`encode_plane_intra_compact_v34`] plane blob.
+pub(crate) fn decode_plane_intra_compact_v34(
+    data: &[u8],
+    cursor: &mut usize,
+    plane: &mut VideoPlane<u8>,
+    qp: i16,
+) -> Result<(), SrsV2Error> {
+    let plane_ver = read_u8(data, cursor)?;
+    if plane_ver != REV34_INTRA_PLANE_V1 {
+        return Err(SrsV2Error::syntax(
+            "FR2 rev34 intra: bad plane schema version",
+        ));
+    }
+
+    let w = plane.width as usize;
+    let h = plane.height as usize;
+    let stride = plane.stride;
+    let pw = (w + 7) & !7;
+    let ph = (h + 7) & !7;
+    let mut rec = vec![128_u8; pw.saturating_mul(ph)];
+    let bw = pw / 8;
+    let bh = ph / 8;
+    let mut prev_row_nz = vec![false; bw.max(1)];
+    for by in 0..bh {
+        let mut left_nz = false;
+        for (bx, prev_slot) in prev_row_nz.iter_mut().enumerate().take(bw) {
+            let above_nz = if by == 0 { false } else { *prev_slot };
+            let _ = (left_nz, above_nz);
+
+            let grouping_b = read_u8(data, cursor)?;
+            let kind = fr2_rev34_transform_kind_from_grouping_wire(grouping_b)
+                .map_err(map_transform_layout_err)?;
+            let scan_b = read_u8(data, cursor)?;
+            let scan = rev32_intra_mb_scan_from_wire(scan_b)?;
+            let mode_b = read_u8(data, cursor)?;
+            let mode = PredMode::from_u8(mode_b)?;
+            let bl = read_u16(data, cursor)? as usize;
+            let end = cursor
+                .checked_add(bl)
+                .ok_or(SrsV2Error::Overflow("rev34 block body"))?;
             if end > data.len() {
                 return Err(SrsV2Error::Truncated);
             }
@@ -1820,6 +2251,10 @@ pub fn decode_p_residual_chunk_with_neighbors(
         let (spatial, _) = decode_p_residual_chunk_compact_v33(chunk, qp)?;
         return Ok(spatial);
     }
+    if layout == TAG_P_RESIDUAL_TRANSFORM_GROUP_V35 {
+        let (spatial, _) = decode_p_residual_chunk_compact_v35(chunk, qp)?;
+        return Ok(spatial);
+    }
     let body = &chunk[1..];
     let mut cur = 0usize;
     let ctx_model = ResidualContextModel::new();
@@ -1925,7 +2360,7 @@ mod residual_entropy_tests {
     use crate::srsv2::intra_codec::{decode_plane_intra, encode_plane_intra, PredMode};
     use crate::srsv2::rate_control::{
         ResidualEncodeStats, SrsV2CoeffLayoutMode, SrsV2CoeffScanMode, SrsV2EncodeSettings,
-        SrsV2ResidualContextMode,
+        SrsV2ResidualContextMode, SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
     };
 
     fn sparse_one_ac_qfreq() -> [i16; 64] {
@@ -1957,6 +2392,81 @@ mod residual_entropy_tests {
         let (az, _) = decode_p_residual_chunk_compact_v33(&wz, qp).unwrap();
         let (ag, _) = decode_p_residual_chunk_compact_v33(&wg, qp).unwrap();
         assert_eq!(az, ag);
+    }
+
+    #[test]
+    fn p_residual_compact_rev35_wire_roundtrip() {
+        let mut cur = [[118_i16; 8]; 8];
+        cur[3][4] = 200;
+        let mut spatial = [[0_i16; 8]; 8];
+        spatial[3][4] = 200_i16.saturating_sub(118);
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            ..Default::default()
+        };
+        let qp = 24_i16;
+        let (wire, nz0) =
+            encode_p_residual_chunk_compact_v35_wire(&cur, &spatial, qp, &st, None).unwrap();
+        assert_eq!(wire[0], TAG_P_RESIDUAL_TRANSFORM_GROUP_V35);
+        let (dec1, nz1) = decode_p_residual_chunk_compact_v35(&wire, qp).unwrap();
+        let (dec2, nz2) = decode_p_residual_chunk_compact_v35(&wire, qp).unwrap();
+        assert_eq!(nz0, nz1);
+        assert_eq!(nz1, nz2);
+        assert_eq!(dec1, dec2);
+    }
+
+    #[test]
+    fn p_residual_compact_rev35_malformed_grouping_fails() {
+        let cur = [[128_i16; 8]; 8];
+        let mut spatial = [[0_i16; 8]; 8];
+        spatial[2][2] = 33;
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::AutoByResidual,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            ..Default::default()
+        };
+        let (mut wire, _) =
+            encode_p_residual_chunk_compact_v35_wire(&cur, &spatial, 22, &st, None).unwrap();
+        wire[1] = 99;
+        assert!(decode_p_residual_chunk_compact_v35(&wire, 22).is_err());
+    }
+
+    #[test]
+    fn p_residual_compact_rev35_malformed_scan_fails() {
+        let cur = [[128_i16; 8]; 8];
+        let mut spatial = [[0_i16; 8]; 8];
+        spatial[2][2] = 44;
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            ..Default::default()
+        };
+        let (mut wire, _) =
+            encode_p_residual_chunk_compact_v35_wire(&cur, &spatial, 22, &st, None).unwrap();
+        wire[2] = 99;
+        assert!(decode_p_residual_chunk_compact_v35(&wire, 22).is_err());
+    }
+
+    #[test]
+    fn p_residual_compact_rev35_wrong_chunk_layout_tag_fails() {
+        let cur = [[128_i16; 8]; 8];
+        let mut spatial = [[0_i16; 8]; 8];
+        spatial[1][1] = 40;
+        let st = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            ..Default::default()
+        };
+        let (mut wire, _) =
+            encode_p_residual_chunk_compact_v35_wire(&cur, &spatial, 20, &st, None).unwrap();
+        wire[0] = TAG_P_RESIDUAL_COMPACT_V1;
+        assert!(decode_p_residual_chunk_compact_v35(&wire, 20).is_err());
     }
 
     /// Dense AC=1 blocks blow up explicit tuples (63×3-byte pairs); static rANS usually wins.

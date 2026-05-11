@@ -1,8 +1,8 @@
 //! Experimental **`FR2` rev 19 / 20 / 25 / 27 / 28** — P-frame variable inter partitions + transform tagging
 //! (`FR2` rev **19** compact MV, **20**/**25** entropy MV, **27** compact map v2, **28** entropy map v2 + explicit MV entropy byte).
 //!
-//! **`FR2` rev **33** (P luma [`SrsV2CoeffLayoutMode::CompactV1`](crate::srsv2::rate_control::SrsV2CoeffLayoutMode): [`crate::srsv2::transform_layout`] compact bitmap + scan before entropy) is only emitted from the fixed **16×16** grid path in [`crate::srsv2::p_frame_codec`] — not here.
-//! Bench harnesses such as **`bench_srsv2 --compare-coeff-layouts`** use **`inter_partition_mode` Fixed16×16** so **`moving_square`** and similar clips exercise rev33 on **P** frames without this module.
+//! **`FR2` rev **33** / **35** (P luma [`SrsV2CoeffLayoutMode::CompactV1`](crate::srsv2::rate_control::SrsV2CoeffLayoutMode): compact coefficients; **35** adds per-chunk transform grouping when grouping mode is not **Legacy8×8**) are only emitted from the fixed **16×16** grid path in [`crate::srsv2::p_frame_codec`] — not here.
+//! Bench harnesses such as **`bench_srsv2 --compare-coeff-layouts`** use **`inter_partition_mode` Fixed16×16** so **`moving_square`** and similar clips exercise rev33/rev35 on **P** frames without this module.
 //!
 //! **`FR2` rev 21 / 22** (**B**) are reserved; see [`crate::srsv2::b_frame_codec`].
 

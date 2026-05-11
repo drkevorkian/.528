@@ -9,6 +9,12 @@
 //! - **Natural order** depends on [`SrsV2TransformKind`] (8×8 raster vs four 4×4 quadrants).
 //! - **Scan order** permutes coefficients for analysis or future serialization.
 //! - [`SrsV2CoeffLayoutMode::CompactV1`] is an experimental `S2TL` container for sizing / tooling.
+//!
+//! ## Transform grouping (spatial residual → transform choice)
+//! - [`SrsV2TransformGrouping`] selects **single 8×8**, **four 4×4**, or **auto** from **spatial**
+//!   residual samples only (Laplacian / quadrant-variance proxies — **no DCT** in this module).
+//! - Quantized spectral coefficients, once produced elsewhere, pair with [`choose_transform_and_scan`]
+//!   and [`estimate_transform_grouping_bytes`] for scan + sizing telemetry.
 
 use super::dct::{ZIGZAG, ZIGZAG_4X4};
 
@@ -108,6 +114,104 @@ impl Default for TransformDecisionConfig {
             variance_select_tx4x4: 400.0,
             hf_energy_select_tx4x4: 5_000.0,
         }
+    }
+}
+
+/// Policy for one **8×8** luma residual region: single spectral shape vs four quadrants (no DCT here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SrsV2TransformGrouping {
+    /// Force [`SrsV2TransformKind::Tx8x8`] coefficient layout.
+    Single8x8,
+    /// Force [`SrsV2TransformKind::Tx4x4`] quadrant coefficient layout.
+    Four4x4,
+    /// Resolve [`SrsV2TransformKind`] from spatial residual proxies ([`spatial_residual_to_transform_input`]).
+    AutoByResidual,
+}
+
+/// Spatial-domain residual shape bucket (telemetry / thresholds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ResidualBlockClass {
+    Zero,
+    DcOnly,
+    Sparse,
+    Dense,
+}
+
+/// Per-block or aggregated byte-estimate accounting for transform grouping experiments.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TransformGroupingStats {
+    pub single_8x8_blocks: u64,
+    pub four_4x4_blocks: u64,
+    pub zero_blocks: u64,
+    pub dc_only_blocks: u64,
+    pub sparse_blocks: u64,
+    pub dense_blocks: u64,
+    pub estimated_legacy_bytes: u64,
+    pub estimated_grouped_bytes: u64,
+    pub estimated_savings_bytes: i64,
+    pub estimated_savings_percent: f64,
+}
+
+/// Legacy-model byte estimates for the **same** natural `64` coefficients under **Tx8×8** vs **Tx4×4** layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SingleVsFourByteEstimate {
+    pub bytes_single_8x8: usize,
+    pub bytes_four_4x4: usize,
+    /// [`SrsV2TransformGrouping::Single8x8`] or [`SrsV2TransformGrouping::Four4x4`] only; ties prefer **Single8x8**.
+    pub prefers: SrsV2TransformGrouping,
+}
+
+impl TransformGroupingStats {
+    /// Recompute [`Self::estimated_savings_percent`] from accumulated byte totals.
+    pub fn finalize_estimated_savings_percent(&mut self) {
+        self.estimated_savings_percent = if self.estimated_legacy_bytes > 0 {
+            100.0 * self.estimated_savings_bytes as f64 / self.estimated_legacy_bytes as f64
+        } else {
+            0.0
+        };
+    }
+}
+
+/// **`FR2` rev34** intra per-MB grouping tag: four **4×4** transforms ([`SrsV2TransformKind::Tx4x4`] layout).
+pub const FR2_REV34_INTRA_GROUPING_FOUR4X4: u8 = 0;
+/// **`FR2` rev34** intra per-MB grouping tag: single **8×8** transform ([`SrsV2TransformKind::Tx8x8`] layout).
+pub const FR2_REV34_INTRA_GROUPING_SINGLE8X8: u8 = 1;
+
+#[inline]
+pub fn fr2_rev34_grouping_wire_from_transform_kind(kind: SrsV2TransformKind) -> u8 {
+    match kind {
+        SrsV2TransformKind::Tx4x4 => FR2_REV34_INTRA_GROUPING_FOUR4X4,
+        SrsV2TransformKind::Tx8x8 => FR2_REV34_INTRA_GROUPING_SINGLE8X8,
+    }
+}
+
+/// Decode rev34 grouping tag → [`SrsV2TransformKind`] (same numeric mapping as rev32 mixed transform byte).
+pub fn fr2_rev34_transform_kind_from_grouping_wire(b: u8) -> Result<SrsV2TransformKind, TransformLayoutError> {
+    match b {
+        FR2_REV34_INTRA_GROUPING_FOUR4X4 => Ok(SrsV2TransformKind::Tx4x4),
+        FR2_REV34_INTRA_GROUPING_SINGLE8X8 => Ok(SrsV2TransformKind::Tx8x8),
+        _ => Err(TransformLayoutError::InvalidDiscriminant(
+            "fr2_rev34_intra_grouping",
+            b,
+        )),
+    }
+}
+
+/// Wire grouping byte for **`FR2` rev35** **P** residuals — same values as [`fr2_rev34_grouping_wire_from_transform_kind`].
+#[inline]
+pub fn fr2_rev35_p_grouping_wire_from_transform_kind(kind: SrsV2TransformKind) -> u8 {
+    fr2_rev34_grouping_wire_from_transform_kind(kind)
+}
+
+/// Decode rev35 **P** grouping tag → [`SrsV2TransformKind`] (distinct error field from intra rev34 for clearer diagnostics).
+pub fn fr2_rev35_p_transform_kind_from_grouping_wire(b: u8) -> Result<SrsV2TransformKind, TransformLayoutError> {
+    match b {
+        FR2_REV34_INTRA_GROUPING_FOUR4X4 => Ok(SrsV2TransformKind::Tx4x4),
+        FR2_REV34_INTRA_GROUPING_SINGLE8X8 => Ok(SrsV2TransformKind::Tx8x8),
+        _ => Err(TransformLayoutError::InvalidDiscriminant(
+            "fr2_rev35_p_grouping",
+            b,
+        )),
     }
 }
 
@@ -310,6 +414,245 @@ pub fn choose_coeff_scan(
     } else {
         Ok(SrsV2CoeffScan::ZigZag)
     }
+}
+
+// --- Spatial residual proxies (no DCT) and transform-grouping API -------------------------------
+
+const SPATIAL_SPARSE_NZ_MAX: usize = 10;
+const SPATIAL_SPARSE_VAR_MAX: f64 = 120.0;
+const QUADRANT_HF_SCALE: f64 = 64.0;
+
+fn spatial_variance_8x8(block: &[[i16; 8]; 8]) -> f64 {
+    let mut sum = 0.0f64;
+    let mut sum2 = 0.0f64;
+    for row in block.iter() {
+        for &cell in row.iter() {
+            let x = cell as f64;
+            sum += x;
+            sum2 += x * x;
+        }
+    }
+    let n = 64.0;
+    let mean = sum / n;
+    (sum2 / n - mean * mean).max(0.0)
+}
+
+fn spatial_laplacian_energy(block: &[[i16; 8]; 8]) -> f64 {
+    let mut acc = 0.0f64;
+    for r in 0..8 {
+        for c in 0..8 {
+            let v = block[r][c] as f64;
+            let mut edge = 0.0f64;
+            let mut k = 0u32;
+            if r > 0 {
+                edge += (v - block[r - 1][c] as f64).abs();
+                k += 1;
+            }
+            if r < 7 {
+                edge += (v - block[r + 1][c] as f64).abs();
+                k += 1;
+            }
+            if c > 0 {
+                edge += (v - block[r][c - 1] as f64).abs();
+                k += 1;
+            }
+            if c < 7 {
+                edge += (v - block[r][c + 1] as f64).abs();
+                k += 1;
+            }
+            if k > 0 {
+                acc += edge / k as f64;
+            }
+        }
+    }
+    acc
+}
+
+fn max_quadrant_variance(block: &[[i16; 8]; 8]) -> f64 {
+    let mut maxv = 0.0f64;
+    for q in 0..4 {
+        let r0 = (q / 2) * 4;
+        let c0 = (q % 2) * 4;
+        let mut sum = 0.0f64;
+        let mut sum2 = 0.0f64;
+        for dr in 0..4 {
+            for dc in 0..4 {
+                let x = block[r0 + dr][c0 + dc] as f64;
+                sum += x;
+                sum2 += x * x;
+            }
+        }
+        let n = 16.0f64;
+        let mean = sum / n;
+        let var = (sum2 / n - mean * mean).max(0.0);
+        maxv = maxv.max(var);
+    }
+    maxv
+}
+
+/// Build [`TransformDecisionInput`] from an **8×8** spatial residual (integer samples).
+///
+/// HF proxy blends Laplacian edge energy with **`max quadrant variance × scale`** so localized
+/// detail can steer toward [`SrsV2TransformKind::Tx4x4`] without running a transform in-module.
+pub fn spatial_residual_to_transform_input(block: &[[i16; 8]; 8]) -> TransformDecisionInput {
+    let spatial_variance = spatial_variance_8x8(block);
+    let lap = spatial_laplacian_energy(block);
+    let qmax = max_quadrant_variance(block);
+    let hf_energy = lap.max(qmax * QUADRANT_HF_SCALE);
+    let mut max_abs = 0_i16;
+    let mut nonzero_count = 0usize;
+    for row in block.iter() {
+        for &v in row.iter() {
+            max_abs = max_abs.max(v.abs());
+            if v != 0 {
+                nonzero_count += 1;
+            }
+        }
+    }
+    TransformDecisionInput {
+        spatial_variance,
+        hf_energy,
+        max_abs_coeff: max_abs,
+        nonzero_count,
+    }
+}
+
+/// Classify spatial residual shape (deterministic thresholds).
+pub fn classify_residual_block(spatial: &[[i16; 8]; 8]) -> ResidualBlockClass {
+    let nz = spatial.iter().flatten().filter(|&&v| v != 0).count();
+    if nz == 0 {
+        return ResidualBlockClass::Zero;
+    }
+    let v0 = spatial[0][0];
+    let constant = spatial
+        .iter()
+        .all(|row| row.iter().all(|&v| v == v0));
+    if constant {
+        return ResidualBlockClass::DcOnly;
+    }
+    let var = spatial_variance_8x8(spatial);
+    if nz <= SPATIAL_SPARSE_NZ_MAX && var < SPATIAL_SPARSE_VAR_MAX {
+        ResidualBlockClass::Sparse
+    } else {
+        ResidualBlockClass::Dense
+    }
+}
+
+/// Resolve [`SrsV2TransformKind`] from grouping policy and spatial residual (no coefficients required).
+pub fn choose_transform_grouping(
+    grouping: SrsV2TransformGrouping,
+    spatial: &[[i16; 8]; 8],
+    cfg: &TransformDecisionConfig,
+) -> SrsV2TransformKind {
+    match grouping {
+        SrsV2TransformGrouping::Single8x8 => SrsV2TransformKind::Tx8x8,
+        SrsV2TransformGrouping::Four4x4 => SrsV2TransformKind::Tx4x4,
+        SrsV2TransformGrouping::AutoByResidual => {
+            let inp = spatial_residual_to_transform_input(spatial);
+            choose_transform_kind(&inp, cfg)
+        }
+    }
+}
+
+/// Resolve [`TransformDecision`] using spatial grouping policy + **caller-supplied natural coefficients**
+/// for the resolved transform kind (must match encoder-side quantization layout).
+pub fn choose_transform_and_scan(
+    grouping: SrsV2TransformGrouping,
+    spatial: &[[i16; 8]; 8],
+    coeffs_natural: &[i16],
+    cfg: &TransformDecisionConfig,
+) -> Result<TransformDecision, TransformLayoutError> {
+    let kind = choose_transform_grouping(grouping, spatial, cfg);
+    expect_coeff_len(coeffs_natural, kind)?;
+    let scan = choose_coeff_scan(kind, coeffs_natural)?;
+    Ok(TransformDecision { kind, scan })
+}
+
+/// Byte estimates for one block: [`SrsV2CoeffLayoutMode::Legacy`] vs [`SrsV2CoeffLayoutMode::CompactV1`]
+/// (“grouped” sparse packaging), plus population counters for [`classify_residual_block`] / transform kind.
+pub fn estimate_transform_grouping_bytes(
+    spatial: &[[i16; 8]; 8],
+    coeffs_natural: &[i16],
+    kind: SrsV2TransformKind,
+    scan: SrsV2CoeffScan,
+) -> Result<TransformGroupingStats, TransformLayoutError> {
+    expect_coeff_len(coeffs_natural, kind)?;
+    let leg = estimate_coeff_layout_bytes(
+        coeffs_natural,
+        kind,
+        scan,
+        SrsV2CoeffLayoutMode::Legacy,
+    )? as u64;
+    let grp = estimate_coeff_layout_bytes(
+        coeffs_natural,
+        kind,
+        scan,
+        SrsV2CoeffLayoutMode::CompactV1,
+    )? as u64;
+    let savings = leg as i64 - grp as i64;
+    let pct = if leg > 0 {
+        100.0 * savings as f64 / leg as f64
+    } else {
+        0.0
+    };
+    let mut stats = TransformGroupingStats {
+        estimated_legacy_bytes: leg,
+        estimated_grouped_bytes: grp,
+        estimated_savings_bytes: savings,
+        estimated_savings_percent: pct,
+        ..Default::default()
+    };
+    match classify_residual_block(spatial) {
+        ResidualBlockClass::Zero => stats.zero_blocks = 1,
+        ResidualBlockClass::DcOnly => stats.dc_only_blocks = 1,
+        ResidualBlockClass::Sparse => stats.sparse_blocks = 1,
+        ResidualBlockClass::Dense => stats.dense_blocks = 1,
+    }
+    match kind {
+        SrsV2TransformKind::Tx8x8 => stats.single_8x8_blocks = 1,
+        SrsV2TransformKind::Tx4x4 => stats.four_4x4_blocks = 1,
+    }
+    Ok(stats)
+}
+
+/// Compare heuristic byte footprint for **Tx8×8** vs **Tx4×4** interpretations of the same natural `64` coeffs.
+pub fn compare_single8x8_vs_four4x4(
+    coeffs_natural: &[i16],
+    scan: SrsV2CoeffScan,
+    mode: SrsV2CoeffLayoutMode,
+) -> Result<SingleVsFourByteEstimate, TransformLayoutError> {
+    expect_coeff_len(coeffs_natural, SrsV2TransformKind::Tx8x8)?;
+    let bytes_single_8x8 =
+        estimate_coeff_layout_bytes(coeffs_natural, SrsV2TransformKind::Tx8x8, scan, mode)?;
+    let bytes_four_4x4 =
+        estimate_coeff_layout_bytes(coeffs_natural, SrsV2TransformKind::Tx4x4, scan, mode)?;
+    let prefers = if bytes_four_4x4 < bytes_single_8x8 {
+        SrsV2TransformGrouping::Four4x4
+    } else {
+        SrsV2TransformGrouping::Single8x8
+    };
+    Ok(SingleVsFourByteEstimate {
+        bytes_single_8x8,
+        bytes_four_4x4,
+        prefers,
+    })
+}
+
+/// Single-line summary for logs / benches.
+pub fn transform_grouping_summary(stats: &TransformGroupingStats) -> String {
+    format!(
+        "single8x8={} four4x4={} zero={} dc_only={} sparse={} dense={} legacy_B={} grouped_B={} savings_B={} savings_pct={:.2}",
+        stats.single_8x8_blocks,
+        stats.four_4x4_blocks,
+        stats.zero_blocks,
+        stats.dc_only_blocks,
+        stats.sparse_blocks,
+        stats.dense_blocks,
+        stats.estimated_legacy_bytes,
+        stats.estimated_grouped_bytes,
+        stats.estimated_savings_bytes,
+        stats.estimated_savings_percent
+    )
 }
 
 /// Map natural-order coefficients to scan order (`out[s] = coeffs[perm[s]]`).
@@ -992,5 +1335,218 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, c);
+    }
+
+    fn spatial_flat_from_raster(raster: &[i16; 64]) -> [[i16; 8]; 8] {
+        let mut b = [[0_i16; 8]; 8];
+        for i in 0..64 {
+            b[i / 8][i % 8] = raster[i];
+        }
+        b
+    }
+
+    fn spatial_smooth_uniform() -> [[i16; 8]; 8] {
+        [[3_i16; 8]; 8]
+    }
+
+    /// Localized checkerboard in quadrant 0 only → high quadrant variance × scale drives Tx4×4.
+    fn spatial_localized_high_detail() -> [[i16; 8]; 8] {
+        let mut b = [[0_i16; 8]; 8];
+        for r in 0..4 {
+            for c in 0..4 {
+                b[r][c] = if (r + c) % 2 == 0 { 40 } else { -40 };
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn transform_grouping_auto_smooth_chooses_single8x8() {
+        let cfg = TransformDecisionConfig::default();
+        let spatial = spatial_smooth_uniform();
+        assert_eq!(
+            choose_transform_grouping(SrsV2TransformGrouping::AutoByResidual, &spatial, &cfg),
+            SrsV2TransformKind::Tx8x8
+        );
+    }
+
+    #[test]
+    fn transform_grouping_auto_localized_detail_chooses_four4x4() {
+        let cfg = TransformDecisionConfig::default();
+        let spatial = spatial_localized_high_detail();
+        assert_eq!(
+            choose_transform_grouping(SrsV2TransformGrouping::AutoByResidual, &spatial, &cfg),
+            SrsV2TransformKind::Tx4x4
+        );
+    }
+
+    #[test]
+    fn transform_grouping_decision_deterministic() {
+        let cfg = TransformDecisionConfig::default();
+        let spatial = spatial_localized_high_detail();
+        let a = choose_transform_grouping(SrsV2TransformGrouping::AutoByResidual, &spatial, &cfg);
+        let b = choose_transform_grouping(SrsV2TransformGrouping::AutoByResidual, &spatial, &cfg);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn estimate_grouping_all_zero_tiny() {
+        let spatial = [[0_i16; 8]; 8];
+        let coeffs = [0_i16; 64];
+        let st = estimate_transform_grouping_bytes(
+            &spatial,
+            &coeffs,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::ZigZag,
+        )
+        .unwrap();
+        assert_eq!(st.zero_blocks, 1);
+        assert!(st.estimated_legacy_bytes <= 32);
+        assert!(st.estimated_grouped_bytes <= 32);
+    }
+
+    #[test]
+    fn estimate_grouping_dc_only_tiny() {
+        let spatial = [[11_i16; 8]; 8];
+        assert_eq!(classify_residual_block(&spatial), ResidualBlockClass::DcOnly);
+        let mut coeffs = [0_i16; 64];
+        coeffs[0] = -77;
+        let st = estimate_transform_grouping_bytes(
+            &spatial,
+            &coeffs,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::ZigZag,
+        )
+        .unwrap();
+        assert_eq!(st.dc_only_blocks, 1);
+        assert!(st.estimated_legacy_bytes < 200);
+        assert!(st.estimated_grouped_bytes < 40);
+    }
+
+    #[test]
+    fn estimate_grouping_sparse_improves_or_ties_legacy() {
+        let mut raster = [0_i16; 64];
+        raster[0] = 1;
+        raster[10] = 2;
+        raster[20] = -1;
+        let spatial = spatial_flat_from_raster(&raster);
+        assert_eq!(classify_residual_block(&spatial), ResidualBlockClass::Sparse);
+        let mut coeffs = [0_i16; 64];
+        coeffs[0] = 10;
+        for &zi in ZIGZAG.iter().skip(3).take(5) {
+            coeffs[zi] = ((zi as i16) % 9) - 4;
+        }
+        let st = estimate_transform_grouping_bytes(
+            &spatial,
+            &coeffs,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::ZigZag,
+        )
+        .unwrap();
+        assert_eq!(st.sparse_blocks, 1);
+        assert!(st.estimated_grouped_bytes <= st.estimated_legacy_bytes);
+    }
+
+    #[test]
+    fn estimate_grouping_dense_noisy_safe_even_if_larger() {
+        let mut raster = [0_i16; 64];
+        for (i, slot) in raster.iter_mut().enumerate() {
+            let x = (i as i64).wrapping_mul(1103515245).wrapping_add(12345);
+            *slot = (x.rem_euclid(2001) - 1000) as i16;
+        }
+        let spatial = spatial_flat_from_raster(&raster);
+        assert_eq!(classify_residual_block(&spatial), ResidualBlockClass::Dense);
+        let coeffs = raster;
+        let st = estimate_transform_grouping_bytes(
+            &spatial,
+            &coeffs,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::ZigZag,
+        )
+        .unwrap();
+        assert_eq!(st.dense_blocks, 1);
+        let _ = transform_grouping_summary(&st);
+        // Grouped may cost more than legacy on dense blocks; must still return finite estimates.
+        assert!(st.estimated_legacy_bytes > 0);
+        assert!(st.estimated_grouped_bytes > 0);
+    }
+
+    #[test]
+    fn choose_transform_and_scan_wires_grouping_and_scan() {
+        let cfg = TransformDecisionConfig::default();
+        let spatial = spatial_smooth_uniform();
+        let coeffs = [0_i16; 64];
+        let d = choose_transform_and_scan(
+            SrsV2TransformGrouping::AutoByResidual,
+            &spatial,
+            &coeffs,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(d.kind, SrsV2TransformKind::Tx8x8);
+        assert_eq!(d.scan, SrsV2CoeffScan::RunOptimized);
+    }
+
+    #[test]
+    fn compare_single_vs_four_tie_prefers_single8x8() {
+        let z = [0_i16; 64];
+        let est = compare_single8x8_vs_four4x4(
+            &z,
+            SrsV2CoeffScan::ZigZag,
+            SrsV2CoeffLayoutMode::Legacy,
+        )
+        .unwrap();
+        assert_eq!(est.bytes_single_8x8, est.bytes_four_4x4);
+        assert_eq!(est.prefers, SrsV2TransformGrouping::Single8x8);
+    }
+
+    #[test]
+    fn transform_grouping_summary_non_empty() {
+        let spatial = [[0_i16; 8]; 8];
+        let coeffs = [0_i16; 64];
+        let st = estimate_transform_grouping_bytes(
+            &spatial,
+            &coeffs,
+            SrsV2TransformKind::Tx8x8,
+            SrsV2CoeffScan::ZigZag,
+        )
+        .unwrap();
+        let s = transform_grouping_summary(&st);
+        assert!(s.contains("single8x8="));
+        assert!(s.contains("savings_pct="));
+    }
+
+    #[test]
+    fn fr2_rev34_grouping_wire_roundtrips_transform_kind() {
+        assert_eq!(
+            fr2_rev34_grouping_wire_from_transform_kind(SrsV2TransformKind::Tx4x4),
+            FR2_REV34_INTRA_GROUPING_FOUR4X4
+        );
+        assert_eq!(
+            fr2_rev34_grouping_wire_from_transform_kind(SrsV2TransformKind::Tx8x8),
+            FR2_REV34_INTRA_GROUPING_SINGLE8X8
+        );
+        assert_eq!(
+            fr2_rev34_transform_kind_from_grouping_wire(FR2_REV34_INTRA_GROUPING_FOUR4X4).unwrap(),
+            SrsV2TransformKind::Tx4x4
+        );
+        assert_eq!(
+            fr2_rev34_transform_kind_from_grouping_wire(FR2_REV34_INTRA_GROUPING_SINGLE8X8).unwrap(),
+            SrsV2TransformKind::Tx8x8
+        );
+        assert!(fr2_rev34_transform_kind_from_grouping_wire(2).is_err());
+    }
+
+    #[test]
+    fn fr2_rev35_p_grouping_wire_matches_rev34_numeric_mapping() {
+        assert_eq!(
+            fr2_rev35_p_grouping_wire_from_transform_kind(SrsV2TransformKind::Tx4x4),
+            FR2_REV34_INTRA_GROUPING_FOUR4X4
+        );
+        assert_eq!(
+            fr2_rev35_p_transform_kind_from_grouping_wire(FR2_REV34_INTRA_GROUPING_SINGLE8X8).unwrap(),
+            SrsV2TransformKind::Tx8x8
+        );
+        assert!(fr2_rev35_p_transform_kind_from_grouping_wire(7).is_err());
     }
 }

@@ -10,7 +10,7 @@ use super::limits::{
 ///
 /// **Intra** uses **`FR2` rev29** when combined with adaptive residual entropy. **P** uses **`FR2` rev30** for strict
 /// residual ContextV1 under [`SrsV2EncodeSettings::validate_residual_context_inter_residual`]; fixed-grid **P** with
-/// [`SrsV2CoeffLayoutMode::CompactV1`] (no residual ContextV1) emits **`FR2` rev33**. **B** encode rejects ContextV1 until **rev31**
+/// [`SrsV2CoeffLayoutMode::CompactV1`] (no residual ContextV1) emits **`FR2` rev33** when **[`SrsV2TransformGroupingMode::Legacy8x8`]**, else **`FR2` rev35** for fixed-grid **P**. **B** encode rejects ContextV1 until **rev31**
 /// ([`SrsV2EncodeSettings::validate_residual_context_b_frame`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SrsV2ResidualContextMode {
@@ -46,7 +46,7 @@ pub struct ResidualEncodeStats {
     pub intra_tx4x4_blocks: u64,
     pub intra_tx8x8_blocks: u64,
     /// Sum of per-block compact coefficient payloads + headers: rev32 intra (`pred` + resolved `scan` + `u16` len + body),
-    /// plus rev33 fixed-grid **P** luma chunks (**`5`** bytes before body: layout tag + pred + scan + `u16` len).
+    /// plus rev33/rev35 fixed-grid **P** luma chunks (**`5`** bytes before body for rev33: tag + pred + scan + `u16` len; **`6`** before body for rev35: tag + grouping + scan + pred + `u16` len).
     pub coeff_layout_bytes: u64,
     /// Sum of [`crate::srsv2::transform_layout::estimate_coeff_layout_bytes`] (**Legacy**) per compact block/chunk,
     /// plus rev32 **`1` byte per plane** header (and per-MB transform tag when mixed).
@@ -57,7 +57,7 @@ pub struct ResidualEncodeStats {
     pub coeff_layout_savings_percent: f64,
     pub p_explicit_chunks: u64,
     pub p_rans_chunks: u64,
-    /// **`FR2` rev33** P luma 8×8 chunks using [`super::residual_entropy::TAG_P_RESIDUAL_COMPACT_V1`] (compact bitmap + scan-ordered coeffs).
+    /// **`FR2` rev33**/**rev35** P luma 8×8 chunks using [`super::residual_entropy::TAG_P_RESIDUAL_COMPACT_V1`] or [`super::residual_entropy::TAG_P_RESIDUAL_TRANSFORM_GROUP_V35`] (compact bitmap + scan-ordered coeffs).
     pub p_compact_coeff_chunks: u64,
     /// Sum of on-wire bytes for [`Self::p_compact_coeff_chunks`] (chunk payload only, excluding outer `u32` length).
     pub p_compact_coeff_payload_bytes: u64,
@@ -76,6 +76,23 @@ pub struct ResidualEncodeStats {
     pub residual_context_savings_percent: f64,
     /// Context blocks whose tail was larger than [`Self::residual_static_bytes_estimate`] contribution for that block.
     pub residual_context_failed_blocks: u64,
+
+    /// Populated when **`FR2` rev34** intra or **`FR2` rev35** **P** compact (transform grouping) ran on this encode call.
+    pub intra_transform_grouping_mode: Option<SrsV2TransformGroupingMode>,
+    /// Populated when **`FR2` rev34** intra ran on this encode call.
+    pub intra_transform_decision_mode: Option<SrsV2TransformDecisionMode>,
+    /// Rev34 intra / rev35 **P** chunks: **8×8** regions coded as **Tx8×8** / Single8×8.
+    pub single_8x8_blocks: u64,
+    /// Rev34 intra / rev35 **P** chunks: **8×8** regions coded as **Tx4×4** / Four4×4.
+    pub four_4x4_blocks: u64,
+    /// Sum of rev34 plane headers + per-MB `(grouping + scan + pred + u16 len + compact body)` bytes (Y+U+V), plus rev35 **P** per-chunk grouping overhead (no plane header).
+    pub transform_grouping_bytes: u64,
+    /// Sum of per-block [`crate::srsv2::transform_layout::estimate_coeff_layout_bytes`] (**Legacy**) for rev34/rev35 grouping blocks.
+    pub legacy_transform_estimated_bytes: u64,
+    /// `legacy_transform_estimated_bytes − transform_grouping_bytes` contribution per MB (may be negative).
+    pub transform_grouping_savings_bytes: i64,
+    /// `100 * transform_grouping_savings_bytes / legacy_transform_estimated_bytes`, or **`0`** if legacy estimate is zero.
+    pub transform_grouping_savings_percent: f64,
 }
 
 impl ResidualEncodeStats {
@@ -89,11 +106,21 @@ impl ResidualEncodeStats {
         };
     }
 
-    /// Recompute [`Self::coeff_layout_savings_percent`] after rev32 intra and/or rev33 **P** compact encode (uses [`Self::coeff_legacy_estimated_bytes`]).
+    /// Recompute [`Self::coeff_layout_savings_percent`] after rev32 intra and/or rev33/rev35 **P** compact encode (uses [`Self::coeff_legacy_estimated_bytes`]).
     pub fn finalize_coeff_layout_derived(&mut self) {
         self.coeff_layout_savings_percent = if self.coeff_legacy_estimated_bytes > 0 {
             100.0 * self.coeff_layout_savings_bytes as f64
                 / self.coeff_legacy_estimated_bytes as f64
+        } else {
+            0.0
+        };
+    }
+
+    /// Recompute [`Self::transform_grouping_savings_percent`] after **`FR2` rev34** intra or **rev35** **P** encode.
+    pub fn finalize_transform_grouping_derived(&mut self) {
+        self.transform_grouping_savings_percent = if self.legacy_transform_estimated_bytes > 0 {
+            100.0 * self.transform_grouping_savings_bytes as f64
+                / self.legacy_transform_estimated_bytes as f64
         } else {
             0.0
         };
@@ -281,6 +308,18 @@ pub enum SrsV2CoeffScanMode {
     Auto,
 }
 
+/// Per **8×8** luma residual: baseline single **8×8** spectral layout vs **four 4×4** vs automatic choice (`FR2` rev32 intra compact when wired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2TransformGroupingMode {
+    /// Historical baseline: uniform **Tx8×8** macroblocks (no per-MB transform byte on rev32 plane tag **`1`**).
+    #[default]
+    Legacy8x8,
+    /// Opt-in: every macroblock uses **Tx4×4** (rev32 plane tag **`2`** with per-MB transform **`0`**).
+    Four4x4,
+    /// Opt-in: encoder chooses **Tx8×8** vs **Tx4×4** per macroblock via [`SrsV2TransformDecisionMode`] (requires [`SrsV2TransformDecisionMode::ResidualAware`] or [`SrsV2TransformDecisionMode::RdoFast`]).
+    AutoByResidual,
+}
+
 /// Transform-size **decision** policy for layout / future coefficient packaging (orthogonal to [`SrsV2TransformSizeMode`] on inter).
 ///
 /// Encoder paths still read [`SrsV2TransformSizeMode`] for partitioned inter; this enum reserves **intra / layout**
@@ -290,8 +329,8 @@ pub enum SrsV2TransformDecisionMode {
     /// Historical baseline: deterministic intra/residual behavior unchanged from pre-settings wiring.
     #[default]
     Legacy,
-    /// Prefer **Tx8×8** on smooth blocks and **Tx4×4** on high-detail blocks using [`crate::srsv2::transform_layout`] heuristics when integrated.
-    Smooth8x8Detail4x4,
+    /// Prefer **Tx8×8** on smooth blocks and **Tx4×4** on high-detail blocks using [`crate::srsv2::transform_layout`] heuristics when integrated (pair with [`SrsV2TransformGroupingMode::Four4x4`] or [`SrsV2TransformGroupingMode::AutoByResidual`]).
+    ResidualAware,
     /// Align transform picks with fast encoder RDO — requires [`SrsV2RdoMode::Fast`].
     RdoFast,
 }
@@ -303,6 +342,8 @@ pub enum SrsV2CoeffLayoutSettingsError {
     RdoFastRequiresRdoModeFast,
     /// [`SrsV2TransformSize::Tx16x16Candidate`] is wire/parser-only until a full encoder path exists.
     Tx16x16TransformNotImplemented,
+    /// [`SrsV2TransformDecisionMode::Legacy`] pairs only with [`SrsV2TransformGroupingMode::Legacy8x8`]; opt-in grouping requires [`SrsV2TransformDecisionMode::ResidualAware`] or [`SrsV2TransformDecisionMode::RdoFast`].
+    InconsistentTransformGroupingAndDecision,
 }
 
 impl std::fmt::Display for SrsV2CoeffLayoutSettingsError {
@@ -314,6 +355,10 @@ impl std::fmt::Display for SrsV2CoeffLayoutSettingsError {
             Self::Tx16x16TransformNotImplemented => write!(
                 f,
                 "Tx16x16 transform size is not implemented for encode (use Tx4x4 or Tx8x8)"
+            ),
+            Self::InconsistentTransformGroupingAndDecision => write!(
+                f,
+                "transform_grouping_mode and transform_decision_mode are inconsistent (Legacy pairs only with Legacy8x8; Four4x4/AutoByResidual require ResidualAware or RdoFast)",
             ),
         }
     }
@@ -344,6 +389,11 @@ impl From<SrsV2CoeffLayoutSettingsError> for SrsV2Error {
             SrsV2CoeffLayoutSettingsError::Tx16x16TransformNotImplemented => {
                 SrsV2Error::Unsupported(
                     "coeff_layout: Tx16x16 transform size is not implemented for encode",
+                )
+            }
+            SrsV2CoeffLayoutSettingsError::InconsistentTransformGroupingAndDecision => {
+                SrsV2Error::Unsupported(
+                    "coeff_layout: transform_grouping_mode and transform_decision_mode are inconsistent",
                 )
             }
         }
@@ -481,6 +531,8 @@ pub struct SrsV2EncodeSettings {
     pub coeff_layout_mode: SrsV2CoeffLayoutMode,
     /// Coefficient scan for layout (**default** [`SrsV2CoeffScanMode::ZigZag`]).
     pub coeff_scan_mode: SrsV2CoeffScanMode,
+    /// Transform grouping for layout (**default** [`SrsV2TransformGroupingMode::Legacy8x8`] — same bytes as before this setting existed).
+    pub transform_grouping_mode: SrsV2TransformGroupingMode,
     /// Transform decision for layout (**default** [`SrsV2TransformDecisionMode::Legacy`]).
     pub transform_decision_mode: SrsV2TransformDecisionMode,
 }
@@ -543,6 +595,7 @@ impl Default for SrsV2EncodeSettings {
 
             coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
             coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            transform_grouping_mode: SrsV2TransformGroupingMode::Legacy8x8,
             transform_decision_mode: SrsV2TransformDecisionMode::Legacy,
         }
     }
@@ -568,6 +621,26 @@ pub fn rdo_lambda_fp_from_qp(qp: u8) -> i64 {
 }
 
 impl SrsV2EncodeSettings {
+    /// [`SrsV2TransformDecisionMode::Legacy`] iff [`SrsV2TransformGroupingMode::Legacy8x8`]; opt-in grouping requires [`SrsV2TransformDecisionMode::ResidualAware`] or [`SrsV2TransformDecisionMode::RdoFast`].
+    pub fn transform_grouping_matches_decision_mode(&self) -> bool {
+        matches!(
+            (self.transform_decision_mode, self.transform_grouping_mode),
+            (
+                SrsV2TransformDecisionMode::Legacy,
+                SrsV2TransformGroupingMode::Legacy8x8
+            )
+        ) || matches!(
+            (
+                self.transform_decision_mode,
+                self.transform_grouping_mode,
+            ),
+            (
+                SrsV2TransformDecisionMode::ResidualAware | SrsV2TransformDecisionMode::RdoFast,
+                SrsV2TransformGroupingMode::Four4x4 | SrsV2TransformGroupingMode::AutoByResidual,
+            )
+        )
+    }
+
     /// [`SrsV2ResidualContextMode::ContextV1`] requires adaptive residual entropy (not [`ResidualEntropy::Explicit`]).
     pub fn validate_residual_context_mode(&self) -> Result<(), SrsV2Error> {
         match self.residual_context_mode {
@@ -669,6 +742,8 @@ impl SrsV2EncodeSettings {
     /// Rejects incoherent combinations early; defaults preserve legacy output.
     ///
     /// - **[`SrsV2CoeffLayoutMode::CompactV1`]** is **opt-in** (default remains **[`Legacy`]** — same bytes as before these settings existed).
+    /// - **[`SrsV2TransformDecisionMode::Legacy`]** pairs only with [`SrsV2TransformGroupingMode::Legacy8x8`]; **[`SrsV2TransformGroupingMode::Four4x4`]**
+    ///   / **[`AutoByResidual`]** require **[`SrsV2TransformDecisionMode::ResidualAware`]** or **[`RdoFast`]** (with **`rdo_mode`** **`Fast`** for **`RdoFast`**).
     /// - **[`SrsV2TransformSize::Tx16x16Candidate`]** is not encode-supported; use [`SrsV2TransformSize::validate_supported_for_encode`]
     ///   when wiring partition/residual paths that select a concrete transform tag.
     pub fn validate_coeff_layout_settings(&self) -> Result<(), SrsV2Error> {
@@ -679,9 +754,13 @@ impl SrsV2EncodeSettings {
         {
             return Err(SrsV2CoeffLayoutSettingsError::RdoFastRequiresRdoModeFast.into());
         }
+        if !self.transform_grouping_matches_decision_mode() {
+            return Err(SrsV2CoeffLayoutSettingsError::InconsistentTransformGroupingAndDecision.into());
+        }
         let _ = (
             self.coeff_layout_mode,
             self.coeff_scan_mode,
+            self.transform_grouping_mode,
             self.transform_decision_mode,
         );
         Ok(())
@@ -1153,6 +1232,10 @@ mod tests {
         assert_eq!(d.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
         assert_eq!(d.coeff_scan_mode, SrsV2CoeffScanMode::ZigZag);
         assert_eq!(
+            d.transform_grouping_mode,
+            SrsV2TransformGroupingMode::Legacy8x8
+        );
+        assert_eq!(
             d.transform_decision_mode,
             SrsV2TransformDecisionMode::Legacy
         );
@@ -1173,6 +1256,7 @@ mod tests {
     fn coeff_layout_rdo_fast_requires_rdo_mode_fast() {
         use crate::srsv2::error::SrsV2Error;
         let s = SrsV2EncodeSettings {
+            transform_grouping_mode: SrsV2TransformGroupingMode::AutoByResidual,
             transform_decision_mode: SrsV2TransformDecisionMode::RdoFast,
             rdo_mode: SrsV2RdoMode::Off,
             ..Default::default()
@@ -1188,6 +1272,7 @@ mod tests {
     #[test]
     fn coeff_layout_rdo_fast_ok_when_rdo_mode_fast() {
         let s = SrsV2EncodeSettings {
+            transform_grouping_mode: SrsV2TransformGroupingMode::AutoByResidual,
             transform_decision_mode: SrsV2TransformDecisionMode::RdoFast,
             rdo_mode: SrsV2RdoMode::Fast,
             ..Default::default()
@@ -1196,12 +1281,51 @@ mod tests {
     }
 
     #[test]
-    fn coeff_layout_smooth_detail_validates() {
+    fn coeff_layout_residual_aware_auto_grouping_validates() {
         let s = SrsV2EncodeSettings {
-            transform_decision_mode: SrsV2TransformDecisionMode::Smooth8x8Detail4x4,
+            transform_grouping_mode: SrsV2TransformGroupingMode::AutoByResidual,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
             ..Default::default()
         };
         s.validate_coeff_layout_settings().unwrap();
+    }
+
+    #[test]
+    fn coeff_layout_four4x4_with_residual_aware_validates() {
+        let s = SrsV2EncodeSettings {
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            ..Default::default()
+        };
+        s.validate_coeff_layout_settings().unwrap();
+    }
+
+    #[test]
+    fn coeff_layout_legacy_with_four4x4_rejected() {
+        use crate::srsv2::error::SrsV2Error;
+        let s = SrsV2EncodeSettings {
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::Legacy,
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate_coeff_layout_settings(),
+            Err(SrsV2Error::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn coeff_layout_residual_aware_with_legacy8x8_rejected() {
+        use crate::srsv2::error::SrsV2Error;
+        let s = SrsV2EncodeSettings {
+            transform_grouping_mode: SrsV2TransformGroupingMode::Legacy8x8,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            ..Default::default()
+        };
+        assert!(matches!(
+            s.validate_coeff_layout_settings(),
+            Err(SrsV2Error::Unsupported(_))
+        ));
     }
 
     #[test]

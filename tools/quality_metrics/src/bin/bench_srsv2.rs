@@ -26,7 +26,8 @@ use libsrs_video::{
     SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
     SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode,
     SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager,
-    SrsV2SubpelMode, SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
+    SrsV2SubpelMode, SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
+    SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::hevc_compare;
 use quality_metrics::x265_bitrate_match;
@@ -143,6 +144,32 @@ struct Args {
         default_value_t = false
     )]
     compare_coeff_layouts: bool,
+
+    /// Per **8×8** transform grouping on compact residuals: **`legacy8x8`** (default), **`four4x4`**, **`auto`**.
+    #[arg(
+        long = "transform-grouping",
+        visible_alias = "transform_grouping",
+        default_value = "legacy8x8",
+        value_parser = parse_transform_grouping_cli_flag
+    )]
+    transform_grouping: String,
+
+    /// Transform decision when grouping is not legacy: **`legacy`** (default), **`residual-aware`**, **`rdo-fast`** (**requires** **`--rdo fast`** with **`auto`**/**`four4x4`**).
+    #[arg(
+        long = "transform-decision",
+        visible_alias = "transform_decision",
+        default_value = "legacy",
+        value_parser = parse_transform_decision_cli_flag
+    )]
+    transform_decision: String,
+
+    /// Four-row harness — **`legacy8x8`**, **`four4x4`**, **`auto-residual-aware`**, **`auto-rdo-fast`** — normalizes compact coeff layout and fixed **16×16** partitions (**no FFmpeg**). Engineering measurement only; **not** a superiority claim vs **HEVC**/**H.265**.
+    #[arg(
+        long = "compare-transform-grouping",
+        visible_alias = "compare_transform_grouping",
+        default_value_t = false
+    )]
+    compare_transform_grouping: bool,
 
     #[arg(long, default_value_t = false)]
     sweep: bool,
@@ -995,6 +1022,30 @@ struct CoeffLayoutCompareRow {
     error: Option<String>,
 }
 
+/// One row from **`--compare-transform-grouping`** (fixed order).
+#[derive(Debug, Clone, Serialize)]
+struct TransformGroupingCompareRow {
+    row_label: String,
+    transform_grouping_mode: String,
+    transform_decision_mode: String,
+    single_8x8_blocks: u64,
+    four_4x4_blocks: u64,
+    transform_grouping_bytes: u64,
+    legacy_transform_estimated_bytes: u64,
+    transform_grouping_savings_bytes: i64,
+    transform_grouping_savings_percent: f64,
+    residual_bytes: u64,
+    total_bytes: u64,
+    psnr_y: f64,
+    ssim_y: f64,
+    encode_fps: f64,
+    decode_fps: f64,
+    #[serde(default)]
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SweepRunReport {
     qp: u8,
@@ -1052,6 +1103,10 @@ struct BenchReport {
     compare_coeff_layouts: Option<Vec<CoeffLayoutCompareRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     coeff_layout_compare_summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_transform_grouping: Option<Vec<TransformGroupingCompareRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transform_grouping_compare_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     match_x264_bitrate_note: Option<String>,
     git_commit: Option<String>,
@@ -1124,6 +1179,56 @@ fn parse_coeff_layout_cli_flag(s: &str) -> Result<String> {
 /// Clap [`value_parser`](clap::builder::ValueParser) — normalizes scan labels (accepts `_` or `-` in tokens).
 fn parse_coeff_scan_cli_flag(s: &str) -> Result<String> {
     Ok(coeff_scan_mode_cli_label(parse_coeff_scan_mode(s)?).to_string())
+}
+
+fn transform_grouping_cli_label(m: SrsV2TransformGroupingMode) -> &'static str {
+    match m {
+        SrsV2TransformGroupingMode::Legacy8x8 => "legacy8x8",
+        SrsV2TransformGroupingMode::Four4x4 => "four4x4",
+        SrsV2TransformGroupingMode::AutoByResidual => "auto",
+    }
+}
+
+fn transform_decision_cli_label(m: SrsV2TransformDecisionMode) -> &'static str {
+    match m {
+        SrsV2TransformDecisionMode::Legacy => "legacy",
+        SrsV2TransformDecisionMode::ResidualAware => "residual-aware",
+        SrsV2TransformDecisionMode::RdoFast => "rdo-fast",
+    }
+}
+
+fn parse_transform_grouping_mode(s: &str) -> Result<SrsV2TransformGroupingMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "legacy8x8" | "legacy-8x8" => Ok(SrsV2TransformGroupingMode::Legacy8x8),
+        "four4x4" | "four-4x4" => Ok(SrsV2TransformGroupingMode::Four4x4),
+        "auto" | "auto-by-residual" => Ok(SrsV2TransformGroupingMode::AutoByResidual),
+        _ => Err(anyhow!(
+            "--transform-grouping must be legacy8x8, four4x4, or auto (got {s})"
+        )),
+    }
+}
+
+fn parse_transform_decision_mode(s: &str) -> Result<SrsV2TransformDecisionMode> {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "legacy" => Ok(SrsV2TransformDecisionMode::Legacy),
+        "residual-aware" => Ok(SrsV2TransformDecisionMode::ResidualAware),
+        "rdo-fast" | "rdofast" => Ok(SrsV2TransformDecisionMode::RdoFast),
+        _ => Err(anyhow!(
+            "--transform-decision must be legacy, residual-aware, or rdo-fast (got {s})"
+        )),
+    }
+}
+
+fn parse_transform_grouping_cli_flag(s: &str) -> Result<String> {
+    Ok(
+        transform_grouping_cli_label(parse_transform_grouping_mode(s)?).to_string(),
+    )
+}
+
+fn parse_transform_decision_cli_flag(s: &str) -> Result<String> {
+    Ok(
+        transform_decision_cli_label(parse_transform_decision_mode(s)?).to_string(),
+    )
 }
 
 fn parse_residual_context_mode(s: &str) -> Result<SrsV2ResidualContextMode> {
@@ -1321,6 +1426,7 @@ fn validate_args(args: &Args) -> Result<()> {
             || args.compare_residual_modes
             || args.compare_residual_contexts
             || args.compare_coeff_layouts
+            || args.compare_transform_grouping
             || args.compare_b_modes
             || args.compare_inter_syntax
             || args.compare_rdo
@@ -1422,6 +1528,11 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     if args.compare_coeff_layouts && (args.sweep || args.sweep_quality_bitrate) {
         bail!("--compare-coeff-layouts cannot be combined with --sweep or --sweep-quality-bitrate");
     }
+    if args.compare_transform_grouping && (args.sweep || args.sweep_quality_bitrate) {
+        bail!(
+            "--compare-transform-grouping cannot be combined with --sweep or --sweep-quality-bitrate"
+        );
+    }
     if args.compare_residual_contexts && args.compare_residual_modes {
         bail!("--compare-residual-contexts cannot be combined with --compare-residual-modes");
     }
@@ -1438,14 +1549,21 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         + args.compare_partition_syntax as u8
         + args.compare_entropy_models as u8
         + args.compare_residual_contexts as u8
-        + args.compare_coeff_layouts as u8;
+        + args.compare_coeff_layouts as u8
+        + args.compare_transform_grouping as u8;
     if compare_pass_count > 1 {
         bail!(
-            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, --compare-residual-contexts, and --compare-coeff-layouts are mutually exclusive"
+            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, --compare-residual-contexts, --compare-coeff-layouts, and --compare-transform-grouping are mutually exclusive"
         );
     }
     if args.compare_residual_contexts && args.compare_coeff_layouts {
         bail!("--compare-residual-contexts cannot be combined with --compare-coeff-layouts");
+    }
+    if args.compare_residual_contexts && args.compare_transform_grouping {
+        bail!("--compare-residual-contexts cannot be combined with --compare-transform-grouping");
+    }
+    if args.compare_coeff_layouts && args.compare_transform_grouping {
+        bail!("--compare-coeff-layouts cannot be combined with --compare-transform-grouping");
     }
     if (args.compare_inter_syntax
         || args.compare_rdo
@@ -1458,18 +1576,20 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             || args.compare_residual_modes
             || args.compare_residual_contexts
             || args.compare_coeff_layouts
+            || args.compare_transform_grouping
             || args.compare_b_modes)
     {
-        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, or --compare-b-modes");
+        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, or --compare-b-modes");
     }
     if args.compare_b_modes
         && (args.sweep
             || args.compare_residual_modes
             || args.compare_residual_contexts
             || args.compare_coeff_layouts
+            || args.compare_transform_grouping
             || args.sweep_quality_bitrate)
     {
-        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, or --compare-coeff-layouts");
+        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, or --compare-transform-grouping");
     }
     if args.compare_b_modes {
         if args.reference_frames < 2 {
@@ -1558,9 +1678,10 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             || args.compare_residual_modes
             || args.compare_residual_contexts
             || args.compare_coeff_layouts
+            || args.compare_transform_grouping
             || args.sweep_quality_bitrate
         {
-            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, or --compare-coeff-layouts");
+            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, or --compare-transform-grouping");
         }
     }
     if args.sweep_quality_bitrate {
@@ -1575,8 +1696,13 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     parse_partition_syntax_mode(&args.partition_syntax)?;
     parse_coeff_layout_mode(&args.coeff_layout)?;
     parse_coeff_scan_mode(&args.coeff_scan)?;
+    parse_transform_grouping_mode(&args.transform_grouping)?;
+    parse_transform_decision_mode(&args.transform_decision)?;
     if args.compare_coeff_layouts && args.bframes > 0 {
         bail!("--compare-coeff-layouts requires --bframes 0 in this slice");
+    }
+    if args.compare_transform_grouping && args.bframes > 0 {
+        bail!("--compare-transform-grouping requires --bframes 0 in this slice");
     }
     Ok(())
 }
@@ -1807,6 +1933,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let residual_context_mode = parse_residual_context_mode(&args.residual_context)?;
     let coeff_layout_mode = parse_coeff_layout_mode(&args.coeff_layout)?;
     let coeff_scan_mode = parse_coeff_scan_mode(&args.coeff_scan)?;
+    let transform_grouping_mode = parse_transform_grouping_mode(&args.transform_grouping)?;
+    let transform_decision_mode = parse_transform_decision_mode(&args.transform_decision)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -1845,6 +1973,8 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         entropy_model_mode,
         coeff_layout_mode,
         coeff_scan_mode,
+        transform_grouping_mode,
+        transform_decision_mode,
         ..Default::default()
     };
     s.validate_residual_context_mode()
@@ -2540,6 +2670,8 @@ fn run_compare_partition_syntax_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3717,6 +3849,8 @@ fn run_compare_b_modes_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3810,6 +3944,8 @@ fn run_single_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -3956,6 +4092,8 @@ fn run_compare_residual_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4104,6 +4242,8 @@ fn run_compare_residual_contexts_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4358,6 +4498,290 @@ fn run_compare_coeff_layouts_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: Some(compare_rows),
         coeff_layout_compare_summary,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
+        match_x264_bitrate_note: None,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
+}
+
+fn normalize_transform_grouping_compare_args(a: &mut Args) -> Result<()> {
+    if a.bframes > 0 {
+        bail!("--compare-transform-grouping requires --bframes 0 in this slice");
+    }
+    a.residual_entropy = "auto".to_string();
+    a.residual_context = "off".to_string();
+    a.inter_partition = "fixed16x16".to_string();
+    a.block_aq = "off".to_string();
+    a.coeff_layout = "compact".to_string();
+    a.coeff_scan = "zigzag".to_string();
+    let syn = parse_inter_syntax_mode(&a.inter_syntax)?;
+    if syn == SrsV2InterSyntaxMode::RawLegacy {
+        a.inter_syntax = "compact".to_string();
+    }
+    Ok(())
+}
+
+fn run_compare_transform_grouping_report(
+    args: &Args,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    type RowSpec<'a> = (
+        &'a str,
+        SrsV2TransformGroupingMode,
+        SrsV2TransformDecisionMode,
+        bool,
+    );
+    let spec: [RowSpec; 4] = [
+        (
+            "legacy8x8",
+            SrsV2TransformGroupingMode::Legacy8x8,
+            SrsV2TransformDecisionMode::Legacy,
+            false,
+        ),
+        (
+            "four4x4",
+            SrsV2TransformGroupingMode::Four4x4,
+            SrsV2TransformDecisionMode::ResidualAware,
+            false,
+        ),
+        (
+            "auto-residual-aware",
+            SrsV2TransformGroupingMode::AutoByResidual,
+            SrsV2TransformDecisionMode::ResidualAware,
+            false,
+        ),
+        (
+            "auto-rdo-fast",
+            SrsV2TransformGroupingMode::AutoByResidual,
+            SrsV2TransformDecisionMode::RdoFast,
+            true,
+        ),
+    ];
+
+    let mut compare_rows: Vec<TransformGroupingCompareRow> = Vec::new();
+    let mut table: Vec<CodecRow> = Vec::new();
+    let mut primary_details: Option<Srsv2Details> = None;
+    let mut baseline_total: Option<u64> = None;
+
+    for &(label, tg, td, force_rdo_fast) in &spec {
+        let mut a = args.clone();
+        if let Err(e) = normalize_transform_grouping_compare_args(&mut a) {
+            compare_rows.push(TransformGroupingCompareRow {
+                row_label: label.to_string(),
+                transform_grouping_mode: transform_grouping_cli_label(tg).to_string(),
+                transform_decision_mode: transform_decision_cli_label(td).to_string(),
+                single_8x8_blocks: 0,
+                four_4x4_blocks: 0,
+                transform_grouping_bytes: 0,
+                legacy_transform_estimated_bytes: 0,
+                transform_grouping_savings_bytes: 0,
+                transform_grouping_savings_percent: 0.0,
+                residual_bytes: 0,
+                total_bytes: 0,
+                psnr_y: 0.0,
+                ssim_y: 0.0,
+                encode_fps: 0.0,
+                decode_fps: 0.0,
+                ok: false,
+                error: Some(format!("normalize: {e:#}")),
+            });
+            table.push(CodecRow {
+                codec: label.to_string(),
+                error: Some(format!("normalize: {e:#}")),
+                bytes: 0,
+                ratio: 0.0,
+                bitrate_bps: 0.0,
+                psnr_y: 0.0,
+                ssim_y: 0.0,
+                enc_fps: 0.0,
+                dec_fps: 0.0,
+            });
+            continue;
+        }
+        a.transform_grouping = transform_grouping_cli_label(tg).to_string();
+        a.transform_decision = transform_decision_cli_label(td).to_string();
+        if force_rdo_fast {
+            a.rdo = "fast".to_string();
+        }
+
+        let re = parse_residual_entropy(&a.residual_entropy)?;
+        let res_entropy_str = match re {
+            ResidualEntropy::Explicit => "explicit",
+            ResidualEntropy::Auto => "auto",
+            ResidualEntropy::Rans => "rans",
+        };
+
+        let settings = match build_settings(&a, re) {
+            Ok(s) => s,
+            Err(e) => {
+                compare_rows.push(TransformGroupingCompareRow {
+                    row_label: label.to_string(),
+                    transform_grouping_mode: transform_grouping_cli_label(tg).to_string(),
+                    transform_decision_mode: transform_decision_cli_label(td).to_string(),
+                    single_8x8_blocks: 0,
+                    four_4x4_blocks: 0,
+                    transform_grouping_bytes: 0,
+                    legacy_transform_estimated_bytes: 0,
+                    transform_grouping_savings_bytes: 0,
+                    transform_grouping_savings_percent: 0.0,
+                    residual_bytes: 0,
+                    total_bytes: 0,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    encode_fps: 0.0,
+                    decode_fps: 0.0,
+                    ok: false,
+                    error: Some(format!("settings: {e:#}")),
+                });
+                table.push(CodecRow {
+                    codec: label.to_string(),
+                    error: Some(format!("settings: {e:#}")),
+                    bytes: 0,
+                    ratio: 0.0,
+                    bitrate_bps: 0.0,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    enc_fps: 0.0,
+                    dec_fps: 0.0,
+                });
+                continue;
+            }
+        };
+
+        let seq = build_seq_header(&a, &settings);
+
+        match run_srsv2_pass(&a, &seq, raw, &settings, expected_frame) {
+            Ok(numbers) => {
+                let mut enc_agg = numbers.enc_stats.clone();
+                enc_agg.finalize_residual_context_derived();
+                enc_agg.finalize_coeff_layout_derived();
+                enc_agg.finalize_transform_grouping_derived();
+                let row_codec = pass_to_row(&a, label, &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, &seq, &settings, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details =
+                    pass_to_details(&a, &seq, &settings, res_entropy_str, &numbers, deblock);
+                if primary_details.is_none() {
+                    primary_details = Some(details.clone());
+                }
+                if label == "legacy8x8" {
+                    baseline_total = Some(details.total_bytes);
+                }
+                compare_rows.push(TransformGroupingCompareRow {
+                    row_label: label.to_string(),
+                    transform_grouping_mode: transform_grouping_cli_label(tg).to_string(),
+                    transform_decision_mode: transform_decision_cli_label(td).to_string(),
+                    single_8x8_blocks: enc_agg.single_8x8_blocks,
+                    four_4x4_blocks: enc_agg.four_4x4_blocks,
+                    transform_grouping_bytes: enc_agg.transform_grouping_bytes,
+                    legacy_transform_estimated_bytes: enc_agg.legacy_transform_estimated_bytes,
+                    transform_grouping_savings_bytes: enc_agg.transform_grouping_savings_bytes,
+                    transform_grouping_savings_percent: enc_agg.transform_grouping_savings_percent,
+                    residual_bytes: details.residual_bytes,
+                    total_bytes: details.total_bytes,
+                    psnr_y: row_codec.psnr_y,
+                    ssim_y: row_codec.ssim_y,
+                    encode_fps: row_codec.enc_fps,
+                    decode_fps: row_codec.dec_fps,
+                    ok: true,
+                    error: None,
+                });
+                table.push(row_codec);
+            }
+            Err(e) => {
+                compare_rows.push(TransformGroupingCompareRow {
+                    row_label: label.to_string(),
+                    transform_grouping_mode: transform_grouping_cli_label(tg).to_string(),
+                    transform_decision_mode: transform_decision_cli_label(td).to_string(),
+                    single_8x8_blocks: 0,
+                    four_4x4_blocks: 0,
+                    transform_grouping_bytes: 0,
+                    legacy_transform_estimated_bytes: 0,
+                    transform_grouping_savings_bytes: 0,
+                    transform_grouping_savings_percent: 0.0,
+                    residual_bytes: 0,
+                    total_bytes: 0,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    encode_fps: 0.0,
+                    decode_fps: 0.0,
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                });
+                table.push(CodecRow {
+                    codec: label.to_string(),
+                    error: Some(format!("{e:#}")),
+                    bytes: 0,
+                    ratio: 0.0,
+                    bitrate_bps: 0.0,
+                    psnr_y: 0.0,
+                    ssim_y: 0.0,
+                    enc_fps: 0.0,
+                    dec_fps: 0.0,
+                });
+            }
+        }
+    }
+
+    let transform_grouping_compare_summary = match baseline_total {
+        Some(b) => {
+            let mut parts = Vec::new();
+            for r in &compare_rows {
+                if r.row_label == "legacy8x8" {
+                    continue;
+                }
+                if r.ok {
+                    let d = r.total_bytes as i64 - b as i64;
+                    parts.push(format!("{} Δ_total={:+} B", r.row_label, d));
+                } else {
+                    parts.push(format!("{} (failed)", r.row_label));
+                }
+            }
+            Some(format!(
+                "Total-byte deltas vs legacy8x8 baseline ({b} B): {}",
+                parts.join("; ")
+            ))
+        }
+        None => Some(
+            "Total-byte deltas vs legacy8x8 baseline: unavailable (baseline row failed).".to_string(),
+        ),
+    };
+
+    let srsv2 = primary_details.unwrap_or_default();
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "`--compare-transform-grouping` measures encoder telemetry for **FR2** rev34 intra / rev35 **P** transform grouping vs a **`legacy8x8`** baseline on the same clip (**`transform_grouping_*`** vs **`legacy_transform_estimated_bytes`**). Engineering measurement only; **not** a superiority claim vs **HEVC**/**H.265** or other codecs.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2,
+        x264: None,
+        x265: None,
+        x265_bitrate_match: None,
+        table,
+        compare_residual_modes: None,
+        compare_residual_contexts: None,
+        sweep: None,
+        compare_b_modes: None,
+        compare_inter_syntax: None,
+        compare_rdo: None,
+        compare_partitions: None,
+        compare_partition_costs: None,
+        compare_partition_syntax: None,
+        compare_entropy_models: None,
+        entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
+        compare_transform_grouping: Some(compare_rows),
+        transform_grouping_compare_summary,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4496,6 +4920,8 @@ fn run_compare_inter_syntax_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4630,6 +5056,8 @@ fn run_compare_rdo_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4769,6 +5197,8 @@ fn run_compare_partitions_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -4931,6 +5361,8 @@ fn run_compare_partition_costs_report(
         entropy_model_compare_summary: None,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -5181,6 +5613,8 @@ fn run_compare_entropy_models_report(
         entropy_model_compare_summary,
         compare_coeff_layouts: None,
         coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
         match_x264_bitrate_note: None,
         git_commit: git_short_hash(),
         os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
@@ -5477,6 +5911,20 @@ fn main() -> Result<()> {
 
     if args.compare_coeff_layouts {
         let report = run_compare_coeff_layouts_report(&args, &raw, expected_frame)?;
+        if let Some(p) = args.report_json.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        if let Some(p) = args.report_md.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        fs::write(&args.report_json, serde_json::to_string_pretty(&report)?)?;
+        fs::write(&args.report_md, to_markdown(&report))?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if args.compare_transform_grouping {
+        let report = run_compare_transform_grouping_report(&args, &raw, expected_frame)?;
         if let Some(p) = args.report_json.parent() {
             fs::create_dir_all(p).ok();
         }
@@ -6037,6 +6485,99 @@ fn to_markdown(r: &BenchReport) -> String {
                 e.tx8x8_blocks,
                 e.residual_bytes,
                 delta_str,
+                e.total_bytes,
+                e.psnr_y,
+                e.ssim_y,
+                e.encode_fps,
+                e.decode_fps,
+                status.replace('|', "/"),
+            ));
+        }
+    }
+
+    if let Some(rows) = &r.compare_transform_grouping {
+        out.push_str("\n## Transform grouping comparison (`--compare-transform-grouping`)\n\n");
+        out.push_str(
+            "_Fixed four-row order: **`legacy8x8`**, **`four4x4`**, **`auto-residual-aware`**, **`auto-rdo-fast`**. Telemetry reflects **FR2** rev34 intra / rev35 **P** when non-legacy grouping is active; use **`transform_grouping_savings_percent`** with **total** / **residual** bytes. Engineering measurement only — not a superiority claim vs **HEVC**/**H.265** or other codecs._\n\n",
+        );
+        if let Some(s) = &r.transform_grouping_compare_summary {
+            out.push_str(&format!("**Summary:** {s}\n\n"));
+        }
+        out.push_str("### Summary table\n\n");
+        out.push_str(
+            "| Row | Grouping | Decision | Grouping B | Legacy est. | Savings B | Savings % | Total B | Residual B | PSNR-Y | SSIM-Y |\n",
+        );
+        out.push_str("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n");
+        for e in rows {
+            let (gb, le, sav_b, sav_pct, tot, res, psnr_s, ssim_s) = if e.ok {
+                (
+                    format!("{}", e.transform_grouping_bytes),
+                    format!("{}", e.legacy_transform_estimated_bytes),
+                    format!("{}", e.transform_grouping_savings_bytes),
+                    format!("{:.2}", e.transform_grouping_savings_percent),
+                    format!("{}", e.total_bytes),
+                    format!("{}", e.residual_bytes),
+                    format!("{:.2}", e.psnr_y),
+                    format!("{:.4}", e.ssim_y),
+                )
+            } else {
+                (
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                )
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                e.row_label,
+                e.transform_grouping_mode,
+                e.transform_decision_mode,
+                gb,
+                le,
+                sav_b,
+                sav_pct,
+                tot,
+                res,
+                psnr_s,
+                ssim_s,
+            ));
+        }
+        out.push_str("\n### Full telemetry\n\n");
+        out.push_str("| Row | Single 8×8 | Four 4×4 | Grouping B | Legacy est. | Savings B | Savings % | Residual B | Total B | PSNR-Y | SSIM-Y | Enc FPS | Dec FPS | Status |\n");
+        out.push_str(
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|\n",
+        );
+        for e in rows {
+            let status = if e.ok {
+                "ok".to_string()
+            } else {
+                e.error
+                    .as_deref()
+                    .map(|s| {
+                        let t = s.trim();
+                        if t.len() > 80 {
+                            format!("{}…", &t[..80])
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "error".to_string())
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {:.2} | {} | {} | {:.2} | {:.4} | {:.2} | {:.2} | {} |\n",
+                e.row_label,
+                e.single_8x8_blocks,
+                e.four_4x4_blocks,
+                e.transform_grouping_bytes,
+                e.legacy_transform_estimated_bytes,
+                e.transform_grouping_savings_bytes,
+                e.transform_grouping_savings_percent,
+                e.residual_bytes,
                 e.total_bytes,
                 e.psnr_y,
                 e.ssim_y,
@@ -6811,12 +7352,11 @@ mod tests {
             "ok",
         ];
         for (i, row) in rows_json.iter().enumerate() {
-            let obj = row.as_object().unwrap_or_else(|| panic!("row {i} not object"));
+            let obj = row
+                .as_object()
+                .unwrap_or_else(|| panic!("row {i} not object"));
             for k in required_row_keys {
-                assert!(
-                    obj.contains_key(k),
-                    "row {i} missing {k}: {obj:?}"
-                );
+                assert!(obj.contains_key(k), "row {i} missing {k}: {obj:?}");
             }
         }
         assert!(
@@ -6845,6 +7385,207 @@ mod tests {
     }
 
     #[test]
+    fn compare_transform_grouping_emits_four_rows_json_markdown() {
+        let (path, raw, fb) = write_test_yuv("tg_cmp", 64, 64, 4);
+        let args = parse_test_args(&path, 64, 64, 4, &["--compare-transform-grouping"]);
+        validate_args(&args).unwrap();
+        let report = run_compare_transform_grouping_report(&args, &raw, fb).unwrap();
+        let rows = report
+            .compare_transform_grouping
+            .as_ref()
+            .expect("compare_transform_grouping");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].row_label, "legacy8x8");
+        assert_eq!(rows[1].row_label, "four4x4");
+        assert_eq!(rows[2].row_label, "auto-residual-aware");
+        assert_eq!(rows[3].row_label, "auto-rdo-fast");
+        assert!(
+            rows.iter().all(|r| r.ok),
+            "{:?}",
+            rows.iter()
+                .find(|r| !r.ok)
+                .map(|r| (&r.row_label, &r.error))
+        );
+        let summary = report
+            .transform_grouping_compare_summary
+            .as_ref()
+            .expect("summary");
+        assert!(summary.contains("Δ_total") || summary.contains("baseline"), "{summary}");
+        let js = serde_json::to_string(&report).unwrap();
+        for key in [
+            "transform_grouping_mode",
+            "transform_decision_mode",
+            "single_8x8_blocks",
+            "four_4x4_blocks",
+            "transform_grouping_bytes",
+            "legacy_transform_estimated_bytes",
+            "transform_grouping_savings_bytes",
+            "transform_grouping_savings_percent",
+            "residual_bytes",
+            "total_bytes",
+            "psnr_y",
+            "ssim_y",
+        ] {
+            assert!(js.contains(key), "missing {key} in {js}");
+        }
+        assert!(js.contains("compare_transform_grouping"));
+        let v: serde_json::Value = serde_json::from_str(&js).unwrap();
+        let rows_json = v
+            .get("compare_transform_grouping")
+            .and_then(|x| x.as_array())
+            .expect("compare_transform_grouping array");
+        assert_eq!(rows_json.len(), 4);
+        let required_row_keys = [
+            "row_label",
+            "transform_grouping_mode",
+            "transform_decision_mode",
+            "single_8x8_blocks",
+            "four_4x4_blocks",
+            "transform_grouping_bytes",
+            "legacy_transform_estimated_bytes",
+            "transform_grouping_savings_bytes",
+            "transform_grouping_savings_percent",
+            "residual_bytes",
+            "total_bytes",
+            "psnr_y",
+            "ssim_y",
+            "ok",
+        ];
+        for (i, row) in rows_json.iter().enumerate() {
+            let obj = row
+                .as_object()
+                .unwrap_or_else(|| panic!("row {i} not object"));
+            for k in required_row_keys {
+                assert!(obj.contains_key(k), "row {i} missing {k}: {obj:?}");
+            }
+        }
+        let md = to_markdown(&report);
+        assert!(md.contains("Transform grouping comparison"));
+        assert!(md.contains("legacy8x8"));
+        assert!(md.contains("PSNR-Y"));
+        assert!(report.x264.is_none());
+        assert!(report.x265.is_none());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn four4x4_transform_grouping_encodes_without_external_codecs() {
+        let report = run_ctu_report(
+            64,
+            64,
+            2,
+            &[
+                "--inter-syntax",
+                "compact",
+                "--coeff-layout",
+                "compact",
+                "--transform-grouping",
+                "four4x4",
+                "--transform-decision",
+                "residual-aware",
+            ],
+        );
+        assert!(report.srsv2.total_bytes > 0);
+        assert!(report.x264.is_none());
+        assert!(report.x265.is_none());
+    }
+
+    #[test]
+    fn auto_transform_grouping_encodes_without_external_codecs() {
+        let report = run_ctu_report(
+            64,
+            64,
+            2,
+            &[
+                "--inter-syntax",
+                "compact",
+                "--coeff-layout",
+                "compact",
+                "--transform-grouping",
+                "auto",
+                "--transform-decision",
+                "residual-aware",
+            ],
+        );
+        assert!(report.srsv2.total_bytes > 0);
+        assert!(report.x264.is_none());
+        assert!(report.x265.is_none());
+    }
+
+    #[test]
+    fn compare_transform_grouping_second_row_failure_keeps_first_row_in_markdown() {
+        fn tg_row(
+            label: &str,
+            ok: bool,
+            err: Option<&str>,
+        ) -> TransformGroupingCompareRow {
+            TransformGroupingCompareRow {
+                row_label: label.to_string(),
+                transform_grouping_mode: "x".into(),
+                transform_decision_mode: "y".into(),
+                single_8x8_blocks: 0,
+                four_4x4_blocks: 0,
+                transform_grouping_bytes: 0,
+                legacy_transform_estimated_bytes: 0,
+                transform_grouping_savings_bytes: 0,
+                transform_grouping_savings_percent: 0.0,
+                residual_bytes: if ok { 10 } else { 0 },
+                total_bytes: if ok { 100 } else { 0 },
+                psnr_y: if ok { 40.0 } else { 0.0 },
+                ssim_y: if ok { 0.99 } else { 0.0 },
+                encode_fps: 1.0,
+                decode_fps: 1.0,
+                ok,
+                error: err.map(|s| s.to_string()),
+            }
+        }
+        let md = to_markdown(&BenchReport {
+            note: "Engineering measurement only; not a marketing claim.",
+            residual_note: "n",
+            command: "test".into(),
+            raw_bytes: 1,
+            width: 64,
+            height: 64,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            x265: None,
+            x265_bitrate_match: None,
+            table: vec![],
+            compare_residual_modes: None,
+            compare_residual_contexts: None,
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: None,
+            compare_partition_syntax: None,
+            compare_entropy_models: None,
+            entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
+            compare_transform_grouping: Some(vec![
+                tg_row("legacy8x8", true, None),
+                tg_row("four4x4", false, Some("simulated four4x4 failure")),
+            ]),
+            transform_grouping_compare_summary: Some(
+                "Total-byte deltas vs legacy8x8 baseline (100 B): four4x4 (failed)".into(),
+            ),
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "test".into(),
+        });
+        assert!(md.contains("legacy8x8"));
+        assert!(md.contains("four4x4"));
+        assert!(
+            md.contains("simulated four4x4 failure") || md.contains("simulated four4x4"),
+            "{md}"
+        );
+    }
+
+    #[test]
     fn coeff_layout_cli_defaults_match_encoder_defaults() {
         let tmp =
             std::env::temp_dir().join(format!("bench-coeff-default-{}.yuv", std::process::id()));
@@ -6858,6 +7599,10 @@ mod tests {
         let s = build_settings(&args, re).unwrap();
         assert_eq!(s.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
         assert_eq!(s.coeff_scan_mode, SrsV2CoeffScanMode::ZigZag);
+        assert_eq!(args.transform_grouping, "legacy8x8");
+        assert_eq!(args.transform_decision, "legacy");
+        assert_eq!(s.transform_grouping_mode, SrsV2TransformGroupingMode::Legacy8x8);
+        assert_eq!(s.transform_decision_mode, SrsV2TransformDecisionMode::Legacy);
         let _ = fs::remove_file(tmp);
     }
 
@@ -6997,6 +7742,8 @@ mod tests {
                 "Residual-byte deltas vs legacy-zigzag baseline (100 B): compact-zigzag (failed)"
                     .into(),
             ),
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "test".into(),
@@ -7085,6 +7832,8 @@ mod tests {
                 "Residual-byte deltas vs legacy-zigzag baseline (100 B): compact-zigzag (failed)"
                     .into(),
             ),
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "test".into(),
@@ -7174,6 +7923,8 @@ mod tests {
             entropy_model_compare_summary: None,
             compare_coeff_layouts: None,
             coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "test".into(),
@@ -7275,6 +8026,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7373,6 +8127,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7470,6 +8227,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7569,6 +8329,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7668,6 +8431,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7769,6 +8535,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7884,6 +8653,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -7990,6 +8762,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8113,6 +8888,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8219,6 +8997,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8330,6 +9111,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8475,6 +9259,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -8735,6 +9522,8 @@ mod tests {
             entropy_model_compare_summary: None,
             compare_coeff_layouts: None,
             coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -8981,6 +9770,8 @@ mod tests {
             entropy_model_compare_summary: None,
             compare_coeff_layouts: None,
             coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9017,6 +9808,8 @@ mod tests {
             entropy_model_compare_summary: None,
             compare_coeff_layouts: None,
             coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9054,6 +9847,8 @@ mod tests {
             entropy_model_compare_summary: None,
             compare_coeff_layouts: None,
             coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9091,6 +9886,8 @@ mod tests {
             entropy_model_compare_summary: None,
             compare_coeff_layouts: None,
             coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "os".to_string(),
@@ -9138,6 +9935,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9429,6 +10229,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9526,6 +10329,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9625,6 +10431,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: true,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9742,6 +10551,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -9928,6 +10740,8 @@ mod tests {
             entropy_model_compare_summary: summary,
             compare_coeff_layouts: None,
             coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
             match_x264_bitrate_note: None,
             git_commit: None,
             os: "x".into(),
@@ -9996,6 +10810,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,
@@ -10093,6 +10910,9 @@ mod tests {
             coeff_layout: "legacy".to_string(),
             coeff_scan: "zigzag".to_string(),
             compare_coeff_layouts: false,
+            transform_grouping: "legacy8x8".to_string(),
+            transform_decision: "legacy".to_string(),
+            compare_transform_grouping: false,
             sweep: false,
             sweep_quality_bitrate: false,
             sweep_ssim_threshold: 0.95,

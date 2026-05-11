@@ -25,6 +25,7 @@ use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode,
     SrsV2CoeffLayoutMode, SrsV2EncodeSettings, SrsV2EntropyModelMode, SrsV2InterPartitionMode,
     SrsV2InterSyntaxMode, SrsV2ResidualContextMode, SrsV2SubpelMode,
+    SrsV2TransformGroupingMode,
 };
 use super::rdo::{
     choose_best_inter_mode_candidate, estimate_mv_delta_wire_bytes,
@@ -33,7 +34,8 @@ use super::rdo::{
 use super::residual_context_entropy::ResidualContextModel;
 use super::residual_entropy::{
     decode_p_residual_chunk, decode_p_residual_chunk_compact_v33,
-    decode_p_residual_chunk_strict_rev30, encode_p_residual_chunk_compact_v33_wire,
+    decode_p_residual_chunk_compact_v35, decode_p_residual_chunk_strict_rev30,
+    encode_p_residual_chunk_compact_v33_wire, encode_p_residual_chunk_compact_v35_wire,
     encode_p_residual_chunk_with_opts, BlockResidualCoding, PResidualChunkEncodeOpts,
     PResidualChunkKind, ResidualPlane,
 };
@@ -64,6 +66,11 @@ pub const FRAME_PAYLOAD_MAGIC_P_RESIDUAL_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 30
 /// Fixed-grid **`P`** with [`crate::srsv2::rate_control::SrsV2CoeffLayoutMode::CompactV1`] luma residual chunks (`FR2` rev **33**):
 /// [`crate::srsv2::residual_entropy::TAG_P_RESIDUAL_COMPACT_V1`] chunks use [`crate::srsv2::transform_layout`] scan + compact bitmap (**Tx8×8**).
 pub const FRAME_PAYLOAD_MAGIC_P_RESIDUAL_COMPACT_V1: [u8; 4] = [b'F', b'R', b'2', 33];
+/// Fixed-grid **`P`** [`SrsV2CoeffLayoutMode::CompactV1`] with **transform grouping** per **8×8** luma residual chunk (`FR2` rev **35**).
+///
+/// Emitted only when [`crate::srsv2::rate_control::SrsV2EncodeSettings::transform_grouping_mode`] is not [`SrsV2TransformGroupingMode::Legacy8x8`].
+/// Chunks use [`crate::srsv2::residual_entropy::TAG_P_RESIDUAL_TRANSFORM_GROUP_V35`].
+pub const FRAME_PAYLOAD_MAGIC_P_RESIDUAL_TRANSFORM_GROUP_V35: [u8; 4] = [b'F', b'R', b'2', 35];
 
 /// One macroblock worth of P residuals (MV stored separately for compact modes).
 #[derive(Clone)]
@@ -215,7 +222,10 @@ fn read_u8(data: &[u8], cur: &mut usize) -> Result<u8, SrsV2Error> {
 
 #[allow(clippy::too_many_arguments)]
 fn encode_p_subblock_residual_chunk(
-    qf: &[i16; 64],
+    cur_pixels: &[[i16; 8]; 8],
+    spatial_residual: &[[i16; 8]; 8],
+    qf_tx8x8: &[i16; 64],
+    eff_qp: i16,
     settings: &SrsV2EncodeSettings,
     rans_model: &RansModel,
     ctx_model: Option<&ResidualContextModel>,
@@ -227,18 +237,29 @@ fn encode_p_subblock_residual_chunk(
     strict_rev30_residual: bool,
     residual_encode_stats: Option<&mut ResidualEncodeStats>,
 ) -> Result<(Vec<u8>, PResidualChunkKind), SrsV2Error> {
-    if matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1) {
-        let wire = encode_p_residual_chunk_compact_v33_wire(qf, settings, residual_encode_stats)?;
-        let nz_ac = qf.iter().skip(1).any(|&v| v != 0);
-        let bx = (mbx * 2 + (si as u32 % 2)) as usize;
-        let by = (mby * 2 + (si as u32 / 2)) as usize;
-        let idx_b = by * luma_grid_bw + bx;
-        luma_nz_grid[idx_b] = nz_ac;
-        return Ok((wire, PResidualChunkKind::CompactCoeffV1));
-    }
     let bx = (mbx * 2 + (si as u32 % 2)) as usize;
     let by = (mby * 2 + (si as u32 / 2)) as usize;
     let idx_b = by * luma_grid_bw + bx;
+
+    if matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1) {
+        if settings.transform_grouping_mode == SrsV2TransformGroupingMode::Legacy8x8 {
+            let wire =
+                encode_p_residual_chunk_compact_v33_wire(qf_tx8x8, settings, residual_encode_stats)?;
+            let nz_ac = qf_tx8x8.iter().skip(1).any(|&v| v != 0);
+            luma_nz_grid[idx_b] = nz_ac;
+            return Ok((wire, PResidualChunkKind::CompactCoeffV1));
+        }
+        let (wire, nz_ac) = encode_p_residual_chunk_compact_v35_wire(
+            cur_pixels,
+            spatial_residual,
+            eff_qp,
+            settings,
+            residual_encode_stats,
+        )?;
+        luma_nz_grid[idx_b] = nz_ac;
+        return Ok((wire, PResidualChunkKind::CompactCoeffV1));
+    }
+
     let left_nz = bx > 0 && luma_nz_grid[idx_b - 1];
     let above_nz = by > 0 && luma_nz_grid[idx_b - luma_grid_bw];
     let opts = PResidualChunkEncodeOpts {
@@ -250,13 +271,13 @@ fn encode_p_subblock_residual_chunk(
         strict_fr2_rev30_residual: strict_rev30_residual,
     };
     let (c, k) = encode_p_residual_chunk_with_opts(
-        qf,
+        qf_tx8x8,
         settings.residual_entropy,
         rans_model,
         &opts,
         residual_encode_stats,
     )?;
-    let nz_ac = qf.iter().skip(1).any(|&v| v != 0);
+    let nz_ac = qf_tx8x8.iter().skip(1).any(|&v| v != 0);
     luma_nz_grid[idx_b] = nz_ac;
     Ok((c, k))
 }
@@ -308,6 +329,7 @@ fn encode_p_macroblock(
 
     let sub_offsets = [(0_u32, 0_u32), (8, 0), (0, 8), (8, 8)];
     for (si, &(dx, dy)) in sub_offsets.iter().enumerate() {
+        let mut cur_px = [[0_i16; 8]; 8];
         let mut blk = [[0_i16; 8]; 8];
         let mut max_abs = 0_i16;
         for row in 0..8 {
@@ -315,6 +337,7 @@ fn encode_p_macroblock(
                 let lx = mbx * 16 + dx + col;
                 let ly = mby * 16 + dy + row;
                 let cx = cur.y.samples[ly as usize * cur.y.stride + lx as usize] as i16;
+                cur_px[row as usize][col as usize] = cx;
                 let pred = if use_subpel {
                     sample_luma_bilinear_qpel(&reference.y, lx as i32, ly as i32, mvx_q, mvy_q)
                         as i16
@@ -385,7 +408,10 @@ fn encode_p_macroblock(
                         let qf = quantize(&f, eff_i);
                         let rs = stats.as_mut().map(|slot| &mut **slot);
                         let (c, k) = encode_p_subblock_residual_chunk(
+                            &cur_px,
+                            &blk,
                             &qf,
+                            eff_i,
                             settings,
                             rans_model,
                             ctx_model,
@@ -498,7 +524,10 @@ fn encode_p_macroblock(
             let qf = quantize(&f, eff_i);
             let rs = stats.as_mut().map(|slot| &mut **slot);
             let (c, kind) = encode_p_subblock_residual_chunk(
+                &cur_px,
+                &blk,
                 &qf,
+                eff_i,
                 settings,
                 rans_model,
                 ctx_model,
@@ -614,10 +643,12 @@ pub fn encode_yuv420_p_payload(
     settings.validate_coeff_layout_settings()?;
 
     let p_coeff_compact_v1 = matches!(settings.coeff_layout_mode, SrsV2CoeffLayoutMode::CompactV1);
+    let p_rev35_compact_residuals = p_coeff_compact_v1
+        && settings.transform_grouping_mode != SrsV2TransformGroupingMode::Legacy8x8;
     if p_coeff_compact_v1 {
         if matches!(settings.residual_entropy, ResidualEntropy::Explicit) {
             return Err(SrsV2Error::syntax(
-                "FR2 rev33 P compact coefficients require residual_entropy Auto or Rans",
+                "FR2 rev33/rev35 P compact coefficients require residual_entropy Auto or Rans",
             ));
         }
         if matches!(
@@ -625,12 +656,12 @@ pub fn encode_yuv420_p_payload(
             SrsV2ResidualContextMode::ContextV1
         ) {
             return Err(SrsV2Error::syntax(
-                "FR2 rev33 P compact coefficients are incompatible with residual_context_mode ContextV1",
+                "FR2 rev33/rev35 P compact coefficients are incompatible with residual_context_mode ContextV1",
             ));
         }
         if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::RawLegacy) {
             return Err(SrsV2Error::syntax(
-                "FR2 rev33 P compact coefficients require inter_syntax_mode CompactV1 or EntropyV1",
+                "FR2 rev33/rev35 P compact coefficients require inter_syntax_mode CompactV1 or EntropyV1",
             ));
         }
         if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::EntropyV1)
@@ -640,7 +671,7 @@ pub fn encode_yuv420_p_payload(
             )
         {
             return Err(SrsV2Error::syntax(
-                "FR2 rev33 P compact coefficients require entropy_model_mode StaticV1",
+                "FR2 rev33/rev35 P compact coefficients require entropy_model_mode StaticV1",
             ));
         }
     }
@@ -661,7 +692,7 @@ pub fn encode_yuv420_p_payload(
     if settings.inter_partition_mode != SrsV2InterPartitionMode::Fixed16x16 {
         if p_coeff_compact_v1 {
             return Err(SrsV2Error::syntax(
-                "FR2 rev33 P compact coefficients require inter_partition_mode Fixed16x16",
+                "FR2 rev33/rev35 P compact coefficients require inter_partition_mode Fixed16x16",
             ));
         }
         if matches!(settings.inter_syntax_mode, SrsV2InterSyntaxMode::RawLegacy) {
@@ -947,7 +978,9 @@ pub fn encode_yuv420_p_payload(
             }
         }
         SrsV2InterSyntaxMode::CompactV1 => {
-            let magic = if p_coeff_compact_v1 {
+            let magic = if p_rev35_compact_residuals {
+                FRAME_PAYLOAD_MAGIC_P_RESIDUAL_TRANSFORM_GROUP_V35
+            } else if p_coeff_compact_v1 {
                 FRAME_PAYLOAD_MAGIC_P_RESIDUAL_COMPACT_V1
             } else {
                 FRAME_PAYLOAD_MAGIC_P_COMPACT
@@ -979,7 +1012,9 @@ pub fn encode_yuv420_p_payload(
             }
         }
         SrsV2InterSyntaxMode::EntropyV1 => {
-            let magic_p_entropy = if p_coeff_compact_v1 {
+            let magic_p_entropy = if p_rev35_compact_residuals {
+                FRAME_PAYLOAD_MAGIC_P_RESIDUAL_TRANSFORM_GROUP_V35
+            } else if p_coeff_compact_v1 {
                 FRAME_PAYLOAD_MAGIC_P_RESIDUAL_COMPACT_V1
             } else if matches!(
                 settings.residual_context_mode,
@@ -1092,6 +1127,9 @@ pub fn encode_yuv420_p_payload(
         }
         s.finalize_residual_context_derived();
         s.finalize_coeff_layout_derived();
+        if p_rev35_compact_residuals {
+            s.finalize_transform_grouping_derived();
+        }
     }
     Ok(out)
 }
@@ -1133,11 +1171,12 @@ pub fn decode_yuv420_p_payload(
             seq, payload, reference, rev,
         );
     }
-    if !matches!(rev, 2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 23 | 30 | 33) {
+    if !matches!(rev, 2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 23 | 30 | 33 | 35) {
         return Err(SrsV2Error::BadMagic);
     }
-    let inter_compact = matches!(rev, 15 | 17 | 23 | 30 | 33);
+    let inter_compact = matches!(rev, 15 | 17 | 23 | 30 | 33 | 35);
     let rev33_compact_coeff = rev == 33;
+    let rev35_compact_coeff = rev == 35;
     let inter_entropy_ctx_v1 = matches!(rev, 23 | 30);
     let rev30_residual = rev == 30;
 
@@ -1147,19 +1186,23 @@ pub fn decode_yuv420_p_payload(
 
     let (use_qpel, block_aq_wire, entropy_chunks, inter_entropy_mv) = if inter_compact {
         let flags = read_u8(payload, &mut cur)?;
-        let allowed_mask = if rev == 33 { 0xFu8 } else { 0x7u8 };
+        let allowed_mask = if matches!(rev, 33 | 35) {
+            0xFu8
+        } else {
+            0x7u8
+        };
         if flags & !allowed_mask != 0 {
             return Err(SrsV2Error::syntax("unknown P inter compact flags"));
         }
         let use_qpel = flags & P_INTER_FLAG_SUBPEL != 0;
         let block_aq_wire = flags & P_INTER_FLAG_BLOCK_AQ != 0;
         let entropy_chunks = flags & P_INTER_FLAG_ENTROPY_RESIDUAL != 0;
-        if rev == 33 && !entropy_chunks {
+        if matches!(rev, 33 | 35) && !entropy_chunks {
             return Err(SrsV2Error::syntax(
-                "FR2 rev33 requires entropy-coded residual chunks",
+                "FR2 rev33/rev35 requires entropy-coded residual chunks",
             ));
         }
-        let inter_entropy_mv = if rev == 33 {
+        let inter_entropy_mv = if matches!(rev, 33 | 35) {
             flags & P_INTER_FLAG_ENTROPY_MV != 0
         } else {
             matches!(rev, 17 | 23 | 30)
@@ -1324,6 +1367,10 @@ pub fn decode_yuv420_p_payload(
                             let (res, nz_ac) = decode_p_residual_chunk_compact_v33(chunk, eff_i)?;
                             luma_nz_grid[idx_blk] = nz_ac;
                             res
+                        } else if rev35_compact_coeff {
+                            let (res, nz_ac) = decode_p_residual_chunk_compact_v35(chunk, eff_i)?;
+                            luma_nz_grid[idx_blk] = nz_ac;
+                            res
                         } else {
                             decode_p_residual_chunk(chunk, eff_i)?
                         }
@@ -1397,7 +1444,8 @@ mod tests {
     };
     use crate::srsv2::rate_control::{
         ResidualEncodeStats, SrsV2CoeffLayoutMode, SrsV2EncodeSettings, SrsV2InterSyntaxMode,
-        SrsV2MotionSearchMode, SrsV2RdoMode, SrsV2SubpelMode,
+        SrsV2MotionSearchMode, SrsV2RdoMode, SrsV2SubpelMode, SrsV2TransformDecisionMode,
+        SrsV2TransformGroupingMode,
     };
 
     fn seq_inter(w: u32, h: u32) -> VideoSequenceHeaderV2 {
@@ -2389,6 +2437,95 @@ mod tests {
             ms.inter_mv.residual_payload_bytes > 0,
             "expected residual bytes accounted in motion stats"
         );
+        decode_yuv420_p_payload(&seq, &p, &slot.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fr2_rev35_p_compact_inter_syntax_roundtrip_moving_square_like() {
+        let seq = seq_inter(32, 32);
+        let mut rgb1 = vec![40_u8; 32 * 32 * 3];
+        for y in 0..32usize {
+            for x in 0..32usize {
+                let i = (y * 32 + x) * 3;
+                let v = ((x.wrapping_mul(11)) ^ (y.wrapping_mul(17))) as u8;
+                rgb1[i] = v;
+                rgb1[i + 1] = v;
+                rgb1[i + 2] = v;
+            }
+        }
+        let rgb0 = vec![55_u8; 32 * 32 * 3];
+        let y0 = rgb888_full_to_yuv420_bt709(&rgb0, 32, 32, ColorRange::Limited).unwrap();
+        let y1 = rgb888_full_to_yuv420_bt709(&rgb1, 32, 32, ColorRange::Limited).unwrap();
+        let st_key = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
+            keyframe_interval: 30,
+            motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
+            ..Default::default()
+        };
+        let st_p = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::AutoByResidual,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            keyframe_interval: 30,
+            motion_search_mode: SrsV2MotionSearchMode::ExhaustiveSmall,
+            ..Default::default()
+        };
+        let intra =
+            encode_yuv420_inter_payload(&seq, &y0, None, 0, 24, &st_key, None, None, None).unwrap();
+        assert_eq!(intra[3], 3);
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let mut rs = ResidualEncodeStats::default();
+        let p = encode_yuv420_inter_payload(
+            &seq,
+            &y1,
+            slot.as_ref(),
+            1,
+            24,
+            &st_p,
+            Some(&mut rs),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(p[3], 35);
+        assert!(rs.p_compact_coeff_chunks > 0);
+        assert!(rs.transform_grouping_bytes > 0);
+        rs.finalize_transform_grouping_derived();
+        decode_yuv420_p_payload(&seq, &p, &slot.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn fr2_rev35_p_identical_ref_skip_pattern_decodes() {
+        let seq = seq_inter(64, 64);
+        let rgb = vec![118_u8; 64 * 64 * 3];
+        let y = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st_key = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
+            keyframe_interval: 30,
+            enable_skip_blocks: true,
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            ..Default::default()
+        };
+        let st_p = SrsV2EncodeSettings {
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            transform_grouping_mode: SrsV2TransformGroupingMode::Four4x4,
+            transform_decision_mode: SrsV2TransformDecisionMode::ResidualAware,
+            inter_syntax_mode: SrsV2InterSyntaxMode::CompactV1,
+            keyframe_interval: 30,
+            enable_skip_blocks: true,
+            motion_search_mode: SrsV2MotionSearchMode::None,
+            ..Default::default()
+        };
+        let intra =
+            encode_yuv420_inter_payload(&seq, &y, None, 0, 28, &st_key, None, None, None).unwrap();
+        let mut slot = None;
+        decode_yuv420_srsv2_payload(&seq, &intra, &mut slot).unwrap();
+        let p =
+            encode_yuv420_inter_payload(&seq, &y, slot.as_ref(), 1, 28, &st_p, None, None, None)
+                .unwrap();
+        assert_eq!(p[3], 35);
         decode_yuv420_p_payload(&seq, &p, &slot.unwrap()).unwrap();
     }
 
