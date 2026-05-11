@@ -76,6 +76,7 @@ This table is the **authoritative** mapping between **on-wire `FR2` byte 4** (th
 | **31** | `0x1F` | *Reserved* | **B** | **Not implemented:** `decode_yuv420_b_payload` returns **`Unsupported`** — reserved for future **B** residual ContextV1 | — |
 | **32** | `0x20` | — | **Intra** | Same header as **rev 3** (`frame_index`, `base_qp`, three length-prefixed Y/U/V planes); **`SrsV2CoeffLayoutMode::CompactV1`** with **`transform_grouping_mode == Legacy8x8`**. Per plane: layout **`1`** = all **8×8** transform; **`2`** = mixed — each **8×8** MB optionally carries transform **`0`**/**`1`** then **`pred`**, **`scan`**, **`u16`** body length, compact coefficient body (`encode_plane_intra_compact_v32`) | Default grouping stays **Legacy8x8** → encoder still emits **rev 32**, not **rev 34** |
 | **34** | `0x22` | — | **Intra** | Same top-level header as **rev 32**; emitted **only** when **`CompactV1`** and **`transform_grouping_mode ≠ Legacy8x8`**. Per plane: schema **`1`**, then each **8×8** MB: **`grouping`** (**`0`** Four4×4, **`1`** Single8×8), **`scan`**, **`pred`**, **`u16`** len, compact body (`encode_plane_intra_compact_v34`). Decode maps coefficients back to **natural** order before inverse DCT | **`Four4x4`**, **`AutoByResidual`**, etc. with **`CompactV1`** |
+| **36** | `0x24` | — | **Intra** | Same **`frame_index`**, **`base_qp`**, and three length-prefixed Y/U/V planes as **rev 3**; each **8×8** block **must** use residual tag **`TAG_RESIDUAL_TOKEN_V3` (5)** with structured [`residual_token_v2`](../../crates/libsrs_video/src/srsv2/residual_token_v2.rs) **v3** blob — decoders reject explicit tuples and static single-model rANS tails | **`SrsV2ResidualTokenMode::TokenV2`** with **`residual_entropy`** **Auto** or **Rans**, **`coeff_layout_mode`** **Legacy**, and **no** block-AQ / **no** residual ContextV1 / **no** compact intra (same encoder gating as **rev 3** entropy path) |
 
 **Policy statements (non-normative but required for project honesty):**
 
@@ -124,6 +125,12 @@ For each **8×8** MB:
 
 Decoders **must** decode coefficients with the declared **`grouping`** and **`scan`**, restore **natural-order** quants, then run the matching inverse transform (**8×8** IDCT or four **4×4** IDCTs). **Rev 34** is **intra** only; **P** transform grouping uses **rev 35** (below).
 
+### Revision 36 — intra mandatory ResidualTokenV2 (`FR2\x24`) — **opt-in**
+
+**Magic** `FR2` + byte **`36` (`0x24`)**. Same top-level header as **rev 3**/**rev 29** (**`frame_index`**, **`base_qp`**, three **`u32` LE** plane lengths, plane bytes). Per **8×8** block: **`pred`** (`u8`), **`dc`** (`i16` LE), then residual tag **`5`** (**`TAG_RESIDUAL_TOKEN_V3`**), **`u16` LE** blob length, structured **VERSION 3** token blob ([`encode_residual_token_v2_block`](../../crates/libsrs_video/src/srsv2/residual_token_v2.rs) with **`StructuredTokenV3`**). Any other residual tag is **malformed** for **rev 36** decoders (fail-safe).
+
+**Emission:** **`SrsV2ResidualTokenMode::TokenV2`** (see `SrsV2EncodeSettings::residual_token_mode` in `rate_control.rs`). Default **`Legacy`** continues to emit **rev 3**/**rev 7**/**rev 29**/**rev 32**/**rev 34** as today — **rev 36** is a distinct revision so mux/classifiers can treat TokenV2-only intra payloads without relying on per-block tags alone.
+
 ### Revision 33 — fixed-grid **P** compact luma residuals (`FR2\x21`) — **opt-in**
 
 **Magic** `FR2` + byte **`33` (`0x21`)**. Same **`frame_index`**, **`base_qp`**, **`flags`** (subpel, block AQ, entropy residuals; **`entropy`** residual flag **must** be set), optional AQ clip bytes, compact MV grid or **`sym_count` / `blob_len` / MV blob** as **rev 15**/**17**/**23**, then per **16×16** macroblock: **`mv`**, **`skip_pattern`** (**4** bits), then for each non-skipped **8×8** luma region optional **`qp_delta`** and **`u32` LE** chunk length and chunk bytes.
@@ -139,6 +146,14 @@ Decoders **must** decode coefficients with the declared **`grouping`** and **`sc
 **Residual chunk:** first byte **`4`** (**`TAG_P_RESIDUAL_TRANSFORM_GROUP_V35`**), then **`grouping`** (`u8`: **`0`** Four4×4, **`1`** Single8×8), **`scan`** (`u8`), **`pred`** (`u8`), **`body_len`** (`u16` LE), **`body`**. Malformed **`grouping`** or **`scan`** values are rejected on decode.
 
 **Emission:** Same encoder constraints as **rev 33**, except **`transform_grouping_mode` ≠ `Legacy8x8`** (e.g. **`Four4x4`** or **`AutoByResidual`** with **`ResidualAware`**/**`RdoFast`**). Default **`Legacy8x8`** keeps **rev 33** unchanged.
+
+### Revision 37 — fixed-grid **P** mandatory ResidualTokenV2 luma chunks (`FR2\x25`) — **opt-in**
+
+**Magic** `FR2` + byte **`37` (`0x25`)**. Same **`frame_index`**, **`base_qp`**, **`flags`** byte as **rev 15**/**33**/**35** compact inter (**bit 0** subpel, **bit 1** block AQ, **bit 2** entropy-coded residuals — **must** be set, **bit 3** entropy MV section). **Rev 37** additionally defines **bit 4** (`0x10`): when **bit 3** is set (**EntropyV1**-style MV blob), **bit 4** selects **ContextV1** MV blob decoding vs static **rANS** MV decoding; **bit 4** set while **bit 3** is clear is **malformed**. With **`SrsV2InterSyntaxMode::CompactV1`**, **bit 3** stays clear and the MV grid is raw compact deltas (**rev 15**-style) after optional AQ clip bytes.
+
+Non-skipped **8×8** luma residual chunks: outer byte **`1`** (adaptive wrapper), inner bytes match **rev 36** intra per block (**`pred`**, **`dc`**, tag **`5`** **`TAG_RESIDUAL_TOKEN_V3`**, **`u16` LE** blob length, structured **VERSION 3** token blob). Any other inner residual tag is **malformed** for **rev 37**.
+
+**Emission:** **`SrsV2ResidualTokenMode::TokenV2`**, **`ResidualEntropy::Auto`** or **`Rans`**, **`SrsV2ResidualContextMode::Off`** (not **rev 30** strict residual ContextV1), not **rev 33**/**rev 35** compact-coefficient paths, **`inter_partition_mode::Fixed16x16`**. Default **`Legacy`** residual token mode keeps historical **P** revisions unchanged.
 
 ### Revision 30 — **P** ContextV1 MV + strict residual ContextV1 (`FR2\x1E`) — **opt-in**
 

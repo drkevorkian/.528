@@ -15,7 +15,8 @@ use super::motion_search::SrsV2MotionEncodeStats;
 use super::p_frame_codec;
 use super::rate_control::{
     ResidualEncodeStats, ResidualEntropy, SrsV2BlockAqMode, SrsV2CoeffLayoutMode,
-    SrsV2EncodeSettings, SrsV2ResidualContextMode, SrsV2TransformGroupingMode,
+    SrsV2EncodeSettings, SrsV2ResidualContextMode, SrsV2ResidualTokenMode,
+    SrsV2TransformGroupingMode,
 };
 use super::reference_manager::SrsV2ReferenceManager;
 use super::residual_entropy::{
@@ -27,6 +28,8 @@ use super::residual_entropy::{
 
 pub const FRAME_PAYLOAD_MAGIC: [u8; 4] = [b'F', b'R', b'2', 1];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY: [u8; 4] = [b'F', b'R', b'2', 3];
+/// Intra with [`SrsV2ResidualTokenMode::TokenV2`] structured residual tails only (`FR2` rev **36**).
+pub const FRAME_PAYLOAD_MAGIC_INTRA_TOKEN_V2_REV36: [u8; 4] = [b'F', b'R', b'2', 36];
 pub const FRAME_PAYLOAD_MAGIC_INTRA_BLOCK_AQ: [u8; 4] = [b'F', b'R', b'2', 7];
 /// Intra adaptive residuals **strict** multi-context rANS (`FR2` rev **29**).
 pub const FRAME_PAYLOAD_MAGIC_INTRA_RESIDUAL_CTX_V1: [u8; 4] = [b'F', b'R', b'2', 29];
@@ -44,7 +47,9 @@ pub const FRAME_PAYLOAD_MAGIC_INTRA_TRANSFORM_GROUP_V34: [u8; 4] = [b'F', b'R', 
 pub const FRAME_PAYLOAD_MAGIC_ALT_REF: [u8; 4] = [b'F', b'R', b'2', 12];
 
 fn intra_magic_matches(payload: &[u8]) -> bool {
-    payload.len() >= 4 && &payload[0..3] == b"FR2" && matches!(payload[3], 1 | 3 | 7 | 29 | 32 | 34)
+    payload.len() >= 4
+        && &payload[0..3] == b"FR2"
+        && matches!(payload[3], 1 | 3 | 7 | 29 | 32 | 34 | 36)
 }
 
 fn intra_use_block_aq_wire(settings: &SrsV2EncodeSettings) -> bool {
@@ -119,7 +124,16 @@ pub fn encode_yuv420_intra_payload(
     } else {
         match settings.residual_entropy {
             ResidualEntropy::Explicit => FRAME_PAYLOAD_MAGIC,
-            ResidualEntropy::Auto | ResidualEntropy::Rans => FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY,
+            ResidualEntropy::Auto | ResidualEntropy::Rans => {
+                if matches!(
+                    settings.residual_token_mode,
+                    SrsV2ResidualTokenMode::TokenV2
+                ) {
+                    FRAME_PAYLOAD_MAGIC_INTRA_TOKEN_V2_REV36
+                } else {
+                    FRAME_PAYLOAD_MAGIC_INTRA_ENTROPY
+                }
+            }
         }
     };
     out.extend_from_slice(&magic);
@@ -148,7 +162,24 @@ pub fn encode_yuv420_intra_payload(
         }
         ResidualEntropy::Auto | ResidualEntropy::Rans => {
             let mut noop = ResidualEncodeStats::default();
-            let acc: &mut ResidualEncodeStats = stats.unwrap_or(&mut noop);
+            let (acc, had_stats) = match stats {
+                Some(a) => (a, true),
+                None => (&mut noop, false),
+            };
+            if had_stats {
+                acc.intra_rev36_residual_wire = false;
+                acc.residual_token_mode = None;
+                acc.residual_token_v2_bytes = 0;
+                acc.residual_legacy_estimated_bytes = 0;
+                acc.residual_token_v2_savings_bytes = 0;
+                acc.residual_token_v2_savings_percent = 0.0;
+                acc.token_v2_zero_runs = 0;
+                acc.token_v2_eob_count = 0;
+                acc.token_v2_large_coeff_count = 0;
+            }
+            if magic == FRAME_PAYLOAD_MAGIC_INTRA_TOKEN_V2_REV36 {
+                acc.intra_rev36_residual_wire = true;
+            }
             if matches!(
                 settings.residual_context_mode,
                 SrsV2ResidualContextMode::ContextV1
@@ -257,6 +288,9 @@ pub fn encode_yuv420_intra_payload(
                     &mut vb,
                 )?;
                 acc.finalize_residual_context_derived();
+                if magic == FRAME_PAYLOAD_MAGIC_INTRA_TOKEN_V2_REV36 {
+                    acc.finalize_residual_token_v2_derived();
+                }
             }
         }
     }
@@ -403,6 +437,7 @@ pub fn decode_yuv420_intra_payload(
                 qp_i,
                 ResidualPlane::Y,
                 false,
+                false,
             )?;
             if c != y_data.len() {
                 return Err(SrsV2Error::syntax("y plane trailing bits"));
@@ -414,6 +449,7 @@ pub fn decode_yuv420_intra_payload(
                 &mut u_plane,
                 qp_i,
                 ResidualPlane::U,
+                false,
                 false,
             )?;
             if c != u_data.len() {
@@ -427,6 +463,48 @@ pub fn decode_yuv420_intra_payload(
                 qp_i,
                 ResidualPlane::V,
                 false,
+                false,
+            )?;
+            if c != v_data.len() {
+                return Err(SrsV2Error::syntax("v plane trailing bits"));
+            }
+        }
+        36 => {
+            let mut c = 0usize;
+            decode_plane_intra_entropy(
+                y_data,
+                &mut c,
+                &mut y_plane,
+                qp_i,
+                ResidualPlane::Y,
+                false,
+                true,
+            )?;
+            if c != y_data.len() {
+                return Err(SrsV2Error::syntax("y plane trailing bits"));
+            }
+            c = 0;
+            decode_plane_intra_entropy(
+                u_data,
+                &mut c,
+                &mut u_plane,
+                qp_i,
+                ResidualPlane::U,
+                false,
+                true,
+            )?;
+            if c != u_data.len() {
+                return Err(SrsV2Error::syntax("u plane trailing bits"));
+            }
+            c = 0;
+            decode_plane_intra_entropy(
+                v_data,
+                &mut c,
+                &mut v_plane,
+                qp_i,
+                ResidualPlane::V,
+                false,
+                true,
             )?;
             if c != v_data.len() {
                 return Err(SrsV2Error::syntax("v plane trailing bits"));
@@ -434,17 +512,41 @@ pub fn decode_yuv420_intra_payload(
         }
         29 => {
             let mut c = 0usize;
-            decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i, ResidualPlane::Y, true)?;
+            decode_plane_intra_entropy(
+                y_data,
+                &mut c,
+                &mut y_plane,
+                qp_i,
+                ResidualPlane::Y,
+                true,
+                false,
+            )?;
             if c != y_data.len() {
                 return Err(SrsV2Error::syntax("y plane trailing bits"));
             }
             c = 0;
-            decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i, ResidualPlane::U, true)?;
+            decode_plane_intra_entropy(
+                u_data,
+                &mut c,
+                &mut u_plane,
+                qp_i,
+                ResidualPlane::U,
+                true,
+                false,
+            )?;
             if c != u_data.len() {
                 return Err(SrsV2Error::syntax("u plane trailing bits"));
             }
             c = 0;
-            decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i, ResidualPlane::V, true)?;
+            decode_plane_intra_entropy(
+                v_data,
+                &mut c,
+                &mut v_plane,
+                qp_i,
+                ResidualPlane::V,
+                true,
+                false,
+            )?;
             if c != v_data.len() {
                 return Err(SrsV2Error::syntax("v plane trailing bits"));
             }
@@ -661,17 +763,41 @@ pub fn decode_yuv420_alt_ref_payload(
     let mut v_plane = VideoPlane::<u8>::try_new(cw, ch, cw as usize)?;
 
     let mut c = 0usize;
-    decode_plane_intra_entropy(y_data, &mut c, &mut y_plane, qp_i, ResidualPlane::Y, false)?;
+    decode_plane_intra_entropy(
+        y_data,
+        &mut c,
+        &mut y_plane,
+        qp_i,
+        ResidualPlane::Y,
+        false,
+        false,
+    )?;
     if c != y_data.len() {
         return Err(SrsV2Error::syntax("alt-ref y plane trailing bits"));
     }
     c = 0;
-    decode_plane_intra_entropy(u_data, &mut c, &mut u_plane, qp_i, ResidualPlane::U, false)?;
+    decode_plane_intra_entropy(
+        u_data,
+        &mut c,
+        &mut u_plane,
+        qp_i,
+        ResidualPlane::U,
+        false,
+        false,
+    )?;
     if c != u_data.len() {
         return Err(SrsV2Error::syntax("alt-ref u plane trailing bits"));
     }
     c = 0;
-    decode_plane_intra_entropy(v_data, &mut c, &mut v_plane, qp_i, ResidualPlane::V, false)?;
+    decode_plane_intra_entropy(
+        v_data,
+        &mut c,
+        &mut v_plane,
+        qp_i,
+        ResidualPlane::V,
+        false,
+        false,
+    )?;
     if c != v_data.len() {
         return Err(SrsV2Error::syntax("alt-ref v plane trailing bits"));
     }
@@ -775,14 +901,14 @@ pub fn decode_yuv420_srsv2_payload_managed(
     }
     let rev = payload[3];
     let mut dec = match rev {
-        1 | 3 | 7 | 29 | 32 | 34 => {
+        1 | 3 | 7 | 29 | 32 | 34 | 36 => {
             let d = decode_yuv420_intra_payload(seq, payload)?;
             if seq.max_ref_frames > 0 {
                 manager.replace_after_keyframe(d.frame_index, d.yuv.clone());
             }
             d
         }
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 | 35 => {
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 | 35 | 37 => {
             let reference = manager
                 .primary_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -828,8 +954,8 @@ pub fn decode_yuv420_srsv2_payload(
         ));
     }
     let mut dec = match payload[3] {
-        1 | 3 | 7 | 29 | 32 | 34 => decode_yuv420_intra_payload(seq, payload)?,
-        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 | 35 => {
+        1 | 3 | 7 | 29 | 32 | 34 | 36 => decode_yuv420_intra_payload(seq, payload)?,
+        2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 | 35 | 37 => {
             let reference = ref_slot
                 .as_ref()
                 .ok_or(SrsV2Error::PFrameWithoutReference)?;
@@ -878,8 +1004,8 @@ mod roundtrip_tests {
     use crate::srsv2::rate_control::{
         ResidualEncodeStats, ResidualEntropy, SrsV2AdaptiveQuantizationMode, SrsV2BlockAqMode,
         SrsV2CoeffLayoutMode, SrsV2CoeffScanMode, SrsV2EncodeSettings, SrsV2EntropyModelMode,
-        SrsV2InterSyntaxMode, SrsV2RdoMode, SrsV2ResidualContextMode, SrsV2TransformDecisionMode,
-        SrsV2TransformGroupingMode,
+        SrsV2InterSyntaxMode, SrsV2RdoMode, SrsV2ResidualContextMode, SrsV2ResidualTokenMode,
+        SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
     };
     use crate::srsv2::reference_manager::SrsV2ReferenceManager;
 
@@ -2351,5 +2477,173 @@ mod roundtrip_tests {
                 Err(crate::srsv2::error::SrsV2Error::Unsupported(_))
             ));
         }
+    }
+
+    fn token_v2_intra_settings() -> SrsV2EncodeSettings {
+        SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Auto,
+            residual_token_mode: SrsV2ResidualTokenMode::TokenV2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fr2_rev36_intra_encode_decode_roundtrip() {
+        let seq = seq64_intra();
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = token_v2_intra_settings();
+        let mut stats = ResidualEncodeStats::default();
+        let payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 3, 18, &st, Some(&mut stats), None).unwrap();
+        assert_eq!(payload[3], 36);
+        let dec = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        assert_eq!(dec.frame_index, 3);
+        let dec_again = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        assert_eq!(dec.yuv.y.samples, dec_again.yuv.y.samples);
+        let mut as_rev3 = payload.clone();
+        as_rev3[3] = 3;
+        let dec_polyglot = decode_yuv420_intra_payload(&seq, &as_rev3).unwrap();
+        assert_eq!(dec.yuv.y.samples, dec_polyglot.yuv.y.samples);
+        assert_eq!(
+            stats.residual_token_mode,
+            Some(SrsV2ResidualTokenMode::TokenV2)
+        );
+        assert!(stats.residual_token_v2_bytes > 0);
+        assert!(stats.residual_legacy_estimated_bytes > 0);
+        assert!(stats.token_v2_eob_count > 0);
+    }
+
+    #[test]
+    fn fr2_rev36_malformed_non_token_v2_residual_tag_fails_decode() {
+        let seq = seq64_intra();
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 0, 20, &token_v2_intra_settings(), None, None)
+                .unwrap();
+        assert_eq!(payload[3], 36);
+        const Y0: usize = 4 + 4 + 1 + 4;
+        const FIRST_RES_TAG: usize = Y0 + 1 + 2;
+        assert_eq!(payload[FIRST_RES_TAG], 5);
+        payload[FIRST_RES_TAG] = crate::srsv2::residual_entropy::TAG_EXPLICIT_AC;
+        assert!(decode_yuv420_intra_payload(&seq, &payload).is_err());
+    }
+
+    #[test]
+    fn fr2_rev36_decode_is_deterministic() {
+        let seq = seq64_intra();
+        let mut rgb = vec![40_u8; 64 * 64 * 3];
+        for i in (0..rgb.len()).step_by(3) {
+            rgb[i] = ((i / 3) % 17) as u8;
+            rgb[i + 1] = ((i / 5) % 19) as u8;
+            rgb[i + 2] = ((i / 7) % 23) as u8;
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let payload =
+            encode_yuv420_intra_payload(&seq, &yuv, 9, 24, &token_v2_intra_settings(), None, None)
+                .unwrap();
+        assert_eq!(payload[3], 36);
+        let a = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        let b = decode_yuv420_intra_payload(&seq, &payload).unwrap();
+        assert_eq!(a.yuv.y.samples, b.yuv.y.samples);
+    }
+
+    #[test]
+    fn fr2_rev3_default_intra_still_encodes_not_rev36() {
+        let seq = seq64_intra();
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let st = SrsV2EncodeSettings {
+            residual_entropy: ResidualEntropy::Auto,
+            ..Default::default()
+        };
+        let payload = encode_yuv420_intra_payload(&seq, &yuv, 1, 22, &st, None, None).unwrap();
+        assert_eq!(payload[3], 3);
+        decode_yuv420_intra_payload(&seq, &payload).unwrap();
+    }
+
+    #[test]
+    fn fr2_rev36_flat_frame_populates_residual_byte_counters() {
+        let seq = seq64_intra();
+        let rgb = vec![128_u8; 64 * 64 * 3];
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut stats = ResidualEncodeStats::default();
+        encode_yuv420_intra_payload(
+            &seq,
+            &yuv,
+            0,
+            22,
+            &token_v2_intra_settings(),
+            Some(&mut stats),
+            None,
+        )
+        .unwrap();
+        assert!(stats.residual_token_v2_bytes > 0);
+        assert!(stats.residual_legacy_estimated_bytes > 0);
+        stats.finalize_residual_token_v2_derived();
+        assert!(stats.residual_token_v2_savings_percent.is_finite());
+    }
+
+    #[test]
+    fn fr2_rev36_sparse_gradient_populates_residual_byte_counters() {
+        let seq = seq64_intra();
+        let mut rgb = vec![0_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let v = (x + y) as u8;
+                let i = (y * 64 + x) * 3;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut stats = ResidualEncodeStats::default();
+        encode_yuv420_intra_payload(
+            &seq,
+            &yuv,
+            2,
+            26,
+            &token_v2_intra_settings(),
+            Some(&mut stats),
+            None,
+        )
+        .unwrap();
+        assert!(stats.residual_token_v2_bytes > 0);
+        assert!(stats.residual_legacy_estimated_bytes > 0);
+        stats.finalize_residual_token_v2_derived();
+        assert!(stats.residual_token_v2_savings_percent.is_finite());
+    }
+
+    #[test]
+    fn fr2_rev36_dense_checkerboard_encodes_and_stats_sane() {
+        let seq = seq64_intra();
+        let mut rgb = vec![0_u8; 64 * 64 * 3];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let v = if ((x ^ y) & 1) == 0 { 20_u8 } else { 235_u8 };
+                let i = (y * 64 + x) * 3;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let yuv = rgb888_full_to_yuv420_bt709(&rgb, 64, 64, ColorRange::Limited).unwrap();
+        let mut stats = ResidualEncodeStats::default();
+        encode_yuv420_intra_payload(
+            &seq,
+            &yuv,
+            0,
+            18,
+            &token_v2_intra_settings(),
+            Some(&mut stats),
+            None,
+        )
+        .expect("encode dense rev36");
+        assert!(stats.residual_token_v2_bytes > 0);
+        assert!(stats.residual_legacy_estimated_bytes > 0);
+        assert!(stats.token_v2_eob_count > 0);
+        let _ = stats.residual_token_v2_savings_percent;
     }
 }

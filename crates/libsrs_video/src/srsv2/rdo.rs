@@ -620,19 +620,18 @@ mod tests {
     use crate::srsv2::rate_control::{SrsV2CoeffScanMode, SrsV2EncodeSettings};
 
     fn settings_zigzag_scan() -> SrsV2EncodeSettings {
-        let mut s = SrsV2EncodeSettings::default();
-        s.coeff_scan_mode = SrsV2CoeffScanMode::ZigZag;
-        s
+        SrsV2EncodeSettings {
+            coeff_scan_mode: SrsV2CoeffScanMode::ZigZag,
+            ..Default::default()
+        }
     }
 
     #[test]
     fn grouping_rdo_smooth_residual_prefers_single8x8() {
         let settings = settings_zigzag_scan();
         let mut diff = [[0_i16; 8]; 8];
-        for r in 0..8 {
-            for c in 0..8 {
-                diff[r][c] = 2;
-            }
+        for row in &mut diff {
+            row.fill(2);
         }
         let d = choose_grouping_rdo_fast(&settings, &diff, 16, 256).unwrap();
         assert_eq!(d.kind, SrsV2TransformKind::Tx8x8);
@@ -656,9 +655,9 @@ mod tests {
         let cfg = TransformDecisionConfig::default();
         let settings = settings_zigzag_scan();
         let mut diff = [[0_i16; 8]; 8];
-        for r in 0..8 {
-            for c in 0..8 {
-                diff[r][c] = if (r + c) % 2 == 0 { 96 } else { -96 };
+        for (r, row) in diff.iter_mut().enumerate() {
+            for (c, cell) in row.iter_mut().enumerate() {
+                *cell = if (r + c) % 2 == 0 { 96 } else { -96 };
             }
         }
         assert_eq!(

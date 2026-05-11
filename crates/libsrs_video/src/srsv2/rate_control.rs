@@ -33,6 +33,18 @@ pub enum ResidualEntropy {
     Rans,
 }
 
+/// Opt-in experimental residual byte packing using [`super::residual_token_v2`] (**structured `FR2` tail tag**).
+///
+/// **Default** [`SrsV2ResidualTokenMode::Legacy`] preserves historical explicit / rANS / context block tails.
+/// [`SrsV2ResidualTokenMode::TokenV2`] emits [`super::residual_entropy::TAG_RESIDUAL_TOKEN_V3`] and **does not** fall back
+/// on encode failure (caller gets [`crate::srsv2::SrsV2Error`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SrsV2ResidualTokenMode {
+    #[default]
+    Legacy,
+    TokenV2,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ResidualEncodeStats {
     pub intra_explicit_blocks: u64,
@@ -102,6 +114,30 @@ pub struct ResidualEncodeStats {
     pub residual_token_v2_ac_body_bytes: u64,
     /// Blocks counted toward residual-token v1 vs v2 simulation (**subset where legacy rANS symbols fit**).
     pub residual_token_compare_block_count: u64,
+
+    /// Intra / adaptive **P** 8×8 blocks whose residual tail used [`super::residual_entropy::TAG_RESIDUAL_TOKEN_V3`].
+    pub residual_token_v2_wire_blocks: u64,
+
+    /// Set by [`super::frame_codec::encode_yuv420_intra_payload`] for **`FR2` rev36** only; gates rev36 telemetry in residual encode.
+    pub(crate) intra_rev36_residual_wire: bool,
+    /// Set by [`super::p_frame_codec::encode_yuv420_p_payload`] for **`FR2` rev37** only; gates strict TokenV2 tail telemetry (includes outer **`0x01`** wrapper byte per **P** chunk).
+    pub(crate) p_rev37_residual_token_v2_wire: bool,
+    /// Populated on **`FR2` rev36** intra: [`SrsV2ResidualTokenMode::TokenV2`].
+    pub residual_token_mode: Option<SrsV2ResidualTokenMode>,
+    /// Sum of per-block intra residual tails (`mode` + DC + [`super::residual_entropy::TAG_RESIDUAL_TOKEN_V3`] + `u16` len + structured v3 blob) for rev36.
+    pub residual_token_v2_bytes: u64,
+    /// Sum of per-block `min`(explicit tuples size, static rANS size) estimates aligned to the same rev36 blocks.
+    pub residual_legacy_estimated_bytes: u64,
+    /// `residual_legacy_estimated_bytes − residual_token_v2_bytes` contribution per block (may be negative).
+    pub residual_token_v2_savings_bytes: i64,
+    /// `100 * residual_token_v2_savings_bytes / residual_legacy_estimated_bytes`, or **`0`** if legacy estimate is zero.
+    pub residual_token_v2_savings_percent: f64,
+    /// Count of zero-run tokens across rev36 TokenV2 blocks.
+    pub token_v2_zero_runs: u64,
+    /// Count of [`super::residual_token_v2::ResidualTokenV2::EndOfBlock`] tokens across rev36 blocks.
+    pub token_v2_eob_count: u64,
+    /// Count of large-magnitude coefficient tokens across rev36 blocks.
+    pub token_v2_large_coeff_count: u64,
 }
 
 impl ResidualEncodeStats {
@@ -130,6 +166,16 @@ impl ResidualEncodeStats {
         self.transform_grouping_savings_percent = if self.legacy_transform_estimated_bytes > 0 {
             100.0 * self.transform_grouping_savings_bytes as f64
                 / self.legacy_transform_estimated_bytes as f64
+        } else {
+            0.0
+        };
+    }
+
+    /// Recompute [`Self::residual_token_v2_savings_percent`] after **`FR2` rev36** intra or **rev37** **P** encode (uses [`Self::residual_legacy_estimated_bytes`]).
+    pub fn finalize_residual_token_v2_derived(&mut self) {
+        self.residual_token_v2_savings_percent = if self.residual_legacy_estimated_bytes > 0 {
+            100.0 * self.residual_token_v2_savings_bytes as f64
+                / self.residual_legacy_estimated_bytes as f64
         } else {
             0.0
         };
@@ -475,6 +521,8 @@ pub struct SrsV2EncodeSettings {
     pub residual_entropy: ResidualEntropy,
     /// Intra-only experimental context residual entropy (**default** [`SrsV2ResidualContextMode::Off`]).
     pub residual_context_mode: SrsV2ResidualContextMode,
+    /// Experimental [`super::residual_token_v2`] block tails on intra / adaptive **P** paths (**default** [`SrsV2ResidualTokenMode::Legacy`]).
+    pub residual_token_mode: SrsV2ResidualTokenMode,
 
     pub adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode,
     pub aq_strength: u8,
@@ -562,6 +610,7 @@ impl Default for SrsV2EncodeSettings {
             tune_quality_vs_speed: 50,
             residual_entropy: ResidualEntropy::Auto,
             residual_context_mode: SrsV2ResidualContextMode::Off,
+            residual_token_mode: SrsV2ResidualTokenMode::Legacy,
 
             adaptive_quantization_mode: SrsV2AdaptiveQuantizationMode::Off,
             aq_strength: 4,
@@ -771,7 +820,36 @@ impl SrsV2EncodeSettings {
             self.transform_grouping_mode,
             self.transform_decision_mode,
         );
+        self.validate_residual_token_settings()?;
         Ok(())
+    }
+
+    /// Reject [`SrsV2ResidualTokenMode::TokenV2`] combinations that are not wired or contradict other modes.
+    pub fn validate_residual_token_settings(&self) -> Result<(), SrsV2Error> {
+        match self.residual_token_mode {
+            SrsV2ResidualTokenMode::Legacy => Ok(()),
+            SrsV2ResidualTokenMode::TokenV2 => {
+                if matches!(self.residual_entropy, ResidualEntropy::Explicit) {
+                    return Err(SrsV2Error::syntax(
+                        "residual_token_mode TokenV2 requires residual_entropy Auto or Rans",
+                    ));
+                }
+                if !matches!(self.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy) {
+                    return Err(SrsV2Error::syntax(
+                        "residual_token_mode TokenV2 requires coeff_layout_mode Legacy (compact intra/P residual paths are separate)",
+                    ));
+                }
+                if matches!(
+                    self.residual_context_mode,
+                    SrsV2ResidualContextMode::ContextV1
+                ) {
+                    return Err(SrsV2Error::syntax(
+                        "residual_token_mode TokenV2 is incompatible with residual_context_mode ContextV1",
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Search radius bounded for hostile-input-safe encode (`≤ MAX_MOTION_SEARCH_RADIUS`).
@@ -1380,5 +1458,58 @@ mod tests {
                 "coeff_layout: Tx16x16 transform size is not implemented for encode",
             )
         ));
+    }
+
+    #[test]
+    fn residual_token_mode_default_is_legacy() {
+        assert_eq!(
+            SrsV2EncodeSettings::default().residual_token_mode,
+            SrsV2ResidualTokenMode::Legacy
+        );
+    }
+
+    #[test]
+    fn residual_token_v2_validates_with_legacy_coeff_layout() {
+        let s = SrsV2EncodeSettings {
+            residual_token_mode: SrsV2ResidualTokenMode::TokenV2,
+            residual_entropy: ResidualEntropy::Auto,
+            coeff_layout_mode: SrsV2CoeffLayoutMode::Legacy,
+            residual_context_mode: SrsV2ResidualContextMode::Off,
+            ..Default::default()
+        };
+        s.validate_residual_token_settings().unwrap();
+        s.validate_coeff_layout_settings().unwrap();
+    }
+
+    #[test]
+    fn residual_token_v2_rejected_with_explicit_entropy() {
+        let s = SrsV2EncodeSettings {
+            residual_token_mode: SrsV2ResidualTokenMode::TokenV2,
+            residual_entropy: ResidualEntropy::Explicit,
+            ..Default::default()
+        };
+        assert!(s.validate_residual_token_settings().is_err());
+    }
+
+    #[test]
+    fn residual_token_v2_rejected_with_compact_coeff_layout() {
+        let s = SrsV2EncodeSettings {
+            residual_token_mode: SrsV2ResidualTokenMode::TokenV2,
+            residual_entropy: ResidualEntropy::Auto,
+            coeff_layout_mode: SrsV2CoeffLayoutMode::CompactV1,
+            ..Default::default()
+        };
+        assert!(s.validate_residual_token_settings().is_err());
+    }
+
+    #[test]
+    fn residual_token_v2_rejected_with_residual_context_v1() {
+        let s = SrsV2EncodeSettings {
+            residual_token_mode: SrsV2ResidualTokenMode::TokenV2,
+            residual_entropy: ResidualEntropy::Auto,
+            residual_context_mode: SrsV2ResidualContextMode::ContextV1,
+            ..Default::default()
+        };
+        assert!(s.validate_residual_token_settings().is_err());
     }
 }

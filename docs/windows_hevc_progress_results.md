@@ -4,17 +4,19 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 
 ## Run
 
-- Date: 2026-05-10 13:43:30 -06:00 (baseline); **`--compare-coeff-layouts`** finished ~13:44 -06:00; **`--compare-transform-grouping`** (Block 4) recorded **2026-05-08** with git **7ed0cba**
+- Date: 2026-05-10 13:43:30 -06:00 (baseline); **`--compare-coeff-layouts`** finished ~13:44 -06:00; **`--compare-transform-grouping`** (Block 4) recorded **2026-05-08** with git **7ed0cba**; **`--compare-residual-token-v2`** (Block 6) recorded **2026-05-08** with git **223a9f8**
 - Output root: `var\bench\windows_hevc_progress\`
 - Seed: 528; fps: 30; QP: 28
 - Corpus: `moving-square`, `scrolling-bars`, `checker`, `scene-cut` (64×64, 8 frames)
 - Gate knobs (Block 4): **keyint 8**, **motion-radius 4**, **`--residual-entropy auto`**, harness normalizes to **compact** inter + **fixed16×16** + **coeff-layout compact** / zigzag (see `bench_srsv2` `--compare-transform-grouping`).
+- Gate knobs (Block 6): same WxH / frames / QP **28** / keyint **8** / motion-radius **4**; **`bench_srsv2 --compare-residual-token-v2`** normalizes **`--residual-entropy auto`**, **`--residual-context off`**, **`--inter-partition fixed16x16`**, **`--coeff-layout legacy`**, **`--block-aq off`**, upgrades raw inter → **compact** (see bench harness).
 - FFmpeg available: **True**; libx264: **True**; libx265: **True**
 - Commands: `var\bench\windows_hevc_progress\commands_run.txt` (coeff-layout lines from earlier baseline + Block 4 gen/bench lines)
-- Git (coeff-layout JSON): **c4a2203**; Git (transform-grouping JSON): **7ed0cba**
+- Git (coeff-layout JSON): **c4a2203**; Git (transform-grouping JSON): **7ed0cba**; Git (residual-token-v2 JSON): **223a9f8**
 - Residual-context tables: `reports\<tag>\compare_residual_contexts.{json,md}`
 - Coefficient-layout compare: `reports\<tag>\compare_coeff_layouts.{json,md}` (`bench_srsv2 --compare-coeff-layouts`, same WxH×frames / QP **28** / keyint **8** / motion-radius **4** as gate)
 - Transform-grouping compare: `reports\<tag>\compare_transform_grouping.{json,md}` (`bench_srsv2 --compare-transform-grouping`)
+- Residual TokenV2 compare: `reports\<tag>\compare_residual_token_v2.{json,md}` (`bench_srsv2 --compare-residual-token-v2`)
 
 ## Required Results
 
@@ -26,6 +28,27 @@ _Engineering measurement only. This report does **not** claim SRSV2 beats H.265/
 - Optional x265 result: status=ok, bytes=3561, bitrate=106830, PSNR-Y=100, SSIM-Y=1
 
 ## Questions Answered
+
+### Residual TokenV2 (`bench_srsv2 --compare-residual-token-v2`)
+
+Harness rows (fixed order): **`legacy`** then **`token-v2`**. **`row.bytes`** / **`details.total_bytes`** = full SRSV2 clip payload for that pass. Telemetry **`details.residual_bytes`** uses the bench intra + **P** residual bucket; the **`token-v2`** row often shows **`residual_bytes: 0`** with a different per-frame breakdown (e.g. **`intra_explicit_blocks: 0`**) — **do not** treat **`residual_bytes`** as directly comparable across rows; prefer **`total_bytes`** and on-wire tail fields such as **`residual_token_v2_bytes`**.
+
+| Clip | legacy total B | legacy `residual_bytes` | token-v2 total B | token-v2 `residual_bytes` | Δ total (v2−legacy) | token-v2 `residual_token_v2_bytes` | PSNR-Y (leg / v2) | SSIM-Y (leg / v2) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `moving_square` | 6566 | 6251 | 14963 | 0 | **+8397** | 13376 | 14.8952 / 14.8952 | 0.619397 / 0.619397 |
+| `scrolling_bars` | 8973 | 8658 | 19590 | 0 | **+10617** | 17595 | 14.6554 / 14.6554 | 0.557608 / 0.557608 |
+| `checker` | 16761 | 16446 | 42125 | 0 | **+25364** | 39906 | 10.5063 / 10.5063 | 0.131160 / 0.131160 |
+| `scene_cut` | 4949 | 4634 | 11205 | 0 | **+6256** | 9666 | 13.3004 / 13.3004 | 0.693524 / 0.693524 |
+
+**Simulated AC-only** (subset of 8×8 blocks where legacy rANS tokenization fits; **not** on FR2 wire): JSON `residual_token_compare_summary` on **every** clip reports **v2 packed ≥ v1 rANS blob sum** (negative **Δ (v1−v2)** in the string): **`moving_square`** **3715** vs **4594** B; **`scrolling_bars`** **4943** vs **6290** B; **`checker`** **10834** vs **11996** B; **`scene_cut`** **2790** vs **3418** B.
+
+**Residual TokenV2 compare — direct answers**
+
+1. **Did TokenV2 reduce residual bytes?** **Not in a comparable way:** **`token-v2`** rows report **`residual_bytes: 0`** here (telemetry path differs). Simulated **AC-only** payloads on the counted subset show **v2 not smaller than v1** on **`moving_square`**. **No evidence of residual-byte reduction** on this harness.
+2. **Did TokenV2 reduce total bytes?** **No.** Δ total (**`token-v2` − `legacy`**) is **+6256…+25364** bytes on **every** clip (**largest regression on `checker`**).
+3. **Did PSNR/SSIM stay the same or improve?** **Same** at the precision printed (paired rows match).
+4. **Which clip improved most (total bytes)?** **None** — every **`token-v2`** total was **larger**. **Smallest absolute regression:** **`scene_cut`** (**+6256** B vs legacy **4949** B).
+5. **Is residual still the largest bottleneck?** **On legacy rows, yes** — e.g. **`scene_cut`** legacy **`residual_bytes` 4634** / total **4949** (**~94%** of that telemetry slice). **`token-v2`** totals add large **`residual_token_v2_bytes`** tails; combined picture is still **coefficient / residual dominated**, not MV-dominated, on these clips.
 
 ### Transform grouping (`bench_srsv2 --compare-transform-grouping`)
 
@@ -181,9 +204,9 @@ Winner: **`residual`** with **4058** bytes.
 
 ## Next Feature
 
-See **`docs/next_hevc_codec_block.md`** — Block 4 transform-grouping numbers narrow the next execution target (**motion-heavy clips still favor `legacy8x8` on totals**).
+See **`docs/next_hevc_codec_block.md`** — **Block 6** selected the next target from **`--compare-residual-token-v2`** (git **223a9f8**): TokenV2 **did not** reduce **total bytes** on any corpus clip; the doc now points to **transform / quantization** follow-up rather than wiring TokenV2 into **B** / variable partitions.
 
-Reason (historical): **`--compare-coeff-layouts`** showed CompactV1 **increases** total bytes on **all four** clips; **`--compare-transform-grouping`** (Block 4) shows **mixed** totals vs **`legacy8x8`** (**engineering measurement only**).
+Reason (historical): **`--compare-coeff-layouts`** showed CompactV1 **increases** total bytes on **all four** clips; **`--compare-transform-grouping`** (Block 4) shows **mixed** totals vs **`legacy8x8`**; **`--compare-residual-token-v2`** shows **larger** totals for **`token-v2`** vs **`legacy`** on **all four** clips (**engineering measurement only**).
 
 Allowed planning labels: **A** CTU64 encode path; **B** transform-size / coefficient layout; **C** context-adaptive residual training (only if residual ContextV1 wins totals); **D** quarter-pel luma motion; **E** bitrate-matched x265 sweep (fairness).
 

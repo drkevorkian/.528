@@ -1,72 +1,71 @@
 # Next HEVC-Class Codec Implementation Block
 
-**Source gate:** [`windows_hevc_progress_results.md`](windows_hevc_progress_results.md) — Windows HEVC progress corpus plus **`bench_srsv2 --compare-transform-grouping`** on **`moving_square`**, **`scrolling_bars`**, **`checker`**, **`scene_cut`** (64×64, 8 frames, QP **28**, keyint **8**, motion-radius **4**, seed **528**, git **7ed0cba**). Engineering measurement only.
+**Source gate:** [`windows_hevc_progress_results.md`](windows_hevc_progress_results.md) — § **Residual TokenV2** (`bench_srsv2 --compare-residual-token-v2`) on **`moving_square`**, **`scrolling_bars`**, **`checker`**, **`scene_cut`** (64×64, 8 frames, QP **28**, keyint **8**, motion-radius **4**, seed **528**, git **223a9f8**). Engineering measurement only; **no** claim that SRSV2 beats H.265/HEVC.
 
-**Selected feature (exactly one):** **Motion- and prediction-aware Auto transform grouping** — steer **`AutoByResidual`** / **`RdoFast`** so **`legacy8x8`-sized totals** are recovered on **motion-heavy** clips (**`scrolling_bars`**, **`scene_cut`**) **without** sacrificing the **`four4x4`** / **`auto-rdo-fast`** byte wins already seen on **`checker`** and **`moving_square`**.
+**Selected feature (exactly one):** **Transform math / quantization redesign** (coefficient domain: scale, deadzone, and/or transform pipeline) — **not** expanding TokenV2 into **B** frames or variable partitions until residual tails shrink on the fixed-grid harness.
 
 ---
 
-## Decision record (Block 4 rubric)
+## Decision record (Block 6 rubric)
 
-Evidence from **`--compare-transform-grouping`** (same gate settings as [`windows_hevc_progress_results.md`](windows_hevc_progress_results.md) § Transform grouping). Primary metric: **`total_bytes`**. Telemetry **`residual_bytes`** is **not** comparable row-to-row without reading the fairness note in the results doc.
+Primary metric: **`total_bytes`** per compare row (`row.bytes` / `details.total_bytes` in JSON). **`token-v2`** vs **`legacy`**:
 
-| Clip | `legacy8x8` total | Best total among tested modes | Which mode | Δ vs legacy (best − legacy) |
-|------|------------------:|------------------------------:|------------|---------------------------:|
-| `moving_square` | 8984 | 8176 | **`four4x4`** | **−808** |
-| `scrolling_bars` | 11894 | 11894 | **`legacy8x8`** | **0** |
-| `checker` | 18410 | 13838 | **`four4x4`** | **−4572** |
-| `scene_cut` | 7698 | 7698 | **`legacy8x8`** | **0** |
+| Clip | legacy total | token-v2 total | Δ (v2 − legacy) | PSNR-Y change | SSIM-Y change |
+|------|-------------:|---------------:|------------------:|---------------|---------------|
+| `moving_square` | 6566 | 14963 | **+8397** | none (match) | none (match) |
+| `scrolling_bars` | 8973 | 19590 | **+10617** | none (match) | none (match) |
+| `checker` | 16761 | 42125 | **+25364** | none (match) | none (match) |
+| `scene_cut` | 4949 | 11205 | **+6256** | none (match) | none (match) |
 
 **Verdict**
 
-- **Localized / high-contrast residual clips** (`moving_square`, `checker`): **explicit `four4x4`** or **`auto-rdo-fast`** can **beat** **`legacy8x8`** on **total bytes** (with **different** PSNR-Y / SSIM-Y vs legacy at printed precision).
-- **Smooth motion / scene-cut style clips** (`scrolling_bars`, `scene_cut`): **`legacy8x8`** remains the **smallest total**; **`four4x4`**, **`auto-residual-aware`**, and **`auto-rdo-fast`** **regress** totals in this run.
+- **TokenV2 does not “help” on clip totals here** — every **`token-v2`** row is **larger** than **`legacy`**.
+- **Quality (PSNR-Y / SSIM-Y)** is **unchanged** at the precision stored in the JSON for these pairs — the regression is **size**, not measured displayed-frame quality on this gate.
+- **Smallest total-byte regression** vs legacy: **`scene_cut`**; **largest**: **`checker`**.
 
-**Conclusion:** The next focused block is **not** “always Four4×4” nor “revert grouping experiments”; it is **conditional Auto grouping** that **tracks prediction effectiveness** (temporal smoothness, MV magnitude, residual energy distribution) so **motion-heavy** clips **collapse toward Tx8×8-style totals** while **keeping** wins where **Four4×4** pays off.
+**Paths not chosen (same rubric)**
+
+- **Integrate TokenV2 into B / variable partitions:** deferred — TokenV2 **failed** the total-byte gate on **all** fixed-grid clips.
+- **CTU64 encode path:** deferred — residual / coefficient tails still dominate legacy telemetry on the reference **`scene_cut`** row in [`windows_hevc_progress_results.md`](windows_hevc_progress_results.md) § Biggest Byte Bottleneck; nothing in Block 6 suggests MV/header became the cap.
+- **Quarter-pel luma:** deferred — no evidence prediction error (vs side information) became the primary limiter in this compare.
+
+**Conclusion:** Next engineering focus is **coefficient budget**: quantization / transform behavior so fewer bits are spent for the same QP and measured quality, **before** widening TokenV2 surface area.
 
 ---
 
-## Numbers pinned to this decision
+## Artifacts
 
-| Clip | L8 total | F4 total | auto-RA total | auto-RDO total | PSNR-Y (L8/F4/ARA/ARDO) | SSIM-Y (L8/F4/ARA/ARDO) |
-|------|---------:|---------:|--------------:|---------------:|-------------------------|-------------------------|
-| `moving_square` | 8984 | 8176 | 8662 | 8276 | 14.895 / 14.987 / 14.897 / 14.962 | 0.619 / 0.653 / 0.622 / 0.645 |
-| `scrolling_bars` | 11894 | 13586 | 12724 | 12752 | 14.655 / 14.679 / 14.667 / 14.755 | 0.558 / 0.582 / 0.558 / 0.576 |
-| `checker` | 18410 | 13838 | 18954 | 14100 | 10.506 / 10.624 / 10.506 / 10.502 | 0.131 / 0.130 / 0.131 / 0.133 |
-| `scene_cut` | 7698 | 8942 | 8072 | 8362 | 13.300 / 13.404 / 13.300 / 13.412 | 0.694 / 0.714 / 0.694 / 0.710 |
-
-Artifacts: `var/bench/windows_hevc_progress/reports/<tag>/compare_transform_grouping.{json,md}`.
+- `var/bench/windows_hevc_progress/reports/<tag>/compare_residual_token_v2.{json,md}`
+- Command lines: `var/bench/windows_hevc_progress/commands_run.txt` (Block 6 append)
 
 ---
 
 ## Cursor block (forward)
 
 ````text
-BLOCK 8 GOAL:
-Make Auto transform grouping (ResidualAware + RdoFast) clip-aware so motion-smooth / prediction-friendly
-MBs avoid Four4×4 side-cost regressions (scrolling_bars, scene_cut) while preserving wins on checker / moving_square.
+BLOCK 7 GOAL:
+Reduce coefficient bits at fixed QP without sacrificing displayed-frame PSNR-Y / SSIM-Y on the
+four-corpus gate (64×64, 8 frames, keyint 8, motion-radius 4, seed 528) — transform / quantization
+path (not TokenV2 wiring into B or var-partitions).
 
 SOURCE:
-docs/windows_hevc_progress_results.md — § Transform grouping (bench_srsv2 --compare-transform-grouping), git 7ed0cba.
+docs/windows_hevc_progress_results.md — § Residual TokenV2 (bench_srsv2 --compare-residual-token-v2), git 223a9f8.
 
 WHY (data-backed):
-- legacy8x8 wins total bytes on scrolling_bars and scene_cut; four4x4 wins on moving_square and checker.
-- auto-rdo-fast is strictly between: better than legacy on 2 clips, worse on 2 clips.
+- token-v2 totals exceed legacy on every clip (+6256 … +25364 B).
+- Simulated AC subset on moving_square: v2 packed bytes ≥ v1 rANS blob sum in JSON summary.
 
 NON-GOALS:
 - No H.265/HEVC/x265 superiority claims.
-- Do not expand variable partitions or B-picture coeff layout until fixed-grid totals are stable.
+- Do not expand TokenV2 into B-picture or adaptive partition paths until fixed-grid totals improve.
 
 MEASUREMENT:
-- Re-run bench_srsv2 --compare-transform-grouping on the four corpus clips (same WxH, frames, QP 28, keyint 8, motion-radius 4, seed 528).
-- Refresh docs/windows_hevc_progress_results.md and this file.
-
-OPTIONAL HYGIENE (parallel):
-- Align residual_bytes telemetry across grouping rows so byte budgets are auditable without relying on total_bytes alone.
+- Re-run bench_srsv2 --compare-residual-token-v2 after changes (same corpus, QP, keyint, motion-radius).
+- Refresh docs/windows_hevc_progress_results.md § Residual TokenV2 and this file.
 ````
 
 ---
 
 ## Relation to earlier option **E**
 
-Bitrate-matched external references remain **parallel** fairness work; they **do not** replace **in-tree grouping policy** tuning above.
+Bitrate-matched external references remain **parallel** fairness work; they **do not** replace in-tree quantization / transform work above.

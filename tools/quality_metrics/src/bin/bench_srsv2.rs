@@ -26,7 +26,8 @@ use libsrs_video::{
     SrsV2InterSyntaxMode, SrsV2LoopFilterMode, SrsV2MotionEncodeStats, SrsV2MotionSearchMode,
     SrsV2PartitionCostModel, SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode,
     SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ReferenceManager,
-    SrsV2SubpelMode, SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
+    SrsV2ResidualTokenMode, SrsV2SubpelMode, SrsV2TransformDecisionMode,
+    SrsV2TransformGroupingMode,
     SrsV2TransformSizeMode, VideoSequenceHeaderV2, YuvFrame,
 };
 use quality_metrics::hevc_compare;
@@ -179,7 +180,16 @@ struct Args {
     )]
     compare_transform_grouping_with_partitions: bool,
 
-    /// When set, include **`residual_token_v2`** vs legacy static **rANS** AC-blob simulation in JSON/Markdown (Telemetry only; not on **`FR2`** wire).
+    /// Residual tail packing for **TokenV2** wire paths (**`legacy`** default, **`v2`** enables [`SrsV2ResidualTokenMode::TokenV2`] where validated in `libsrs_video`).
+    #[arg(
+        long = "residual-token",
+        visible_alias = "residual_token",
+        default_value = "legacy",
+        value_parser = parse_residual_token_cli_flag
+    )]
+    residual_token: String,
+
+    /// Two-row harness — **`legacy`** then **`token-v2`** — same clip; JSON/Markdown include wire + simulation telemetry (**no FFmpeg**). A failing **v2** row does not abort the baseline row. Engineering measurement only — **not** a superiority claim vs **HEVC**/**H.265**.
     #[arg(
         long = "compare-residual-token-v2",
         visible_alias = "compare_residual_token_v2",
@@ -816,9 +826,28 @@ struct Srsv2Details {
     residual_token_v2_ac_body_bytes: u64,
     #[serde(default)]
     residual_token_compare_block_count: u64,
-    /// Present when **`--compare-residual-token-v2`** and at least one comparable block exists.
+    /// Present when at least one comparable block exists for simulated **v1** vs **v2** AC payloads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     residual_token_compare_summary: Option<String>,
+    /// CLI / settings mirror: **`legacy`** or **`token-v2`** ([`SrsV2ResidualTokenMode`]).
+    #[serde(default)]
+    residual_token_mode: String,
+    /// On-wire **TokenV2** tail bytes summed by the encoder (**rev36** intra / **rev37** **P** telemetry); **`0`** when mode is legacy or no TokenV2 blocks.
+    #[serde(default)]
+    residual_token_v2_bytes: u64,
+    /// Legacy static **rANS** / explicit estimate paired with [`Self::residual_token_v2_bytes`] for savings math.
+    #[serde(default)]
+    residual_legacy_estimated_bytes: u64,
+    #[serde(default)]
+    residual_token_v2_savings_bytes: i64,
+    #[serde(default)]
+    residual_token_v2_savings_percent: f64,
+    #[serde(default)]
+    token_v2_zero_runs: u64,
+    #[serde(default)]
+    token_v2_eob_count: u64,
+    #[serde(default)]
+    token_v2_large_coeff_count: u64,
     /// Sum of encoded frame payload sizes (display-order bench aggregate).
     #[serde(default)]
     total_bytes: u64,
@@ -926,12 +955,49 @@ impl Default for Srsv2Details {
             residual_token_v2_ac_body_bytes: 0,
             residual_token_compare_block_count: 0,
             residual_token_compare_summary: None,
+            residual_token_mode: String::new(),
+            residual_token_v2_bytes: 0,
+            residual_legacy_estimated_bytes: 0,
+            residual_token_v2_savings_bytes: 0,
+            residual_token_v2_savings_percent: 0.0,
+            token_v2_zero_runs: 0,
+            token_v2_eob_count: 0,
+            token_v2_large_coeff_count: 0,
             total_bytes: 0,
             residual_bytes: 0,
             encode_fps: 0.0,
             decode_fps: 0.0,
             entropy_failure_reason: None,
         }
+    }
+}
+
+fn residual_token_mode_cli_label(m: SrsV2ResidualTokenMode) -> &'static str {
+    match m {
+        SrsV2ResidualTokenMode::Legacy => "legacy",
+        SrsV2ResidualTokenMode::TokenV2 => "token-v2",
+    }
+}
+
+fn parse_residual_token_cli_flag(s: &str) -> Result<String, String> {
+    let t = s.to_ascii_lowercase().replace('_', "-");
+    match t.as_str() {
+        "legacy" => Ok("legacy".into()),
+        "v2" | "token-v2" | "tokenv2" => Ok("v2".into()),
+        _ => Err(format!(
+            "must be 'legacy' or 'v2' (aliases: token-v2, tokenv2); got {s}"
+        )),
+    }
+}
+
+fn parse_residual_token_mode(args: &Args) -> Result<SrsV2ResidualTokenMode> {
+    match args.residual_token.as_str() {
+        "legacy" => Ok(SrsV2ResidualTokenMode::Legacy),
+        "v2" => Ok(SrsV2ResidualTokenMode::TokenV2),
+        _ => Err(anyhow!(
+            "internal: residual_token normalized to legacy|v2 (got {})",
+            args.residual_token
+        )),
     }
 }
 
@@ -1114,6 +1180,9 @@ struct BenchReport {
     compare_residual_modes: Option<Vec<ResidualCompareEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compare_residual_contexts: Option<Vec<ResidualCompareEntry>>,
+    /// When **`--compare-residual-token-v2`**: **`legacy`** vs **`token-v2`** rows (same clip).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_residual_token_v2: Option<Vec<ResidualCompareEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sweep: Option<Vec<SweepRunReport>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1597,13 +1666,20 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         + args.compare_partition_syntax as u8
         + args.compare_entropy_models as u8
         + args.compare_residual_contexts as u8
+        + args.compare_residual_token_v2 as u8
         + args.compare_coeff_layouts as u8
         + args.compare_transform_grouping as u8
         + args.compare_transform_grouping_with_partitions as u8;
     if compare_pass_count > 1 {
         bail!(
-            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, and --compare-transform-grouping-with-partitions are mutually exclusive"
+            "--compare-inter-syntax, --compare-rdo, --compare-partitions, --compare-partition-costs, --compare-partition-syntax, --compare-entropy-models, --compare-residual-contexts, --compare-residual-token-v2, --compare-coeff-layouts, --compare-transform-grouping, and --compare-transform-grouping-with-partitions are mutually exclusive"
         );
+    }
+    if args.compare_residual_contexts && args.compare_residual_token_v2 {
+        bail!("--compare-residual-contexts cannot be combined with --compare-residual-token-v2");
+    }
+    if args.compare_residual_token_v2 && args.compare_coeff_layouts {
+        bail!("--compare-residual-token-v2 cannot be combined with --compare-coeff-layouts");
     }
     if args.compare_residual_contexts && args.compare_coeff_layouts {
         bail!("--compare-residual-contexts cannot be combined with --compare-coeff-layouts");
@@ -1611,8 +1687,14 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
     if args.compare_residual_contexts && args.compare_transform_grouping {
         bail!("--compare-residual-contexts cannot be combined with --compare-transform-grouping");
     }
+    if args.compare_residual_token_v2 && args.compare_transform_grouping {
+        bail!("--compare-residual-token-v2 cannot be combined with --compare-transform-grouping");
+    }
     if args.compare_residual_contexts && args.compare_transform_grouping_with_partitions {
         bail!("--compare-residual-contexts cannot be combined with --compare-transform-grouping-with-partitions");
+    }
+    if args.compare_residual_token_v2 && args.compare_transform_grouping_with_partitions {
+        bail!("--compare-residual-token-v2 cannot be combined with --compare-transform-grouping-with-partitions");
     }
     if args.compare_coeff_layouts && args.compare_transform_grouping {
         bail!("--compare-coeff-layouts cannot be combined with --compare-transform-grouping");
@@ -1633,23 +1715,25 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
             || args.sweep_quality_bitrate
             || args.compare_residual_modes
             || args.compare_residual_contexts
+            || args.compare_residual_token_v2
             || args.compare_coeff_layouts
             || args.compare_transform_grouping
             || args.compare_transform_grouping_with_partitions
             || args.compare_b_modes)
     {
-        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, --compare-transform-grouping-with-partitions, or --compare-b-modes");
+        bail!("comparison modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-residual-token-v2, --compare-coeff-layouts, --compare-transform-grouping, --compare-transform-grouping-with-partitions, or --compare-b-modes");
     }
     if args.compare_b_modes
         && (args.sweep
             || args.compare_residual_modes
             || args.compare_residual_contexts
+            || args.compare_residual_token_v2
             || args.compare_coeff_layouts
             || args.compare_transform_grouping
             || args.compare_transform_grouping_with_partitions
             || args.sweep_quality_bitrate)
     {
-        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, or --compare-transform-grouping-with-partitions");
+        bail!("--compare-b-modes cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-residual-token-v2, --compare-coeff-layouts, --compare-transform-grouping, or --compare-transform-grouping-with-partitions");
     }
     if args.compare_b_modes {
         if args.reference_frames < 2 {
@@ -1737,12 +1821,13 @@ Provide paths from a prior `bench_srsv2` compare/sweep run.",
         if args.sweep
             || args.compare_residual_modes
             || args.compare_residual_contexts
+            || args.compare_residual_token_v2
             || args.compare_coeff_layouts
             || args.compare_transform_grouping
             || args.compare_transform_grouping_with_partitions
             || args.sweep_quality_bitrate
         {
-            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-coeff-layouts, --compare-transform-grouping, or --compare-transform-grouping-with-partitions");
+            bail!("--bframes 1 cannot be combined with --sweep, --sweep-quality-bitrate, --compare-residual-modes, --compare-residual-contexts, --compare-residual-token-v2, --compare-coeff-layouts, --compare-transform-grouping, or --compare-transform-grouping-with-partitions");
         }
     }
     if args.sweep_quality_bitrate {
@@ -1999,6 +2084,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
     let coeff_scan_mode = parse_coeff_scan_mode(&args.coeff_scan)?;
     let transform_grouping_mode = parse_transform_grouping_mode(&args.transform_grouping)?;
     let transform_decision_mode = parse_transform_decision_mode(&args.transform_decision)?;
+    let residual_token_mode = parse_residual_token_mode(args)?;
     let s = SrsV2EncodeSettings {
         quantizer: args.qp,
         rate_control_mode: rc,
@@ -2039,6 +2125,7 @@ fn build_settings(args: &Args, residual: ResidualEntropy) -> Result<SrsV2EncodeS
         coeff_scan_mode,
         transform_grouping_mode,
         transform_decision_mode,
+        residual_token_mode,
         ..Default::default()
     };
     s.validate_residual_context_mode()
@@ -2723,6 +2810,7 @@ fn run_compare_partition_syntax_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -3386,6 +3474,8 @@ fn run_srsv2_numbers(
             settings_leg.block_aq_mode = SrsV2BlockAqMode::Off;
             // Explicit tuple baseline must stay on legacy coefficient packaging (CompactV1 forbids Explicit).
             settings_leg.coeff_layout_mode = SrsV2CoeffLayoutMode::Legacy;
+            // TokenV2 is invalid with explicit residual entropy; baseline re-encode is always legacy tuples.
+            settings_leg.residual_token_mode = SrsV2ResidualTokenMode::Legacy;
             let mut sum = 0_u64;
             let mut slot = None::<YuvFrame>;
             for fi in 0..args.frames {
@@ -3556,8 +3646,10 @@ fn pass_to_details(
         .sum();
     for pl in &p.payloads {
         match pl.get(3).copied() {
-            Some(1 | 3 | 7 | 29 | 32) => i_bytes.push(pl.len() as u64),
-            Some(2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 33) => {
+            Some(1 | 3 | 7 | 29 | 32 | 34 | 36) => i_bytes.push(pl.len() as u64),
+            Some(
+                2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 | 35 | 37,
+            ) => {
                 p_bytes.push(pl.len() as u64)
             }
             Some(10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26) => b_bytes.push(pl.len() as u64),
@@ -3591,12 +3683,13 @@ fn pass_to_details(
     .unwrap_or_else(|_| ctu_grid_stats(args.width, args.height, CtuSize::Ctu16).unwrap());
     let mut enc_agg = p.enc_stats.clone();
     enc_agg.finalize_residual_context_derived();
-    let residual_token_compare_summary = if args.compare_residual_token_v2
-        && p.enc_stats.residual_token_compare_block_count > 0
-    {
-        let n = p.enc_stats.residual_token_compare_block_count;
-        let v1 = p.enc_stats.residual_token_v1_rans_ac_body_bytes;
-        let v2 = p.enc_stats.residual_token_v2_ac_body_bytes;
+    enc_agg.finalize_coeff_layout_derived();
+    enc_agg.finalize_transform_grouping_derived();
+    enc_agg.finalize_residual_token_v2_derived();
+    let residual_token_compare_summary = if enc_agg.residual_token_compare_block_count > 0 {
+        let n = enc_agg.residual_token_compare_block_count;
+        let v1 = enc_agg.residual_token_v1_rans_ac_body_bytes;
+        let v2 = enc_agg.residual_token_v2_ac_body_bytes;
         let d = v1 as i128 - v2 as i128;
         Some(format!(
             "Simulated **AC-only** payloads on **n={n}** 8×8 blocks where legacy rANS tokenization fits: **v1** rANS blob sum = **{v1}** B, **v2** packed = **{v2}** B, **Δ (v1−v2)** = **{d:+}** B. Not on **FR2** wire; engineering measurement only."
@@ -3696,6 +3789,14 @@ fn pass_to_details(
         residual_token_v2_ac_body_bytes: p.enc_stats.residual_token_v2_ac_body_bytes,
         residual_token_compare_block_count: p.enc_stats.residual_token_compare_block_count,
         residual_token_compare_summary,
+        residual_token_mode: residual_token_mode_cli_label(settings.residual_token_mode).to_string(),
+        residual_token_v2_bytes: enc_agg.residual_token_v2_bytes,
+        residual_legacy_estimated_bytes: enc_agg.residual_legacy_estimated_bytes,
+        residual_token_v2_savings_bytes: enc_agg.residual_token_v2_savings_bytes,
+        residual_token_v2_savings_percent: enc_agg.residual_token_v2_savings_percent,
+        token_v2_zero_runs: enc_agg.token_v2_zero_runs,
+        token_v2_eob_count: enc_agg.token_v2_eob_count,
+        token_v2_large_coeff_count: enc_agg.token_v2_large_coeff_count,
         total_bytes: enc_bytes,
         residual_bytes: residual_bytes_total,
         encode_fps: frames_f / p.enc_secs.max(1e-12),
@@ -3921,6 +4022,7 @@ fn run_compare_b_modes_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: Some(rows),
         compare_inter_syntax: None,
@@ -4018,6 +4120,7 @@ fn run_single_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -4168,6 +4271,7 @@ fn run_compare_residual_report(
         table,
         compare_residual_modes: Some(entries),
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -4320,6 +4424,169 @@ fn run_compare_residual_contexts_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: Some(entries),
+        compare_residual_token_v2: None,
+        sweep: None,
+        compare_b_modes: None,
+        compare_inter_syntax: None,
+        compare_rdo: None,
+        compare_partitions: None,
+        compare_partition_costs: None,
+        compare_partition_syntax: None,
+        compare_entropy_models: None,
+        entropy_model_compare_summary: None,
+        compare_coeff_layouts: None,
+        coeff_layout_compare_summary: None,
+        compare_transform_grouping: None,
+        transform_grouping_compare_summary: None,
+        compare_transform_grouping_split8x8: None,
+        transform_grouping_compare_summary_split8x8: None,
+        match_x264_bitrate_note: None,
+        git_commit: git_short_hash(),
+        os: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+    })
+}
+
+fn normalize_residual_token_compare_args(a: &mut Args) -> Result<()> {
+    if a.bframes > 0 {
+        bail!("--compare-residual-token-v2 requires --bframes 0 in this slice");
+    }
+    a.residual_entropy = "auto".to_string();
+    a.residual_context = "off".to_string();
+    a.inter_partition = "fixed16x16".to_string();
+    a.coeff_layout = "legacy".to_string();
+    a.block_aq = "off".to_string();
+    let syn = parse_inter_syntax_mode(&a.inter_syntax)?;
+    if syn == SrsV2InterSyntaxMode::RawLegacy {
+        a.inter_syntax = "compact".to_string();
+    }
+    Ok(())
+}
+
+fn run_compare_residual_token_v2_report(
+    args: &Args,
+    raw: &[u8],
+    expected_frame: usize,
+) -> Result<BenchReport> {
+    let passes: [(&str, SrsV2ResidualTokenMode); 2] = [
+        ("legacy", SrsV2ResidualTokenMode::Legacy),
+        ("token-v2", SrsV2ResidualTokenMode::TokenV2),
+    ];
+    let mut entries = Vec::new();
+    let mut table = Vec::new();
+    let mut primary_details: Option<Srsv2Details> = None;
+
+    for &(label, tok_mode) in &passes {
+        let mut a = args.clone();
+        normalize_residual_token_compare_args(&mut a)?;
+        a.residual_token = match tok_mode {
+            SrsV2ResidualTokenMode::Legacy => "legacy".to_string(),
+            SrsV2ResidualTokenMode::TokenV2 => "v2".to_string(),
+        };
+        let re = parse_residual_entropy(&a.residual_entropy)?;
+        let res_entropy_str = match re {
+            ResidualEntropy::Explicit => "explicit",
+            ResidualEntropy::Auto => "auto",
+            ResidualEntropy::Rans => "rans",
+        };
+
+        let st = match build_settings(&a, re) {
+            Ok(s) => s,
+            Err(e) => {
+                entries.push(ResidualCompareEntry {
+                    label: label.to_string(),
+                    ok: false,
+                    error: Some(format!("settings: {e:#}")),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(format!("settings: {e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        residual_entropy: res_entropy_str.to_string(),
+                        residual_token_mode: residual_token_mode_cli_label(tok_mode).to_string(),
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+                continue;
+            }
+        };
+
+        let seq = build_seq_header(&a, &st);
+
+        match run_srsv2_pass(&a, &seq, raw, &st, expected_frame) {
+            Ok(numbers) => {
+                let row = pass_to_row(&a, label, &numbers);
+                let deblock =
+                    build_deblock_bench_report(&a, &seq, &st, raw, expected_frame, &numbers)
+                        .unwrap_or_else(|_| DeblockBenchReport::default());
+                let details = pass_to_details(&a, &seq, &st, res_entropy_str, &numbers, deblock);
+                if primary_details.is_none() {
+                    primary_details = Some(details.clone());
+                }
+                entries.push(ResidualCompareEntry {
+                    label: label.to_string(),
+                    ok: true,
+                    error: None,
+                    row: row.clone(),
+                    details,
+                });
+                table.push(row);
+            }
+            Err(e) => {
+                entries.push(ResidualCompareEntry {
+                    label: label.to_string(),
+                    ok: false,
+                    error: Some(format!("{e:#}")),
+                    row: CodecRow {
+                        codec: label.to_string(),
+                        error: Some(format!("{e:#}")),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: args.frames,
+                        residual_entropy: res_entropy_str.to_string(),
+                        residual_token_mode: residual_token_mode_cli_label(tok_mode).to_string(),
+                        ..Default::default()
+                    },
+                });
+                table.push(entries.last().unwrap().row.clone());
+            }
+        }
+    }
+
+    let srsv2 = primary_details.unwrap_or_else(|| entries[0].details.clone());
+
+    Ok(BenchReport {
+        note: "Engineering measurement only; not a marketing claim.",
+        residual_note: "`--compare-residual-token-v2` runs **legacy** then **TokenV2** on the same clip (fixed **16×16** inter, **legacy** coeff layout, **`auto`** residual entropy). Telemetry includes on-wire **TokenV2** tail bytes where applicable. Engineering measurement only — **not** a superiority claim vs **HEVC**/**H.265**.",
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        raw_bytes: raw.len() as u64,
+        width: args.width,
+        height: args.height,
+        frames: args.frames,
+        fps: args.fps.max(1),
+        srsv2,
+        x264: None,
+        x265: None,
+        x265_bitrate_match: None,
+        table,
+        compare_residual_modes: None,
+        compare_residual_contexts: None,
+        compare_residual_token_v2: Some(entries),
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -4578,6 +4845,7 @@ fn run_compare_coeff_layouts_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -4875,6 +5143,7 @@ fn run_compare_transform_grouping_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -5030,6 +5299,7 @@ fn run_compare_inter_syntax_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: Some(entries),
@@ -5168,6 +5438,7 @@ fn run_compare_rdo_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -5311,6 +5582,7 @@ fn run_compare_partitions_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -5477,6 +5749,7 @@ fn run_compare_partition_costs_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -5731,6 +6004,7 @@ fn run_compare_entropy_models_report(
         table,
         compare_residual_modes: None,
         compare_residual_contexts: None,
+        compare_residual_token_v2: None,
         sweep: None,
         compare_b_modes: None,
         compare_inter_syntax: None,
@@ -6028,6 +6302,20 @@ fn main() -> Result<()> {
 
     if args.compare_residual_contexts {
         let report = run_compare_residual_contexts_report(&args, &raw, expected_frame)?;
+        if let Some(p) = args.report_json.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        if let Some(p) = args.report_md.parent() {
+            fs::create_dir_all(p).ok();
+        }
+        fs::write(&args.report_json, serde_json::to_string_pretty(&report)?)?;
+        fs::write(&args.report_md, to_markdown(&report))?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    if args.compare_residual_token_v2 {
+        let report = run_compare_residual_token_v2_report(&args, &raw, expected_frame)?;
         if let Some(p) = args.report_json.parent() {
             fs::create_dir_all(p).ok();
         }
@@ -6683,6 +6971,61 @@ fn to_markdown(r: &BenchReport) -> String {
                 e.row.psnr_y,
                 e.row.ssim_y,
                 status.replace('|', "/"),
+            ));
+        }
+    }
+
+    if let Some(cr) = &r.compare_residual_token_v2 {
+        out.push_str("\n## Residual TokenV2 comparison (`--compare-residual-token-v2`)\n\n");
+        out.push_str(
+            "_**legacy** vs **token-v2** on the same clip (normalized harness: **`auto`** residual entropy, **`legacy`** coeff layout, fixed **16×16** inter). Includes on-wire **TokenV2** tail byte telemetry where applicable. **No FFmpeg.** Engineering measurement only — **not** a superiority claim vs **HEVC**/**H.265**._\n\n",
+        );
+        out.push_str("| Residual token mode | Total bytes | Residual bytes | Token bytes | Savings | PSNR-Y | SSIM-Y |\n");
+        out.push_str("|---|---:|---:|---:|---:|---:|---:|\n");
+        for e in cr {
+            let d = &e.details;
+            let savings = format!(
+                "{} B ({:.2}%)",
+                d.residual_token_v2_savings_bytes, d.residual_token_v2_savings_percent
+            );
+            let (tot_s, res_s, tok_s, sav_s, psnr_s, ssim_s) = if e.ok {
+                (
+                    format!("{}", d.total_bytes),
+                    format!("{}", d.residual_bytes),
+                    format!("{}", d.residual_token_v2_bytes),
+                    savings,
+                    format!("{:.2}", e.row.psnr_y),
+                    format!("{:.4}", e.row.ssim_y),
+                )
+            } else {
+                (
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                    "—".to_string(),
+                )
+            };
+            out.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {} |\n",
+                d.residual_token_mode, tot_s, res_s, tok_s, sav_s, psnr_s, ssim_s,
+            ));
+        }
+        if let (Some(lb), Some(tv)) = (cr.first(), cr.get(1)) {
+            if lb.ok && tv.ok {
+                let delta = tv.details.residual_bytes as i64 - lb.details.residual_bytes as i64;
+                out.push_str(&format!(
+                    "\n**Δ Residual bytes** (token-v2 − legacy): **{delta:+}** (intra plane chunk bytes + **P** residual payload telemetry).\n\n"
+                ));
+            }
+        }
+        out.push_str("### Full telemetry (JSON)\n\n");
+        out.push_str("Each row’s `details` includes `encode_fps`, `decode_fps`, `residual_legacy_estimated_bytes`, `token_v2_zero_runs`, `token_v2_eob_count`, `token_v2_large_coeff_count`, and simulated AC `residual_token_v1_rans_ac_body_bytes` / `residual_token_v2_ac_body_bytes` where collected.\n\n");
+        for e in cr {
+            out.push_str(&format!(
+                "- **{}**: ok={} residual_token_v2_bytes={} error={:?}\n",
+                e.label, e.ok, e.details.residual_token_v2_bytes, e.error
             ));
         }
     }
@@ -7487,6 +7830,232 @@ mod tests {
     }
 
     #[test]
+    fn compare_residual_token_v2_two_passes_emit_rows_json_markdown_and_keys() {
+        let (path, raw, fb) = write_test_yuv("rtok_cmp", 64, 64, 4);
+        let args = parse_test_args(&path, 64, 64, 4, &["--compare-residual-token-v2"]);
+        validate_args(&args).unwrap();
+        let report = run_compare_residual_token_v2_report(&args, &raw, fb).unwrap();
+        let rows = report.compare_residual_token_v2.as_ref().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "legacy");
+        assert_eq!(rows[1].label, "token-v2");
+        assert!(rows[0].ok, "{:?}", rows[0].error);
+        assert!(rows[1].ok, "{:?}", rows[1].error);
+        assert_eq!(rows[0].details.residual_token_mode, "legacy");
+        assert_eq!(rows[1].details.residual_token_mode, "token-v2");
+        let js = serde_json::to_string(&report).unwrap();
+        assert!(js.contains("\"compare_residual_token_v2\""));
+        assert!(js.contains("\"residual_token_v2_bytes\""));
+        assert!(js.contains("\"residual_legacy_estimated_bytes\""));
+        let md = to_markdown(&report);
+        assert!(md.contains(
+            "| Residual token mode | Total bytes | Residual bytes | Token bytes | Savings | PSNR-Y | SSIM-Y |"
+        ));
+        assert!(md.contains("| legacy |"));
+        assert!(md.contains("| token-v2 |"));
+        assert!(
+            md.contains("Δ Residual bytes") || md.contains("token-v2 − legacy"),
+            "expected residual byte delta when both rows ok: {md}"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn residual_token_v2_single_pass_encodes_without_external_codecs() {
+        let report = run_ctu_report(64, 64, 2, &["--residual-token", "v2"]);
+        assert!(report.srsv2.total_bytes > 0);
+        assert_eq!(report.srsv2.residual_token_mode, "token-v2");
+        assert!(report.x264.is_none());
+        assert!(report.x265.is_none());
+    }
+
+    #[test]
+    fn compare_residual_token_v2_second_row_error_keeps_legacy_row_and_json_array() {
+        let md = to_markdown(&BenchReport {
+            note: "Engineering measurement only; not a marketing claim.",
+            residual_note: "n",
+            command: "test".into(),
+            raw_bytes: 1,
+            width: 64,
+            height: 64,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            x265: None,
+            x265_bitrate_match: None,
+            table: vec![],
+            compare_residual_modes: None,
+            compare_residual_contexts: None,
+            compare_residual_token_v2: Some(vec![
+                ResidualCompareEntry {
+                    label: "legacy".into(),
+                    ok: true,
+                    error: None,
+                    row: CodecRow {
+                        codec: "legacy".into(),
+                        error: None,
+                        bytes: 100,
+                        ratio: 1.0,
+                        bitrate_bps: 1.0,
+                        psnr_y: 40.0,
+                        ssim_y: 0.99,
+                        enc_fps: 10.0,
+                        dec_fps: 10.0,
+                    },
+                    details: Srsv2Details {
+                        frames: 2,
+                        residual_token_mode: "legacy".into(),
+                        total_bytes: 100,
+                        residual_bytes: 40,
+                        residual_token_v2_bytes: 0,
+                        residual_legacy_estimated_bytes: 40,
+                        residual_token_v2_savings_bytes: 0,
+                        residual_token_v2_savings_percent: 0.0,
+                        token_v2_zero_runs: 0,
+                        token_v2_eob_count: 0,
+                        token_v2_large_coeff_count: 0,
+                        ..Default::default()
+                    },
+                },
+                ResidualCompareEntry {
+                    label: "token-v2".into(),
+                    ok: false,
+                    error: Some("simulated token-v2 encode failure".into()),
+                    row: CodecRow {
+                        codec: "token-v2".into(),
+                        error: Some("simulated token-v2 encode failure".into()),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: 2,
+                        residual_token_mode: "token-v2".into(),
+                        ..Default::default()
+                    },
+                },
+            ]),
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: None,
+            compare_partition_syntax: None,
+            compare_entropy_models: None,
+            entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "test".into(),
+        });
+        assert!(md.contains("| legacy |"));
+        assert!(md.contains("| token-v2 |"));
+        assert!(md.contains("simulated token-v2 encode failure"));
+        assert!(
+            !md.contains("Δ Residual bytes"),
+            "delta line only when both rows encode successfully"
+        );
+        let r = BenchReport {
+            note: "Engineering measurement only; not a marketing claim.",
+            residual_note: "n",
+            command: "test".into(),
+            raw_bytes: 1,
+            width: 64,
+            height: 64,
+            frames: 2,
+            fps: 30,
+            srsv2: Srsv2Details::default(),
+            x264: None,
+            x265: None,
+            x265_bitrate_match: None,
+            table: vec![],
+            compare_residual_modes: None,
+            compare_residual_contexts: None,
+            compare_residual_token_v2: Some(vec![
+                ResidualCompareEntry {
+                    label: "legacy".into(),
+                    ok: true,
+                    error: None,
+                    row: CodecRow {
+                        codec: "legacy".into(),
+                        error: None,
+                        bytes: 100,
+                        ratio: 1.0,
+                        bitrate_bps: 1.0,
+                        psnr_y: 40.0,
+                        ssim_y: 0.99,
+                        enc_fps: 10.0,
+                        dec_fps: 10.0,
+                    },
+                    details: Srsv2Details {
+                        frames: 2,
+                        residual_token_mode: "legacy".into(),
+                        total_bytes: 100,
+                        residual_bytes: 40,
+                        ..Default::default()
+                    },
+                },
+                ResidualCompareEntry {
+                    label: "token-v2".into(),
+                    ok: false,
+                    error: Some("simulated token-v2 encode failure".into()),
+                    row: CodecRow {
+                        codec: "token-v2".into(),
+                        error: Some("simulated token-v2 encode failure".into()),
+                        bytes: 0,
+                        ratio: 0.0,
+                        bitrate_bps: 0.0,
+                        psnr_y: 0.0,
+                        ssim_y: 0.0,
+                        enc_fps: 0.0,
+                        dec_fps: 0.0,
+                    },
+                    details: Srsv2Details {
+                        frames: 2,
+                        residual_token_mode: "token-v2".into(),
+                        ..Default::default()
+                    },
+                },
+            ]),
+            sweep: None,
+            compare_b_modes: None,
+            compare_inter_syntax: None,
+            compare_rdo: None,
+            compare_partitions: None,
+            compare_partition_costs: None,
+            compare_partition_syntax: None,
+            compare_entropy_models: None,
+            entropy_model_compare_summary: None,
+            compare_coeff_layouts: None,
+            coeff_layout_compare_summary: None,
+            compare_transform_grouping: None,
+            transform_grouping_compare_summary: None,
+            compare_transform_grouping_split8x8: None,
+            transform_grouping_compare_summary_split8x8: None,
+            match_x264_bitrate_note: None,
+            git_commit: None,
+            os: "test".into(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        let arr = v["compare_residual_token_v2"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["ok"], true);
+        assert_eq!(arr[1]["ok"], false);
+        assert!(arr[1]["error"].is_string());
+    }
+
+    #[test]
     fn compare_coeff_layouts_emits_five_rows_json_markdown_and_residual_delta_summary() {
         let (path, raw, fb) = write_test_yuv("coeff_layout_cmp", 64, 64, 4);
         let args = parse_test_args(&path, 64, 64, 4, &["--compare-coeff-layouts"]);
@@ -7850,6 +8419,7 @@ mod tests {
             table: vec![],
             compare_residual_modes: None,
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -7897,6 +8467,7 @@ mod tests {
         validate_args(&args).unwrap();
         assert_eq!(args.coeff_layout, "legacy");
         assert_eq!(args.coeff_scan, "zigzag");
+        assert_eq!(args.residual_token, "legacy");
         let re = parse_residual_entropy(&args.residual_entropy).unwrap();
         let s = build_settings(&args, re).unwrap();
         assert_eq!(s.coeff_layout_mode, SrsV2CoeffLayoutMode::Legacy);
@@ -7911,6 +8482,7 @@ mod tests {
             s.transform_decision_mode,
             SrsV2TransformDecisionMode::Legacy
         );
+        assert_eq!(s.residual_token_mode, SrsV2ResidualTokenMode::Legacy);
         let _ = fs::remove_file(tmp);
     }
 
@@ -7995,6 +8567,7 @@ mod tests {
             table: vec![],
             compare_residual_modes: None,
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -8087,6 +8660,7 @@ mod tests {
             table: vec![],
             compare_residual_modes: None,
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -8224,6 +8798,7 @@ mod tests {
                     },
                 },
             ]),
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -8344,6 +8919,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -8447,6 +9023,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -8549,6 +9126,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -8653,6 +9231,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -8757,6 +9336,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -8863,6 +9443,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -8983,6 +9564,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -9094,6 +9676,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -9222,6 +9805,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -9333,6 +9917,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -9449,6 +10034,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -9599,6 +10185,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -9831,6 +10418,14 @@ mod tests {
                 residual_token_v2_ac_body_bytes: 0,
                 residual_token_compare_block_count: 0,
                 residual_token_compare_summary: None,
+                residual_token_mode: String::new(),
+                residual_token_v2_bytes: 0,
+                residual_legacy_estimated_bytes: 0,
+                residual_token_v2_savings_bytes: 0,
+                residual_token_v2_savings_percent: 0.0,
+                token_v2_zero_runs: 0,
+                token_v2_eob_count: 0,
+                token_v2_large_coeff_count: 0,
                 total_bytes: 0,
                 residual_bytes: 0,
                 encode_fps: 0.0,
@@ -9853,6 +10448,7 @@ mod tests {
             }],
             compare_residual_modes: None,
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -9988,6 +10584,14 @@ mod tests {
                 residual_token_v2_ac_body_bytes: 0,
                 residual_token_compare_block_count: 0,
                 residual_token_compare_summary: None,
+                residual_token_mode: String::new(),
+                residual_token_v2_bytes: 0,
+                residual_legacy_estimated_bytes: 0,
+                residual_token_v2_savings_bytes: 0,
+                residual_token_v2_savings_percent: 0.0,
+                token_v2_zero_runs: 0,
+                token_v2_eob_count: 0,
+                token_v2_large_coeff_count: 0,
                 total_bytes: 0,
                 residual_bytes: 0,
                 encode_fps: 0.0,
@@ -10103,6 +10707,14 @@ mod tests {
                     residual_token_v2_ac_body_bytes: 0,
                     residual_token_compare_block_count: 0,
                     residual_token_compare_summary: None,
+                    residual_token_mode: String::new(),
+                    residual_token_v2_bytes: 0,
+                    residual_legacy_estimated_bytes: 0,
+                    residual_token_v2_savings_bytes: 0,
+                    residual_token_v2_savings_percent: 0.0,
+                    token_v2_zero_runs: 0,
+                    token_v2_eob_count: 0,
+                    token_v2_large_coeff_count: 0,
                     total_bytes: 0,
                     residual_bytes: 0,
                     encode_fps: 0.0,
@@ -10111,6 +10723,7 @@ mod tests {
                 },
             }]),
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -10151,6 +10764,7 @@ mod tests {
             table: vec![],
             compare_residual_modes: None,
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -10192,6 +10806,7 @@ mod tests {
             table: vec![],
             compare_residual_modes: None,
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -10233,6 +10848,7 @@ mod tests {
             table: vec![],
             compare_residual_modes: None,
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -10299,6 +10915,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -10548,6 +11165,14 @@ mod tests {
                     residual_token_v2_ac_body_bytes: 0,
                     residual_token_compare_block_count: 0,
                     residual_token_compare_summary: None,
+                    residual_token_mode: String::new(),
+                    residual_token_v2_bytes: 0,
+                    residual_legacy_estimated_bytes: 0,
+                    residual_token_v2_savings_bytes: 0,
+                    residual_token_v2_savings_percent: 0.0,
+                    token_v2_zero_runs: 0,
+                    token_v2_eob_count: 0,
+                    token_v2_large_coeff_count: 0,
                     total_bytes: 0,
                     residual_bytes: 0,
                     encode_fps: 0.0,
@@ -10599,6 +11224,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -10701,6 +11327,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -10805,6 +11432,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: true,
             sweep_quality_bitrate: false,
@@ -10927,6 +11555,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -11103,6 +11732,7 @@ mod tests {
             table: vec![],
             compare_residual_modes: None,
             compare_residual_contexts: None,
+            compare_residual_token_v2: None,
             sweep: None,
             compare_b_modes: None,
             compare_inter_syntax: None,
@@ -11190,6 +11820,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,
@@ -11292,6 +11923,7 @@ mod tests {
             transform_decision: "legacy".to_string(),
             compare_transform_grouping: false,
             compare_transform_grouping_with_partitions: false,
+            residual_token: "legacy".to_string(),
             compare_residual_token_v2: false,
             sweep: false,
             sweep_quality_bitrate: false,

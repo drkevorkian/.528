@@ -282,7 +282,12 @@ fn build_b_macroblock_encoded(
             }
             let f = super::dct::fdct_8x8(&linear);
             let qf = super::intra_codec::quantize(&f, qp_i);
-            let (chunk, _) = encode_p_residual_chunk(&qf, ResidualEntropy::Auto, model)?;
+            let (chunk, _) = encode_p_residual_chunk(
+                &qf,
+                ResidualEntropy::Auto,
+                model,
+                super::rate_control::SrsV2ResidualTokenMode::Legacy,
+            )?;
             chunks.push(chunk);
         }
     }
@@ -501,6 +506,7 @@ pub fn encode_yuv420_b_payload(
                         &qf,
                         super::rate_control::ResidualEntropy::Auto,
                         &model,
+                        super::rate_control::SrsV2ResidualTokenMode::Legacy,
                     )?;
                     chunks.push(chunk);
                 }

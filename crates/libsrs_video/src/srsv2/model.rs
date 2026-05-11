@@ -114,7 +114,7 @@ pub enum ColorRange {
 #[repr(u8)]
 pub enum FrameTypeV2 {
     Intra = 0,
-    /// Forward/inter predicted (`FR2` rev **2**/**4**/**5**/**6**/**8**/**9**/**15**/**17**/**19**/**20**/**23**/**25**/**27**/**28**/**30**/**33**/**35** — see `docs/video_bitstream_v2.md`).
+    /// Forward/inter predicted (`FR2` rev **2**/**4**/**5**/**6**/**8**/**9**/**15**/**17**/**19**/**20**/**23**/**25**/**27**/**28**/**30**/**33**/**35**/**37** — see `docs/video_bitstream_v2.md`).
     PredictedP = 1,
     /// Experimental bidirectional (`FR2` rev **10**/**11**/**13**/**14**/**16**/**18**/**21**/**22**/**24**/**26**/**31** — rev **26**/**31** decode is `Unsupported` today).
     BidirectionalB = 2,
@@ -130,9 +130,9 @@ impl FrameTypeV2 {
     /// Map **`FR2` revision byte** (payload `[3]`) to a logical frame type (wire taxonomy).
     pub fn from_srsv2_revision(rev: u8) -> Result<Self, super::error::SrsV2Error> {
         Ok(match rev {
-            1 | 3 | 7 | 29 | 32 | 34 => Self::Intra,
-            // **33** / **35** — fixed-grid **P** with CompactV1 luma residuals (**35** adds transform grouping).
-            2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 | 35 => {
+            1 | 3 | 7 | 29 | 32 | 34 | 36 => Self::Intra,
+            // **33** / **35** — fixed-grid **P** with CompactV1 luma residuals (**35** adds transform grouping). **37** — fixed-grid **P** with strict TokenV2 luma chunks.
+            2 | 4 | 5 | 6 | 8 | 9 | 15 | 17 | 19 | 20 | 23 | 25 | 27 | 28 | 30 | 33 | 35 | 37 => {
                 Self::PredictedP
             }
             10 | 11 | 13 | 14 | 16 | 18 | 21 | 22 | 24 | 26 | 31 => Self::BidirectionalB,
@@ -503,14 +503,14 @@ mod frame_type_revision_tests {
 
     #[test]
     fn frame_type_maps_intra_predicted_p_bidirectional_b_and_alt_ref() {
-        for rev in [1u8, 3, 7, 29, 32, 34] {
+        for rev in [1u8, 3, 7, 29, 32, 34, 36] {
             assert_eq!(
                 frame_type_from_srsv2_revision(rev).unwrap(),
                 FrameTypeV2::Intra
             );
         }
         for rev in [
-            2u8, 4, 5, 6, 8, 9, 15, 17, 19, 20, 23, 25, 27, 28, 30, 33, 35,
+            2u8, 4, 5, 6, 8, 9, 15, 17, 19, 20, 23, 25, 27, 28, 30, 33, 35, 37,
         ] {
             assert_eq!(
                 frame_type_from_srsv2_revision(rev).unwrap(),

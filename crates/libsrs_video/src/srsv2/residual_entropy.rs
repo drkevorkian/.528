@@ -17,8 +17,8 @@ use super::intra_codec::{
 use super::limits::MAX_FRAME_PAYLOAD_BYTES;
 use super::rate_control::{
     rdo_lambda_effective, ResidualEncodeStats, ResidualEntropy, SrsV2CoeffScanMode,
-    SrsV2EncodeSettings, SrsV2ResidualContextMode, SrsV2TransformDecisionMode,
-    SrsV2TransformGroupingMode,
+    SrsV2EncodeSettings, SrsV2ResidualContextMode, SrsV2ResidualTokenMode,
+    SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
 };
 use super::rdo::choose_grouping_rdo_fast;
 pub use super::residual_context_entropy::ResidualPlane;
@@ -43,6 +43,8 @@ pub const TAG_EXPLICIT_AC: u8 = 0;
 pub const TAG_RANS_AC: u8 = 1;
 /// Multi-context static rANS residual (`SrsV2ResidualContextMode::ContextV1`).
 pub const TAG_CONTEXT_RANS_AC: u8 = 2;
+/// Structured [`super::residual_token_v2`] **VERSION 3** block tail (`u16` **len** + blob).
+pub const TAG_RESIDUAL_TOKEN_V3: u8 = 5;
 /// **`FR2` rev33** fixed-grid **P** 8×8 residual: compact bitmap + scan-ordered `i16` values ([`encode_p_residual_chunk_compact_v33_wire`]).
 pub const TAG_P_RESIDUAL_COMPACT_V1: u8 = 2;
 /// **`FR2` rev35** fixed-grid **P** 8×8 residual: explicit transform grouping + scan + compact body ([`encode_p_residual_chunk_compact_v35_wire`]).
@@ -53,12 +55,15 @@ pub enum BlockResidualCoding {
     ExplicitTuples,
     RansV1,
     ContextRansV1,
+    TokenV2StructuredV3,
 }
 
 /// Optional **`P`/`B`** 8×8 residual chunk controls for [`encode_p_residual_chunk_with_opts`].
 #[derive(Debug, Clone, Copy)]
 pub struct PResidualChunkEncodeOpts<'a> {
     pub residual_context_mode: SrsV2ResidualContextMode,
+    /// Must match [`SrsV2EncodeSettings::residual_token_mode`] when wiring from the frame encoder.
+    pub residual_token_mode: SrsV2ResidualTokenMode,
     pub context_model: Option<&'a ResidualContextModel>,
     pub plane: ResidualPlane,
     pub left_neighbor_nonzero: bool,
@@ -72,6 +77,7 @@ impl Default for PResidualChunkEncodeOpts<'_> {
     fn default() -> Self {
         Self {
             residual_context_mode: SrsV2ResidualContextMode::Off,
+            residual_token_mode: SrsV2ResidualTokenMode::Legacy,
             context_model: None,
             plane: ResidualPlane::Y,
             left_neighbor_nonzero: false,
@@ -169,6 +175,113 @@ fn read_i16(data: &[u8], cur: &mut usize) -> Result<i16, SrsV2Error> {
     let v = i16::from_le_bytes([data[*cur], data[*cur + 1]]);
     *cur += 2;
     Ok(v)
+}
+
+fn map_residual_token_v2_encode_err(e: residual_token_v2::ResidualTokenV2Error) -> SrsV2Error {
+    SrsV2Error::PartitionMapSyntax(format!("residual_token_v2 encode: {e}"))
+}
+
+fn map_residual_token_v2_decode_err(e: residual_token_v2::ResidualTokenV2Error) -> SrsV2Error {
+    SrsV2Error::PartitionMapSyntax(format!("residual_token_v2 decode: {e}"))
+}
+
+fn plane_residual_to_token_v2(p: ResidualPlane) -> residual_token_v2::ResidualTokenV2Plane {
+    match p {
+        ResidualPlane::Y => residual_token_v2::ResidualTokenV2Plane::Y,
+        ResidualPlane::U => residual_token_v2::ResidualTokenV2Plane::U,
+        ResidualPlane::V => residual_token_v2::ResidualTokenV2Plane::V,
+    }
+}
+
+fn ac_nonzero_count_hint(freq: &[i16; 64]) -> u8 {
+    let mut n = 0_u8;
+    for &zi in ZIGZAG.iter().skip(1) {
+        if freq[zi] != 0 {
+            n = n.saturating_add(1);
+        }
+    }
+    n.min(31)
+}
+
+fn build_residual_token_v2_ctx(
+    plane: ResidualPlane,
+    left_nz: bool,
+    above_nz: bool,
+    freq: &[i16; 64],
+) -> residual_token_v2::ResidualTokenV2Context {
+    residual_token_v2::ResidualTokenV2Context {
+        plane: plane_residual_to_token_v2(plane),
+        band_hint: None,
+        prev_nonzero_ac_count: ac_nonzero_count_hint(freq),
+        neighbor_residual_present: left_nz || above_nz,
+        activity: residual_token_v2::BlockActivityClass::Flat,
+        transform: residual_token_v2::ResidualTokenV2TransformKind::Tx8x8,
+    }
+}
+
+fn encode_residual_token_v3_wire(
+    freq: &[i16; 64],
+    plane: ResidualPlane,
+    left_nz: bool,
+    above_nz: bool,
+) -> Result<Vec<u8>, SrsV2Error> {
+    Ok(encode_residual_token_v3_wire_with_stats(freq, plane, left_nz, above_nz)?.0)
+}
+
+fn encode_residual_token_v3_wire_with_stats(
+    freq: &[i16; 64],
+    plane: ResidualPlane,
+    left_nz: bool,
+    above_nz: bool,
+) -> Result<(Vec<u8>, residual_token_v2::ResidualTokenV2Stats), SrsV2Error> {
+    let ctx = build_residual_token_v2_ctx(plane, left_nz, above_nz, freq);
+    residual_token_v2::encode_residual_token_v2_block_with_stats(
+        residual_token_v2::ResidualTokenV2Block::Tx8x8(freq),
+        &ctx,
+        residual_token_v2::ResidualTokenV2Mode::StructuredTokenV3,
+    )
+    .map_err(map_residual_token_v2_encode_err)
+}
+
+fn record_intra_rev36_token_v2_block_tail_stats(
+    st: &mut ResidualEncodeStats,
+    freq: &[i16; 64],
+    blob_len: usize,
+    tstats: &residual_token_v2::ResidualTokenV2Stats,
+    model: &RansModel,
+) {
+    if !st.intra_rev36_residual_wire && !st.p_rev37_residual_token_v2_wire {
+        return;
+    }
+    const BLOCK_TAIL: usize = 1 + 2 + 1 + 2;
+    let mut wire = (BLOCK_TAIL + blob_len) as u64;
+    if st.p_rev37_residual_token_v2_wire {
+        wire = wire.saturating_add(1);
+    }
+    st.residual_token_v2_bytes = st.residual_token_v2_bytes.saturating_add(wire);
+    st.residual_token_mode = Some(SrsV2ResidualTokenMode::TokenV2);
+
+    let explicit_full = explicit_wire_len(freq);
+    let legacy_block = match try_rans_payload(freq, model) {
+        Ok(Some((_, enc))) => explicit_full.min(rans_wire_len(enc.len())),
+        _ => explicit_full,
+    };
+    st.residual_legacy_estimated_bytes = st
+        .residual_legacy_estimated_bytes
+        .saturating_add(legacy_block as u64);
+    st.residual_token_v2_savings_bytes = st
+        .residual_token_v2_savings_bytes
+        .saturating_add((legacy_block as i64).saturating_sub(wire as i64));
+
+    st.token_v2_zero_runs = st
+        .token_v2_zero_runs
+        .saturating_add(tstats.zero_run_tokens as u64);
+    st.token_v2_eob_count = st
+        .token_v2_eob_count
+        .saturating_add(tstats.eob_count as u64);
+    st.token_v2_large_coeff_count = st
+        .token_v2_large_coeff_count
+        .saturating_add(tstats.large_mag_tokens as u64);
 }
 
 fn try_rans_payload(
@@ -332,6 +445,7 @@ pub(crate) fn encode_intra_block_residual(
     freq: &[i16; 64],
     policy: ResidualEntropy,
     residual_ctx_mode: SrsV2ResidualContextMode,
+    residual_token_mode: SrsV2ResidualTokenMode,
     model: &RansModel,
     ctx_model: Option<&ResidualContextModel>,
     plane: ResidualPlane,
@@ -370,6 +484,28 @@ pub(crate) fn encode_intra_block_residual(
     } else {
         None
     };
+
+    if matches!(residual_token_mode, SrsV2ResidualTokenMode::TokenV2) {
+        if use_ctx {
+            return Err(SrsV2Error::syntax(
+                "internal: residual_token_mode TokenV2 with ContextV1 (validate settings)",
+            ));
+        }
+        let (blob, tstats) =
+            encode_residual_token_v3_wire_with_stats(freq, plane, left_nz, above_nz)?;
+        out.push(mode as u8);
+        out.extend_from_slice(&freq[0].to_le_bytes());
+        out.push(TAG_RESIDUAL_TOKEN_V3);
+        let bl =
+            u16::try_from(blob.len()).map_err(|_| SrsV2Error::syntax("token v3 blob length"))?;
+        out.extend_from_slice(&bl.to_le_bytes());
+        out.extend_from_slice(&blob);
+        if let Some(st) = context_residual_stats {
+            st.residual_token_v2_wire_blocks = st.residual_token_v2_wire_blocks.saturating_add(1);
+            record_intra_rev36_token_v2_block_tail_stats(st, freq, blob.len(), &tstats, model);
+        }
+        return Ok(BlockResidualCoding::TokenV2StructuredV3);
+    }
 
     let coding = match policy {
         ResidualEntropy::Explicit => {
@@ -451,6 +587,7 @@ pub(crate) fn encode_intra_block_residual(
             }
             Ok(BlockResidualCoding::ContextRansV1)
         }
+        BlockResidualCoding::TokenV2StructuredV3 => unreachable!(),
     }
 }
 
@@ -508,8 +645,58 @@ pub(crate) fn decode_intra_block_residual(
                 .map_err(map_residual_context_entropy)?;
             Ok((mode, freq))
         }
+        TAG_RESIDUAL_TOKEN_V3 => {
+            let bl = read_u16(data, cur)? as usize;
+            let end = cur
+                .checked_add(bl)
+                .ok_or(SrsV2Error::Overflow("token v3 blob"))?;
+            if end > data.len() {
+                return Err(SrsV2Error::Truncated);
+            }
+            let blob = &data[*cur..end];
+            *cur = end;
+            let ctx = build_residual_token_v2_ctx(plane, left_nz, above_nz, &freq);
+            let mut block = residual_token_v2::ResidualTokenV2BlockMut::Tx8x8(&mut freq);
+            residual_token_v2::decode_residual_token_v2_block(blob, &ctx, &mut block, None)
+                .map_err(map_residual_token_v2_decode_err)?;
+            Ok((mode, freq))
+        }
         _ => Err(SrsV2Error::syntax("bad residual coding tag")),
     }
+}
+
+/// [`FR2` rev **36**] intra plane block: residual tag **must** be [`TAG_RESIDUAL_TOKEN_V3`].
+pub(crate) fn decode_intra_block_residual_strict_token_v2(
+    data: &[u8],
+    cur: &mut usize,
+    plane: ResidualPlane,
+    left_nz: bool,
+    above_nz: bool,
+) -> Result<(PredMode, [i16; 64]), SrsV2Error> {
+    let mode_b = read_u8(data, cur)?;
+    let mode = PredMode::from_u8(mode_b)?;
+    let mut freq = [0_i16; 64];
+    freq[0] = read_i16(data, cur)?;
+    let tag = read_u8(data, cur)?;
+    if tag != TAG_RESIDUAL_TOKEN_V3 {
+        return Err(SrsV2Error::syntax(
+            "FR2 strict TokenV2 residual requires TAG_RESIDUAL_TOKEN_V3",
+        ));
+    }
+    let bl = read_u16(data, cur)? as usize;
+    let end = cur
+        .checked_add(bl)
+        .ok_or(SrsV2Error::Overflow("token v3 blob"))?;
+    if end > data.len() {
+        return Err(SrsV2Error::Truncated);
+    }
+    let blob = &data[*cur..end];
+    *cur = end;
+    let ctx = build_residual_token_v2_ctx(plane, left_nz, above_nz, &freq);
+    let mut block = residual_token_v2::ResidualTokenV2BlockMut::Tx8x8(&mut freq);
+    residual_token_v2::decode_residual_token_v2_block(blob, &ctx, &mut block, None)
+        .map_err(map_residual_token_v2_decode_err)?;
+    Ok((mode, freq))
 }
 
 /// [`FR2` rev **29**] intra plane block: residual tag **must** be [`TAG_CONTEXT_RANS_AC`].
@@ -552,6 +739,7 @@ pub(crate) fn encode_intra_block_residual_rev7(
     qp_delta: i8,
     policy: ResidualEntropy,
     residual_ctx_mode: SrsV2ResidualContextMode,
+    residual_token_mode: SrsV2ResidualTokenMode,
     model: &RansModel,
     ctx_model: Option<&ResidualContextModel>,
     plane: ResidualPlane,
@@ -590,6 +778,27 @@ pub(crate) fn encode_intra_block_residual_rev7(
     } else {
         None
     };
+
+    if matches!(residual_token_mode, SrsV2ResidualTokenMode::TokenV2) {
+        if use_ctx {
+            return Err(SrsV2Error::syntax(
+                "internal: residual_token_mode TokenV2 with ContextV1 (validate settings)",
+            ));
+        }
+        let blob = encode_residual_token_v3_wire(freq, plane, left_nz, above_nz)?;
+        out.push(mode as u8);
+        out.extend_from_slice(&freq[0].to_le_bytes());
+        out.push(qp_delta as u8);
+        out.push(TAG_RESIDUAL_TOKEN_V3);
+        let bl =
+            u16::try_from(blob.len()).map_err(|_| SrsV2Error::syntax("token v3 blob length"))?;
+        out.extend_from_slice(&bl.to_le_bytes());
+        out.extend_from_slice(&blob);
+        if let Some(st) = context_residual_stats {
+            st.residual_token_v2_wire_blocks = st.residual_token_v2_wire_blocks.saturating_add(1);
+        }
+        return Ok(BlockResidualCoding::TokenV2StructuredV3);
+    }
 
     let coding = match policy {
         ResidualEntropy::Explicit => {
@@ -672,6 +881,7 @@ pub(crate) fn encode_intra_block_residual_rev7(
             }
             Ok(BlockResidualCoding::ContextRansV1)
         }
+        BlockResidualCoding::TokenV2StructuredV3 => unreachable!(),
     }
 }
 
@@ -729,6 +939,22 @@ pub(crate) fn decode_intra_block_residual_rev7(
             *cur = end;
             decode_residual_context_v1_plane(ctx_model, plane, left_nz, above_nz, blob, &mut freq)
                 .map_err(map_residual_context_entropy)?;
+            Ok((mode, qp_delta, freq))
+        }
+        TAG_RESIDUAL_TOKEN_V3 => {
+            let bl = read_u16(data, cur)? as usize;
+            let end = cur
+                .checked_add(bl)
+                .ok_or(SrsV2Error::Overflow("token v3 blob"))?;
+            if end > data.len() {
+                return Err(SrsV2Error::Truncated);
+            }
+            let blob = &data[*cur..end];
+            *cur = end;
+            let ctx = build_residual_token_v2_ctx(plane, left_nz, above_nz, &freq);
+            let mut block = residual_token_v2::ResidualTokenV2BlockMut::Tx8x8(&mut freq);
+            residual_token_v2::decode_residual_token_v2_block(blob, &ctx, &mut block, None)
+                .map_err(map_residual_token_v2_decode_err)?;
             Ok((mode, qp_delta, freq))
         }
         _ => Err(SrsV2Error::syntax("bad residual coding tag")),
@@ -1734,6 +1960,7 @@ pub(crate) fn encode_plane_intra_entropy(
                 &qfreq,
                 policy,
                 residual_ctx_mode,
+                settings.residual_token_mode,
                 &model,
                 ctx_model_ref,
                 plane_kind,
@@ -1747,6 +1974,7 @@ pub(crate) fn encode_plane_intra_entropy(
                 BlockResidualCoding::ExplicitTuples => stats.intra_explicit_blocks += 1,
                 BlockResidualCoding::RansV1 => stats.intra_rans_blocks += 1,
                 BlockResidualCoding::ContextRansV1 => stats.intra_context_residual_blocks += 1,
+                BlockResidualCoding::TokenV2StructuredV3 => {}
             }
             let nz_ac = qfreq.iter().skip(1).any(|&v| v != 0);
             left_nz = nz_ac;
@@ -1876,6 +2104,7 @@ pub(crate) fn encode_plane_intra_entropy_block_aq(
                 qp_delta,
                 policy,
                 residual_ctx_mode,
+                settings.residual_token_mode,
                 &model,
                 ctx_model_ref,
                 plane_kind,
@@ -1889,6 +2118,7 @@ pub(crate) fn encode_plane_intra_entropy_block_aq(
                 BlockResidualCoding::ExplicitTuples => stats.intra_explicit_blocks += 1,
                 BlockResidualCoding::RansV1 => stats.intra_rans_blocks += 1,
                 BlockResidualCoding::ContextRansV1 => stats.intra_context_residual_blocks += 1,
+                BlockResidualCoding::TokenV2StructuredV3 => {}
             }
             let nz_ac = qfreq.iter().skip(1).any(|&v| v != 0);
             left_nz = nz_ac;
@@ -1917,6 +2147,7 @@ pub(crate) fn decode_plane_intra_entropy(
     qp: i16,
     plane_kind: ResidualPlane,
     strict_fr2_rev29_context_v1: bool,
+    strict_fr2_rev36_token_v2: bool,
 ) -> Result<(), SrsV2Error> {
     let ctx_model = ResidualContextModel::new();
     let w = plane.width as usize;
@@ -1935,6 +2166,10 @@ pub(crate) fn decode_plane_intra_entropy(
             let (mode, freq) = if strict_fr2_rev29_context_v1 {
                 decode_intra_block_residual_strict_context_v1(
                     data, cursor, &ctx_model, plane_kind, left_nz, above_nz,
+                )?
+            } else if strict_fr2_rev36_token_v2 {
+                decode_intra_block_residual_strict_token_v2(
+                    data, cursor, plane_kind, left_nz, above_nz,
                 )?
             } else {
                 decode_intra_block_residual(
@@ -2027,12 +2262,16 @@ pub fn encode_p_residual_chunk(
     qfreq: &[i16; 64],
     policy: ResidualEntropy,
     model: &RansModel,
+    residual_token_mode: SrsV2ResidualTokenMode,
 ) -> Result<(Vec<u8>, PResidualChunkKind), SrsV2Error> {
     encode_p_residual_chunk_with_opts(
         qfreq,
         policy,
         model,
-        &PResidualChunkEncodeOpts::default(),
+        &PResidualChunkEncodeOpts {
+            residual_token_mode,
+            ..PResidualChunkEncodeOpts::default()
+        },
         None,
     )
 }
@@ -2080,6 +2319,7 @@ pub fn encode_p_residual_chunk_with_opts<'a>(
                 qfreq,
                 ResidualEntropy::Rans,
                 opts.residual_context_mode,
+                opts.residual_token_mode,
                 model,
                 opts.context_model,
                 opts.plane,
@@ -2107,6 +2347,7 @@ pub fn encode_p_residual_chunk_with_opts<'a>(
                     qfreq,
                     ResidualEntropy::Auto,
                     opts.residual_context_mode,
+                    opts.residual_token_mode,
                     model,
                     opts.context_model,
                     opts.plane,
@@ -2127,6 +2368,7 @@ pub fn encode_p_residual_chunk_with_opts<'a>(
                 qfreq,
                 ResidualEntropy::Auto,
                 opts.residual_context_mode,
+                opts.residual_token_mode,
                 model,
                 opts.context_model,
                 opts.plane,
@@ -2136,7 +2378,9 @@ pub fn encode_p_residual_chunk_with_opts<'a>(
                 residual_encode_stats,
                 &mut adaptive,
             )?;
-            if adaptive.len() < legacy.len() {
+            if adaptive.len() < legacy.len()
+                || matches!(opts.residual_token_mode, SrsV2ResidualTokenMode::TokenV2)
+            {
                 let mut out = Vec::with_capacity(1 + adaptive.len());
                 out.push(1);
                 out.extend_from_slice(&adaptive);
@@ -2352,6 +2596,48 @@ pub fn decode_p_residual_chunk_strict_rev30(
     Ok((out, nz_ac))
 }
 
+/// [`FR2` rev **37**] fixed-grid **`P`** luma 8×8 residual: outer adaptive byte **`1`** and inner strict [`TAG_RESIDUAL_TOKEN_V3`] tail (same layout as intra rev36 block body).
+///
+/// Returns reconstructed residual samples and **nonzero-AC** flag for neighbor threading.
+pub fn decode_p_residual_chunk_strict_rev37(
+    chunk: &[u8],
+    qp: i16,
+    plane: ResidualPlane,
+    left_neighbor_nonzero: bool,
+    above_neighbor_nonzero: bool,
+) -> Result<([[i16; 8]; 8], bool), SrsV2Error> {
+    if chunk.is_empty() {
+        return Err(SrsV2Error::Truncated);
+    }
+    if chunk[0] != 1 {
+        return Err(SrsV2Error::syntax(
+            "FR2 rev37 P residual requires adaptive chunk wrapper (0x01)",
+        ));
+    }
+    let body = &chunk[1..];
+    let mut cur = 0usize;
+    let (_m, freq) = decode_intra_block_residual_strict_token_v2(
+        body,
+        &mut cur,
+        plane,
+        left_neighbor_nonzero,
+        above_neighbor_nonzero,
+    )?;
+    if cur != body.len() {
+        return Err(SrsV2Error::syntax("FR2 rev37 P residual trailing bytes"));
+    }
+    let nz_ac = freq.iter().skip(1).any(|&v| v != 0);
+    let recon_freq = dequantize(&freq, qp);
+    let rpix = idct_8x8(&recon_freq);
+    let mut out = [[0_i16; 8]; 8];
+    for r in 0..8 {
+        for c in 0..8 {
+            out[r][c] = rpix[r * 8 + c];
+        }
+    }
+    Ok((out, nz_ac))
+}
+
 #[cfg(test)]
 mod residual_entropy_tests {
     use super::*;
@@ -2360,7 +2646,8 @@ mod residual_entropy_tests {
     use crate::srsv2::intra_codec::{decode_plane_intra, encode_plane_intra, PredMode};
     use crate::srsv2::rate_control::{
         ResidualEncodeStats, SrsV2CoeffLayoutMode, SrsV2CoeffScanMode, SrsV2EncodeSettings,
-        SrsV2ResidualContextMode, SrsV2TransformDecisionMode, SrsV2TransformGroupingMode,
+        SrsV2ResidualContextMode, SrsV2ResidualTokenMode, SrsV2TransformDecisionMode,
+        SrsV2TransformGroupingMode,
     };
 
     fn sparse_one_ac_qfreq() -> [i16; 64] {
@@ -2499,6 +2786,7 @@ mod residual_entropy_tests {
             &qf,
             ResidualEntropy::Rans,
             SrsV2ResidualContextMode::Off,
+            SrsV2ResidualTokenMode::Legacy,
             &model,
             None,
             ResidualPlane::Y,
@@ -2510,6 +2798,36 @@ mod residual_entropy_tests {
         )
         .unwrap();
         assert_eq!(k, BlockResidualCoding::RansV1);
+        let mut c = 0usize;
+        let cm = ResidualContextModel::new();
+        let (_m, f2) =
+            decode_intra_block_residual(&out, &mut c, &cm, ResidualPlane::Y, false, false).unwrap();
+        assert_eq!(f2, qf);
+    }
+
+    #[test]
+    fn residual_token_v2_mode_emits_tag_and_roundtrips() {
+        let model = residual_token_model();
+        let mut out = Vec::new();
+        let qf = sparse_one_ac_qfreq();
+        let k = encode_intra_block_residual(
+            PredMode::Dc,
+            &qf,
+            ResidualEntropy::Auto,
+            SrsV2ResidualContextMode::Off,
+            SrsV2ResidualTokenMode::TokenV2,
+            &model,
+            None,
+            ResidualPlane::Y,
+            false,
+            false,
+            false,
+            None,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(k, BlockResidualCoding::TokenV2StructuredV3);
+        assert_eq!(out[3], super::TAG_RESIDUAL_TOKEN_V3);
         let mut c = 0usize;
         let cm = ResidualContextModel::new();
         let (_m, f2) =
@@ -2536,6 +2854,7 @@ mod residual_entropy_tests {
             &f,
             ResidualEntropy::Auto,
             SrsV2ResidualContextMode::Off,
+            SrsV2ResidualTokenMode::Legacy,
             &model,
             None,
             ResidualPlane::Y,
@@ -2573,6 +2892,7 @@ mod residual_entropy_tests {
                 &noisy,
                 ResidualEntropy::Auto,
                 SrsV2ResidualContextMode::Off,
+                SrsV2ResidualTokenMode::Legacy,
                 &model,
                 None,
                 ResidualPlane::Y,
@@ -2598,6 +2918,7 @@ mod residual_entropy_tests {
             &qf,
             ResidualEntropy::Rans,
             SrsV2ResidualContextMode::ContextV1,
+            SrsV2ResidualTokenMode::Legacy,
             &model,
             Some(&ctx),
             ResidualPlane::Y,
@@ -2629,6 +2950,7 @@ mod residual_entropy_tests {
             &qf,
             ResidualEntropy::Rans,
             SrsV2ResidualContextMode::ContextV1,
+            SrsV2ResidualTokenMode::Legacy,
             &model,
             Some(&ctx),
             ResidualPlane::Y,
@@ -2661,6 +2983,7 @@ mod residual_entropy_tests {
             &qf,
             ResidualEntropy::Rans,
             SrsV2ResidualContextMode::ContextV1,
+            SrsV2ResidualTokenMode::Legacy,
             &model,
             Some(&ctx),
             ResidualPlane::Y,
@@ -2712,8 +3035,16 @@ mod residual_entropy_tests {
         decode_plane_intra(&exp, &mut cur_e, &mut dec_exp, qp).unwrap();
         let mut cur_n = 0usize;
         let mut dec_ent = VideoPlane::<u8>::try_new(w, h, w as usize).unwrap();
-        decode_plane_intra_entropy(&ent, &mut cur_n, &mut dec_ent, qp, ResidualPlane::Y, false)
-            .unwrap();
+        decode_plane_intra_entropy(
+            &ent,
+            &mut cur_n,
+            &mut dec_ent,
+            qp,
+            ResidualPlane::Y,
+            false,
+            false,
+        )
+        .unwrap();
         assert_eq!(dec_exp.samples, dec_ent.samples);
     }
 
@@ -2730,7 +3061,13 @@ mod residual_entropy_tests {
         }
         let f = fdct_8x8(&linear);
         let qf = quantize(&f, 28);
-        let (chunk, _) = encode_p_residual_chunk(&qf, ResidualEntropy::Explicit, &model).unwrap();
+        let (chunk, _) = encode_p_residual_chunk(
+            &qf,
+            ResidualEntropy::Explicit,
+            &model,
+            SrsV2ResidualTokenMode::Legacy,
+        )
+        .unwrap();
         let dec = decode_p_residual_chunk(&chunk, 28).unwrap();
         let mut cur = 1usize;
         let legacy =

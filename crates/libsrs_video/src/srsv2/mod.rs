@@ -71,7 +71,7 @@ pub use frame_codec::{
     decode_yuv420_intra_payload, decode_yuv420_srsv2_payload, decode_yuv420_srsv2_payload_managed,
     encode_yuv420_alt_ref_payload, encode_yuv420_inter_payload, encode_yuv420_intra_payload,
     FRAME_PAYLOAD_MAGIC_ALT_REF, FRAME_PAYLOAD_MAGIC_INTRA_COMPACT_V1,
-    FRAME_PAYLOAD_MAGIC_INTRA_TRANSFORM_GROUP_V34,
+    FRAME_PAYLOAD_MAGIC_INTRA_TOKEN_V2_REV36, FRAME_PAYLOAD_MAGIC_INTRA_TRANSFORM_GROUP_V34,
 };
 pub use model::{
     decode_sequence_header_v2, encode_sequence_header_v2, frame_type_from_srsv2_revision,
@@ -84,6 +84,7 @@ pub use motion_search::{
 };
 pub use p_frame_codec::{
     FRAME_PAYLOAD_MAGIC_P_INTER_ENTROPY_CTX_V1, FRAME_PAYLOAD_MAGIC_P_RESIDUAL_COMPACT_V1,
+    FRAME_PAYLOAD_MAGIC_P_RESIDUAL_TOKEN_V2_REV37,
     FRAME_PAYLOAD_MAGIC_P_RESIDUAL_TRANSFORM_GROUP_V35,
 };
 pub use p_var_partition::{
@@ -106,8 +107,8 @@ pub use rate_control::{
     SrsV2InterPartitionMode, SrsV2InterSyntaxMode, SrsV2MotionSearchMode, SrsV2PartitionCostModel,
     SrsV2PartitionMapEncoding, SrsV2PartitionSyntaxMode, SrsV2RateControlError,
     SrsV2RateControlMode, SrsV2RateController, SrsV2RdoMode, SrsV2ResidualContextMode,
-    SrsV2SubpelMode, SrsV2TransformDecisionMode, SrsV2TransformGroupingMode, SrsV2TransformSize,
-    SrsV2TransformSizeMode,
+    SrsV2ResidualTokenMode, SrsV2SubpelMode, SrsV2TransformDecisionMode,
+    SrsV2TransformGroupingMode, SrsV2TransformSize, SrsV2TransformSizeMode,
 };
 pub use rdo::{
     autofast_partition_mb_rdo_score, autofast_partition_mb_wire_cost, b_blend_rdo_score,
