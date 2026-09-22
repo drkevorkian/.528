@@ -1,0 +1,665 @@
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use libsrs_app_services::{DecodedVideoFrame, PlaybackEvent, PlaybackSession, PlaybackState};
+
+const COMMAND_CAPACITY: usize = 16;
+const EVENT_CAPACITY: usize = 16;
+const PLAYBACK_TICK: Duration = Duration::from_millis(33);
+const COMPAT_FRAME_DURATION_MS: u64 = 40;
+const MAX_PRESENTATION_REORDER_FRAMES: usize = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerState {
+    Closed,
+    Ready,
+    Playing,
+    Paused,
+    Seeking,
+    Ended,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlaybackSnapshot {
+    pub generation: u64,
+    pub state: PlayerState,
+    pub duration_ms: u64,
+    pub presented_position_ms: u64,
+    pub decoded_position_ms: u64,
+    pub decoded_video_frames: u64,
+    pub decoded_audio_chunks: u64,
+    pub presented_video_frames: u64,
+    pub dropped_video_frames: u64,
+    pub reorder_depth: usize,
+    pub seek_in_progress: bool,
+    pub last_error: Option<String>,
+}
+
+impl Default for PlaybackSnapshot {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            state: PlayerState::Closed,
+            duration_ms: 0,
+            presented_position_ms: 0,
+            decoded_position_ms: 0,
+            decoded_video_frames: 0,
+            decoded_audio_chunks: 0,
+            presented_video_frames: 0,
+            dropped_video_frames: 0,
+            reorder_depth: 0,
+            seek_in_progress: false,
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PresentationFrame {
+    pub generation: u64,
+    pub frame: DecodedVideoFrame,
+    pub presented_position_ms: u64,
+}
+
+#[derive(Debug)]
+pub enum PlaybackWorkerCommand {
+    Open {
+        generation: u64,
+        path: PathBuf,
+    },
+    Play {
+        generation: u64,
+    },
+    Pause {
+        generation: u64,
+    },
+    Stop {
+        generation: u64,
+    },
+    Seek {
+        generation: u64,
+        target_ms: u64,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone)]
+pub enum PlaybackWorkerEvent {
+    Snapshot(PlaybackSnapshot),
+    FrameReady {
+        generation: u64,
+    },
+    SeekCompleted {
+        generation: u64,
+        presented_position_ms: u64,
+    },
+    FatalError {
+        generation: u64,
+        message: String,
+    },
+    WorkerStopped,
+}
+
+pub struct PlaybackWorkerHandle {
+    command_tx: SyncSender<PlaybackWorkerCommand>,
+    event_rx: Receiver<PlaybackWorkerEvent>,
+    frame_slot: Arc<Mutex<Option<PresentationFrame>>>,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl PlaybackWorkerHandle {
+    pub fn spawn() -> Self {
+        let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
+        let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
+        let frame_slot = Arc::new(Mutex::new(None));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let worker_slot = Arc::clone(&frame_slot);
+        let worker_shutdown = Arc::clone(&shutdown);
+        let thread = thread::Builder::new()
+            .name("srs-playback-worker".to_string())
+            .spawn(move || {
+                let mut worker = PlaybackWorker::new(command_rx, event_tx, worker_slot, worker_shutdown);
+                worker.run();
+            })
+            .ok();
+
+        Self {
+            command_tx,
+            event_rx,
+            frame_slot,
+            shutdown,
+            thread,
+        }
+    }
+
+    pub fn try_send(
+        &self,
+        command: PlaybackWorkerCommand,
+    ) -> Result<(), mpsc::TrySendError<PlaybackWorkerCommand>> {
+        self.command_tx.try_send(command)
+    }
+
+    pub fn try_recv_event(&self) -> Result<PlaybackWorkerEvent, TryRecvError> {
+        self.event_rx.try_recv()
+    }
+
+    pub fn take_latest_frame(&self) -> Result<Option<PresentationFrame>, String> {
+        match self.frame_slot.lock() {
+            Ok(mut slot) => Ok(slot.take()),
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                slot.take();
+                Err("playback frame slot mutex was poisoned".to_string())
+            }
+        }
+    }
+}
+
+impl Drop for PlaybackWorkerHandle {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = self.command_tx.try_send(PlaybackWorkerCommand::Shutdown);
+        // Do not block the egui thread waiting for a decoder/file operation to finish. Dropping
+        // the JoinHandle detaches the worker; the atomic shutdown flag is checked between steps.
+        let _ = self.thread.take();
+    }
+}
+
+struct PresentationReorder {
+    next_display_index: Option<u32>,
+    pending: BTreeMap<u32, DecodedVideoFrame>,
+}
+
+impl PresentationReorder {
+    fn new() -> Self {
+        Self {
+            next_display_index: None,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    fn reset(&mut self, presentation_floor: Option<u32>) {
+        self.pending.clear();
+        self.next_display_index = presentation_floor;
+    }
+
+    fn depth(&self) -> usize {
+        self.pending.len()
+    }
+
+    fn push(&mut self, frame: DecodedVideoFrame) -> Result<(), String> {
+        let index = frame.frame_index;
+        let next = self.next_display_index.get_or_insert(index);
+
+        if index < *next {
+            return Ok(());
+        }
+        let gap = index.saturating_sub(*next) as usize;
+        if gap > MAX_PRESENTATION_REORDER_FRAMES {
+            return Err(format!(
+                "presentation index gap {gap} exceeds reorder bound {MAX_PRESENTATION_REORDER_FRAMES}"
+            ));
+        }
+        if self.pending.insert(index, frame).is_some() {
+            return Err(format!("duplicate presentation frame index {index}"));
+        }
+        if self.pending.len() > MAX_PRESENTATION_REORDER_FRAMES + 1 {
+            return Err(format!(
+                "presentation reorder depth {} exceeds bound",
+                self.pending.len()
+            ));
+        }
+        Ok(())
+    }
+
+    fn pop_ready(&mut self) -> Option<DecodedVideoFrame> {
+        let next = self.next_display_index?;
+        let frame = self.pending.remove(&next)?;
+        self.next_display_index = Some(next.saturating_add(1));
+        Some(frame)
+    }
+
+    fn finish_eos(&self) -> Result<(), String> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            let expected = self.next_display_index.unwrap_or(0);
+            let first = self.pending.keys().next().copied().unwrap_or(expected);
+            Err(format!(
+                "end of stream with unresolved presentation gap: expected {expected}, first buffered {first}"
+            ))
+        }
+    }
+}
+
+struct PlaybackWorker {
+    command_rx: Receiver<PlaybackWorkerCommand>,
+    event_tx: SyncSender<PlaybackWorkerEvent>,
+    frame_slot: Arc<Mutex<Option<PresentationFrame>>>,
+    shutdown: Arc<AtomicBool>,
+    session: Option<PlaybackSession>,
+    generation: u64,
+    state: PlayerState,
+    reorder: PresentationReorder,
+    presented_video_frames: u64,
+    dropped_video_frames: u64,
+    presented_position_ms: u64,
+}
+
+impl PlaybackWorker {
+    fn new(
+        command_rx: Receiver<PlaybackWorkerCommand>,
+        event_tx: SyncSender<PlaybackWorkerEvent>,
+        frame_slot: Arc<Mutex<Option<PresentationFrame>>>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            command_rx,
+            event_tx,
+            frame_slot,
+            shutdown,
+            session: None,
+            generation: 0,
+            state: PlayerState::Closed,
+            reorder: PresentationReorder::new(),
+            presented_video_frames: 0,
+            dropped_video_frames: 0,
+            presented_position_ms: 0,
+        }
+    }
+
+    fn run(&mut self) {
+        while !self.shutdown.load(Ordering::Acquire) {
+            if self.state == PlayerState::Playing {
+                match self.command_rx.recv_timeout(PLAYBACK_TICK) {
+                    Ok(command) => {
+                        if !self.handle_command(command) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => self.playback_step(),
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                match self.command_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(command) => {
+                        if !self.handle_command(command) {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+        self.session = None;
+        let _ = self.event_tx.try_send(PlaybackWorkerEvent::WorkerStopped);
+    }
+
+    fn command_generation_is_current(&self, generation: u64) -> bool {
+        generation == self.generation
+    }
+
+    fn handle_command(&mut self, command: PlaybackWorkerCommand) -> bool {
+        match command {
+            PlaybackWorkerCommand::Shutdown => return false,
+            PlaybackWorkerCommand::Open { generation, path } => {
+                self.generation = generation;
+                self.reorder.reset(None);
+                self.clear_frame_slot();
+                self.presented_video_frames = 0;
+                self.dropped_video_frames = 0;
+                self.presented_position_ms = 0;
+                match PlaybackSession::open(&path) {
+                    Ok(session) => {
+                        self.session = Some(session);
+                        self.state = PlayerState::Ready;
+                        self.emit_snapshot();
+                    }
+                    Err(error) => self.fail(error.to_string()),
+                }
+            }
+            PlaybackWorkerCommand::Play { generation } => {
+                if !self.command_generation_is_current(generation) {
+                    return true;
+                }
+                let Some(session) = self.session.as_mut() else {
+                    self.fail("playback session is not open".to_string());
+                    return true;
+                };
+                if session.state() == PlaybackState::EndOfStream {
+                    if let Err(error) = session.stop() {
+                        self.fail(error.to_string());
+                        return true;
+                    }
+                    self.reorder.reset(None);
+                }
+                session.play();
+                self.state = PlayerState::Playing;
+                self.emit_snapshot();
+            }
+            PlaybackWorkerCommand::Pause { generation } => {
+                if !self.command_generation_is_current(generation) {
+                    return true;
+                }
+                if let Some(session) = self.session.as_mut() {
+                    session.pause();
+                }
+                self.state = PlayerState::Paused;
+                self.emit_snapshot();
+            }
+            PlaybackWorkerCommand::Stop { generation } => {
+                if !self.command_generation_is_current(generation) {
+                    return true;
+                }
+                if let Some(session) = self.session.as_mut() {
+                    if let Err(error) = session.stop() {
+                        self.fail(error.to_string());
+                        return true;
+                    }
+                }
+                self.reorder.reset(None);
+                self.clear_frame_slot();
+                self.presented_position_ms = 0;
+                self.state = PlayerState::Ready;
+                self.emit_snapshot();
+            }
+            PlaybackWorkerCommand::Seek {
+                generation,
+                target_ms,
+            } => {
+                if generation != self.generation {
+                    self.generation = generation;
+                }
+                self.perform_seek(target_ms);
+            }
+        }
+        true
+    }
+
+    fn playback_step(&mut self) {
+        if let Some(frame) = self.reorder.pop_ready() {
+            self.publish_frame(frame);
+            return;
+        }
+
+        let event = {
+            let Some(session) = self.session.as_mut() else {
+                self.fail("playback session disappeared".to_string());
+                return;
+            };
+            session.decode_next_step()
+        };
+
+        match event {
+            Ok(PlaybackEvent::Video(frame)) => {
+                if let Err(error) = self.reorder.push(frame) {
+                    self.fail(error);
+                    return;
+                }
+                if let Some(frame) = self.reorder.pop_ready() {
+                    self.publish_frame(frame);
+                }
+                self.emit_snapshot();
+            }
+            Ok(PlaybackEvent::Audio(_)) => self.emit_snapshot(),
+            Ok(PlaybackEvent::EndOfStream) => {
+                if let Some(frame) = self.reorder.pop_ready() {
+                    self.publish_frame(frame);
+                    return;
+                }
+                match self.reorder.finish_eos() {
+                    Ok(()) => {
+                        self.state = PlayerState::Ended;
+                        self.emit_snapshot();
+                    }
+                    Err(error) => self.fail(error),
+                }
+            }
+            Err(error) => self.fail(error.to_string()),
+        }
+    }
+
+    fn perform_seek(&mut self, target_ms: u64) {
+        let resume_playing = self.state == PlayerState::Playing;
+        self.state = PlayerState::Seeking;
+        self.reorder
+            .reset(Some((target_ms / COMPAT_FRAME_DURATION_MS).min(u32::MAX as u64) as u32));
+        self.clear_frame_slot();
+        self.emit_snapshot();
+
+        let Some(session) = self.session.as_mut() else {
+            self.fail("seek requested without an open playback session".to_string());
+            return;
+        };
+
+        let saved_video = session.decoded_video_frames;
+        let saved_audio = session.decoded_audio_chunks;
+        if let Err(error) = session.seek_video_keyframe_before_or_at_ms(target_ms) {
+            self.fail(error.to_string());
+            return;
+        }
+
+        const RECOVERY_STEP_BUDGET: usize = 8192;
+        let target_index = (target_ms / COMPAT_FRAME_DURATION_MS).min(u32::MAX as u64) as u32;
+        let mut target_reached = false;
+
+        for _ in 0..RECOVERY_STEP_BUDGET {
+            if self.shutdown.load(Ordering::Acquire) {
+                break;
+            }
+            match session.decode_next_step() {
+                Ok(PlaybackEvent::Video(frame)) => {
+                    if frame.frame_index >= target_index {
+                        target_reached = true;
+                    }
+                    if let Err(error) = self.reorder.push(frame) {
+                        session.decoded_video_frames = saved_video;
+                        session.decoded_audio_chunks = saved_audio;
+                        self.fail(error);
+                        return;
+                    }
+                    if target_reached && self.reorder.pending.contains_key(&target_index) {
+                        break;
+                    }
+                }
+                Ok(PlaybackEvent::Audio(_)) => {}
+                Ok(PlaybackEvent::EndOfStream) => break,
+                Err(error) => {
+                    session.decoded_video_frames = saved_video;
+                    session.decoded_audio_chunks = saved_audio;
+                    self.fail(error.to_string());
+                    return;
+                }
+            }
+        }
+
+        session.decoded_video_frames = saved_video;
+        session.decoded_audio_chunks = saved_audio;
+
+        if !target_reached {
+            self.fail("seek recovery did not reach requested presentation floor".to_string());
+            return;
+        }
+
+        self.presented_position_ms = u64::from(target_index).saturating_mul(COMPAT_FRAME_DURATION_MS);
+        self.state = if resume_playing {
+            PlayerState::Playing
+        } else {
+            PlayerState::Paused
+        };
+        let _ = self.event_tx.try_send(PlaybackWorkerEvent::SeekCompleted {
+            generation: self.generation,
+            presented_position_ms: self.presented_position_ms,
+        });
+        self.emit_snapshot();
+    }
+
+    fn publish_frame(&mut self, frame: DecodedVideoFrame) {
+        let position_ms = u64::from(frame.frame_index).saturating_mul(COMPAT_FRAME_DURATION_MS);
+        let presentation = PresentationFrame {
+            generation: self.generation,
+            frame,
+            presented_position_ms: position_ms,
+        };
+
+        match self.frame_slot.lock() {
+            Ok(mut slot) => {
+                if slot.replace(presentation).is_some() {
+                    self.dropped_video_frames = self.dropped_video_frames.saturating_add(1);
+                }
+            }
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                slot.take();
+                self.fail("playback frame slot mutex was poisoned".to_string());
+                return;
+            }
+        }
+
+        self.presented_position_ms = position_ms;
+        self.presented_video_frames = self.presented_video_frames.saturating_add(1);
+        let _ = self.event_tx.try_send(PlaybackWorkerEvent::FrameReady {
+            generation: self.generation,
+        });
+        self.emit_snapshot();
+    }
+
+    fn clear_frame_slot(&self) {
+        match self.frame_slot.lock() {
+            Ok(mut slot) => {
+                slot.take();
+            }
+            Err(poisoned) => {
+                let mut slot = poisoned.into_inner();
+                slot.take();
+            }
+        }
+    }
+
+    fn snapshot(&self) -> PlaybackSnapshot {
+        let (duration_ms, decoded_position_ms, decoded_video_frames, decoded_audio_chunks) =
+            self.session.as_ref().map_or((0, 0, 0, 0), |session| {
+                (
+                    session.duration_ms(),
+                    session.position().as_ms(),
+                    session.decoded_video_frames,
+                    session.decoded_audio_chunks,
+                )
+            });
+
+        PlaybackSnapshot {
+            generation: self.generation,
+            state: self.state,
+            duration_ms,
+            presented_position_ms: self.presented_position_ms,
+            decoded_position_ms,
+            decoded_video_frames,
+            decoded_audio_chunks,
+            presented_video_frames: self.presented_video_frames,
+            dropped_video_frames: self.dropped_video_frames,
+            reorder_depth: self.reorder.depth(),
+            seek_in_progress: self.state == PlayerState::Seeking,
+            last_error: None,
+        }
+    }
+
+    fn emit_snapshot(&self) {
+        let _ = self
+            .event_tx
+            .try_send(PlaybackWorkerEvent::Snapshot(self.snapshot()));
+    }
+
+    fn fail(&mut self, message: String) {
+        self.state = PlayerState::Error;
+        let mut snapshot = self.snapshot();
+        snapshot.last_error = Some(message.clone());
+        let _ = self
+            .event_tx
+            .try_send(PlaybackWorkerEvent::FatalError {
+                generation: self.generation,
+                message,
+            });
+        let _ = self
+            .event_tx
+            .try_send(PlaybackWorkerEvent::Snapshot(snapshot));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(index: u32) -> DecodedVideoFrame {
+        DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            frame_index: index,
+            pts_ticks: u64::from(index) * 3_000,
+            dts_ticks: u64::from(index) * 3_000,
+            timescale_hz: 90_000,
+            payload_crc32c: index,
+            gray8: vec![index as u8; 4],
+        }
+    }
+
+    #[test]
+    fn reorder_restores_single_b_decode_order() {
+        let mut reorder = PresentationReorder::new();
+
+        reorder.push(frame(0)).expect("push 0");
+        assert_eq!(reorder.pop_ready().map(|f| f.frame_index), Some(0));
+
+        reorder.push(frame(2)).expect("push 2");
+        assert!(reorder.pop_ready().is_none());
+
+        reorder.push(frame(1)).expect("push 1");
+        assert_eq!(reorder.pop_ready().map(|f| f.frame_index), Some(1));
+        assert_eq!(reorder.pop_ready().map(|f| f.frame_index), Some(2));
+        assert!(reorder.pop_ready().is_none());
+    }
+
+    #[test]
+    fn reorder_rejects_duplicate_index() {
+        let mut reorder = PresentationReorder::new();
+        reorder.reset(Some(1));
+        reorder.push(frame(2)).expect("first frame");
+        let error = reorder.push(frame(2)).expect_err("duplicate must fail");
+        assert!(error.contains("duplicate"));
+    }
+
+    #[test]
+    fn reorder_rejects_gap_beyond_bound() {
+        let mut reorder = PresentationReorder::new();
+        reorder.reset(Some(0));
+        let error = reorder
+            .push(frame((MAX_PRESENTATION_REORDER_FRAMES + 1) as u32))
+            .expect_err("oversized gap must fail");
+        assert!(error.contains("exceeds reorder bound"));
+    }
+
+    #[test]
+    fn eos_rejects_unresolved_gap() {
+        let mut reorder = PresentationReorder::new();
+        reorder.reset(Some(1));
+        reorder.push(frame(2)).expect("buffer future frame");
+        assert!(reorder.finish_eos().is_err());
+    }
+
+    #[test]
+    fn presentation_floor_discards_older_recovery_frames() {
+        let mut reorder = PresentationReorder::new();
+        reorder.reset(Some(5));
+        reorder.push(frame(3)).expect("older recovery frame");
+        reorder.push(frame(5)).expect("target frame");
+        assert_eq!(reorder.pop_ready().map(|f| f.frame_index), Some(5));
+    }
+}
