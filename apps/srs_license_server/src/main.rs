@@ -431,10 +431,8 @@ impl Database {
         };
 
         let features = load_features(&tx, &key_row.license_id)?;
-        let effective_ip = request
-            .claimed_ip
-            .as_deref()
-            .or(remote_ip)
+        let effective_ip = remote_ip
+            .or(request.claimed_ip.as_deref())
             .map(ToOwned::to_owned);
         let existing_installation =
             find_installation(&tx, &key_row.license_id, &request.device.install_id)?;
@@ -1520,9 +1518,7 @@ async fn issue_json(
     headers: HeaderMap,
     Json(mut request): Json<IssueKeyRequest>,
 ) -> AppResult<Json<IssueKeyResponse>> {
-    if request.registrant_ip.is_none() {
-        request.registrant_ip = Some(addr.ip().to_string());
-    }
+    request.registrant_ip = Some(addr.ip().to_string());
     if request.registrant_os.is_none() {
         request.registrant_os = user_agent_string(&headers);
     }
