@@ -767,7 +767,7 @@ impl Database {
                 Ok(AdminKeyRecord {
                     key_id: row.get(0)?,
                     license_id: row.get(1)?,
-                    key_value: row.get(2)?,
+                    key_hint: security::redact_license_key(&row.get::<_, String>(2)?),
                     key_version: row.get::<_, i64>(3)?,
                     active: row.get::<_, i64>(4)? == 1,
                     created_at_epoch_s: row.get::<_, i64>(5)? as u64,
@@ -2501,7 +2501,7 @@ fn render_admin_page(snapshot: &AdminSnapshot) -> String {
                 </tr>",
                 html_escape(&key.key_id),
                 html_escape(&key.license_id),
-                html_escape(&key.key_value),
+                html_escape(&key.key_hint),
                 key.key_version,
                 if key.active { "active" } else { "inactive" },
                 format_epoch(key.created_at_epoch_s),
