@@ -1,7 +1,7 @@
-use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use ffmpeg_next as ffmpeg;
 use libsrs_contract::{
     CodecType, MediaKind, Packet, StreamId, StreamRole, Timebase, Timestamp, TrackId,
@@ -55,81 +55,103 @@ impl MediaProbe for FfmpegProbe {
     }
 }
 
-#[derive(Debug, Default)]
+/// Streaming FFmpeg-backed packet source.
+///
+/// The previous implementation eagerly copied every demuxed packet into a VecDeque during
+/// open_path, making memory use proportional to the entire input file. This implementation
+/// retains the AVFormatContext and copies only the packet currently returned to the caller.
+/// Consequently, ingest memory is bounded by FFmpeg's internal demux buffers plus one owned
+/// SourcePacket, regardless of source duration.
 pub struct FfmpegIngestor {
-    queue: VecDeque<SourcePacket>,
-    opened: bool,
+    input: Option<ffmpeg::format::context::Input>,
+}
+
+impl fmt::Debug for FfmpegIngestor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FfmpegIngestor")
+            .field("opened", &self.input.is_some())
+            .finish()
+    }
+}
+
+impl Default for FfmpegIngestor {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FfmpegIngestor {
-    pub fn new() -> Self {
-        Self {
-            queue: VecDeque::new(),
-            opened: false,
-        }
+    pub const fn new() -> Self {
+        Self { input: None }
     }
 }
 
 impl MediaIngestor for FfmpegIngestor {
     fn open_path(&mut self, input: &Path) -> Result<()> {
         ffmpeg::init()?;
-        self.queue.clear();
 
-        let mut ictx = ffmpeg::format::input(input)?;
-        let mut timebases = HashMap::new();
-        for (idx, stream) in ictx.streams().enumerate() {
-            let tb = stream.time_base();
-            let den = tb.denominator().max(1) as u32;
-            let num = tb.numerator().max(1) as u32;
-            timebases.insert(idx, Timebase::new(num, den));
-        }
-
-        for (stream, packet) in ictx.packets() {
-            let stream_idx = stream.index();
-            let timebase = timebases
-                .get(&stream_idx)
-                .copied()
-                .unwrap_or_else(Timebase::milliseconds);
-            let payload = packet.data().map_or_else(Vec::new, ToOwned::to_owned);
-            self.queue.push_back(SourcePacket {
-                packet: Packet {
-                    stream_id: StreamId(stream_idx as u32),
-                    pts: packet.pts().map(|v| Timestamp::new(v, timebase)),
-                    dts: packet.dts().map(|v| Timestamp::new(v, timebase)),
-                    duration: (packet.duration() != 0)
-                        .then(|| Timestamp::new(packet.duration(), timebase)),
-                    keyframe: packet.is_key(),
-                    data: payload,
-                },
-                source_offset: packet.position().try_into().ok(),
-            });
-        }
-
-        self.opened = true;
+        // Drop any previously-open input before attempting a replacement so stale file handles,
+        // network handles, and demux buffers cannot survive a failed reopen.
+        self.input = None;
+        self.input = Some(ffmpeg::format::input(input)?);
         Ok(())
     }
 
     fn read_packet(&mut self) -> Result<Option<SourcePacket>> {
-        if !self.opened {
+        let Some(ictx) = self.input.as_mut() else {
             return Ok(None);
-        }
-        Ok(self.queue.pop_front())
+        };
+
+        // A fresh iterator is cheap: it borrows the retained AVFormatContext and advances that
+        // context by one av_read_frame call. We intentionally take only one packet per API call
+        // instead of buffering the rest of the source in Rust memory.
+        let Some((stream, packet)) = ictx.packets().next() else {
+            return Ok(None);
+        };
+
+        let stream_idx = stream.index();
+        let tb = stream.time_base();
+        let den = tb.denominator().max(1) as u32;
+        let num = tb.numerator().max(1) as u32;
+        let timebase = Timebase::new(num, den);
+        let payload = packet.data().map_or_else(Vec::new, ToOwned::to_owned);
+
+        Ok(Some(SourcePacket {
+            packet: Packet {
+                stream_id: StreamId(stream_idx as u32),
+                pts: packet.pts().map(|v| Timestamp::new(v, timebase)),
+                dts: packet.dts().map(|v| Timestamp::new(v, timebase)),
+                duration: (packet.duration() != 0)
+                    .then(|| Timestamp::new(packet.duration(), timebase)),
+                keyframe: packet.is_key(),
+                data: payload,
+            },
+            source_offset: packet.position().try_into().ok(),
+        }))
     }
 
     fn seek_ms(&mut self, position_ms: u64) -> Result<()> {
-        let target_ticks = (position_ms as i64) * 1_000;
-        let index = self
-            .queue
-            .iter()
-            .position(|pkt| pkt.packet.pts.is_some_and(|pts| pts.ticks >= target_ticks))
-            .unwrap_or(self.queue.len());
-        self.queue.drain(..index);
+        let Some(ictx) = self.input.as_mut() else {
+            return Ok(());
+        };
+
+        // FFmpeg's global seek timestamp is AV_TIME_BASE units (microseconds) when no stream
+        // index is supplied. Use checked conversion so attacker-controlled or corrupted timeline
+        // values cannot wrap into a negative seek target.
+        let target_us = i64::try_from(position_ms)
+            .ok()
+            .and_then(|ms| ms.checked_mul(1_000))
+            .ok_or_else(|| anyhow!("seek position exceeds FFmpeg timestamp range"))?;
+
+        // Seeking the retained demuxer resets read position without reopening the source. FFmpeg
+        // may land on an earlier keyframe, which is the normal demux-level seek contract.
+        ictx.seek(target_us, ..target_us)?;
         Ok(())
     }
 
     fn close(&mut self) -> Result<()> {
-        self.queue.clear();
-        self.opened = false;
+        // Dropping Input releases the AVFormatContext and its owned I/O resources immediately.
+        self.input = None;
         Ok(())
     }
 }
@@ -159,7 +181,7 @@ fn audio_params_from_ffmpeg_parameters(
     if par.medium() != ffmpeg::media::Type::Audio {
         return (None, None);
     }
-    // SAFETY: `Parameters` wraps a live `AVCodecParameters` for this stream; sample_rate/channels
+    // SAFETY: Parameters wraps a live AVCodecParameters for this stream; sample_rate/channels
     // are valid for audio types per FFmpeg's public ABI.
     let (sample_rate, channels) = unsafe {
         let p = par.as_ptr();
