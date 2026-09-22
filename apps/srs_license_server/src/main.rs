@@ -29,7 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 const SCHEMA_SQL: &str = r#"
@@ -159,7 +159,10 @@ async fn main() -> Result<()> {
     let public_routes = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
-        .route("/confirm/{token}", get(confirm_request))
+        .route(
+            "/confirm/{token}",
+            get(confirm_request_page).post(confirm_request_post),
+        )
         .route("/api/v1/verify", post(verify_json))
         .route(
             "/api/v1/client/notifications/read",
@@ -374,6 +377,22 @@ impl Database {
         })
     }
 
+    fn confirmation_license(&self, token: &str) -> Result<Option<String>> {
+        let now = now_epoch_s() as i64;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        conn.query_row(
+            "SELECT license_id FROM verification_requests
+             WHERE token = ?1 AND expires_at_epoch_s >= ?2 AND record_state = 'active'",
+            params![token, now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     fn confirm_request(&self, token: &str) -> Result<Option<String>> {
         let now = now_epoch_s();
         let mut conn = self
@@ -383,21 +402,28 @@ impl Database {
         let tx = conn.transaction()?;
         let record = tx
             .query_row(
-                "SELECT request_id, license_id, approved_at_epoch_s FROM verification_requests WHERE token = ?1",
+                "SELECT request_id, license_id, approved_at_epoch_s, expires_at_epoch_s, record_state
+                 FROM verification_requests WHERE token = ?1",
                 params![token],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((request_id, license_id, approved_at)) = record else {
+        let Some((request_id, license_id, approved_at, expires_at, record_state)) = record else {
             tx.commit()?;
             return Ok(None);
         };
+        if expires_at < now as i64 || record_state != "active" {
+            tx.commit()?;
+            return Ok(None);
+        }
         if approved_at.is_none() {
             tx.execute(
                 "UPDATE verification_requests SET approved_at_epoch_s = ?1 WHERE request_id = ?2",
@@ -1579,7 +1605,25 @@ async fn report_unsupported_playback_json(
     }))
 }
 
-async fn confirm_request(
+async fn confirm_request_page(
+    State(state): State<Arc<AppState>>,
+    AxumPath(token): AxumPath<String>,
+) -> AppResult<Html<String>> {
+    let token_for_lookup = token.clone();
+    let license_id = state
+        .run_db(move |db| db.confirmation_license(&token_for_lookup))
+        .await?;
+    let Some(license_id) = license_id else {
+        return Err(AppError::not_found("confirmation token not found or expired"));
+    };
+    Ok(Html(format!(
+        "<html><body><h1>Confirm Installation</h1><p>License {}</p><form method=\"post\" action=\"/confirm/{}\"><button type=\"submit\">Confirm Installation</button></form></body></html>",
+        html_escape(&license_id),
+        html_escape(&token)
+    )))
+}
+
+async fn confirm_request_post(
     State(state): State<Arc<AppState>>,
     AxumPath(token): AxumPath<String>,
 ) -> AppResult<Html<String>> {
@@ -1591,7 +1635,7 @@ async fn confirm_request(
             "<html><body><h1>Confirmation Recorded</h1><p>License {}</p><p>The next client refresh will trust this installation.</p></body></html>",
             html_escape(&license_id)
         ))),
-        None => Err(AppError::not_found("confirmation token not found")),
+        None => Err(AppError::not_found("confirmation token not found or expired")),
     }
 }
 
@@ -1914,6 +1958,10 @@ where
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
+        if self.status.is_server_error() {
+            error!(status = %self.status, detail = %self.message, "request failed");
+            return (self.status, "internal server error").into_response();
+        }
         (self.status, self.message).into_response()
     }
 }
