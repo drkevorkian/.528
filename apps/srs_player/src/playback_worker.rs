@@ -313,6 +313,9 @@ impl PlaybackWorker {
             PlaybackWorkerCommand::Shutdown => return false,
             PlaybackWorkerCommand::Open { generation, path } => {
                 self.generation = generation;
+                // Fail closed on reopen: drop the previous media/session before touching the new
+                // path so an Open failure cannot leave old content playable under a new generation.
+                self.session = None;
                 self.reorder.reset(None);
                 self.clear_frame_slot();
                 self.presented_video_frames = 0;
