@@ -1,15 +1,19 @@
+mod db_exec;
+mod mail_exec;
+mod mailer;
+mod outbox_ops;
+mod security;
+
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use axum::extract::{ConnectInfo, Form, Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{Message, SmtpTransport, Transport};
 use libsrs_app_config::{ServerConfig, SrsConfig};
 use libsrs_licensing_proto::{
     decode_signing_key, AdminActionResponse, AdminAuditRecord, AdminCreateNotificationRequest,
@@ -21,12 +25,13 @@ use libsrs_licensing_proto::{
     IssueKeyResponse, LicensedFeature, NotificationDeliveryState, SignedEntitlementEnvelope,
     VerifyKeyRequest, VerifyKeyResponse,
 };
+use mailer::MailDelivery;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
-use tracing::info;
+use tracing::{error, info};
 use uuid::Uuid;
 
 const SCHEMA_SQL: &str = r#"
@@ -145,6 +150,7 @@ CREATE TABLE IF NOT EXISTS playback_requests (
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let config = SrsConfig::load()?.server;
+    security::validate_startup(&config)?;
     let state = Arc::new(AppState::new(config)?);
     let bind_addr: SocketAddr = state
         .config
@@ -152,11 +158,41 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("parse bind addr {}", state.config.bind_addr))?;
 
-    let app = Router::new()
+    let app = build_router(state);
+
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind {bind_addr}"))?;
+    info!("srs_license_server listening on {}", bind_addr);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve axum")?;
+    Ok(())
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    let public_routes = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
+        .route(
+            "/confirm/{token}",
+            get(confirm_request_page).post(confirm_request_post),
+        )
+        .route("/api/v1/verify", post(verify_json))
+        .route(
+            "/api/v1/client/notifications/read",
+            post(read_client_notifications_json),
+        )
+        .route(
+            "/api/v1/client/playback/unsupported",
+            post(report_unsupported_playback_json),
+        );
+
+    let admin_routes = Router::new()
         .route("/issue", post(issue_form))
-        .route("/confirm/{token}", get(confirm_request))
         .route("/admin", get(admin_dashboard))
         .route(
             "/admin/licenses/features",
@@ -236,42 +272,73 @@ async fn main() -> Result<()> {
             post(delete_audit_json),
         )
         .route("/api/v1/issue", post(issue_json))
-        .route("/api/v1/verify", post(verify_json))
-        .route(
-            "/api/v1/client/notifications/read",
-            post(read_client_notifications_json),
-        )
-        .route(
-            "/api/v1/client/playback/unsupported",
-            post(report_unsupported_playback_json),
-        )
-        .with_state(state);
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_middleware,
+        ));
 
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("bind {}", bind_addr))?;
-    info!("srs_license_server listening on {}", bind_addr);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .context("serve axum")?;
-    Ok(())
+    public_routes.merge(admin_routes).with_state(state)
 }
 
 #[derive(Clone)]
 struct AppState {
     config: ServerConfig,
     db: Arc<Database>,
+    db_exec: db_exec::BoundedDbExecutor,
+    mail_exec: mail_exec::BoundedMailExecutor,
 }
 
 impl AppState {
     fn new(config: ServerConfig) -> Result<Self> {
         Ok(Self {
             db: Arc::new(Database::open(&config)?),
+            db_exec: db_exec::BoundedDbExecutor::new(),
+            mail_exec: mail_exec::new_mail_executor(),
             config,
         })
+    }
+
+    async fn run_db<T, F>(&self, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Database>) -> Result<T> + Send + 'static,
+    {
+        let db = self.db.clone();
+        self.db_exec.run(move || work(db)).await
+    }
+
+    async fn deliver_pending_mail(&self, pending: PendingMail) -> Result<MailDelivery> {
+        let email_id = pending.email_id.clone();
+        let config = self.config.clone();
+        let recipient = pending.recipient;
+        let subject = pending.subject;
+        let body = pending.body;
+
+        let delivery = match self
+            .mail_exec
+            .run(move || Ok(mailer::deliver_email(&recipient, &subject, &body, &config)))
+            .await
+        {
+            Ok(delivery) => delivery,
+            Err(err) => {
+                let email_id_for_unclaim = email_id.clone();
+                let _ = self
+                    .run_db(move |db| db.unclaim_mail(&email_id_for_unclaim))
+                    .await;
+                return Err(err);
+            }
+        };
+
+        match delivery {
+            MailDelivery::Delivered | MailDelivery::LoggedOnly => {
+                self.run_db(move |db| db.mark_mail_accepted(&email_id))
+                    .await?;
+            }
+            MailDelivery::Failed => {
+                self.run_db(move |db| db.unclaim_mail(&email_id)).await?;
+            }
+        }
+        Ok(delivery)
     }
 }
 
@@ -290,6 +357,14 @@ impl Database {
         conn.execute_batch(SCHEMA_SQL)
             .context("initialize database schema")?;
         migrate_record_state_columns(&conn)?;
+        conn.execute(
+            "UPDATE email_outbox
+             SET notification_state = 'queued',
+                 state_changed_at_epoch_s = ?1
+             WHERE notification_state = 'sending'
+               AND record_state = 'active'",
+            params![now_epoch_s() as i64],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -352,6 +427,22 @@ impl Database {
         })
     }
 
+    fn confirmation_license(&self, token: &str) -> Result<Option<String>> {
+        let now = now_epoch_s() as i64;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        conn.query_row(
+            "SELECT license_id FROM verification_requests
+             WHERE token = ?1 AND expires_at_epoch_s >= ?2 AND record_state = 'active'",
+            params![token, now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     fn confirm_request(&self, token: &str) -> Result<Option<String>> {
         let now = now_epoch_s();
         let mut conn = self
@@ -361,21 +452,28 @@ impl Database {
         let tx = conn.transaction()?;
         let record = tx
             .query_row(
-                "SELECT request_id, license_id, approved_at_epoch_s FROM verification_requests WHERE token = ?1",
+                "SELECT request_id, license_id, approved_at_epoch_s, expires_at_epoch_s, record_state
+                 FROM verification_requests WHERE token = ?1",
                 params![token],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((request_id, license_id, approved_at)) = record else {
+        let Some((request_id, license_id, approved_at, expires_at, record_state)) = record else {
             tx.commit()?;
             return Ok(None);
         };
+        if expires_at < now as i64 || record_state != "active" {
+            tx.commit()?;
+            return Ok(None);
+        }
         if approved_at.is_none() {
             tx.execute(
                 "UPDATE verification_requests SET approved_at_epoch_s = ?1 WHERE request_id = ?2",
@@ -421,10 +519,8 @@ impl Database {
         };
 
         let features = load_features(&tx, &key_row.license_id)?;
-        let effective_ip = request
-            .claimed_ip
-            .as_deref()
-            .or(remote_ip)
+        let effective_ip = remote_ip
+            .or(request.claimed_ip.as_deref())
             .map(ToOwned::to_owned);
         let existing_installation =
             find_installation(&tx, &key_row.license_id, &request.device.install_id)?;
@@ -574,7 +670,7 @@ impl Database {
                     "replacement_key_issued",
                     json!({
                         "superseded_request_id": pending.request_id,
-                        "replacement_key": replacement.key_value,
+                        "replacement_key_id": replacement.key_id,
                     }),
                 )?;
                 let response = signed_response(
@@ -599,7 +695,8 @@ impl Database {
                 &request.device.install_id,
                 LicensedFeature::basic_defaults(),
                 EntitlementStatus::PendingConfirmation,
-                "Confirmation email sent; editor mode remains disabled until approved.".to_string(),
+                "Confirmation email queued; editor mode remains disabled until approved."
+                    .to_string(),
                 None,
                 None,
             )?;
@@ -635,8 +732,9 @@ impl Database {
         );
         let subject = "Was this you? Confirm a new SRS installation".to_string();
         let body = format!(
-            "A new installation requested access.\n\nKey: {}\nIP: {}\nOS: {}/{}\nHostname: {}\n\nConfirm: {}\n\nIf you do nothing for {} hours, the requester will receive a separate basic key.",
-            request.key,
+            "A new installation requested access.\n\nKey ID: {}\nKey hint: {}\nIP: {}\nOS: {}/{}\nHostname: {}\n\nConfirm: {}\n\nIf you do nothing for {} hours, the requester will receive a separate basic key.",
+            key_row.key_id,
+            security::redact_license_key(&request.key),
             effective_ip.clone().unwrap_or_else(|| "unknown".to_string()),
             request.os.family,
             request.os.arch,
@@ -662,7 +760,6 @@ impl Database {
             json!({
                 "request_id": request_id,
                 "device_install_id": request.device.install_id,
-                "confirmation_link": confirmation_link,
             }),
         )?;
         let response = signed_response(
@@ -672,17 +769,73 @@ impl Database {
             &request.device.install_id,
             LicensedFeature::basic_defaults(),
             EntitlementStatus::PendingConfirmation,
-            "New origin detected. Confirmation email sent to the original owner.".to_string(),
+            "New origin detected. Confirmation email queued for the original owner.".to_string(),
             None,
             None,
         )?;
         tx.commit()?;
         drop(conn);
-        self.mark_notification_sent(&email_id)?;
-        if deliver_email(&key_row.owner_email, &subject, &body, config) {
-            self.mark_notification_delivered(&email_id)?;
-        }
+        let _ = email_id;
         Ok(response)
+    }
+
+    fn claim_pending_mail_for_device(
+        &self,
+        license_id: &str,
+        device_install_id: &str,
+    ) -> Result<Option<PendingMail>> {
+        let now = now_epoch_s() as i64;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+
+        let pending = conn
+            .query_row(
+                outbox_ops::PENDING_MAIL_SQL,
+                params![device_install_id, license_id, now],
+                |row| {
+                    Ok(PendingMail {
+                        email_id: row.get(0)?,
+                        recipient: row.get(1)?,
+                        subject: row.get(2)?,
+                        body: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        if !outbox_ops::claim_queued(&conn, &pending.email_id, now)? {
+            return Ok(None);
+        }
+        Ok(Some(pending))
+    }
+
+    fn claim_mail(&self, email_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        outbox_ops::claim_queued(&conn, email_id, now_epoch_s() as i64)
+    }
+
+    fn mark_mail_accepted(&self, email_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        outbox_ops::mark_accepted(&conn, email_id, now_epoch_s() as i64)
+    }
+
+    fn unclaim_mail(&self, email_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        outbox_ops::unclaim_to_queued(&conn, email_id, now_epoch_s() as i64)
     }
 
     fn admin_snapshot(&self) -> Result<AdminSnapshot> {
@@ -757,7 +910,7 @@ impl Database {
                 Ok(AdminKeyRecord {
                     key_id: row.get(0)?,
                     license_id: row.get(1)?,
-                    key_value: row.get(2)?,
+                    key_hint: security::redact_license_key(&row.get::<_, String>(2)?),
                     key_version: row.get::<_, i64>(3)?,
                     active: row.get::<_, i64>(4)? == 1,
                     created_at_epoch_s: row.get::<_, i64>(5)? as u64,
@@ -1215,11 +1368,10 @@ impl Database {
         self.set_audit_record_state(event_id, AdminRecordState::Deleted)
     }
 
-    fn create_and_send_notification(
+    fn enqueue_admin_notification(
         &self,
-        config: &ServerConfig,
         request: &AdminCreateNotificationRequest,
-    ) -> Result<String> {
+    ) -> Result<PendingMail> {
         let now = now_epoch_s();
         let mut conn = self
             .conn
@@ -1244,13 +1396,16 @@ impl Database {
             return Err(anyhow!("notification body is required"));
         }
 
+        let recipient = request.recipient.trim().to_string();
+        let subject = request.subject.trim().to_string();
+        let body = request.body.trim().to_string();
         let email_id = enqueue_email(
             &tx,
             &request.license_id,
             None,
-            request.recipient.trim(),
-            request.subject.trim(),
-            request.body.trim(),
+            &recipient,
+            &subject,
+            &body,
             now,
         )?;
         insert_audit_event(
@@ -1261,24 +1416,18 @@ impl Database {
             "admin_notification_created",
             json!({
                 "email_id": email_id,
-                "recipient": request.recipient,
-                "subject": request.subject,
+                "recipient": recipient,
+                "subject": subject,
             }),
         )?;
         tx.commit()?;
-        drop(conn);
 
-        self.mark_notification_sent(&email_id)?;
-        if deliver_email(
-            request.recipient.trim(),
-            request.subject.trim(),
-            request.body.trim(),
-            config,
-        ) {
-            self.mark_notification_delivered(&email_id)?;
-        }
-
-        Ok(email_id)
+        Ok(PendingMail {
+            email_id,
+            recipient,
+            subject,
+            body,
+        })
     }
 
     fn read_client_notifications(
@@ -1397,41 +1546,14 @@ impl Database {
         tx.commit()?;
         Ok(playback_request_id)
     }
+}
 
-    fn mark_notification_sent(&self, email_id: &str) -> Result<()> {
-        let now = now_epoch_s();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("database mutex poisoned"))?;
-        conn.execute(
-            "UPDATE email_outbox
-             SET sent_at_epoch_s = COALESCE(sent_at_epoch_s, ?1),
-                 notification_state = 'sent',
-                 state_changed_at_epoch_s = ?1
-             WHERE email_id = ?2",
-            params![now as i64, email_id],
-        )?;
-        Ok(())
-    }
-
-    fn mark_notification_delivered(&self, email_id: &str) -> Result<()> {
-        let now = now_epoch_s();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("database mutex poisoned"))?;
-        conn.execute(
-            "UPDATE email_outbox
-             SET sent_at_epoch_s = COALESCE(sent_at_epoch_s, ?1),
-                 delivered_at_epoch_s = COALESCE(delivered_at_epoch_s, ?1),
-                 notification_state = 'delivered',
-                 state_changed_at_epoch_s = ?1
-             WHERE email_id = ?2",
-            params![now as i64, email_id],
-        )?;
-        Ok(())
-    }
+#[derive(Debug, Clone)]
+struct PendingMail {
+    email_id: String,
+    recipient: String,
+    subject: String,
+    body: String,
 }
 
 #[derive(Debug)]
@@ -1495,12 +1617,13 @@ async fn issue_form(
     headers: HeaderMap,
     Form(form): Form<IssueForm>,
 ) -> AppResult<Html<String>> {
-    let response = state.db.issue_license(&IssueKeyRequest {
+    let request = IssueKeyRequest {
         email: form.email,
         requested_features: None,
         registrant_os: user_agent_string(&headers),
         registrant_ip: Some(addr.ip().to_string()),
-    })?;
+    };
+    let response = state.run_db(move |db| db.issue_license(&request)).await?;
     Ok(Html(render_index_page(Some(&response))))
 }
 
@@ -1510,13 +1633,12 @@ async fn issue_json(
     headers: HeaderMap,
     Json(mut request): Json<IssueKeyRequest>,
 ) -> AppResult<Json<IssueKeyResponse>> {
-    if request.registrant_ip.is_none() {
-        request.registrant_ip = Some(addr.ip().to_string());
-    }
+    request.registrant_ip = Some(addr.ip().to_string());
     if request.registrant_os.is_none() {
         request.registrant_os = user_agent_string(&headers);
     }
-    Ok(Json(state.db.issue_license(&request)?))
+    let response = state.run_db(move |db| db.issue_license(&request)).await?;
+    Ok(Json(response))
 }
 
 async fn verify_json(
@@ -1524,10 +1646,22 @@ async fn verify_json(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<VerifyKeyRequest>,
 ) -> AppResult<Json<VerifyKeyResponse>> {
-    let remote_ip = Some(addr.ip().to_string());
-    let response = state
-        .db
-        .verify_key(&state.config, &request, remote_ip.as_deref())?;
+    let remote_ip = addr.ip().to_string();
+    let config = state.config.clone();
+    let device_install_id = request.device.install_id.clone();
+    let (response, pending_mail) = state
+        .run_db(move |db| {
+            let response = db.verify_key(&config, &request, Some(&remote_ip))?;
+            let claims: EntitlementClaims = serde_json::from_str(&response.envelope.claims_json)
+                .context("decode server-generated entitlement claims")?;
+            let pending_mail =
+                db.claim_pending_mail_for_device(&claims.license_id, &device_install_id)?;
+            Ok((response, pending_mail))
+        })
+        .await?;
+    if let Some(pending_mail) = pending_mail {
+        let _ = state.deliver_pending_mail(pending_mail).await?;
+    }
     Ok(Json(response))
 }
 
@@ -1535,157 +1669,195 @@ async fn read_client_notifications_json(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ClientNotificationReadRequest>,
 ) -> AppResult<Json<Vec<ClientNotification>>> {
-    Ok(Json(state.db.read_client_notifications(&request)?))
+    let notifications = state
+        .run_db(move |db| db.read_client_notifications(&request))
+        .await?;
+    Ok(Json(notifications))
 }
 
 async fn report_unsupported_playback_json(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ClientUnsupportedPlaybackRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    let id = state.db.record_unsupported_playback(&request)?;
+    let id = state
+        .run_db(move |db| db.record_unsupported_playback(&request))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: format!("unsupported playback request recorded: {id}"),
     }))
 }
 
-async fn confirm_request(
+async fn confirm_request_page(
+    State(state): State<Arc<AppState>>,
+    AxumPath(token): AxumPath<String>,
+) -> AppResult<(HeaderMap, Html<String>)> {
+    let token_for_lookup = token.clone();
+    let license_id = state
+        .run_db(move |db| db.confirmation_license(&token_for_lookup))
+        .await?;
+    let Some(license_id) = license_id else {
+        return Err(AppError::not_found(
+            "confirmation token not found or expired",
+        ));
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; form-action 'self'; base-uri 'none'"),
+    );
+    Ok((
+        headers,
+        Html(format!(
+            "<html><body><h1>Confirm Installation</h1><p>License {}</p><form method=\"post\" action=\"/confirm/{}\"><button type=\"submit\">Confirm Installation</button></form></body></html>",
+            html_escape(&license_id),
+            html_escape(&token)
+        )),
+    ))
+}
+
+async fn confirm_request_post(
     State(state): State<Arc<AppState>>,
     AxumPath(token): AxumPath<String>,
 ) -> AppResult<Html<String>> {
-    match state.db.confirm_request(&token)? {
+    let confirmed = state.run_db(move |db| db.confirm_request(&token)).await?;
+    match confirmed {
         Some(license_id) => Ok(Html(format!(
             "<html><body><h1>Confirmation Recorded</h1><p>License {}</p><p>The next client refresh will trust this installation.</p></body></html>",
             html_escape(&license_id)
         ))),
-        None => Err(AppError::not_found("confirmation token not found")),
+        None => Err(AppError::not_found("confirmation token not found or expired")),
     }
 }
 
-async fn admin_dashboard(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> AppResult<Html<String>> {
-    ensure_local_admin(&addr)?;
-    let snapshot = state.db.admin_snapshot()?;
+async fn admin_dashboard(State(state): State<Arc<AppState>>) -> AppResult<Html<String>> {
+    let snapshot = state.run_db(|db| db.admin_snapshot()).await?;
     Ok(Html(render_admin_page(&snapshot)))
 }
 
 async fn update_license_features_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Form(form): Form<AdminFeatureForm>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
+    let features = parse_feature_csv(&form.features_csv);
+    let license_id = form.license_id;
     state
-        .db
-        .update_license_features(&form.license_id, &parse_feature_csv(&form.features_csv))?;
+        .run_db(move |db| db.update_license_features(&license_id, &features))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn delete_license_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(license_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_license(&license_id)?;
+    state
+        .run_db(move |db| db.delete_license(&license_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn update_key_status_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Form(form): Form<AdminKeyStatusForm>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     let active = matches!(form.active.as_str(), "1" | "true" | "on" | "yes");
-    state.db.set_key_active(&form.key_id, active)?;
+    let key_id = form.key_id;
+    state
+        .run_db(move |db| db.set_key_active(&key_id, active))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn delete_key_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(key_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_key(&key_id)?;
+    state.run_db(move |db| db.delete_key(&key_id)).await?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn approve_request_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
-    state.db.approve_request_by_id(&request_id)?;
+    state
+        .run_db(move |db| db.approve_request_by_id(&request_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn delete_request_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_request(&request_id)?;
+    state
+        .run_db(move |db| db.delete_request(&request_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn delete_installation_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(installation_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_installation(&installation_id)?;
+    state
+        .run_db(move |db| db.delete_installation(&installation_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn delete_audit_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(event_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_audit(&event_id)?;
+    state.run_db(move |db| db.delete_audit(&event_id)).await?;
     Ok(Redirect::to("/admin"))
 }
 
-async fn admin_snapshot_json(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-) -> AppResult<Json<AdminSnapshot>> {
-    ensure_local_admin(&addr)?;
-    Ok(Json(state.db.admin_snapshot()?))
+async fn admin_snapshot_json(State(state): State<Arc<AppState>>) -> AppResult<Json<AdminSnapshot>> {
+    Ok(Json(state.run_db(|db| db.admin_snapshot()).await?))
 }
 
 async fn create_notification_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<AdminCreateNotificationRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    let email_id = state
-        .db
-        .create_and_send_notification(&state.config, &request)?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: format!("notification queued and sent: {email_id}"),
-    }))
+    let pending = state
+        .run_db(move |db| db.enqueue_admin_notification(&request))
+        .await?;
+    let email_id = pending.email_id.clone();
+    let email_id_for_claim = email_id.clone();
+    let claimed = state
+        .run_db(move |db| db.claim_mail(&email_id_for_claim))
+        .await?;
+    let delivery = if claimed {
+        state.deliver_pending_mail(pending).await?
+    } else {
+        MailDelivery::Failed
+    };
+    let message = match delivery {
+        MailDelivery::Delivered | MailDelivery::LoggedOnly => {
+            format!("notification queued and delivered: {email_id}")
+        }
+        MailDelivery::Failed => format!("notification queued for retry: {email_id}"),
+    };
+    Ok(Json(AdminActionResponse { ok: true, message }))
 }
 
 async fn update_license_features_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<AdminUpdateLicenseFeaturesRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state
-        .db
-        .update_license_features(&request.license_id, &request.features)?;
+        .run_db(move |db| db.update_license_features(&request.license_id, &request.features))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "license features updated".to_string(),
@@ -1694,11 +1866,11 @@ async fn update_license_features_json(
 
 async fn delete_license_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(license_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_license(&license_id)?;
+    state
+        .run_db(move |db| db.delete_license(&license_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "license deleted".to_string(),
@@ -1707,27 +1879,26 @@ async fn delete_license_json(
 
 async fn update_license_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(license_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
+    let new_state = request.state;
     state
-        .db
-        .set_license_record_state(&license_id, request.state)?;
+        .run_db(move |db| db.set_license_record_state(&license_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
-        message: format!("license state updated to {}", request.state.as_str()),
+        message: format!("license state updated to {}", new_state.as_str()),
     }))
 }
 
 async fn update_key_status_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<AdminUpdateKeyStatusRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.set_key_active(&request.key_id, request.active)?;
+    state
+        .run_db(move |db| db.set_key_active(&request.key_id, request.active))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "key status updated".to_string(),
@@ -1736,25 +1907,24 @@ async fn update_key_status_json(
 
 async fn update_key_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(key_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.set_key_record_state(&key_id, request.state)?;
+    let new_state = request.state;
+    state
+        .run_db(move |db| db.set_key_record_state(&key_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
-        message: format!("key state updated to {}", request.state.as_str()),
+        message: format!("key state updated to {}", new_state.as_str()),
     }))
 }
 
 async fn delete_key_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(key_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_key(&key_id)?;
+    state.run_db(move |db| db.delete_key(&key_id)).await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "key deleted".to_string(),
@@ -1763,11 +1933,11 @@ async fn delete_key_json(
 
 async fn approve_request_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.approve_request_by_id(&request_id)?;
+    state
+        .run_db(move |db| db.approve_request_by_id(&request_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "verification request approved".to_string(),
@@ -1776,30 +1946,29 @@ async fn approve_request_json(
 
 async fn update_request_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
+    let new_state = request.state;
     state
-        .db
-        .set_request_record_state(&request_id, request.state)?;
+        .run_db(move |db| db.set_request_record_state(&request_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: format!(
             "verification request state updated to {}",
-            request.state.as_str()
+            new_state.as_str()
         ),
     }))
 }
 
 async fn delete_request_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_request(&request_id)?;
+    state
+        .run_db(move |db| db.delete_request(&request_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "verification request deleted".to_string(),
@@ -1808,11 +1977,11 @@ async fn delete_request_json(
 
 async fn delete_installation_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(installation_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_installation(&installation_id)?;
+    state
+        .run_db(move |db| db.delete_installation(&installation_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "installation deleted".to_string(),
@@ -1821,27 +1990,24 @@ async fn delete_installation_json(
 
 async fn update_installation_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(installation_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
+    let new_state = request.state;
     state
-        .db
-        .set_installation_record_state(&installation_id, request.state)?;
+        .run_db(move |db| db.set_installation_record_state(&installation_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
-        message: format!("installation state updated to {}", request.state.as_str()),
+        message: format!("installation state updated to {}", new_state.as_str()),
     }))
 }
 
 async fn delete_audit_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(event_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.delete_audit(&event_id)?;
+    state.run_db(move |db| db.delete_audit(&event_id)).await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "audit event deleted".to_string(),
@@ -1850,15 +2016,16 @@ async fn delete_audit_json(
 
 async fn update_audit_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(event_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
-    state.db.set_audit_record_state(&event_id, request.state)?;
+    let new_state = request.state;
+    state
+        .run_db(move |db| db.set_audit_record_state(&event_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
-        message: format!("audit state updated to {}", request.state.as_str()),
+        message: format!("audit state updated to {}", new_state.as_str()),
     }))
 }
 
@@ -1868,7 +2035,6 @@ struct AppError {
     status: StatusCode,
     message: String,
 }
-
 impl AppError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
@@ -1892,6 +2058,10 @@ where
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
+        if self.status.is_server_error() {
+            error!(status = %self.status, detail = %self.message, "request failed");
+            return (self.status, "internal server error").into_response();
+        }
         (self.status, self.message).into_response()
     }
 }
@@ -2369,81 +2539,6 @@ fn parse_feature_name(feature: &str) -> Option<LicensedFeature> {
     }
 }
 
-fn deliver_email(recipient: &str, subject: &str, body: &str, config: &ServerConfig) -> bool {
-    if let (Some(mail_from), Some(smtp_server)) = (&config.mail_from, &config.smtp_server) {
-        let email = match Message::builder()
-            .from(match mail_from.parse() {
-                Ok(value) => value,
-                Err(err) => {
-                    info!(
-                        target: "srs_license_server::mailer",
-                        "invalid mail_from {}: {}",
-                        mail_from,
-                        err
-                    );
-                    return false;
-                }
-            })
-            .to(match recipient.parse() {
-                Ok(value) => value,
-                Err(err) => {
-                    info!(
-                        target: "srs_license_server::mailer",
-                        "invalid recipient {}: {}",
-                        recipient,
-                        err
-                    );
-                    return false;
-                }
-            })
-            .subject(subject)
-            .body(body.to_string())
-        {
-            Ok(email) => email,
-            Err(err) => {
-                info!(target: "srs_license_server::mailer", "message build failed: {}", err);
-                return false;
-            }
-        };
-
-        let mut builder = SmtpTransport::builder_dangerous(smtp_server);
-        if let (Some(username), Some(password)) = (&config.smtp_username, &config.smtp_password) {
-            builder = builder.credentials(Credentials::new(username.clone(), password.clone()));
-        }
-        let mailer = builder.build();
-        return match mailer.send(&email) {
-            Ok(_) => {
-                info!(
-                    target: "srs_license_server::mailer",
-                    "smtp delivered to {} with subject {}",
-                    recipient,
-                    subject
-                );
-                true
-            }
-            Err(err) => {
-                info!(
-                    target: "srs_license_server::mailer",
-                    "smtp delivery failed for {}: {}",
-                    recipient,
-                    err
-                );
-                false
-            }
-        };
-    }
-
-    info!(
-        target: "srs_license_server::mailer",
-        mode = "log",
-        recipient,
-        subject,
-        "{}",
-        body
-    );
-    true
-}
-
 fn render_index_page(response: Option<&IssueKeyResponse>) -> String {
     let issued = response.map(|response| {
         format!(
@@ -2459,7 +2554,7 @@ fn render_index_page(response: Option<&IssueKeyResponse>) -> String {
         )
     }).unwrap_or_default();
     format!(
-        "<html><body><h1>SRS Licensing</h1><p>Free keys default to the <code>basic</code> feature set. Future editor upgrades can be assigned per key.</p><form method=\"post\" action=\"/issue\"><label>Email <input type=\"email\" name=\"email\" required></label><button type=\"submit\">Issue Key</button></form>{issued}<p>Health: <a href=\"/healthz\">/healthz</a></p></body></html>"
+        "<html><body><h1>SRS Licensing</h1><p>License issuance is restricted to authenticated administrators.</p>{issued}<p>Health: <a href=\"/healthz\">/healthz</a></p></body></html>"
     )
 }
 
@@ -2539,7 +2634,7 @@ fn render_admin_page(snapshot: &AdminSnapshot) -> String {
                 </tr>",
                 html_escape(&key.key_id),
                 html_escape(&key.license_id),
-                html_escape(&key.key_value),
+                html_escape(&key.key_hint),
                 key.key_version,
                 if key.active { "active" } else { "inactive" },
                 format_epoch(key.created_at_epoch_s),
@@ -2672,35 +2767,39 @@ fn render_admin_page(snapshot: &AdminSnapshot) -> String {
         </style></head><body>\
             <h1>SRS License Server Admin</h1>\
             <p>Local-only admin dashboard. Use this GUI on the Gentoo server to inspect and edit licensing state.</p>\
-            <div class='panel'><h2>Database Stats</h2>{}</div>\
+            <div class='panel'><h2>Database Stats</h2>{stats}</div>\
             <div class='panel'><h2>Licenses And Feature Editing</h2>\
-                <table><thead><tr><th>License</th><th>Owner Email</th><th>Active Keys</th><th>Edit Features</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>License</th><th>Owner Email</th><th>Active Keys</th><th>Edit Features</th></tr></thead><tbody>{licenses}</tbody></table>\
             </div>\
             <div class='panel'><h2>Keys</h2>\
-                <table><thead><tr><th>Key Id</th><th>License</th><th>Key</th><th>Version</th><th>Status</th><th>Created</th><th>Edit</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>Key Id</th><th>License</th><th>Key</th><th>Version</th><th>Status</th><th>Created</th><th>Edit</th></tr></thead><tbody>{keys}</tbody></table>\
             </div>\
             <div class='panel'><h2>Connected Installations And Verification Status</h2>\
-                <table><thead><tr><th>Installation</th><th>License</th><th>Device</th><th>Last IP</th><th>First IP</th><th>OS</th><th>Hostname</th><th>Status</th><th>Seen</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>Installation</th><th>License</th><th>Device</th><th>Last IP</th><th>First IP</th><th>OS</th><th>Hostname</th><th>Status</th><th>Seen</th></tr></thead><tbody>{installations}</tbody></table>\
             </div>\
             <div class='panel'><h2>Pending Verification Requests</h2>\
-                <table><thead><tr><th>Request</th><th>License</th><th>Device</th><th>Requested IP</th><th>Requested OS</th><th>Hostname</th><th>Status</th><th>Action</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>Request</th><th>License</th><th>Device</th><th>Requested IP</th><th>Requested OS</th><th>Hostname</th><th>Status</th><th>Action</th></tr></thead><tbody>{pending_requests}</tbody></table>\
             </div>\
             <div class='panel'><h2>Recent Audit And Connection Log</h2>\
-                <table><thead><tr><th>Event Id</th><th>Time</th><th>License</th><th>Event</th><th>Key</th><th>Installation</th><th>Payload</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>Event Id</th><th>Time</th><th>License</th><th>Event</th><th>Key</th><th>Installation</th><th>Payload</th></tr></thead><tbody>{audits}</tbody></table>\
             </div>\
-        </body></html>",
-        stats, licenses, keys, installations, pending_requests, audits
+        </body></html>"
     )
 }
 
-fn ensure_local_admin(addr: &SocketAddr) -> AppResult<()> {
-    if addr.ip().is_loopback() {
-        Ok(())
-    } else {
-        Err(AppError {
-            status: StatusCode::FORBIDDEN,
-            message: "admin dashboard is only available from localhost".to_string(),
-        })
+async fn require_admin_middleware(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match security::authorize_admin(&state.config, &addr, &headers) {
+        Ok(()) => next.run(request).await,
+        Err(err) => {
+            let (status, message) = err.status_message();
+            (status, message).into_response()
+        }
     }
 }
 
@@ -3182,6 +3281,13 @@ mod tests {
         db.verify_key(&config, &second, Some("203.0.113.10"))
             .expect("create pending request");
 
+        let pending_mail = db
+            .claim_pending_mail_for_device(&issued.license_id, "install-b")
+            .expect("query pending mail")
+            .expect("pending confirmation mail");
+        db.mark_mail_accepted(&pending_mail.email_id)
+            .expect("mark confirmation accepted");
+
         let (token, request_id, sent_at, delivered_at, state_before, record_state_before): (
             String,
             String,
@@ -3273,16 +3379,13 @@ mod tests {
             })
             .expect("issue license");
 
-        let email_id = db
-            .create_and_send_notification(
-                &config,
-                &AdminCreateNotificationRequest {
-                    license_id: issued.license_id.clone(),
-                    recipient: "user@example.com".to_string(),
-                    subject: "Manual admin notice".to_string(),
-                    body: "This is a manual notification.".to_string(),
-                },
-            )
+        let pending_mail = db
+            .enqueue_admin_notification(&AdminCreateNotificationRequest {
+                license_id: issued.license_id.clone(),
+                recipient: "user@example.com".to_string(),
+                subject: "Manual admin notice".to_string(),
+                body: "This is a manual notification.".to_string(),
+            })
             .expect("create notification");
 
         let (state, record_state, sent_at, delivered_at): (
@@ -3296,7 +3399,7 @@ mod tests {
                 "SELECT notification_state, record_state, sent_at_epoch_s, delivered_at_epoch_s
                  FROM email_outbox
                  WHERE email_id = ?1",
-                params![email_id],
+                params![&pending_mail.email_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -3309,10 +3412,10 @@ mod tests {
             .expect("fetch notification")
         };
 
-        assert_eq!(state, "delivered");
+        assert_eq!(state, "queued");
         assert_eq!(record_state, "active");
-        assert!(sent_at.is_some());
-        assert!(delivered_at.is_some());
+        assert!(sent_at.is_none());
+        assert!(delivered_at.is_none());
 
         let _ = fs::remove_file(std::path::Path::new(&config.database_path));
     }
@@ -3352,17 +3455,19 @@ mod tests {
         db.verify_key(&config, &request, Some("127.0.0.1"))
             .expect("verify initial install");
 
-        let email_id = db
-            .create_and_send_notification(
-                &config,
-                &AdminCreateNotificationRequest {
-                    license_id: issued.license_id.clone(),
-                    recipient: "user@example.com".to_string(),
-                    subject: "Manual admin notice".to_string(),
-                    body: "This is a manual notification.".to_string(),
-                },
-            )
+        let pending_mail = db
+            .enqueue_admin_notification(&AdminCreateNotificationRequest {
+                license_id: issued.license_id.clone(),
+                recipient: "user@example.com".to_string(),
+                subject: "Manual admin notice".to_string(),
+                body: "This is a manual notification.".to_string(),
+            })
             .expect("create notification");
+
+        db.claim_mail(&pending_mail.email_id)
+            .expect("claim notification");
+        db.mark_mail_accepted(&pending_mail.email_id)
+            .expect("mark notification accepted");
 
         let notifications = db
             .read_client_notifications(&ClientNotificationReadRequest {
@@ -3372,13 +3477,13 @@ mod tests {
             })
             .expect("read notifications");
         assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].notification_id, email_id);
+        assert_eq!(notifications[0].notification_id, pending_mail.email_id);
 
         let (state, record_state): (String, String) = {
             let conn = db.conn.lock().expect("lock db");
             conn.query_row(
                 "SELECT notification_state, record_state FROM email_outbox WHERE email_id = ?1",
-                params![email_id],
+                params![&pending_mail.email_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("fetch notification state")
@@ -3427,6 +3532,382 @@ mod tests {
             snapshot.playback_requests[0].license_id.as_deref(),
             Some(issued.license_id.as_str())
         );
+
+        let _ = fs::remove_file(std::path::Path::new(&config.database_path));
+    }
+
+    fn authenticated_test_config(name: &str) -> ServerConfig {
+        let mut config = test_config(name);
+        config.admin_token = Some("0123456789abcdef0123456789abcdef".to_string());
+        config
+    }
+
+    fn request_with_peer(
+        mut request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Request<axum::body::Body> {
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 45678))));
+        request
+    }
+
+    #[tokio::test]
+    async fn issuance_requires_valid_bearer_and_snapshot_redacts_key() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let config = authenticated_test_config("router-auth");
+        let database_path = config.database_path.clone();
+        let state = Arc::new(AppState::new(config).expect("app state"));
+
+        let issue = IssueKeyRequest {
+            email: "admin-issued@example.com".to_string(),
+            requested_features: Some(LicensedFeature::editor_defaults()),
+            registrant_os: Some("test".to_string()),
+            registrant_ip: Some("198.51.100.10".to_string()),
+        };
+        let body = serde_json::to_vec(&issue).expect("serialize issue");
+
+        let missing = request_with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/issue")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.clone()))
+                .expect("request"),
+        );
+        let response = build_router(state.clone())
+            .oneshot(missing)
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = request_with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/issue")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer definitely-not-the-admin-token",
+                )
+                .body(Body::from(body.clone()))
+                .expect("request"),
+        );
+        let response = build_router(state.clone())
+            .oneshot(wrong)
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let valid = request_with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/issue")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer 0123456789abcdef0123456789abcdef",
+                )
+                .body(Body::from(body))
+                .expect("request"),
+        );
+        let response = build_router(state.clone())
+            .oneshot(valid)
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::OK);
+        let issued_body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("issued body");
+        let issued: IssueKeyResponse =
+            serde_json::from_slice(&issued_body).expect("issued response");
+        let raw_key = issued.key;
+
+        let snapshot_request = request_with_peer(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/snapshot")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer 0123456789abcdef0123456789abcdef",
+                )
+                .body(Body::empty())
+                .expect("request"),
+        );
+        let response = build_router(state.clone())
+            .oneshot(snapshot_request)
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot_body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .expect("snapshot body");
+        let snapshot_text = String::from_utf8(snapshot_body.to_vec()).expect("utf8");
+        assert!(!snapshot_text.contains(&raw_key));
+        assert!(!snapshot_text.contains("\"key_value\""));
+        assert!(snapshot_text.contains("\"key_hint\""));
+
+        drop(state);
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn transport_peer_ip_overrides_claimed_ip_for_audit_identity() {
+        let config = test_config("peer-ip");
+        let db = Database::open(&config).expect("open db");
+        let issued = db
+            .issue_license(&IssueKeyRequest {
+                email: "user@example.com".to_string(),
+                requested_features: None,
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue");
+
+        let request = VerifyKeyRequest {
+            key: issued.key,
+            claimed_ip: Some("203.0.113.99".to_string()),
+            os: libsrs_licensing_proto::ClientOsInfo {
+                family: "linux".to_string(),
+                version: None,
+                arch: "x86_64".to_string(),
+            },
+            device: libsrs_licensing_proto::DeviceFingerprint {
+                install_id: "peer-ip-install".to_string(),
+                hostname: Some("host".to_string()),
+            },
+            app: libsrs_licensing_proto::ClientAppInfo {
+                name: "srs-player".to_string(),
+                version: "0.1.0".to_string(),
+                channel: None,
+            },
+            session_secret: None,
+        };
+        db.verify_key(&config, &request, Some("10.23.45.67"))
+            .expect("verify");
+
+        let conn = db.conn.lock().expect("lock db");
+        let last_seen: String = conn
+            .query_row(
+                "SELECT last_seen_ip FROM installations WHERE device_install_id = ?1",
+                params!["peer-ip-install"],
+                |row| row.get(0),
+            )
+            .expect("last seen");
+        assert_eq!(last_seen, "10.23.45.67");
+        drop(conn);
+
+        let _ = fs::remove_file(std::path::Path::new(&config.database_path));
+    }
+
+    #[test]
+    fn trusted_session_mismatch_heals_rotates_and_remains_active() {
+        let config = test_config("session-heal");
+        let db = Database::open(&config).expect("open db");
+        let issued = db
+            .issue_license(&IssueKeyRequest {
+                email: "user@example.com".to_string(),
+                requested_features: Some(LicensedFeature::editor_defaults()),
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue");
+
+        let mut request = VerifyKeyRequest {
+            key: issued.key,
+            claimed_ip: Some("198.51.100.1".to_string()),
+            os: libsrs_licensing_proto::ClientOsInfo {
+                family: "linux".to_string(),
+                version: None,
+                arch: "x86_64".to_string(),
+            },
+            device: libsrs_licensing_proto::DeviceFingerprint {
+                install_id: "session-heal-install".to_string(),
+                hostname: Some("host".to_string()),
+            },
+            app: libsrs_licensing_proto::ClientAppInfo {
+                name: "srs-player".to_string(),
+                version: "0.1.0".to_string(),
+                channel: None,
+            },
+            session_secret: None,
+        };
+
+        let first = db
+            .verify_key(&config, &request, Some("198.51.100.1"))
+            .expect("initial verify");
+        let first_secret = first.new_session_secret.expect("initial session secret");
+
+        request.session_secret = Some("wrong-session-secret".to_string());
+        let healed = db
+            .verify_key(&config, &request, Some("198.51.100.1"))
+            .expect("healed verify");
+        let healed_secret = healed.new_session_secret.expect("rotated session secret");
+        assert_ne!(first_secret, healed_secret);
+
+        let signing_key =
+            decode_signing_key(config.signing_key_seed()).expect("decode signing key");
+        let claims = healed
+            .envelope
+            .verify(&signing_key.verifying_key())
+            .expect("verify entitlement");
+        assert_eq!(claims.status, EntitlementStatus::Active);
+
+        let conn = db.conn.lock().expect("lock db");
+        let mismatch_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type = 'session_secret_mismatch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mismatch count");
+        assert_eq!(mismatch_events, 1);
+        drop(conn);
+
+        let _ = fs::remove_file(std::path::Path::new(&config.database_path));
+    }
+
+    #[test]
+    fn outbox_claim_is_single_owner_and_failure_is_retryable() {
+        let config = test_config("outbox-claim");
+        let db = Database::open(&config).expect("open db");
+        let issued = db
+            .issue_license(&IssueKeyRequest {
+                email: "owner@example.com".to_string(),
+                requested_features: None,
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue");
+
+        let pending = db
+            .enqueue_admin_notification(&AdminCreateNotificationRequest {
+                license_id: issued.license_id,
+                recipient: "owner@example.com".to_string(),
+                subject: "test".to_string(),
+                body: "body".to_string(),
+            })
+            .expect("enqueue");
+
+        assert!(db.claim_mail(&pending.email_id).expect("first claim"));
+        assert!(!db.claim_mail(&pending.email_id).expect("second claim"));
+
+        db.unclaim_mail(&pending.email_id).expect("unclaim");
+        assert!(db.claim_mail(&pending.email_id).expect("retry claim"));
+        db.mark_mail_accepted(&pending.email_id)
+            .expect("mark accepted");
+
+        let conn = db.conn.lock().expect("lock db");
+        let (state, sent, delivered): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT notification_state, sent_at_epoch_s, delivered_at_epoch_s
+                 FROM email_outbox WHERE email_id = ?1",
+                params![&pending.email_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("outbox state");
+        assert_eq!(state, "delivered");
+        assert!(sent.is_some());
+        assert!(delivered.is_some());
+        drop(conn);
+
+        let _ = fs::remove_file(std::path::Path::new(&config.database_path));
+    }
+
+    #[test]
+    fn pending_confirmation_mail_is_scoped_by_license_and_hides_raw_key() {
+        fn request_for(key: String, install_id: &str) -> VerifyKeyRequest {
+            VerifyKeyRequest {
+                key,
+                claimed_ip: Some("192.0.2.20".to_string()),
+                os: libsrs_licensing_proto::ClientOsInfo {
+                    family: "linux".to_string(),
+                    version: None,
+                    arch: "x86_64".to_string(),
+                },
+                device: libsrs_licensing_proto::DeviceFingerprint {
+                    install_id: install_id.to_string(),
+                    hostname: Some("host".to_string()),
+                },
+                app: libsrs_licensing_proto::ClientAppInfo {
+                    name: "srs-player".to_string(),
+                    version: "0.1.0".to_string(),
+                    channel: None,
+                },
+                session_secret: None,
+            }
+        }
+
+        let config = test_config("outbox-scope");
+        let db = Database::open(&config).expect("open db");
+
+        let issued_a = db
+            .issue_license(&IssueKeyRequest {
+                email: "owner-a@example.com".to_string(),
+                requested_features: None,
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue a");
+        let issued_b = db
+            .issue_license(&IssueKeyRequest {
+                email: "owner-b@example.com".to_string(),
+                requested_features: None,
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue b");
+
+        db.verify_key(
+            &config,
+            &request_for(issued_a.key.clone(), "trusted-a"),
+            Some("192.0.2.1"),
+        )
+        .expect("trust a");
+        db.verify_key(
+            &config,
+            &request_for(issued_b.key.clone(), "trusted-b"),
+            Some("192.0.2.2"),
+        )
+        .expect("trust b");
+
+        let shared_install = "same-client-supplied-device-id";
+        db.verify_key(
+            &config,
+            &request_for(issued_a.key.clone(), shared_install),
+            Some("192.0.2.3"),
+        )
+        .expect("pending a");
+        db.verify_key(
+            &config,
+            &request_for(issued_b.key.clone(), shared_install),
+            Some("192.0.2.4"),
+        )
+        .expect("pending b");
+
+        let mail_a = db
+            .claim_pending_mail_for_device(&issued_a.license_id, shared_install)
+            .expect("claim a")
+            .expect("mail a");
+        assert_eq!(mail_a.recipient, "owner-a@example.com");
+        assert!(!mail_a.body.contains(&issued_a.key));
+        assert!(mail_a
+            .body
+            .contains(&security::redact_license_key(&issued_a.key)));
+
+        let mail_b = db
+            .claim_pending_mail_for_device(&issued_b.license_id, shared_install)
+            .expect("claim b")
+            .expect("mail b");
+        assert_eq!(mail_b.recipient, "owner-b@example.com");
+        assert!(!mail_b.body.contains(&issued_b.key));
+        assert!(mail_b
+            .body
+            .contains(&security::redact_license_key(&issued_b.key)));
+
+        assert_ne!(mail_a.email_id, mail_b.email_id);
 
         let _ = fs::remove_file(std::path::Path::new(&config.database_path));
     }

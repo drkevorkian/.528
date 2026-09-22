@@ -12,3 +12,5 @@ egui = "0.33"
 libsrs_app_config = { version = "0.1.0", path = "../../crates/libsrs_app_config" }
 libsrs_licensing_proto = { version = "0.1.0", path = "../../crates/libsrs_licensing_proto" }
 reqwest = { version = "0.13.2", default-features = false, features = ["blocking", "json", "rustls"] }
+serde.workspace = true
+zeroize = "1.8"

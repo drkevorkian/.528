@@ -183,7 +183,7 @@ pub struct AdminLicenseRecord {
 pub struct AdminKeyRecord {
     pub key_id: String,
     pub license_id: String,
-    pub key_value: String,
+    pub key_hint: String,
     pub key_version: i64,
     pub active: bool,
     pub created_at_epoch_s: u64,

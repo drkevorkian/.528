@@ -10,10 +10,18 @@ refresh_interval_s = 3600
 contact_email = "support@localhost"
 help_url = "http://localhost:3000"
 
+[admin]
+# Client-facing URL used by the native srs_admin application.
+# Override with SRS_ADMIN_BASE_URL. Authentication comes from SRS_ADMIN_TOKEN,
+# never from this file.
+base_url = "http://localhost:3000"
+
 [server]
-# Change to 0.0.0.0:3000 (or your preferred interface) when serving remote clients.
+# Development mode is loopback-only. To serve remote clients, explicitly switch
+# operating_mode to "production", configure a unique signing seed/admin token,
+# use a production HTTPS base URL, and then choose the intended public bind.
 bind_addr = "127.0.0.1:3000"
-# Set this to the public/reachable URL of your Gentoo licensing server for remote clients.
+# In production this must be the HTTPS URL clients actually reach.
 base_url = "http://localhost:3000"
 database_path = "var/srs_license.sqlite3"
 confirmation_window_hours = 72
@@ -22,3 +30,8 @@ token_ttl_hours = 24
 # smtp_server = "127.0.0.1"
 # smtp_username = "smtp-user"
 # smtp_password = "smtp-password"
+
+# development | production
+# operating_mode = "development"
+# Required for issuance and /admin APIs. Prefer the SRS_ADMIN_TOKEN environment variable.
+# admin_token = ""
