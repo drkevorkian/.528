@@ -82,6 +82,9 @@ pub enum PlaybackWorkerCommand {
     Stop {
         generation: u64,
     },
+    Close {
+        generation: u64,
+    },
     Seek {
         generation: u64,
         target_ms: u64,
@@ -373,6 +376,15 @@ impl PlaybackWorker {
                 self.clear_frame_slot();
                 self.presented_position_ms = 0;
                 self.state = PlayerState::Ready;
+                self.emit_snapshot();
+            }
+            PlaybackWorkerCommand::Close { generation } => {
+                self.generation = generation;
+                self.session = None;
+                self.reorder.reset(None);
+                self.clear_frame_slot();
+                self.presented_position_ms = 0;
+                self.state = PlayerState::Closed;
                 self.emit_snapshot();
             }
             PlaybackWorkerCommand::Seek {
