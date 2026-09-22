@@ -335,8 +335,10 @@ mod tests {
 
     #[test]
     fn production_mode_is_case_insensitive() {
-        let mut server = ServerConfig::default();
-        server.operating_mode = "PrOdUcTiOn".to_string();
+        let server = ServerConfig {
+            operating_mode: "PrOdUcTiOn".to_string(),
+            ..ServerConfig::default()
+        };
         assert!(server.is_production());
     }
 }
