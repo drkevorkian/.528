@@ -156,6 +156,22 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("parse bind addr {}", state.config.bind_addr))?;
 
+    let app = build_router(state);
+
+    let listener = TcpListener::bind(bind_addr)
+        .await
+        .with_context(|| format!("bind {}", bind_addr))?;
+    info!("srs_license_server listening on {}", bind_addr);
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .context("serve axum")?;
+    Ok(())
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
     let public_routes = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
@@ -259,19 +275,7 @@ async fn main() -> Result<()> {
             require_admin_middleware,
         ));
 
-    let app = public_routes.merge(admin_routes).with_state(state);
-
-    let listener = TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("bind {}", bind_addr))?;
-    info!("srs_license_server listening on {}", bind_addr);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await
-    .context("serve axum")?;
-    Ok(())
+    public_routes.merge(admin_routes).with_state(state)
 }
 
 #[derive(Clone)]
