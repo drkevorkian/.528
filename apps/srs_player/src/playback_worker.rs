@@ -385,14 +385,16 @@ impl PlaybackWorker {
                 if !self.command_generation_is_current(generation) {
                     return true;
                 }
-                let Some(session) = self.session.as_mut() else {
+                let Some(state) = self.session.as_ref().map(PlaybackSession::state) else {
                     self.fail("playback session is not open".to_string());
                     return true;
                 };
-                if session.state() == PlaybackState::EndOfStream {
-                    if let Err(error) = session.stop() {
-                        self.fail(error.to_string());
-                        return true;
+                if state == PlaybackState::EndOfStream {
+                    if let Some(session) = self.session.as_mut() {
+                        if let Err(error) = session.stop() {
+                            self.fail(error.to_string());
+                            return true;
+                        }
                     }
                     self.reorder.reset(None);
                     self.presentation_time_slots_ms.clear();
@@ -404,7 +406,9 @@ impl PlaybackWorker {
                         return true;
                     }
                 }
-                session.play();
+                if let Some(session) = self.session.as_mut() {
+                    session.play();
+                }
                 self.state = PlayerState::Playing;
                 self.emit_snapshot();
             }
@@ -473,6 +477,18 @@ impl PlaybackWorker {
     }
 
     fn playback_step(&mut self) {
+        match self.flush_pending_audio() {
+            Ok(true) => {}
+            Ok(false) => {
+                self.emit_snapshot();
+                return;
+            }
+            Err(error) => {
+                self.fail(error);
+                return;
+            }
+        }
+
         if let Some(frame) = self.reorder.pop_ready() {
             let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
                 self.fail("presentation frame became ready without a timestamp slot".to_string());
@@ -522,7 +538,13 @@ impl PlaybackWorker {
                 }
                 self.emit_snapshot();
             }
-            Ok(PlaybackEvent::Audio(_)) => self.emit_snapshot(),
+            Ok(PlaybackEvent::Audio(chunk)) => {
+                if let Err(error) = self.queue_audio_chunk(chunk) {
+                    self.fail(error);
+                    return;
+                }
+                self.emit_snapshot();
+            }
             Ok(PlaybackEvent::EndOfStream) => {
                 if let Some(frame) = self.reorder.pop_ready() {
                     let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
@@ -691,6 +713,139 @@ impl PlaybackWorker {
             presented_position_ms: self.presented_position_ms,
         });
         self.emit_snapshot();
+    }
+
+    fn reset_audio_for_open(&mut self) {
+        self.audio_output = None;
+        self.pending_audio = None;
+        self.audio_epoch = self.audio_epoch.wrapping_add(1);
+        self.audio_epoch_media_start_ms = None;
+        self.audio_epoch_consumed_base = 0;
+        self.audio_epoch_armed = false;
+        self.audio_last_stream_errors = 0;
+    }
+
+    fn advance_audio_epoch(&mut self, media_start_ms: Option<u64>) {
+        self.pending_audio = None;
+        self.audio_epoch = self.audio_epoch.wrapping_add(1);
+        self.audio_epoch_media_start_ms = media_start_ms;
+        self.audio_epoch_consumed_base = 0;
+        self.audio_epoch_armed = false;
+        if let Some(audio) = self.audio_output.as_ref() {
+            audio.request_epoch(self.audio_epoch);
+        }
+    }
+
+    fn queue_audio_chunk(&mut self, chunk: DecodedAudioChunk) -> Result<(), String> {
+        if self.pending_audio.is_some() {
+            return Err("audio chunk arrived while previous PCM is still pending".to_string());
+        }
+
+        if self.audio_output.is_none() {
+            let output = AudioOutput::open(chunk.sample_rate, chunk.channels, self.audio_epoch)
+                .map_err(|error| format!("audio output initialization failed: {error:#}"))?;
+            self.audio_last_stream_errors = output.telemetry().stream_errors;
+            self.audio_output = Some(output);
+        }
+
+        let Some(audio) = self.audio_output.as_ref() else {
+            return Err("audio output disappeared after initialization".to_string());
+        };
+        if !audio.matches_format(chunk.sample_rate, chunk.channels) {
+            return Err(format!(
+                "decoded audio format changed from {} Hz / {} channels to {} Hz / {} channels",
+                audio.sample_rate(),
+                audio.channels(),
+                chunk.sample_rate,
+                chunk.channels
+            ));
+        }
+
+        if self.audio_epoch_media_start_ms.is_none() {
+            self.audio_epoch_media_start_ms = Some(audio_chunk_position_ms(&chunk));
+        }
+
+        self.pending_audio = Some(PendingAudioChunk {
+            sample_rate: chunk.sample_rate,
+            channels: chunk.channels,
+            samples: chunk.samples_interleaved,
+            offset: 0,
+        });
+
+        let _ = self.flush_pending_audio()?;
+        Ok(())
+    }
+
+    fn flush_pending_audio(&mut self) -> Result<bool, String> {
+        if self.pending_audio.is_none() {
+            return Ok(true);
+        }
+
+        let Some(audio) = self.audio_output.as_mut() else {
+            return Err("pending PCM exists without an audio output".to_string());
+        };
+
+        if !audio.epoch_ready(self.audio_epoch) {
+            return Ok(false);
+        }
+
+        let telemetry = audio.telemetry();
+        if telemetry.stream_errors > self.audio_last_stream_errors {
+            self.audio_last_stream_errors = telemetry.stream_errors;
+            return Err("audio output stream reported a device/runtime error".to_string());
+        }
+
+        if !self.audio_epoch_armed {
+            self.audio_epoch_consumed_base = telemetry.consumed_samples;
+            self.audio_epoch_armed = true;
+        }
+
+        let done = {
+            let pending = self
+                .pending_audio
+                .as_mut()
+                .ok_or_else(|| "pending PCM disappeared".to_string())?;
+            if pending.sample_rate != audio.sample_rate()
+                || u16::from(pending.channels) != audio.channels()
+            {
+                return Err("pending PCM format disagrees with active audio device".to_string());
+            }
+            let remaining = &pending.samples[pending.offset..];
+            let written = audio
+                .push_pcm(self.audio_epoch, remaining)
+                .map_err(|error| format!("audio ring push failed: {error:#}"))?;
+            pending.offset = pending.offset.saturating_add(written);
+            pending.offset >= pending.samples.len()
+        };
+
+        if done {
+            self.pending_audio = None;
+        }
+        Ok(done)
+    }
+
+    fn audio_media_position_ms(&self) -> Option<u64> {
+        if !self.audio_epoch_armed {
+            return None;
+        }
+        let start_ms = self.audio_epoch_media_start_ms?;
+        let audio = self.audio_output.as_ref()?;
+        let telemetry = audio.telemetry();
+        let played_samples = telemetry
+            .consumed_samples
+            .saturating_sub(self.audio_epoch_consumed_base);
+        let samples_per_second =
+            u64::from(audio.sample_rate()).checked_mul(u64::from(audio.channels()))?;
+        if samples_per_second == 0 {
+            return None;
+        }
+        Some(
+            start_ms.saturating_add(
+                played_samples
+                    .saturating_mul(1_000)
+                    .saturating_div(samples_per_second),
+            ),
+        )
     }
 
     fn publish_frame_at_position(&mut self, frame: DecodedVideoFrame, position_ms: u64) {
