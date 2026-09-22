@@ -519,23 +519,23 @@ impl AdminApp {
                 self.issue_license();
             }
 
-            if let Some((license_id, key)) = self
-                .issued_credential
-                .as_ref()
-                .map(|issued| (issued.license_id.clone(), issued.key.clone()))
-            {
+            let mut clear_issued_credential = false;
+            if let Some(issued) = self.issued_credential.as_ref() {
                 ui.separator();
                 ui.strong("New credential — copy it now");
-                ui.monospace(format!("License: {license_id}"));
+                ui.monospace(format!("License: {}", issued.license_id));
                 ui.horizontal_wrapped(|ui| {
-                    ui.monospace(&key);
+                    ui.monospace(&issued.key);
                     if ui.button("Clear Credential").clicked() {
-                        self.issued_credential = None;
+                        clear_issued_credential = true;
                     }
                 });
                 ui.label(
                     "This credential is intentionally not retained in normal administrator snapshots.",
                 );
+            }
+            if clear_issued_credential {
+                self.issued_credential = None;
             }
         });
 
