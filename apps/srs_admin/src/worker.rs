@@ -18,7 +18,8 @@ use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::{StatusCode, Url};
 use zeroize::Zeroizing;
 
-#[derive(Debug)]
+// Intentionally no Debug derive: commands can contain administrator-entered
+// notification subjects/bodies and other privacy-sensitive request data.
 pub enum AdminCommand {
     RefreshSnapshot,
     IssueLicense(IssueKeyRequest),
