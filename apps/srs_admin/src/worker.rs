@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use libsrs_licensing_proto::{
     AdminActionResponse, AdminCreateNotificationRequest, AdminSnapshot,
-    AdminUpdateLicenseFeaturesRequest, AdminUpdateRecordStateRequest,
-    AdminUpdateKeyStatusRequest, IssueKeyRequest, IssueKeyResponse,
+    AdminUpdateKeyStatusRequest, AdminUpdateLicenseFeaturesRequest, AdminUpdateRecordStateRequest,
+    IssueKeyRequest, IssueKeyResponse,
 };
 use reqwest::blocking::{Client, RequestBuilder};
 use reqwest::{StatusCode, Url};
@@ -63,11 +63,14 @@ impl AdminClientError {
             Self::ServerFailure => "The licensing server reported an internal failure.",
             Self::Offline => "The licensing server is unreachable.",
             Self::Timeout => "The licensing server request timed out.",
-            Self::SecurityFailure => "A secure connection to the licensing server could not be established.",
-            Self::ProtocolFailure => "The licensing server returned an invalid or unexpected response.",
+            Self::SecurityFailure => {
+                "A secure connection to the licensing server could not be established."
+            }
+            Self::ProtocolFailure => {
+                "The licensing server returned an invalid or unexpected response."
+            }
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,8 +121,7 @@ impl AdminWorker {
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, String> {
-        validate_admin_endpoint(&base_url)
-            .map_err(|error| error.user_message().to_string())?;
+        validate_admin_endpoint(&base_url).map_err(|error| error.user_message().to_string())?;
 
         let client = Client::builder()
             .connect_timeout(connect_timeout)
@@ -181,59 +183,65 @@ fn run_worker(
 
     while let Ok(command) = command_rx.recv() {
         let event = match command {
-            AdminCommand::RefreshSnapshot => AdminEvent::Snapshot(
-                send_json::<AdminSnapshot>(authorized(
+            AdminCommand::RefreshSnapshot => {
+                AdminEvent::Snapshot(send_json::<AdminSnapshot>(authorized(
                     client.get(format!("{base_url}/api/v1/admin/snapshot")),
                     bearer_token.as_str(),
-                )),
-            ),
-            AdminCommand::IssueLicense(request) => AdminEvent::Issued(
-                send_json::<IssueKeyResponse>(
-                    authorized(client.post(format!("{base_url}/api/v1/issue")), bearer_token.as_str())
-                        .json(&request),
-                ),
-            ),
-            AdminCommand::UpdateLicenseFeatures(request) => AdminEvent::Action(
-                send_json::<AdminActionResponse>(
+                )))
+            }
+            AdminCommand::IssueLicense(request) => {
+                AdminEvent::Issued(send_json::<IssueKeyResponse>(
+                    authorized(
+                        client.post(format!("{base_url}/api/v1/issue")),
+                        bearer_token.as_str(),
+                    )
+                    .json(&request),
+                ))
+            }
+            AdminCommand::UpdateLicenseFeatures(request) => {
+                AdminEvent::Action(send_json::<AdminActionResponse>(
                     authorized(
                         client.post(format!("{base_url}/api/v1/admin/licenses/features")),
                         bearer_token.as_str(),
                     )
                     .json(&request),
-                ),
-            ),
-            AdminCommand::UpdateKeyStatus(request) => AdminEvent::Action(
-                send_json::<AdminActionResponse>(
+                ))
+            }
+            AdminCommand::UpdateKeyStatus(request) => {
+                AdminEvent::Action(send_json::<AdminActionResponse>(
                     authorized(
                         client.post(format!("{base_url}/api/v1/admin/keys/status")),
                         bearer_token.as_str(),
                     )
                     .json(&request),
-                ),
-            ),
-            AdminCommand::SetRecordState { path, request } => AdminEvent::Action(
-                send_json::<AdminActionResponse>(
-                    authorized(client.post(format!("{base_url}/{path}")), bearer_token.as_str())
-                        .json(&request),
-                ),
-            ),
-            AdminCommand::ApproveRequest { request_id } => AdminEvent::Action(
-                send_json::<AdminActionResponse>(authorized(
+                ))
+            }
+            AdminCommand::SetRecordState { path, request } => {
+                AdminEvent::Action(send_json::<AdminActionResponse>(
+                    authorized(
+                        client.post(format!("{base_url}/{path}")),
+                        bearer_token.as_str(),
+                    )
+                    .json(&request),
+                ))
+            }
+            AdminCommand::ApproveRequest { request_id } => {
+                AdminEvent::Action(send_json::<AdminActionResponse>(authorized(
                     client.post(format!(
                         "{base_url}/api/v1/admin/requests/{request_id}/approve"
                     )),
                     bearer_token.as_str(),
-                )),
-            ),
-            AdminCommand::CreateNotification(request) => AdminEvent::Action(
-                send_json::<AdminActionResponse>(
+                )))
+            }
+            AdminCommand::CreateNotification(request) => {
+                AdminEvent::Action(send_json::<AdminActionResponse>(
                     authorized(
                         client.post(format!("{base_url}/api/v1/admin/notifications/create")),
                         bearer_token.as_str(),
                     )
                     .json(&request),
-                ),
-            ),
+                ))
+            }
             AdminCommand::Shutdown => break,
         };
 
@@ -293,7 +301,6 @@ fn classify_transport(error: reqwest::Error) -> AdminClientError {
         AdminClientError::ProtocolFailure
     }
 }
-
 
 #[cfg(test)]
 mod tests {

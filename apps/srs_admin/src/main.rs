@@ -62,8 +62,9 @@ impl AdminApp {
 
     fn try_bootstrap() -> anyhow::Result<Self> {
         let config = SrsConfig::load()?;
-        let admin_token = env::var("SRS_ADMIN_TOKEN")
-            .map_err(|_| anyhow::anyhow!("SRS_ADMIN_TOKEN is required for the admin application"))?;
+        let admin_token = env::var("SRS_ADMIN_TOKEN").map_err(|_| {
+            anyhow::anyhow!("SRS_ADMIN_TOKEN is required for the admin application")
+        })?;
         let admin_token = admin_token.trim().to_string();
         if admin_token.is_empty() {
             return Err(anyhow::anyhow!(
@@ -270,9 +271,7 @@ impl AdminApp {
 
     fn send_mutation_command(&mut self, command: AdminCommand) {
         if self.mutation_pending {
-            self.push_notification(
-                "An administrator mutation is already in progress.".to_string(),
-            );
+            self.push_notification("An administrator mutation is already in progress.".to_string());
             return;
         }
         let Some(worker) = &self.worker else {
@@ -306,29 +305,29 @@ impl AdminApp {
                 AdminEvent::Action(result) => {
                     self.mutation_pending = false;
                     match result {
-                    Ok(action) => {
-                        self.push_notification(action.message);
-                        self.refresh_snapshot();
-                    }
-                    Err(error) => self.handle_client_error(error, false),
+                        Ok(action) => {
+                            self.push_notification(action.message);
+                            self.refresh_snapshot();
+                        }
+                        Err(error) => self.handle_client_error(error, false),
                     }
                 }
                 AdminEvent::Issued(result) => {
                     self.issue_pending = false;
                     match result {
-                    Ok(issued) => {
-                        self.issued_credential = Some(IssuedCredential {
-                            license_id: issued.license_id,
-                            key: Zeroizing::new(issued.key),
-                        });
-                        self.push_notification(
+                        Ok(issued) => {
+                            self.issued_credential = Some(IssuedCredential {
+                                license_id: issued.license_id,
+                                key: Zeroizing::new(issued.key),
+                            });
+                            self.push_notification(
                             "License issued. Copy the credential from the issuance panel, then clear it."
                                 .to_string(),
                         );
-                        self.issue_email.clear();
-                        self.refresh_snapshot();
-                    }
-                    Err(error) => self.handle_client_error(error, false),
+                            self.issue_email.clear();
+                            self.refresh_snapshot();
+                        }
+                        Err(error) => self.handle_client_error(error, false),
                     }
                 }
             }
@@ -1432,7 +1431,6 @@ impl DeleteTarget {
         }
     }
 }
-
 
 #[cfg(test)]
 mod admin_ui_tests {

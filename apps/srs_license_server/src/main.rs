@@ -1,7 +1,7 @@
-mod outbox_ops;
+mod db_exec;
 mod mail_exec;
 mod mailer;
-mod db_exec;
+mod outbox_ops;
 mod security;
 
 use std::fs;
@@ -25,11 +25,11 @@ use libsrs_licensing_proto::{
     IssueKeyResponse, LicensedFeature, NotificationDeliveryState, SignedEntitlementEnvelope,
     VerifyKeyRequest, VerifyKeyResponse,
 };
+use mailer::MailDelivery;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use mailer::MailDelivery;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 use uuid::Uuid;
@@ -695,7 +695,8 @@ impl Database {
                 &request.device.install_id,
                 LicensedFeature::basic_defaults(),
                 EntitlementStatus::PendingConfirmation,
-                "Confirmation email queued; editor mode remains disabled until approved.".to_string(),
+                "Confirmation email queued; editor mode remains disabled until approved."
+                    .to_string(),
                 None,
                 None,
             )?;
@@ -1545,7 +1546,6 @@ impl Database {
         tx.commit()?;
         Ok(playback_request_id)
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -1623,9 +1623,7 @@ async fn issue_form(
         registrant_os: user_agent_string(&headers),
         registrant_ip: Some(addr.ip().to_string()),
     };
-    let response = state
-        .run_db(move |db| db.issue_license(&request))
-        .await?;
+    let response = state.run_db(move |db| db.issue_license(&request)).await?;
     Ok(Html(render_index_page(Some(&response))))
 }
 
@@ -1639,9 +1637,7 @@ async fn issue_json(
     if request.registrant_os.is_none() {
         request.registrant_os = user_agent_string(&headers);
     }
-    let response = state
-        .run_db(move |db| db.issue_license(&request))
-        .await?;
+    let response = state.run_db(move |db| db.issue_license(&request)).await?;
     Ok(Json(response))
 }
 
@@ -1701,7 +1697,9 @@ async fn confirm_request_page(
         .run_db(move |db| db.confirmation_license(&token_for_lookup))
         .await?;
     let Some(license_id) = license_id else {
-        return Err(AppError::not_found("confirmation token not found or expired"));
+        return Err(AppError::not_found(
+            "confirmation token not found or expired",
+        ));
     };
     let mut headers = HeaderMap::new();
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -1728,9 +1726,7 @@ async fn confirm_request_post(
     State(state): State<Arc<AppState>>,
     AxumPath(token): AxumPath<String>,
 ) -> AppResult<Html<String>> {
-    let confirmed = state
-        .run_db(move |db| db.confirm_request(&token))
-        .await?;
+    let confirmed = state.run_db(move |db| db.confirm_request(&token)).await?;
     match confirmed {
         Some(license_id) => Ok(Html(format!(
             "<html><body><h1>Confirmation Recorded</h1><p>License {}</p><p>The next client refresh will trust this installation.</p></body></html>",
@@ -1740,9 +1736,7 @@ async fn confirm_request_post(
     }
 }
 
-async fn admin_dashboard(
-    State(state): State<Arc<AppState>>,
-) -> AppResult<Html<String>> {
+async fn admin_dashboard(State(state): State<Arc<AppState>>) -> AppResult<Html<String>> {
     let snapshot = state.run_db(|db| db.admin_snapshot()).await?;
     Ok(Html(render_admin_page(&snapshot)))
 }
@@ -1823,15 +1817,11 @@ async fn delete_audit_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(event_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    state
-        .run_db(move |db| db.delete_audit(&event_id))
-        .await?;
+    state.run_db(move |db| db.delete_audit(&event_id)).await?;
     Ok(Redirect::to("/admin"))
 }
 
-async fn admin_snapshot_json(
-    State(state): State<Arc<AppState>>,
-) -> AppResult<Json<AdminSnapshot>> {
+async fn admin_snapshot_json(State(state): State<Arc<AppState>>) -> AppResult<Json<AdminSnapshot>> {
     Ok(Json(state.run_db(|db| db.admin_snapshot()).await?))
 }
 
@@ -2017,9 +2007,7 @@ async fn delete_audit_json(
     State(state): State<Arc<AppState>>,
     AxumPath(event_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state
-        .run_db(move |db| db.delete_audit(&event_id))
-        .await?;
+    state.run_db(move |db| db.delete_audit(&event_id)).await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "audit event deleted".to_string(),
@@ -3392,13 +3380,12 @@ mod tests {
             .expect("issue license");
 
         let pending_mail = db
-            .enqueue_admin_notification(
-                &AdminCreateNotificationRequest {
-                    license_id: issued.license_id.clone(),
-                    recipient: "user@example.com".to_string(),
-                    subject: "Manual admin notice".to_string(),
-                    body: "This is a manual notification.".to_string(),
-                })
+            .enqueue_admin_notification(&AdminCreateNotificationRequest {
+                license_id: issued.license_id.clone(),
+                recipient: "user@example.com".to_string(),
+                subject: "Manual admin notice".to_string(),
+                body: "This is a manual notification.".to_string(),
+            })
             .expect("create notification");
 
         let (state, record_state, sent_at, delivered_at): (
@@ -3469,13 +3456,12 @@ mod tests {
             .expect("verify initial install");
 
         let pending_mail = db
-            .enqueue_admin_notification(
-                &AdminCreateNotificationRequest {
-                    license_id: issued.license_id.clone(),
-                    recipient: "user@example.com".to_string(),
-                    subject: "Manual admin notice".to_string(),
-                    body: "This is a manual notification.".to_string(),
-                })
+            .enqueue_admin_notification(&AdminCreateNotificationRequest {
+                license_id: issued.license_id.clone(),
+                recipient: "user@example.com".to_string(),
+                subject: "Manual admin notice".to_string(),
+                body: "This is a manual notification.".to_string(),
+            })
             .expect("create notification");
 
         db.claim_mail(&pending_mail.email_id)
@@ -3552,18 +3538,16 @@ mod tests {
 
     fn authenticated_test_config(name: &str) -> ServerConfig {
         let mut config = test_config(name);
-        config.admin_token =
-            Some("0123456789abcdef0123456789abcdef".to_string());
+        config.admin_token = Some("0123456789abcdef0123456789abcdef".to_string());
         config
     }
 
     fn request_with_peer(
         mut request: axum::http::Request<axum::body::Body>,
     ) -> axum::http::Request<axum::body::Body> {
-        request.extensions_mut().insert(ConnectInfo(SocketAddr::from((
-            [127, 0, 0, 1],
-            45678,
-        ))));
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 45678))));
         request
     }
 
@@ -3604,7 +3588,10 @@ mod tests {
                 .method("POST")
                 .uri("/api/v1/issue")
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, "Bearer definitely-not-the-admin-token")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer definitely-not-the-admin-token",
+                )
                 .body(Body::from(body.clone()))
                 .expect("request"),
         );
@@ -3751,17 +3738,13 @@ mod tests {
         let first = db
             .verify_key(&config, &request, Some("198.51.100.1"))
             .expect("initial verify");
-        let first_secret = first
-            .new_session_secret
-            .expect("initial session secret");
+        let first_secret = first.new_session_secret.expect("initial session secret");
 
         request.session_secret = Some("wrong-session-secret".to_string());
         let healed = db
             .verify_key(&config, &request, Some("198.51.100.1"))
             .expect("healed verify");
-        let healed_secret = healed
-            .new_session_secret
-            .expect("rotated session secret");
+        let healed_secret = healed.new_session_secret.expect("rotated session secret");
         assert_ne!(first_secret, healed_secret);
 
         let signing_key =
@@ -3785,7 +3768,6 @@ mod tests {
 
         let _ = fs::remove_file(std::path::Path::new(&config.database_path));
     }
-
 
     #[test]
     fn outbox_claim_is_single_owner_and_failure_is_retryable() {
@@ -3911,7 +3893,9 @@ mod tests {
             .expect("mail a");
         assert_eq!(mail_a.recipient, "owner-a@example.com");
         assert!(!mail_a.body.contains(&issued_a.key));
-        assert!(mail_a.body.contains(&security::redact_license_key(&issued_a.key)));
+        assert!(mail_a
+            .body
+            .contains(&security::redact_license_key(&issued_a.key)));
 
         let mail_b = db
             .claim_pending_mail_for_device(&issued_b.license_id, shared_install)
@@ -3919,11 +3903,12 @@ mod tests {
             .expect("mail b");
         assert_eq!(mail_b.recipient, "owner-b@example.com");
         assert!(!mail_b.body.contains(&issued_b.key));
-        assert!(mail_b.body.contains(&security::redact_license_key(&issued_b.key)));
+        assert!(mail_b
+            .body
+            .contains(&security::redact_license_key(&issued_b.key)));
 
         assert_ne!(mail_a.email_id, mail_b.email_id);
 
         let _ = fs::remove_file(std::path::Path::new(&config.database_path));
     }
-
 }

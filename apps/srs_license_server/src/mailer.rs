@@ -31,7 +31,12 @@ fn redact_addr(value: &str) -> String {
     format!("{}***", &value[..1])
 }
 
-pub fn deliver_email(recipient: &str, subject: &str, body: &str, config: &ServerConfig) -> MailDelivery {
+pub fn deliver_email(
+    recipient: &str,
+    subject: &str,
+    body: &str,
+    config: &ServerConfig,
+) -> MailDelivery {
     let _ = body; // body may contain confirmation tokens; never log it
     if let (Some(mail_from), Some(smtp_server)) = (&config.mail_from, &config.smtp_server) {
         let email = match Message::builder()

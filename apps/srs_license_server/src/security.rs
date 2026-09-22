@@ -150,7 +150,8 @@ pub fn authorize_admin(
         return Err(AdminAuthError::InvalidToken);
     }
 
-    if OperatingMode::from_config(config) == OperatingMode::Development && !peer.ip().is_loopback() {
+    if OperatingMode::from_config(config) == OperatingMode::Development && !peer.ip().is_loopback()
+    {
         return Err(AdminAuthError::LoopbackRequired);
     }
     Ok(())
@@ -165,7 +166,6 @@ pub fn redact_license_key(key: &str) -> String {
     let tail = &trimmed[trimmed.len() - 4..];
     format!("****{tail}")
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -188,9 +188,10 @@ mod tests {
     #[test]
     fn bearer_is_the_only_supported_admin_credential() {
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static(
-            "Bearer 0123456789abcdef0123456789abcdef",
-        ));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer 0123456789abcdef0123456789abcdef"),
+        );
         assert_eq!(
             extract_presented_token(&headers).as_deref(),
             Some("0123456789abcdef0123456789abcdef")
@@ -208,9 +209,10 @@ mod tests {
     fn development_requires_loopback_even_with_valid_token() {
         let config = config_with_token();
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static(
-            "Bearer 0123456789abcdef0123456789abcdef",
-        ));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer 0123456789abcdef0123456789abcdef"),
+        );
         assert_eq!(
             authorize_admin(&config, &peer([203, 0, 113, 9]), &headers),
             Err(AdminAuthError::LoopbackRequired)
@@ -221,9 +223,10 @@ mod tests {
     fn development_allows_loopback_with_valid_token() {
         let config = config_with_token();
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, HeaderValue::from_static(
-            "Bearer 0123456789abcdef0123456789abcdef",
-        ));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer 0123456789abcdef0123456789abcdef"),
+        );
         assert_eq!(
             authorize_admin(&config, &peer([127, 0, 0, 1]), &headers),
             Ok(())
