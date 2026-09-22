@@ -1349,6 +1349,123 @@ mod tests {
         assert_eq!(snapshot.state, PlayerState::Error);
     }
 
+    fn scheduled(generation: u64, index: u32, position_ms: u64) -> ScheduledPresentation {
+        ScheduledPresentation {
+            generation,
+            frame: frame(index),
+            position_ms,
+        }
+    }
+
+    #[test]
+    fn scheduler_holds_early_frame_without_consuming_it() {
+        let mut scheduler = PresentationScheduler::default();
+        scheduler.enqueue(scheduled(1, 0, 100)).expect("enqueue");
+
+        assert_eq!(scheduler.decision(90), Some(PresentationDecision::Hold));
+        assert_eq!(scheduler.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_presents_due_and_slightly_late_frames() {
+        let mut scheduler = PresentationScheduler::default();
+        scheduler.enqueue(scheduled(1, 0, 100)).expect("enqueue");
+        assert_eq!(scheduler.decision(95), Some(PresentationDecision::Present));
+        let due = scheduler.pop_front().expect("due frame");
+        assert_eq!(due.position_ms, 100);
+
+        scheduler.enqueue(scheduled(1, 1, 200)).expect("enqueue");
+        assert_eq!(scheduler.decision(250), Some(PresentationDecision::Present));
+    }
+
+    #[test]
+    fn scheduler_drops_only_very_late_presentation_output() {
+        let mut scheduler = PresentationScheduler::default();
+        scheduler.enqueue(scheduled(1, 0, 100)).expect("enqueue");
+
+        assert_eq!(
+            scheduler.decision(100 + PRESENT_LATE_DROP_THRESHOLD_MS),
+            Some(PresentationDecision::Present)
+        );
+        assert_eq!(
+            scheduler.decision(101 + PRESENT_LATE_DROP_THRESHOLD_MS),
+            Some(PresentationDecision::DropLate)
+        );
+        assert_eq!(scheduler.len(), 1);
+    }
+
+    #[test]
+    fn scheduler_enforces_bounded_queue_backpressure() {
+        let mut scheduler = PresentationScheduler::default();
+        for index in 0..MAX_HELD_PRESENTATION_FRAMES {
+            scheduler
+                .enqueue(scheduled(1, index as u32, index as u64 * 10))
+                .expect("within bound");
+        }
+        assert!(scheduler.is_full());
+        let error = scheduler
+            .enqueue(scheduled(1, 99, 999))
+            .expect_err("queue must stay bounded");
+        assert!(error.contains("bounded capacity"));
+    }
+
+    #[test]
+    fn scheduler_purges_old_generation_frames() {
+        let mut scheduler = PresentationScheduler::default();
+        scheduler.enqueue(scheduled(1, 0, 10)).expect("old");
+        scheduler.enqueue(scheduled(2, 1, 20)).expect("new");
+
+        scheduler.purge_generation(2);
+
+        assert_eq!(scheduler.len(), 1);
+        assert_eq!(scheduler.held.front().map(|item| item.generation), Some(2));
+    }
+
+    #[test]
+    fn scheduler_eos_finishes_only_after_held_frames_drain() {
+        let mut scheduler = PresentationScheduler::default();
+        scheduler.enqueue(scheduled(1, 0, 10)).expect("enqueue");
+        scheduler.mark_eos();
+
+        assert!(!scheduler.can_finish_eos());
+        scheduler.pop_front();
+        assert!(scheduler.can_finish_eos());
+    }
+
+    #[test]
+    fn fallback_clock_pauses_without_wall_clock_drift() {
+        let base = Instant::now();
+        let mut clock = FallbackClock::new(1_000, base);
+
+        assert_eq!(
+            clock.media_time_ms(base + Duration::from_millis(250)),
+            1_250
+        );
+        clock.pause(base + Duration::from_millis(300));
+        assert_eq!(
+            clock.media_time_ms(base + Duration::from_secs(30)),
+            1_300
+        );
+
+        clock.resume(base + Duration::from_secs(30));
+        assert_eq!(
+            clock.media_time_ms(base + Duration::from_secs(30) + Duration::from_millis(200)),
+            1_500
+        );
+    }
+
+    #[test]
+    fn fallback_clock_reset_reanchors_media_time() {
+        let base = Instant::now();
+        let mut clock = FallbackClock::new(500, base);
+        clock.reset(9_000, base + Duration::from_secs(1));
+
+        assert_eq!(
+            clock.media_time_ms(base + Duration::from_secs(1) + Duration::from_millis(75)),
+            9_075
+        );
+    }
+
     #[test]
     fn audio_epoch_change_clears_pending_pcm_and_disarms_clock() {
         let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
