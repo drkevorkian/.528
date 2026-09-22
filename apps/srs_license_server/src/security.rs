@@ -179,9 +179,10 @@ mod tests {
     }
 
     fn config_with_token() -> ServerConfig {
-        let mut config = ServerConfig::default();
-        config.admin_token = Some("0123456789abcdef0123456789abcdef".to_string());
-        config
+        ServerConfig {
+            admin_token: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..ServerConfig::default()
+        }
     }
 
     #[test]
