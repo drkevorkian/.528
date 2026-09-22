@@ -215,7 +215,7 @@ impl AdminApp {
     }
 
     fn issue_license(&mut self) {
-        let email = self.issue_email.trim();
+        let email = self.issue_email.trim().to_string();
         if email.is_empty() {
             self.push_notification("Enter an owner email before issuing a license.".to_string());
             return;
@@ -228,7 +228,7 @@ impl AdminApp {
         };
         self.issued_credential = None;
         self.send_command(AdminCommand::IssueLicense(IssueKeyRequest {
-            email: email.to_string(),
+            email,
             requested_features: Some(features),
             registrant_os: Some(std::env::consts::OS.to_string()),
             registrant_ip: None,
