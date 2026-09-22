@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use axum::extract::{ConnectInfo, Form, Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -737,7 +737,6 @@ impl Database {
             json!({
                 "request_id": request_id,
                 "device_install_id": request.device.install_id,
-                "confirmation_link": confirmation_link,
             }),
         )?;
         let response = signed_response(
@@ -1674,7 +1673,7 @@ async fn report_unsupported_playback_json(
 async fn confirm_request_page(
     State(state): State<Arc<AppState>>,
     AxumPath(token): AxumPath<String>,
-) -> AppResult<Html<String>> {
+) -> AppResult<(HeaderMap, Html<String>)> {
     let token_for_lookup = token.clone();
     let license_id = state
         .run_db(move |db| db.confirmation_license(&token_for_lookup))
@@ -1682,11 +1681,25 @@ async fn confirm_request_page(
     let Some(license_id) = license_id else {
         return Err(AppError::not_found("confirmation token not found or expired"));
     };
-    Ok(Html(format!(
-        "<html><body><h1>Confirm Installation</h1><p>License {}</p><form method=\"post\" action=\"/confirm/{}\"><button type=\"submit\">Confirm Installation</button></form></body></html>",
-        html_escape(&license_id),
-        html_escape(&token)
-    )))
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; form-action 'self'; base-uri 'none'"),
+    );
+    Ok((
+        headers,
+        Html(format!(
+            "<html><body><h1>Confirm Installation</h1><p>License {}</p><form method=\"post\" action=\"/confirm/{}\"><button type=\"submit\">Confirm Installation</button></form></body></html>",
+            html_escape(&license_id),
+            html_escape(&token)
+        )),
+    ))
 }
 
 async fn confirm_request_post(
