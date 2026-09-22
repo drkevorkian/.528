@@ -93,10 +93,11 @@ impl MediaIngestor for FfmpegIngestor {
             let payload = packet.data().map_or_else(Vec::new, ToOwned::to_owned);
             self.queue.push_back(SourcePacket {
                 packet: Packet {
-                    stream_id: StreamId(stream_idx as u16),
+                    stream_id: StreamId(stream_idx as u32),
                     pts: packet.pts().map(|v| Timestamp::new(v, timebase)),
                     dts: packet.dts().map(|v| Timestamp::new(v, timebase)),
-                    duration: packet.duration().map(|v| Timestamp::new(v, timebase)),
+                    duration: (packet.duration() != 0)
+                        .then(|| Timestamp::new(packet.duration(), timebase)),
                     keyframe: packet.is_key(),
                     data: payload,
                 },
