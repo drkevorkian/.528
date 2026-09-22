@@ -639,7 +639,7 @@ impl PlayerApp {
             .map(|value| format!("{value:08x}"))
             .unwrap_or_else(|| "n/a".to_string());
         self.playback.debug_stats = format!(
-            "worker={:?} | decoded_v={} decoded_a={} | presented_v={} dropped_v={} | decoded_ms={} presented_ms={} | reorder={} | crc={} | dims={}x{}",
+            "worker={:?} | decoded_v={} decoded_a={} | presented_v={} dropped_v={} | decoded_ms={} presented_ms={} audio_ms={:?} | audio_samples={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
             snapshot.state,
             snapshot.decoded_video_frames,
             snapshot.decoded_audio_chunks,
@@ -647,6 +647,10 @@ impl PlayerApp {
             snapshot.dropped_video_frames,
             snapshot.decoded_position_ms,
             snapshot.presented_position_ms,
+            snapshot.audio_media_position_ms,
+            snapshot.audio_consumed_samples,
+            snapshot.audio_underrun_samples,
+            snapshot.audio_stream_errors,
             snapshot.reorder_depth,
             crc,
             self.playback.last_frame_dims.0,
@@ -1839,6 +1843,10 @@ mod tests {
             dropped_video_frames: 0,
             reorder_depth: 0,
             seek_in_progress: false,
+            audio_media_position_ms: None,
+            audio_consumed_samples: 0,
+            audio_underrun_samples: 0,
+            audio_stream_errors: 0,
             last_error: None,
         });
 
