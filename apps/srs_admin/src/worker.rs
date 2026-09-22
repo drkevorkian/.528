@@ -35,7 +35,6 @@ pub enum AdminCommand {
     Shutdown,
 }
 
-#[derive(Debug)]
 pub enum AdminEvent {
     Snapshot(Result<AdminSnapshot, AdminClientError>),
     Action(Result<AdminActionResponse, AdminClientError>),
