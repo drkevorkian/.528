@@ -1,3 +1,5 @@
+mod mail_exec;
+mod mailer;
 mod db_exec;
 mod security;
 
@@ -11,8 +13,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use lettre::transport::smtp::authentication::Credentials;
-use lettre::{Message, SmtpTransport, Transport};
 use libsrs_app_config::{ServerConfig, SrsConfig};
 use libsrs_licensing_proto::{
     decode_signing_key, AdminActionResponse, AdminAuditRecord, AdminCreateNotificationRequest,
@@ -30,6 +30,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tracing::{error, info};
+use mailer::MailDelivery;
 use uuid::Uuid;
 
 const SCHEMA_SQL: &str = r#"
@@ -283,6 +284,7 @@ struct AppState {
     config: ServerConfig,
     db: Arc<Database>,
     db_exec: db_exec::BoundedDbExecutor,
+    mail_exec: mail_exec::BoundedMailExecutor,
 }
 
 impl AppState {
@@ -290,6 +292,7 @@ impl AppState {
         Ok(Self {
             db: Arc::new(Database::open(&config)?),
             db_exec: db_exec::BoundedDbExecutor::new(),
+            mail_exec: mail_exec::new_mail_executor(),
             config,
         })
     }
@@ -301,6 +304,28 @@ impl AppState {
     {
         let db = self.db.clone();
         self.db_exec.run(move || work(db)).await
+    }
+
+    async fn deliver_pending_mail(&self, pending: PendingMail) -> Result<MailDelivery> {
+        let config = self.config.clone();
+        let recipient = pending.recipient.clone();
+        let subject = pending.subject.clone();
+        let body = pending.body.clone();
+        let delivery = self
+            .mail_exec
+            .run(move || Ok(mailer::deliver_email(&recipient, &subject, &body, &config)))
+            .await?;
+
+        if matches!(delivery, MailDelivery::Delivered | MailDelivery::LoggedOnly) {
+            let email_id = pending.email_id;
+            self.run_db(move |db| {
+                db.mark_notification_sent(&email_id)?;
+                db.mark_notification_delivered(&email_id)?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(delivery)
     }
 }
 
@@ -728,11 +753,36 @@ impl Database {
         )?;
         tx.commit()?;
         drop(conn);
-        self.mark_notification_sent(&email_id)?;
-        if deliver_email(&key_row.owner_email, &subject, &body, config) {
-            self.mark_notification_delivered(&email_id)?;
-        }
+        let _ = email_id;
         Ok(response)
+    }
+
+    fn pending_mail_for_device(&self, device_install_id: &str) -> Result<Option<PendingMail>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        conn.query_row(
+            "SELECT e.email_id, e.recipient, e.subject, e.body
+             FROM email_outbox e
+             JOIN verification_requests v ON v.request_id = e.request_id
+             WHERE v.device_install_id = ?1
+               AND e.notification_state = 'queued'
+               AND e.record_state = 'active'
+             ORDER BY e.created_at_epoch_s DESC
+             LIMIT 1",
+            params![device_install_id],
+            |row| {
+                Ok(PendingMail {
+                    email_id: row.get(0)?,
+                    recipient: row.get(1)?,
+                    subject: row.get(2)?,
+                    body: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     fn admin_snapshot(&self) -> Result<AdminSnapshot> {
@@ -1265,11 +1315,10 @@ impl Database {
         self.set_audit_record_state(event_id, AdminRecordState::Deleted)
     }
 
-    fn create_and_send_notification(
+    fn enqueue_admin_notification(
         &self,
-        config: &ServerConfig,
         request: &AdminCreateNotificationRequest,
-    ) -> Result<String> {
+    ) -> Result<PendingMail> {
         let now = now_epoch_s();
         let mut conn = self
             .conn
@@ -1294,13 +1343,16 @@ impl Database {
             return Err(anyhow!("notification body is required"));
         }
 
+        let recipient = request.recipient.trim().to_string();
+        let subject = request.subject.trim().to_string();
+        let body = request.body.trim().to_string();
         let email_id = enqueue_email(
             &tx,
             &request.license_id,
             None,
-            request.recipient.trim(),
-            request.subject.trim(),
-            request.body.trim(),
+            &recipient,
+            &subject,
+            &body,
             now,
         )?;
         insert_audit_event(
@@ -1311,24 +1363,18 @@ impl Database {
             "admin_notification_created",
             json!({
                 "email_id": email_id,
-                "recipient": request.recipient,
-                "subject": request.subject,
+                "recipient": recipient,
+                "subject": subject,
             }),
         )?;
         tx.commit()?;
-        drop(conn);
 
-        self.mark_notification_sent(&email_id)?;
-        if deliver_email(
-            request.recipient.trim(),
-            request.subject.trim(),
-            request.body.trim(),
-            config,
-        ) {
-            self.mark_notification_delivered(&email_id)?;
-        }
-
-        Ok(email_id)
+        Ok(PendingMail {
+            email_id,
+            recipient,
+            subject,
+            body,
+        })
     }
 
     fn read_client_notifications(
@@ -1484,6 +1530,14 @@ impl Database {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingMail {
+    email_id: String,
+    recipient: String,
+    subject: String,
+    body: String,
+}
+
 #[derive(Debug)]
 struct KeyRow {
     key_id: String,
@@ -1580,9 +1634,17 @@ async fn verify_json(
 ) -> AppResult<Json<VerifyKeyResponse>> {
     let remote_ip = addr.ip().to_string();
     let config = state.config.clone();
-    let response = state
-        .run_db(move |db| db.verify_key(&config, &request, Some(&remote_ip)))
+    let device_install_id = request.device.install_id.clone();
+    let (response, pending_mail) = state
+        .run_db(move |db| {
+            let response = db.verify_key(&config, &request, Some(&remote_ip))?;
+            let pending_mail = db.pending_mail_for_device(&device_install_id)?;
+            Ok((response, pending_mail))
+        })
         .await?;
+    if let Some(pending_mail) = pending_mail {
+        let _ = state.deliver_pending_mail(pending_mail).await?;
+    }
     Ok(Json(response))
 }
 
@@ -1742,14 +1804,18 @@ async fn create_notification_json(
     State(state): State<Arc<AppState>>,
     Json(request): Json<AdminCreateNotificationRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    let config = state.config.clone();
-    let email_id = state
-        .run_db(move |db| db.create_and_send_notification(&config, &request))
+    let pending = state
+        .run_db(move |db| db.enqueue_admin_notification(&request))
         .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: format!("notification queued and sent: {email_id}"),
-    }))
+    let email_id = pending.email_id.clone();
+    let delivery = state.deliver_pending_mail(pending).await?;
+    let message = match delivery {
+        MailDelivery::Delivered | MailDelivery::LoggedOnly => {
+            format!("notification queued and delivered: {email_id}")
+        }
+        MailDelivery::Failed => format!("notification queued for retry: {email_id}"),
+    };
+    Ok(Json(AdminActionResponse { ok: true, message }))
 }
 
 async fn update_license_features_json(
@@ -2441,81 +2507,6 @@ fn parse_feature_name(feature: &str) -> Option<LicensedFeature> {
         "export" => Some(LicensedFeature::Export),
         _ => None,
     }
-}
-
-fn deliver_email(recipient: &str, subject: &str, body: &str, config: &ServerConfig) -> bool {
-    if let (Some(mail_from), Some(smtp_server)) = (&config.mail_from, &config.smtp_server) {
-        let email = match Message::builder()
-            .from(match mail_from.parse() {
-                Ok(value) => value,
-                Err(err) => {
-                    info!(
-                        target: "srs_license_server::mailer",
-                        "invalid mail_from {}: {}",
-                        mail_from,
-                        err
-                    );
-                    return false;
-                }
-            })
-            .to(match recipient.parse() {
-                Ok(value) => value,
-                Err(err) => {
-                    info!(
-                        target: "srs_license_server::mailer",
-                        "invalid recipient {}: {}",
-                        recipient,
-                        err
-                    );
-                    return false;
-                }
-            })
-            .subject(subject)
-            .body(body.to_string())
-        {
-            Ok(email) => email,
-            Err(err) => {
-                info!(target: "srs_license_server::mailer", "message build failed: {}", err);
-                return false;
-            }
-        };
-
-        let mut builder = SmtpTransport::builder_dangerous(smtp_server);
-        if let (Some(username), Some(password)) = (&config.smtp_username, &config.smtp_password) {
-            builder = builder.credentials(Credentials::new(username.clone(), password.clone()));
-        }
-        let mailer = builder.build();
-        return match mailer.send(&email) {
-            Ok(_) => {
-                info!(
-                    target: "srs_license_server::mailer",
-                    "smtp delivered to {} with subject {}",
-                    recipient,
-                    subject
-                );
-                true
-            }
-            Err(err) => {
-                info!(
-                    target: "srs_license_server::mailer",
-                    "smtp delivery failed for {}: {}",
-                    recipient,
-                    err
-                );
-                false
-            }
-        };
-    }
-
-    info!(
-        target: "srs_license_server::mailer",
-        mode = "log",
-        recipient,
-        subject,
-        "{}",
-        body
-    );
-    true
 }
 
 fn render_index_page(response: Option<&IssueKeyResponse>) -> String {
@@ -3352,16 +3343,14 @@ mod tests {
             })
             .expect("issue license");
 
-        let email_id = db
-            .create_and_send_notification(
-                &config,
+        let pending_mail = db
+            .enqueue_admin_notification(
                 &AdminCreateNotificationRequest {
                     license_id: issued.license_id.clone(),
                     recipient: "user@example.com".to_string(),
                     subject: "Manual admin notice".to_string(),
                     body: "This is a manual notification.".to_string(),
-                },
-            )
+                })
             .expect("create notification");
 
         let (state, record_state, sent_at, delivered_at): (
@@ -3375,7 +3364,7 @@ mod tests {
                 "SELECT notification_state, record_state, sent_at_epoch_s, delivered_at_epoch_s
                  FROM email_outbox
                  WHERE email_id = ?1",
-                params![email_id],
+                params![&pending_mail.email_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -3388,10 +3377,10 @@ mod tests {
             .expect("fetch notification")
         };
 
-        assert_eq!(state, "delivered");
+        assert_eq!(state, "queued");
         assert_eq!(record_state, "active");
-        assert!(sent_at.is_some());
-        assert!(delivered_at.is_some());
+        assert!(sent_at.is_none());
+        assert!(delivered_at.is_none());
 
         let _ = fs::remove_file(std::path::Path::new(&config.database_path));
     }
@@ -3431,17 +3420,20 @@ mod tests {
         db.verify_key(&config, &request, Some("127.0.0.1"))
             .expect("verify initial install");
 
-        let email_id = db
-            .create_and_send_notification(
-                &config,
+        let pending_mail = db
+            .enqueue_admin_notification(
                 &AdminCreateNotificationRequest {
                     license_id: issued.license_id.clone(),
                     recipient: "user@example.com".to_string(),
                     subject: "Manual admin notice".to_string(),
                     body: "This is a manual notification.".to_string(),
-                },
-            )
+                })
             .expect("create notification");
+
+        db.mark_notification_sent(&pending_mail.email_id)
+            .expect("mark notification sent");
+        db.mark_notification_delivered(&pending_mail.email_id)
+            .expect("mark notification delivered");
 
         let notifications = db
             .read_client_notifications(&ClientNotificationReadRequest {
@@ -3451,13 +3443,13 @@ mod tests {
             })
             .expect("read notifications");
         assert_eq!(notifications.len(), 1);
-        assert_eq!(notifications[0].notification_id, email_id);
+        assert_eq!(notifications[0].notification_id, pending_mail.email_id);
 
         let (state, record_state): (String, String) = {
             let conn = db.conn.lock().expect("lock db");
             conn.query_row(
                 "SELECT notification_state, record_state FROM email_outbox WHERE email_id = ?1",
-                params![email_id],
+                params![&pending_mail.email_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("fetch notification state")
