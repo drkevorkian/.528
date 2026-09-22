@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 
 use anyhow::{anyhow, Result};
 use axum::http::HeaderMap;
-use libsrs_app_config::{ServerConfig, LOCALHOST_DEV_SIGNING_KEY_SEED_B64};
+use libsrs_app_config::ServerConfig;
 use subtle::ConstantTimeEq;
 
 /// Minimum accepted administrator bearer length.
@@ -52,10 +52,9 @@ pub fn validate_startup(config: &ServerConfig) -> Result<()> {
 
     match mode {
         OperatingMode::Development => {
-            if !loopback && uses_dev_seed {
+            if !loopback {
                 return Err(anyhow!(
-                    "development signing seed {} cannot be used when bind_addr is not loopback ({})",
-                    LOCALHOST_DEV_SIGNING_KEY_SEED_B64,
+                    "development mode requires a loopback bind_addr (got {})",
                     config.bind_addr
                 ));
             }
