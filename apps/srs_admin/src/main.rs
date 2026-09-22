@@ -510,7 +510,7 @@ impl AdminApp {
                             ui.push_id(("key_row", &key.key_id), |ui| {
                                 ui.monospace(&key.key_id);
                                 ui.monospace(&key.license_id);
-                                ui.monospace(&key.key_value);
+                                ui.monospace(&key.key_hint);
                                 ui.label(key.key_version.to_string());
                                 ui.colored_label(
                                     if key.active {
