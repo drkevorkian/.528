@@ -359,33 +359,46 @@ where
                 let requested = requested_epoch.load(Ordering::Acquire);
                 let active = callback_epoch.load(Ordering::Acquire);
                 if requested != active {
-                    while consumer.pop().is_ok() {}
-                    callback_epoch.store(requested, Ordering::Release);
-                    for sample in output.iter_mut() {
-                        *sample = T::silence();
+                    let available = consumer.slots();
+                    if available != 0 {
+                        if let Ok(chunk) = consumer.read_chunk(available) {
+                            chunk.commit_all();
+                        }
                     }
+                    callback_epoch.store(requested, Ordering::Release);
+                    fill_silence(output);
                     return;
                 }
 
-                let mut consumed = 0_u64;
-                let mut underrun = 0_u64;
-                for sample in output.iter_mut() {
-                    match consumer.pop() {
-                        Ok(value) => {
-                            *sample = T::from_pcm_i16(value);
-                            consumed = consumed.saturating_add(1);
+                let available = consumer.slots().min(output.len());
+                let consumed = if available == 0 {
+                    0
+                } else {
+                    match consumer.read_chunk(available) {
+                        Ok(chunk) => {
+                            let (head, tail) = chunk.as_slices();
+                            let head_len = head.len();
+                            copy_pcm_to_output(head, &mut output[..head_len]);
+                            copy_pcm_to_output(
+                                tail,
+                                &mut output[head_len..head_len + tail.len()],
+                            );
+                            chunk.commit_all();
+                            available
                         }
-                        Err(_) => {
-                            *sample = T::silence();
-                            underrun = underrun.saturating_add(1);
-                        }
+                        Err(_) => 0,
                     }
+                };
+
+                if consumed < output.len() {
+                    fill_silence(&mut output[consumed..]);
                 }
                 if consumed != 0 {
-                    consumed_samples.fetch_add(consumed, Ordering::Relaxed);
+                    consumed_samples.fetch_add(consumed as u64, Ordering::Relaxed);
                 }
+                let underrun = output.len().saturating_sub(consumed);
                 if underrun != 0 {
-                    underrun_samples.fetch_add(underrun, Ordering::Relaxed);
+                    underrun_samples.fetch_add(underrun as u64, Ordering::Relaxed);
                 }
             },
             move |_error| {
@@ -394,6 +407,19 @@ where
             None,
         )
         .context("failed to build exact-format audio output stream")
+}
+
+fn copy_pcm_to_output<T: FromPcmI16>(input: &[i16], output: &mut [T]) {
+    debug_assert_eq!(input.len(), output.len());
+    for (source, destination) in input.iter().zip(output.iter_mut()) {
+        *destination = T::from_pcm_i16(*source);
+    }
+}
+
+fn fill_silence<T: FromPcmI16>(output: &mut [T]) {
+    for sample in output.iter_mut() {
+        *sample = T::silence();
+    }
 }
 
 #[cfg(test)]
