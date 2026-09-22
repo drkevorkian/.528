@@ -12,8 +12,8 @@ use axum::http::HeaderMap;
 use libsrs_app_config::{ServerConfig, LOCALHOST_DEV_SIGNING_KEY_SEED_B64};
 use subtle::ConstantTimeEq;
 
-/// Minimum accepted administrator token length (high-entropy bearer, not a password KDF).
-pub const MIN_ADMIN_TOKEN_LEN: usize = 16;
+/// Minimum accepted administrator bearer length.
+pub const MIN_ADMIN_TOKEN_LEN: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OperatingMode {
@@ -84,44 +84,15 @@ pub fn validate_startup(config: &ServerConfig) -> Result<()> {
     Ok(())
 }
 
-/// Extract a presented administrator credential from Authorization, cookie, or X-SRS-Admin-Token.
+/// Extract the canonical administrator bearer credential.
 pub fn extract_presented_token(headers: &HeaderMap) -> Option<String> {
-    if let Some(value) = headers.get("x-srs-admin-token") {
-        if let Ok(text) = value.to_str() {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    if let Some(value) = headers.get(axum::http::header::COOKIE) {
-        if let Ok(text) = value.to_str() {
-            for part in text.split(';') {
-                let part = part.trim();
-                if let Some(value) = part.strip_prefix("srs_admin=") {
-                    let value = value.trim();
-                    if !value.is_empty() {
-                        return Some(value.to_string());
-                    }
-                }
-            }
-        }
-    }
-    if let Some(value) = headers.get(axum::http::header::AUTHORIZATION) {
-        if let Ok(text) = value.to_str() {
-            let trimmed = text.trim();
-            let bearer = trimmed
-                .strip_prefix("Bearer ")
-                .or_else(|| trimmed.strip_prefix("bearer "));
-            if let Some(token) = bearer {
-                let token = token.trim();
-                if !token.is_empty() {
-                    return Some(token.to_string());
-                }
-            }
-        }
-    }
-    None
+    let value = headers.get(axum::http::header::AUTHORIZATION)?;
+    let text = value.to_str().ok()?.trim();
+    let token = text
+        .strip_prefix("Bearer ")
+        .or_else(|| text.strip_prefix("bearer "))?
+        .trim();
+    (!token.is_empty()).then(|| token.to_string())
 }
 
 fn tokens_equal(left: &str, right: &str) -> bool {
@@ -194,4 +165,97 @@ pub fn redact_license_key(key: &str) -> String {
     }
     let tail = &trimmed[trimmed.len() - 4..];
     format!("****{tail}")
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{header::AUTHORIZATION, HeaderValue};
+    use libsrs_app_config::ServerConfig;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn peer(ip: [u8; 4]) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::from(ip)), 12345)
+    }
+
+    fn config_with_token() -> ServerConfig {
+        let mut config = ServerConfig::default();
+        config.admin_token = Some("0123456789abcdef0123456789abcdef".to_string());
+        config
+    }
+
+    #[test]
+    fn bearer_is_the_only_supported_admin_credential() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static(
+            "Bearer 0123456789abcdef0123456789abcdef",
+        ));
+        assert_eq!(
+            extract_presented_token(&headers).as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+
+        let mut legacy = HeaderMap::new();
+        legacy.insert(
+            "x-srs-admin-token",
+            HeaderValue::from_static("0123456789abcdef0123456789abcdef"),
+        );
+        assert!(extract_presented_token(&legacy).is_none());
+    }
+
+    #[test]
+    fn development_requires_loopback_even_with_valid_token() {
+        let config = config_with_token();
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static(
+            "Bearer 0123456789abcdef0123456789abcdef",
+        ));
+        assert_eq!(
+            authorize_admin(&config, &peer([203, 0, 113, 9]), &headers),
+            Err(AdminAuthError::LoopbackRequired)
+        );
+    }
+
+    #[test]
+    fn development_allows_loopback_with_valid_token() {
+        let config = config_with_token();
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static(
+            "Bearer 0123456789abcdef0123456789abcdef",
+        ));
+        assert_eq!(
+            authorize_admin(&config, &peer([127, 0, 0, 1]), &headers),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn startup_rejects_missing_or_short_admin_token() {
+        let mut config = ServerConfig::default();
+        assert!(validate_startup(&config).is_err());
+        config.admin_token = Some("too-short".to_string());
+        assert!(validate_startup(&config).is_err());
+    }
+
+    #[test]
+    fn production_rejects_published_dev_seed() {
+        let mut config = config_with_token();
+        config.operating_mode = "production".to_string();
+        assert!(validate_startup(&config).is_err());
+    }
+
+    #[test]
+    fn development_rejects_public_bind_with_dev_seed() {
+        let mut config = config_with_token();
+        config.bind_addr = "0.0.0.0:3000".to_string();
+        assert!(validate_startup(&config).is_err());
+    }
+
+    #[test]
+    fn redaction_never_returns_full_key() {
+        let redacted = redact_license_key("SRS-AAAA-BBBB-CCCC-DDDD");
+        assert_eq!(redacted, "****DDDD");
+        assert_ne!(redacted, "SRS-AAAA-BBBB-CCCC-DDDD");
+    }
 }
