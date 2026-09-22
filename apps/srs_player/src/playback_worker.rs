@@ -893,7 +893,10 @@ impl PlaybackWorker {
             ));
         }
 
-        if self.audio_epoch_media_start_ms.is_none() {
+        // A seek target expresses user intent, but the first accepted decoded audio packet
+        // defines the real playable media anchor for this epoch. This avoids carrying a
+        // requested timestamp forward when the demux/codec resumes at a later audio PTS.
+        if !self.audio_epoch_armed {
             self.audio_epoch_media_start_ms = Some(audio_chunk_position_ms(&chunk));
         }
 
@@ -1570,6 +1573,30 @@ mod tests {
             .flush_pending_audio()
             .expect_err("new stream error must fail");
         assert!(error.contains("device/runtime error"));
+    }
+
+    #[test]
+    fn first_post_seek_audio_pts_replaces_requested_epoch_anchor() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 70, usize::MAX);
+
+        worker.advance_audio_epoch(Some(10_000));
+        state.acknowledge_requested_epoch();
+
+        let chunk = DecodedAudioChunk {
+            sample_rate: 48_000,
+            channels: 2,
+            frame_index: 0,
+            pts_ticks: 10_500,
+            dts_ticks: 10_500,
+            timescale_hz: 1_000,
+            samples_interleaved: vec![1, 2, 3, 4],
+        };
+        worker.queue_audio_chunk(chunk).expect("queue post-seek PCM");
+
+        assert_eq!(worker.audio_epoch_media_start_ms, Some(10_500));
+        assert_eq!(worker.audio_media_position_ms(), Some(10_500));
     }
 
     #[test]
