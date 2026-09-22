@@ -1,3 +1,5 @@
+mod security;
+
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -145,6 +147,7 @@ CREATE TABLE IF NOT EXISTS playback_requests (
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let config = SrsConfig::load()?.server;
+    security::validate_startup(&config)?;
     let state = Arc::new(AppState::new(config)?);
     let bind_addr: SocketAddr = state
         .config
@@ -152,11 +155,22 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("parse bind addr {}", state.config.bind_addr))?;
 
-    let app = Router::new()
+    let public_routes = Router::new()
         .route("/", get(index))
         .route("/healthz", get(healthz))
-        .route("/issue", post(issue_form))
         .route("/confirm/{token}", get(confirm_request))
+        .route("/api/v1/verify", post(verify_json))
+        .route(
+            "/api/v1/client/notifications/read",
+            post(read_client_notifications_json),
+        )
+        .route(
+            "/api/v1/client/playback/unsupported",
+            post(report_unsupported_playback_json),
+        );
+
+    let admin_routes = Router::new()
+        .route("/issue", post(issue_form))
         .route("/admin", get(admin_dashboard))
         .route(
             "/admin/licenses/features",
@@ -236,16 +250,12 @@ async fn main() -> Result<()> {
             post(delete_audit_json),
         )
         .route("/api/v1/issue", post(issue_json))
-        .route("/api/v1/verify", post(verify_json))
-        .route(
-            "/api/v1/client/notifications/read",
-            post(read_client_notifications_json),
-        )
-        .route(
-            "/api/v1/client/playback/unsupported",
-            post(report_unsupported_playback_json),
-        )
-        .with_state(state);
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_middleware,
+        ));
+
+    let app = public_routes.merge(admin_routes).with_state(state);
 
     let listener = TcpListener::bind(bind_addr)
         .await
@@ -1564,19 +1574,15 @@ async fn confirm_request(
 
 async fn admin_dashboard(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> AppResult<Html<String>> {
-    ensure_local_admin(&addr)?;
     let snapshot = state.db.admin_snapshot()?;
     Ok(Html(render_admin_page(&snapshot)))
 }
 
 async fn update_license_features_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Form(form): Form<AdminFeatureForm>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     state
         .db
         .update_license_features(&form.license_id, &parse_feature_csv(&form.features_csv))?;
@@ -1585,20 +1591,16 @@ async fn update_license_features_handler(
 
 async fn delete_license_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(license_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     state.db.delete_license(&license_id)?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn update_key_status_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Form(form): Form<AdminKeyStatusForm>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     let active = matches!(form.active.as_str(), "1" | "true" | "on" | "yes");
     state.db.set_key_active(&form.key_id, active)?;
     Ok(Redirect::to("/admin"))
@@ -1606,68 +1608,54 @@ async fn update_key_status_handler(
 
 async fn delete_key_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(key_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     state.db.delete_key(&key_id)?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn approve_request_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     state.db.approve_request_by_id(&request_id)?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn delete_request_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     state.db.delete_request(&request_id)?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn delete_installation_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(installation_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     state.db.delete_installation(&installation_id)?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn delete_audit_handler(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(event_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    ensure_local_admin(&addr)?;
     state.db.delete_audit(&event_id)?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn admin_snapshot_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> AppResult<Json<AdminSnapshot>> {
-    ensure_local_admin(&addr)?;
     Ok(Json(state.db.admin_snapshot()?))
 }
 
 async fn create_notification_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<AdminCreateNotificationRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     let email_id = state
         .db
         .create_and_send_notification(&state.config, &request)?;
@@ -1679,10 +1667,8 @@ async fn create_notification_json(
 
 async fn update_license_features_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<AdminUpdateLicenseFeaturesRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state
         .db
         .update_license_features(&request.license_id, &request.features)?;
@@ -1694,10 +1680,8 @@ async fn update_license_features_json(
 
 async fn delete_license_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(license_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.delete_license(&license_id)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -1707,11 +1691,9 @@ async fn delete_license_json(
 
 async fn update_license_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(license_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state
         .db
         .set_license_record_state(&license_id, request.state)?;
@@ -1723,10 +1705,8 @@ async fn update_license_state_json(
 
 async fn update_key_status_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<AdminUpdateKeyStatusRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.set_key_active(&request.key_id, request.active)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -1736,11 +1716,9 @@ async fn update_key_status_json(
 
 async fn update_key_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(key_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.set_key_record_state(&key_id, request.state)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -1750,10 +1728,8 @@ async fn update_key_state_json(
 
 async fn delete_key_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(key_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.delete_key(&key_id)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -1763,10 +1739,8 @@ async fn delete_key_json(
 
 async fn approve_request_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.approve_request_by_id(&request_id)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -1776,11 +1750,9 @@ async fn approve_request_json(
 
 async fn update_request_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state
         .db
         .set_request_record_state(&request_id, request.state)?;
@@ -1795,10 +1767,8 @@ async fn update_request_state_json(
 
 async fn delete_request_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.delete_request(&request_id)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -1808,10 +1778,8 @@ async fn delete_request_json(
 
 async fn delete_installation_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(installation_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.delete_installation(&installation_id)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -1821,11 +1789,9 @@ async fn delete_installation_json(
 
 async fn update_installation_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(installation_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state
         .db
         .set_installation_record_state(&installation_id, request.state)?;
@@ -1837,10 +1803,8 @@ async fn update_installation_state_json(
 
 async fn delete_audit_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(event_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.delete_audit(&event_id)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -1850,11 +1814,9 @@ async fn delete_audit_json(
 
 async fn update_audit_state_json(
     State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     AxumPath(event_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    ensure_local_admin(&addr)?;
     state.db.set_audit_record_state(&event_id, request.state)?;
     Ok(Json(AdminActionResponse {
         ok: true,
@@ -2459,7 +2421,7 @@ fn render_index_page(response: Option<&IssueKeyResponse>) -> String {
         )
     }).unwrap_or_default();
     format!(
-        "<html><body><h1>SRS Licensing</h1><p>Free keys default to the <code>basic</code> feature set. Future editor upgrades can be assigned per key.</p><form method=\"post\" action=\"/issue\"><label>Email <input type=\"email\" name=\"email\" required></label><button type=\"submit\">Issue Key</button></form>{issued}<p>Health: <a href=\"/healthz\">/healthz</a></p></body></html>"
+        "<html><body><h1>SRS Licensing</h1><p>License issuance is restricted to authenticated administrators.</p>{issued}<p>Health: <a href=\"/healthz\">/healthz</a></p></body></html>"
     )
 }
 
@@ -2693,14 +2655,19 @@ fn render_admin_page(snapshot: &AdminSnapshot) -> String {
     )
 }
 
-fn ensure_local_admin(addr: &SocketAddr) -> AppResult<()> {
-    if addr.ip().is_loopback() {
-        Ok(())
-    } else {
-        Err(AppError {
-            status: StatusCode::FORBIDDEN,
-            message: "admin dashboard is only available from localhost".to_string(),
-        })
+async fn require_admin_middleware(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    match security::authorize_admin(&state.config, &addr, &headers) {
+        Ok(()) => next.run(request).await,
+        Err(err) => {
+            let (status, message) = err.status_message();
+            (status, message).into_response()
+        }
     }
 }
 
