@@ -772,6 +772,20 @@ fn push_bounded_time_slot_ms(slots: &mut VecDeque<u64>, slot_ms: u64) -> Result<
 mod tests {
     use super::*;
 
+    fn worker_with_snapshot_slot(
+        snapshot_slot: Arc<Mutex<PlaybackSnapshot>>,
+    ) -> PlaybackWorker {
+        let (_command_tx, command_rx) = mpsc::sync_channel(1);
+        let (event_tx, _event_rx) = mpsc::sync_channel(1);
+        PlaybackWorker::new(
+            command_rx,
+            event_tx,
+            Arc::new(Mutex::new(None)),
+            snapshot_slot,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
     fn frame(index: u32) -> DecodedVideoFrame {
         DecodedVideoFrame {
             width: 2,
@@ -783,6 +797,79 @@ mod tests {
             payload_crc32c: index,
             gray8: vec![index as u8; 4],
         }
+    }
+
+    #[test]
+    fn snapshot_slot_keeps_latest_authoritative_state() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(Arc::clone(&snapshot_slot));
+
+        worker.generation = 7;
+        worker.state = PlayerState::Playing;
+        worker.presented_position_ms = 120;
+        worker.emit_snapshot();
+
+        worker.state = PlayerState::Paused;
+        worker.presented_position_ms = 240;
+        worker.emit_snapshot();
+
+        let snapshot = snapshot_slot
+            .lock()
+            .expect("snapshot slot should not be poisoned")
+            .clone();
+        assert_eq!(snapshot.generation, 7);
+        assert_eq!(snapshot.state, PlayerState::Paused);
+        assert_eq!(snapshot.presented_position_ms, 240);
+    }
+
+    #[test]
+    fn poisoned_snapshot_slot_is_a_controlled_read_error() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let poison_target = Arc::clone(&snapshot_slot);
+        let _ = thread::spawn(move || {
+            let _guard = poison_target.lock().expect("lock before poison");
+            panic!("intentional snapshot poison");
+        })
+        .join();
+
+        let (command_tx, _command_rx) = mpsc::sync_channel(1);
+        let (_event_tx, event_rx) = mpsc::sync_channel(1);
+        let handle = PlaybackWorkerHandle {
+            command_tx,
+            event_rx,
+            frame_slot: Arc::new(Mutex::new(None)),
+            snapshot_slot,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        };
+
+        let error = handle
+            .latest_snapshot()
+            .expect_err("poisoned snapshot must not be treated as valid state");
+        assert!(error.contains("poisoned"));
+    }
+
+    #[test]
+    fn worker_overwrites_poisoned_snapshot_without_panicking() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let poison_target = Arc::clone(&snapshot_slot);
+        let _ = thread::spawn(move || {
+            let _guard = poison_target.lock().expect("lock before poison");
+            panic!("intentional snapshot poison");
+        })
+        .join();
+
+        let mut worker = worker_with_snapshot_slot(Arc::clone(&snapshot_slot));
+        worker.generation = 9;
+        worker.state = PlayerState::Error;
+        worker.store_snapshot(worker.snapshot());
+
+        let snapshot = match snapshot_slot.lock() {
+            Ok(snapshot) => snapshot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        assert_eq!(snapshot.generation, 9);
+        assert_eq!(snapshot.state, PlayerState::Error);
     }
 
     #[test]
