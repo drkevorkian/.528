@@ -1,53 +1,47 @@
-# Wire BoundedDbExecutor (AI B → AI A)
+# Phase 1 bounded SQLite execution status
 
-Module is on the branch: `apps/srs_license_server/src/db_exec.rs`.
-It is not compiled until `main.rs` includes it. Do not merge until this wiring exists and `cargo test -p srs_license_server` runs.
+The bounded SQLite executor is now wired on `ai/phase0-baseline-security`.
 
-## main.rs
+## Current architecture
 
-```rust
-mod db_exec;
-mod security;
+- `apps/srs_license_server/src/db_exec.rs` owns a bounded semaphore and runs synchronous rusqlite work through `tokio::task::spawn_blocking`.
+- The permit limit is **1**, matching the server's current single `Mutex<Connection>` database architecture.
+- `AppState::run_db` is the only request-path bridge used by the Axum handlers.
+- Existing `Database` methods remain synchronous and continue to use parameterized `rusqlite::params!` SQL.
+- No SQLite mutex is intentionally held across an `.await`.
+
+The following request paths have been moved behind the bounded executor:
+
+- authenticated issuance
+- entitlement verification
+- confirmation lookup and confirmation mutation
+- client notification reads
+- unsupported-playback reporting
+- admin snapshots
+- license/key/request/installation/audit mutations
+- notification creation
+
+## Important limitation
+
+This branch has **not** been compiled or test-executed in the current AI execution environment. It is implementation-under-review, not merge-ready.
+
+Required verification before merge:
+
+```bash
+cargo fmt --all --check
+cargo check --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check -p libsrs_compat --features ffmpeg
 ```
 
-```rust
-struct Database {
-    conn: Mutex<Connection>,
-    exec: db_exec::BoundedDbExecutor,
-}
+Server-specific verification:
+
+```bash
+cargo test -p srs_license_server
+cargo clippy -p srs_license_server --all-targets -- -D warnings
 ```
 
-In `Database::open`:
+## Follow-up
 
-```rust
-Ok(Self {
-    conn: Mutex::new(conn),
-    exec: db_exec::BoundedDbExecutor::new(),
-})
-```
-
-Keep every existing method synchronous and parameterized (`params![]`). Handlers become:
-
-```rust
-async fn issue_json(...) -> AppResult<Json<IssueKeyResponse>> {
-    request.registrant_ip = Some(addr.ip().to_string());
-    let db = state.db.clone();
-    let response = db.exec.run({
-        let db = db.clone();
-        move || db.issue_license(&request)
-    }).await?;
-    Ok(Json(response))
-}
-```
-
-Same pattern for `verify_json`, `admin_snapshot_json`, `confirm_request`, mutations.
-Never hold `Mutex<Connection>` across `.await`.
-Never call `spawn_blocking` from a handler except through `BoundedDbExecutor` (permit count = 1).
-
-## Tests already in db_exec.rs
-
-- value return
-- error propagation / permit release
-- four concurrent jobs peak inflight == 1
-
-A still owns HTTP contract tests (401/403/issue-without-auth) once a test harness can bind the router.
+SMTP delivery is synchronous and currently executes inside the same bounded blocking job used by notification creation. It no longer blocks Tokio's async runtime, but a slow SMTP server can occupy the single blocking permit and delay other DB-backed requests. Split SMTP onto its own bounded blocking resource before calling Phase 1 availability hardening complete.
