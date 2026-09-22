@@ -3509,4 +3509,241 @@ mod tests {
 
         let _ = fs::remove_file(std::path::Path::new(&config.database_path));
     }
+
+    fn authenticated_test_config(name: &str) -> ServerConfig {
+        let mut config = test_config(name);
+        config.admin_token =
+            Some("0123456789abcdef0123456789abcdef".to_string());
+        config
+    }
+
+    fn request_with_peer(
+        mut request: axum::http::Request<axum::body::Body>,
+    ) -> axum::http::Request<axum::body::Body> {
+        request.extensions_mut().insert(ConnectInfo(SocketAddr::from((
+            [127, 0, 0, 1],
+            45678,
+        ))));
+        request
+    }
+
+    #[tokio::test]
+    async fn issuance_requires_valid_bearer_and_snapshot_redacts_key() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{header, Request};
+        use tower::ServiceExt;
+
+        let config = authenticated_test_config("router-auth");
+        let database_path = config.database_path.clone();
+        let state = Arc::new(AppState::new(config).expect("app state"));
+
+        let issue = IssueKeyRequest {
+            email: "admin-issued@example.com".to_string(),
+            requested_features: Some(LicensedFeature::editor_defaults()),
+            registrant_os: Some("test".to_string()),
+            registrant_ip: Some("198.51.100.10".to_string()),
+        };
+        let body = serde_json::to_vec(&issue).expect("serialize issue");
+
+        let missing = request_with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/issue")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.clone()))
+                .expect("request"),
+        );
+        let response = build_router(state.clone())
+            .oneshot(missing)
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let wrong = request_with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/issue")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer definitely-not-the-admin-token")
+                .body(Body::from(body.clone()))
+                .expect("request"),
+        );
+        let response = build_router(state.clone())
+            .oneshot(wrong)
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let valid = request_with_peer(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/issue")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer 0123456789abcdef0123456789abcdef",
+                )
+                .body(Body::from(body))
+                .expect("request"),
+        );
+        let response = build_router(state.clone())
+            .oneshot(valid)
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::OK);
+        let issued_body = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("issued body");
+        let issued: IssueKeyResponse =
+            serde_json::from_slice(&issued_body).expect("issued response");
+        let raw_key = issued.key;
+
+        let snapshot_request = request_with_peer(
+            Request::builder()
+                .method("GET")
+                .uri("/api/v1/admin/snapshot")
+                .header(
+                    header::AUTHORIZATION,
+                    "Bearer 0123456789abcdef0123456789abcdef",
+                )
+                .body(Body::empty())
+                .expect("request"),
+        );
+        let response = build_router(state.clone())
+            .oneshot(snapshot_request)
+            .await
+            .expect("router");
+        assert_eq!(response.status(), StatusCode::OK);
+        let snapshot_body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .expect("snapshot body");
+        let snapshot_text = String::from_utf8(snapshot_body.to_vec()).expect("utf8");
+        assert!(!snapshot_text.contains(&raw_key));
+        assert!(!snapshot_text.contains("\"key_value\""));
+        assert!(snapshot_text.contains("\"key_hint\""));
+
+        drop(state);
+        let _ = fs::remove_file(database_path);
+    }
+
+    #[test]
+    fn transport_peer_ip_overrides_claimed_ip_for_audit_identity() {
+        let config = test_config("peer-ip");
+        let db = Database::open(&config).expect("open db");
+        let issued = db
+            .issue_license(&IssueKeyRequest {
+                email: "user@example.com".to_string(),
+                requested_features: None,
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue");
+
+        let request = VerifyKeyRequest {
+            key: issued.key,
+            claimed_ip: Some("203.0.113.99".to_string()),
+            os: libsrs_licensing_proto::ClientOsInfo {
+                family: "linux".to_string(),
+                version: None,
+                arch: "x86_64".to_string(),
+            },
+            device: libsrs_licensing_proto::DeviceFingerprint {
+                install_id: "peer-ip-install".to_string(),
+                hostname: Some("host".to_string()),
+            },
+            app: libsrs_licensing_proto::ClientAppInfo {
+                name: "srs-player".to_string(),
+                version: "0.1.0".to_string(),
+                channel: None,
+            },
+            session_secret: None,
+        };
+        db.verify_key(&config, &request, Some("10.23.45.67"))
+            .expect("verify");
+
+        let conn = db.conn.lock().expect("lock db");
+        let last_seen: String = conn
+            .query_row(
+                "SELECT last_seen_ip FROM installations WHERE device_install_id = ?1",
+                params!["peer-ip-install"],
+                |row| row.get(0),
+            )
+            .expect("last seen");
+        assert_eq!(last_seen, "10.23.45.67");
+        drop(conn);
+
+        let _ = fs::remove_file(std::path::Path::new(&config.database_path));
+    }
+
+    #[test]
+    fn trusted_session_mismatch_heals_rotates_and_remains_active() {
+        let config = test_config("session-heal");
+        let db = Database::open(&config).expect("open db");
+        let issued = db
+            .issue_license(&IssueKeyRequest {
+                email: "user@example.com".to_string(),
+                requested_features: Some(LicensedFeature::editor_defaults()),
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue");
+
+        let mut request = VerifyKeyRequest {
+            key: issued.key,
+            claimed_ip: Some("198.51.100.1".to_string()),
+            os: libsrs_licensing_proto::ClientOsInfo {
+                family: "linux".to_string(),
+                version: None,
+                arch: "x86_64".to_string(),
+            },
+            device: libsrs_licensing_proto::DeviceFingerprint {
+                install_id: "session-heal-install".to_string(),
+                hostname: Some("host".to_string()),
+            },
+            app: libsrs_licensing_proto::ClientAppInfo {
+                name: "srs-player".to_string(),
+                version: "0.1.0".to_string(),
+                channel: None,
+            },
+            session_secret: None,
+        };
+
+        let first = db
+            .verify_key(&config, &request, Some("198.51.100.1"))
+            .expect("initial verify");
+        let first_secret = first
+            .new_session_secret
+            .expect("initial session secret");
+
+        request.session_secret = Some("wrong-session-secret".to_string());
+        let healed = db
+            .verify_key(&config, &request, Some("198.51.100.1"))
+            .expect("healed verify");
+        let healed_secret = healed
+            .new_session_secret
+            .expect("rotated session secret");
+        assert_ne!(first_secret, healed_secret);
+
+        let signing_key =
+            decode_signing_key(config.signing_key_seed()).expect("decode signing key");
+        let claims = healed
+            .envelope
+            .verify(&signing_key.verifying_key())
+            .expect("verify entitlement");
+        assert_eq!(claims.status, EntitlementStatus::Active);
+
+        let conn = db.conn.lock().expect("lock db");
+        let mismatch_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event_type = 'session_secret_mismatch'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("mismatch count");
+        assert_eq!(mismatch_events, 1);
+        drop(conn);
+
+        let _ = fs::remove_file(std::path::Path::new(&config.database_path));
+    }
+
 }
