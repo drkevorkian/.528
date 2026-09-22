@@ -5,7 +5,7 @@
 //! intentionally not returned in events, formatted into status text, or stored in
 //! the UI model.
 
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::Duration;
 
@@ -67,16 +67,10 @@ impl AdminClientError {
         }
     }
 
-    pub const fn retryable(self) -> bool {
-        matches!(
-            self,
-            Self::RateLimited | Self::ServerFailure | Self::Offline | Self::Timeout
-        )
-    }
 }
 
 pub struct AdminWorker {
-    command_tx: Sender<AdminCommand>,
+    command_tx: SyncSender<AdminCommand>,
     event_rx: Receiver<AdminEvent>,
 }
 
@@ -93,8 +87,10 @@ impl AdminWorker {
             .build()
             .map_err(|_| "Unable to initialize the administrator HTTP client.".to_string())?;
 
-        let (command_tx, command_rx) = mpsc::channel();
-        let (event_tx, event_rx) = mpsc::channel();
+        // Bounded queues prevent repeated UI actions from growing memory without limit.
+        // The UI uses try_send so saturation never blocks the egui frame thread.
+        let (command_tx, command_rx) = mpsc::sync_channel(32);
+        let (event_tx, event_rx) = mpsc::sync_channel(32);
 
         thread::Builder::new()
             .name("srs-admin-http".to_string())
@@ -110,9 +106,15 @@ impl AdminWorker {
     }
 
     pub fn send(&self, command: AdminCommand) -> Result<(), String> {
-        self.command_tx
-            .send(command)
-            .map_err(|_| "Administrator HTTP worker is unavailable.".to_string())
+        match self.command_tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                Err("Administrator request queue is busy; try again shortly.".to_string())
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                Err("Administrator HTTP worker is unavailable.".to_string())
+            }
+        }
     }
 
     pub fn try_recv(&self) -> Option<AdminEvent> {
@@ -131,7 +133,7 @@ fn run_worker(
     base_url: String,
     bearer_token: String,
     command_rx: Receiver<AdminCommand>,
-    event_tx: Sender<AdminEvent>,
+    event_tx: SyncSender<AdminEvent>,
 ) {
     let base_url = base_url.trim_end_matches('/').to_string();
 
@@ -247,5 +249,55 @@ fn classify_transport(error: reqwest::Error) -> AdminClientError {
         AdminClientError::Offline
     } else {
         AdminClientError::ProtocolFailure
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_statuses_map_to_sanitized_admin_errors() {
+        assert_eq!(
+            classify_status(StatusCode::UNAUTHORIZED),
+            AdminClientError::AuthenticationRequired
+        );
+        assert_eq!(
+            classify_status(StatusCode::FORBIDDEN),
+            AdminClientError::Forbidden
+        );
+        assert_eq!(
+            classify_status(StatusCode::TOO_MANY_REQUESTS),
+            AdminClientError::RateLimited
+        );
+        assert_eq!(
+            classify_status(StatusCode::INTERNAL_SERVER_ERROR),
+            AdminClientError::ServerFailure
+        );
+        assert_eq!(
+            classify_status(StatusCode::BAD_REQUEST),
+            AdminClientError::ProtocolFailure
+        );
+    }
+
+    #[test]
+    fn public_error_messages_do_not_embed_credentials_or_transport_details() {
+        for error in [
+            AdminClientError::AuthenticationRequired,
+            AdminClientError::Forbidden,
+            AdminClientError::RateLimited,
+            AdminClientError::ServerFailure,
+            AdminClientError::Offline,
+            AdminClientError::Timeout,
+            AdminClientError::SecurityFailure,
+            AdminClientError::ProtocolFailure,
+        ] {
+            let message = error.user_message();
+            assert!(!message.contains("Bearer "));
+            assert!(!message.contains("SRS_ADMIN_TOKEN"));
+            assert!(!message.contains("http://"));
+            assert!(!message.contains("https://"));
+        }
     }
 }
