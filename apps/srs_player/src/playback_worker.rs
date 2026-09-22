@@ -17,6 +17,7 @@ const MAX_PRESENTATION_REORDER_FRAMES: usize = 4;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
     Closed,
+    Opening,
     Ready,
     Playing,
     Paused,
@@ -324,6 +325,8 @@ impl PlaybackWorker {
                 self.presented_video_frames = 0;
                 self.dropped_video_frames = 0;
                 self.presented_position_ms = 0;
+                self.state = PlayerState::Opening;
+                self.emit_snapshot();
                 match PlaybackSession::open(&path) {
                     Ok(session) => {
                         self.session = Some(session);
