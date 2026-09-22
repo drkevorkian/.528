@@ -31,6 +31,7 @@ struct AdminApp {
     next_refresh_at: Instant,
     mutation_pending: bool,
     issue_pending: bool,
+    last_client_error: Option<AdminClientError>,
     license_presets: BTreeMap<String, LicensePreset>,
     license_features: BTreeMap<String, Vec<LicensedFeature>>,
     pending_delete: Option<DeleteTarget>,
@@ -58,7 +59,8 @@ impl AdminApp {
         let config = SrsConfig::load()?;
         let admin_token = env::var("SRS_ADMIN_TOKEN")
             .map_err(|_| anyhow::anyhow!("SRS_ADMIN_TOKEN is required for the admin application"))?;
-        if admin_token.trim().is_empty() {
+        let admin_token = admin_token.trim().to_string();
+        if admin_token.is_empty() {
             return Err(anyhow::anyhow!(
                 "SRS_ADMIN_TOKEN is required for the admin application"
             ));
@@ -83,6 +85,7 @@ impl AdminApp {
             next_refresh_at: now,
             mutation_pending: false,
             issue_pending: false,
+            last_client_error: None,
             license_presets: BTreeMap::new(),
             license_features: BTreeMap::new(),
             pending_delete: None,
@@ -115,6 +118,7 @@ impl AdminApp {
             next_refresh_at: now + Duration::from_secs(30),
             mutation_pending: false,
             issue_pending: false,
+            last_client_error: None,
             license_presets: BTreeMap::new(),
             license_features: BTreeMap::new(),
             pending_delete: None,
@@ -324,6 +328,7 @@ impl AdminApp {
 
     fn apply_snapshot(&mut self, snapshot: AdminSnapshot) {
         self.status = "Admin snapshot refreshed".to_string();
+        self.last_client_error = None;
         self.last_refresh = Instant::now();
         self.refresh_failure_count = 0;
         self.next_refresh_at = self.last_refresh + Duration::from_secs(5);
@@ -354,10 +359,10 @@ impl AdminApp {
     fn handle_client_error(&mut self, error: AdminClientError, from_refresh: bool) {
         if from_refresh {
             self.refresh_failure_count = self.refresh_failure_count.saturating_add(1);
-            let exponent = self.refresh_failure_count.saturating_sub(1).min(4);
-            let delay_secs = 5u64.saturating_mul(1u64 << exponent).min(60);
+            let delay_secs = refresh_backoff_secs(self.refresh_failure_count);
             self.next_refresh_at = Instant::now() + Duration::from_secs(delay_secs);
         }
+        self.last_client_error = Some(error);
         self.push_notification(error.user_message().to_string());
 
         if matches!(
@@ -433,6 +438,11 @@ impl AdminApp {
             "Last refresh age: {}s",
             self.last_refresh.elapsed().as_secs()
         ));
+        if let Some(error) = self.last_client_error {
+            ui.label(format!("Connection state: {:?}", error));
+        } else {
+            ui.label("Connection state: connected");
+        }
 
         ui.separator();
         ui.heading("Recent Notifications");
@@ -1126,6 +1136,11 @@ impl eframe::App for AdminApp {
     }
 }
 
+fn refresh_backoff_secs(failure_count: u32) -> u64 {
+    let exponent = failure_count.saturating_sub(1).min(4);
+    5u64.saturating_mul(1u64 << exponent).min(60)
+}
+
 fn stat_card(ui: &mut egui::Ui, label: &str, value: u64) {
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.vertical(|ui| {
@@ -1394,5 +1409,21 @@ impl DeleteTarget {
             Self::Request(id) => format!("verification request {id}"),
             Self::Audit(id) => format!("audit event {id}"),
         }
+    }
+}
+
+
+#[cfg(test)]
+mod admin_ui_tests {
+    use super::*;
+
+    #[test]
+    fn admin_refresh_backoff_is_bounded() {
+        assert_eq!(refresh_backoff_secs(1), 5);
+        assert_eq!(refresh_backoff_secs(2), 10);
+        assert_eq!(refresh_backoff_secs(3), 20);
+        assert_eq!(refresh_backoff_secs(4), 40);
+        assert_eq!(refresh_backoff_secs(5), 60);
+        assert_eq!(refresh_backoff_secs(100), 60);
     }
 }
