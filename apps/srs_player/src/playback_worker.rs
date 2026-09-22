@@ -363,6 +363,7 @@ impl PlaybackWorker {
                 // Fail closed on reopen: drop the previous media/session before touching the new
                 // path so an Open failure cannot leave old content playable under a new generation.
                 self.session = None;
+                self.reset_audio_for_open();
                 self.reorder.reset(None);
                 self.presentation_time_slots_ms.clear();
                 self.clear_frame_slot();
@@ -395,6 +396,13 @@ impl PlaybackWorker {
                     }
                     self.reorder.reset(None);
                     self.presentation_time_slots_ms.clear();
+                    self.advance_audio_epoch(Some(0));
+                }
+                if let Some(audio) = self.audio_output.as_ref() {
+                    if let Err(error) = audio.play() {
+                        self.fail(error.to_string());
+                        return true;
+                    }
                 }
                 session.play();
                 self.state = PlayerState::Playing;
@@ -406,6 +414,12 @@ impl PlaybackWorker {
                 }
                 if let Some(session) = self.session.as_mut() {
                     session.pause();
+                }
+                if let Some(audio) = self.audio_output.as_ref() {
+                    if let Err(error) = audio.pause() {
+                        self.fail(error.to_string());
+                        return true;
+                    }
                 }
                 self.state = PlayerState::Paused;
                 self.emit_snapshot();
@@ -424,12 +438,20 @@ impl PlaybackWorker {
                 self.presentation_time_slots_ms.clear();
                 self.clear_frame_slot();
                 self.presented_position_ms = 0;
+                self.advance_audio_epoch(Some(0));
+                if let Some(audio) = self.audio_output.as_ref() {
+                    if let Err(error) = audio.pause() {
+                        self.fail(error.to_string());
+                        return true;
+                    }
+                }
                 self.state = PlayerState::Ready;
                 self.emit_snapshot();
             }
             PlaybackWorkerCommand::Close { generation } => {
                 self.generation = generation;
                 self.session = None;
+                self.reset_audio_for_open();
                 self.reorder.reset(None);
                 self.presentation_time_slots_ms.clear();
                 self.clear_frame_slot();
@@ -527,6 +549,7 @@ impl PlaybackWorker {
 
     fn perform_seek(&mut self, target_ms: u64) {
         let resume_playing = self.state == PlayerState::Playing;
+        self.advance_audio_epoch(Some(target_ms));
         self.state = PlayerState::Seeking;
         self.clear_frame_slot();
         self.emit_snapshot();
