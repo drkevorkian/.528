@@ -750,6 +750,36 @@ mod tests {
     }
 
     #[test]
+    fn decode_order_time_slots_map_to_display_order() {
+        let mut reorder = PresentationReorder::new();
+        let mut slots = VecDeque::new();
+
+        let mut i0 = frame(0);
+        i0.pts_ticks = 0;
+        let mut p2 = frame(2);
+        p2.pts_ticks = 3_000;
+        let mut b1 = frame(1);
+        b1.pts_ticks = 6_000;
+
+        reorder.push(i0).expect("I0");
+        slots.push_back(0_u64);
+        let first = reorder.pop_ready().expect("display 0");
+        assert_eq!((first.frame_index, slots.pop_front()), (0, Some(0)));
+
+        reorder.push(p2).expect("P2");
+        slots.push_back(33);
+        assert!(reorder.pop_ready().is_none());
+
+        reorder.push(b1).expect("B1");
+        slots.push_back(66);
+        let second = reorder.pop_ready().expect("display 1");
+        let third = reorder.pop_ready().expect("display 2");
+        assert_eq!((second.frame_index, slots.pop_front()), (1, Some(33)));
+        assert_eq!((third.frame_index, slots.pop_front()), (2, Some(66)));
+        assert!(slots.is_empty());
+    }
+
+    #[test]
     fn reorder_rejects_duplicate_index() {
         let mut reorder = PresentationReorder::new();
         reorder.reset(Some(1));
