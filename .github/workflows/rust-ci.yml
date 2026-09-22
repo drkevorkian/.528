@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: System dependencies
         run: |
@@ -44,9 +46,6 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Format
-        run: cargo fmt --all --check
-
       - name: Check workspace
         run: cargo check --workspace
 
@@ -58,3 +57,13 @@ jobs:
 
       - name: Check FFmpeg compatibility backend
         run: cargo check -p libsrs_compat --features ffmpeg
+
+      - name: Format changed Rust files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          mapfile -t changed < <(git diff --name-only "$BASE_SHA" HEAD -- '*.rs')
+          cargo fmt --all
+          if (("${#changed[@]}" > 0)); then
+            git diff --exit-code -- "${changed[@]}"
+          fi
