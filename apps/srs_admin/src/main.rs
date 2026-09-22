@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -10,6 +11,7 @@ use libsrs_licensing_proto::{
     NotificationDeliveryState,
 };
 use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
@@ -45,12 +47,26 @@ impl AdminApp {
 
     fn try_bootstrap() -> anyhow::Result<Self> {
         let config = SrsConfig::load()?;
+        let admin_token = env::var("SRS_ADMIN_TOKEN")
+            .map_err(|_| anyhow::anyhow!("SRS_ADMIN_TOKEN is required for the admin application"))?;
+        let admin_token = admin_token.trim();
+        if admin_token.is_empty() {
+            return Err(anyhow::anyhow!(
+                "SRS_ADMIN_TOKEN is required for the admin application"
+            ));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {admin_token}"))?,
+        );
         let client = Client::builder()
+            .default_headers(headers)
             .connect_timeout(Duration::from_millis(config.client.connect_timeout_ms))
             .timeout(Duration::from_millis(config.client.request_timeout_ms))
             .build()?;
         let mut app = Self {
-            base_url: config.server.local_base_url(),
+            base_url: config.admin.base_url,
             client: Some(client),
             snapshot: None,
             license_presets: BTreeMap::new(),
@@ -61,7 +77,7 @@ impl AdminApp {
             notification_recipient: String::new(),
             notification_subject: String::new(),
             notification_body: String::new(),
-            status: "Connecting to local licensing server".to_string(),
+            status: "Connecting to licensing server".to_string(),
             notifications: vec![],
             auto_refresh: true,
             last_refresh: Instant::now() - Duration::from_secs(60),
@@ -132,7 +148,7 @@ impl AdminApp {
                 },
                 Err(err) => self.push_notification(format!("Snapshot request failed: {err}")),
             },
-            Err(err) => self.push_notification(format!("Local admin server unreachable: {err}")),
+            Err(err) => self.push_notification(format!("Admin server unreachable: {err}")),
         }
     }
 
