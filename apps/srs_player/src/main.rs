@@ -1,3 +1,4 @@
+mod audio_output;
 mod playback_worker;
 
 use std::path::{Path, PathBuf};
