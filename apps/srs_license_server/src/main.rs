@@ -1,3 +1,4 @@
+mod db_exec;
 mod security;
 
 use std::fs;
@@ -274,14 +275,25 @@ async fn main() -> Result<()> {
 struct AppState {
     config: ServerConfig,
     db: Arc<Database>,
+    db_exec: db_exec::BoundedDbExecutor,
 }
 
 impl AppState {
     fn new(config: ServerConfig) -> Result<Self> {
         Ok(Self {
             db: Arc::new(Database::open(&config)?),
+            db_exec: db_exec::BoundedDbExecutor::new(),
             config,
         })
+    }
+
+    async fn run_db<T, F>(&self, work: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Database>) -> Result<T> + Send + 'static,
+    {
+        let db = self.db.clone();
+        self.db_exec.run(move || work(db)).await
     }
 }
 
