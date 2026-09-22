@@ -568,7 +568,9 @@ impl PlaybackWorker {
                         );
                         return;
                     }
-                    if let Err(error) = self.push_time_slot_ms(slot_ms) {
+                    if let Err(error) =
+                        push_bounded_time_slot_ms(&mut self.presentation_time_slots_ms, slot_ms)
+                    {
                         session.decoded_video_frames = saved_video;
                         session.decoded_audio_chunks = saved_audio;
                         self.fail(error);
@@ -661,18 +663,7 @@ impl PlaybackWorker {
     }
 
     fn push_time_slot_ms(&mut self, slot_ms: u64) -> Result<(), String> {
-        if self.presentation_time_slots_ms.len() >= MAX_PRESENTATION_REORDER_FRAMES + 1 {
-            return Err("presentation timestamp-slot queue exceeded reorder bound".to_string());
-        }
-        if let Some(previous) = self.presentation_time_slots_ms.back().copied() {
-            if slot_ms < previous {
-                return Err(format!(
-                    "presentation timestamp regressed from {previous} ms to {slot_ms} ms"
-                ));
-            }
-        }
-        self.presentation_time_slots_ms.push_back(slot_ms);
-        Ok(())
+        push_bounded_time_slot_ms(&mut self.presentation_time_slots_ms, slot_ms)
     }
 
     fn clear_frame_slot(&self) {
@@ -745,6 +736,24 @@ fn frame_position_ms(frame: &DecodedVideoFrame) -> u64 {
             .saturating_mul(1000)
             .saturating_div(u64::from(frame.timescale_hz))
     }
+}
+
+fn push_bounded_time_slot_ms(
+    slots: &mut VecDeque<u64>,
+    slot_ms: u64,
+) -> Result<(), String> {
+    if slots.len() >= MAX_PRESENTATION_REORDER_FRAMES + 1 {
+        return Err("presentation timestamp-slot queue exceeded reorder bound".to_string());
+    }
+    if let Some(previous) = slots.back().copied() {
+        if slot_ms < previous {
+            return Err(format!(
+                "presentation timestamp regressed from {previous} ms to {slot_ms} ms"
+            ));
+        }
+    }
+    slots.push_back(slot_ms);
+    Ok(())
 }
 
 #[cfg(test)]
