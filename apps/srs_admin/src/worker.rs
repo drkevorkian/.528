@@ -15,7 +15,8 @@ use libsrs_licensing_proto::{
     AdminUpdateKeyStatusRequest, IssueKeyRequest, IssueKeyResponse,
 };
 use reqwest::blocking::{Client, RequestBuilder};
-use reqwest::StatusCode;
+use reqwest::{StatusCode, Url};
+use zeroize::Zeroizing;
 
 #[derive(Debug)]
 pub enum AdminCommand {
@@ -69,6 +70,42 @@ impl AdminClientError {
 
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminEndpointSecurity {
+    LocalHttp,
+    Https,
+}
+
+impl AdminEndpointSecurity {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::LocalHttp => "HTTP (local development)",
+            Self::Https => "HTTPS",
+        }
+    }
+}
+
+pub fn validate_admin_endpoint(base_url: &str) -> Result<AdminEndpointSecurity, AdminClientError> {
+    let url = Url::parse(base_url).map_err(|_| AdminClientError::SecurityFailure)?;
+    match url.scheme() {
+        "https" => Ok(AdminEndpointSecurity::Https),
+        "http" if is_loopback_host(&url) => Ok(AdminEndpointSecurity::LocalHttp),
+        _ => Err(AdminClientError::SecurityFailure),
+    }
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
 pub struct AdminWorker {
     command_tx: SyncSender<AdminCommand>,
     event_rx: Receiver<AdminEvent>,
@@ -77,10 +114,13 @@ pub struct AdminWorker {
 impl AdminWorker {
     pub fn spawn(
         base_url: String,
-        bearer_token: String,
+        bearer_token: Zeroizing<String>,
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, String> {
+        validate_admin_endpoint(&base_url)
+            .map_err(|error| error.user_message().to_string())?;
+
         let client = Client::builder()
             .connect_timeout(connect_timeout)
             .timeout(request_timeout)
@@ -92,6 +132,7 @@ impl AdminWorker {
         let (command_tx, command_rx) = mpsc::sync_channel(32);
         let (event_tx, event_rx) = mpsc::sync_channel(32);
 
+        let bearer_token = Zeroizing::new(bearer_token);
         thread::Builder::new()
             .name("srs-admin-http".to_string())
             .spawn(move || {
@@ -143,12 +184,12 @@ fn run_worker(
             AdminCommand::RefreshSnapshot => AdminEvent::Snapshot(
                 send_json::<AdminSnapshot>(authorized(
                     client.get(format!("{base_url}/api/v1/admin/snapshot")),
-                    &bearer_token,
+                    bearer_token.as_str(),
                 )),
             ),
             AdminCommand::IssueLicense(request) => AdminEvent::Issued(
                 send_json::<IssueKeyResponse>(
-                    authorized(client.post(format!("{base_url}/api/v1/issue")), &bearer_token)
+                    authorized(client.post(format!("{base_url}/api/v1/issue")), bearer_token.as_str())
                         .json(&request),
                 ),
             ),
@@ -156,7 +197,7 @@ fn run_worker(
                 send_json::<AdminActionResponse>(
                     authorized(
                         client.post(format!("{base_url}/api/v1/admin/licenses/features")),
-                        &bearer_token,
+                        bearer_token.as_str(),
                     )
                     .json(&request),
                 ),
@@ -165,7 +206,7 @@ fn run_worker(
                 send_json::<AdminActionResponse>(
                     authorized(
                         client.post(format!("{base_url}/api/v1/admin/keys/status")),
-                        &bearer_token,
+                        bearer_token.as_str(),
                     )
                     .json(&request),
                 ),
@@ -181,14 +222,14 @@ fn run_worker(
                     client.post(format!(
                         "{base_url}/api/v1/admin/requests/{request_id}/approve"
                     )),
-                    &bearer_token,
+                    bearer_token.as_str(),
                 )),
             ),
             AdminCommand::CreateNotification(request) => AdminEvent::Action(
                 send_json::<AdminActionResponse>(
                     authorized(
                         client.post(format!("{base_url}/api/v1/admin/notifications/create")),
-                        &bearer_token,
+                        bearer_token.as_str(),
                     )
                     .json(&request),
                 ),
@@ -279,6 +320,26 @@ mod tests {
         assert_eq!(
             classify_status(StatusCode::BAD_REQUEST),
             AdminClientError::ProtocolFailure
+        );
+    }
+
+    #[test]
+    fn endpoint_security_rejects_remote_plain_http() {
+        assert_eq!(
+            validate_admin_endpoint("http://127.0.0.1:3000").unwrap(),
+            AdminEndpointSecurity::LocalHttp
+        );
+        assert_eq!(
+            validate_admin_endpoint("http://localhost:3000").unwrap(),
+            AdminEndpointSecurity::LocalHttp
+        );
+        assert_eq!(
+            validate_admin_endpoint("https://admin.example.test").unwrap(),
+            AdminEndpointSecurity::Https
+        );
+        assert_eq!(
+            validate_admin_endpoint("http://admin.example.test"),
+            Err(AdminClientError::SecurityFailure)
         );
     }
 
