@@ -28,9 +28,9 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use mailer::MailDelivery;
 use tokio::net::TcpListener;
 use tracing::{error, info};
-use mailer::MailDelivery;
 use uuid::Uuid;
 
 const SCHEMA_SQL: &str = r#"
@@ -674,7 +674,7 @@ impl Database {
                 &request.device.install_id,
                 LicensedFeature::basic_defaults(),
                 EntitlementStatus::PendingConfirmation,
-                "Confirmation email sent; editor mode remains disabled until approved.".to_string(),
+                "Confirmation email queued; editor mode remains disabled until approved.".to_string(),
                 None,
                 None,
             )?;
@@ -747,7 +747,7 @@ impl Database {
             &request.device.install_id,
             LicensedFeature::basic_defaults(),
             EntitlementStatus::PendingConfirmation,
-            "New origin detected. Confirmation email sent to the original owner.".to_string(),
+            "New origin detected. Confirmation email queued for the original owner.".to_string(),
             None,
             None,
         )?;
@@ -3251,6 +3251,15 @@ mod tests {
         };
         db.verify_key(&config, &second, Some("203.0.113.10"))
             .expect("create pending request");
+
+        let pending_mail = db
+            .pending_mail_for_device("install-b")
+            .expect("query pending mail")
+            .expect("pending confirmation mail");
+        db.mark_notification_sent(&pending_mail.email_id)
+            .expect("mark confirmation sent");
+        db.mark_notification_delivered(&pending_mail.email_id)
+            .expect("mark confirmation delivered");
 
         let (token, request_id, sent_at, delivered_at, state_before, record_state_before): (
             String,
