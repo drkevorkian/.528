@@ -620,7 +620,7 @@ impl Database {
                     "replacement_key_issued",
                     json!({
                         "superseded_request_id": pending.request_id,
-                        "replacement_key": replacement.key_value,
+                        "replacement_key_id": replacement.key_id,
                     }),
                 )?;
                 let response = signed_response(
