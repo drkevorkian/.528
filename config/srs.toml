@@ -22,3 +22,8 @@ token_ttl_hours = 24
 # smtp_server = "127.0.0.1"
 # smtp_username = "smtp-user"
 # smtp_password = "smtp-password"
+
+# development | production
+# operating_mode = "development"
+# Required for issuance and /admin APIs. Prefer the SRS_ADMIN_TOKEN environment variable.
+# admin_token = ""
