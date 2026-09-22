@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use libsrs_app_services::{DecodedVideoFrame, PlaybackEvent, PlaybackSession, PlaybackState};
+use crate::audio_output::AudioOutput;
+use libsrs_app_services::{
+    DecodedAudioChunk, DecodedVideoFrame, PlaybackEvent, PlaybackSession, PlaybackState,
+};
 
 const COMMAND_CAPACITY: usize = 16;
 const EVENT_CAPACITY: usize = 16;
@@ -38,6 +41,10 @@ pub struct PlaybackSnapshot {
     pub dropped_video_frames: u64,
     pub reorder_depth: usize,
     pub seek_in_progress: bool,
+    pub audio_media_position_ms: Option<u64>,
+    pub audio_consumed_samples: u64,
+    pub audio_underrun_samples: u64,
+    pub audio_stream_errors: u64,
     pub last_error: Option<String>,
 }
 
@@ -55,6 +62,10 @@ impl Default for PlaybackSnapshot {
             dropped_video_frames: 0,
             reorder_depth: 0,
             seek_in_progress: false,
+            audio_media_position_ms: None,
+            audio_consumed_samples: 0,
+            audio_underrun_samples: 0,
+            audio_stream_errors: 0,
             last_error: None,
         }
     }
@@ -248,6 +259,13 @@ impl PresentationReorder {
     }
 }
 
+struct PendingAudioChunk {
+    sample_rate: u32,
+    channels: u8,
+    samples: Vec<i16>,
+    offset: usize,
+}
+
 struct PlaybackWorker {
     command_rx: Receiver<PlaybackWorkerCommand>,
     event_tx: SyncSender<PlaybackWorkerEvent>,
@@ -262,6 +280,13 @@ struct PlaybackWorker {
     dropped_video_frames: u64,
     presented_position_ms: u64,
     presentation_time_slots_ms: VecDeque<u64>,
+    audio_output: Option<AudioOutput>,
+    pending_audio: Option<PendingAudioChunk>,
+    audio_epoch: u64,
+    audio_epoch_media_start_ms: Option<u64>,
+    audio_epoch_consumed_base: u64,
+    audio_epoch_armed: bool,
+    audio_last_stream_errors: u64,
 }
 
 impl PlaybackWorker {
@@ -288,6 +313,13 @@ impl PlaybackWorker {
             presentation_time_slots_ms: VecDeque::with_capacity(
                 MAX_PRESENTATION_REORDER_FRAMES + 1,
             ),
+            audio_output: None,
+            pending_audio: None,
+            audio_epoch: 1,
+            audio_epoch_media_start_ms: None,
+            audio_epoch_consumed_base: 0,
+            audio_epoch_armed: false,
+            audio_last_stream_errors: 0,
         }
     }
 
