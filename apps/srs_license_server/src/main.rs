@@ -3286,4 +3286,144 @@ mod tests {
         let _ = fs::remove_file(std::path::Path::new(&config.database_path));
     }
 
+
+    #[test]
+    fn outbox_claim_is_single_owner_and_failure_is_retryable() {
+        let config = test_config("outbox-claim");
+        let db = Database::open(&config).expect("open db");
+        let issued = db
+            .issue_license(&IssueKeyRequest {
+                email: "owner@example.com".to_string(),
+                requested_features: None,
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue");
+
+        let pending = db
+            .enqueue_admin_notification(&AdminCreateNotificationRequest {
+                license_id: issued.license_id,
+                recipient: "owner@example.com".to_string(),
+                subject: "test".to_string(),
+                body: "body".to_string(),
+            })
+            .expect("enqueue");
+
+        assert!(db.claim_mail(&pending.email_id).expect("first claim"));
+        assert!(!db.claim_mail(&pending.email_id).expect("second claim"));
+
+        db.unclaim_mail(&pending.email_id).expect("unclaim");
+        assert!(db.claim_mail(&pending.email_id).expect("retry claim"));
+        db.mark_mail_accepted(&pending.email_id)
+            .expect("mark accepted");
+
+        let conn = db.conn.lock().expect("lock db");
+        let (state, sent, delivered): (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT notification_state, sent_at_epoch_s, delivered_at_epoch_s
+                 FROM email_outbox WHERE email_id = ?1",
+                params![&pending.email_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("outbox state");
+        assert_eq!(state, "delivered");
+        assert!(sent.is_some());
+        assert!(delivered.is_some());
+        drop(conn);
+
+        let _ = fs::remove_file(std::path::Path::new(&config.database_path));
+    }
+
+    #[test]
+    fn pending_confirmation_mail_is_scoped_by_license_and_hides_raw_key() {
+        fn request_for(key: String, install_id: &str) -> VerifyKeyRequest {
+            VerifyKeyRequest {
+                key,
+                claimed_ip: Some("192.0.2.20".to_string()),
+                os: libsrs_licensing_proto::ClientOsInfo {
+                    family: "linux".to_string(),
+                    version: None,
+                    arch: "x86_64".to_string(),
+                },
+                device: libsrs_licensing_proto::DeviceFingerprint {
+                    install_id: install_id.to_string(),
+                    hostname: Some("host".to_string()),
+                },
+                app: libsrs_licensing_proto::ClientAppInfo {
+                    name: "srs-player".to_string(),
+                    version: "0.1.0".to_string(),
+                    channel: None,
+                },
+                session_secret: None,
+            }
+        }
+
+        let config = test_config("outbox-scope");
+        let db = Database::open(&config).expect("open db");
+
+        let issued_a = db
+            .issue_license(&IssueKeyRequest {
+                email: "owner-a@example.com".to_string(),
+                requested_features: None,
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue a");
+        let issued_b = db
+            .issue_license(&IssueKeyRequest {
+                email: "owner-b@example.com".to_string(),
+                requested_features: None,
+                registrant_os: Some("Linux".to_string()),
+                registrant_ip: Some("127.0.0.1".to_string()),
+            })
+            .expect("issue b");
+
+        db.verify_key(
+            &config,
+            &request_for(issued_a.key.clone(), "trusted-a"),
+            Some("192.0.2.1"),
+        )
+        .expect("trust a");
+        db.verify_key(
+            &config,
+            &request_for(issued_b.key.clone(), "trusted-b"),
+            Some("192.0.2.2"),
+        )
+        .expect("trust b");
+
+        let shared_install = "same-client-supplied-device-id";
+        db.verify_key(
+            &config,
+            &request_for(issued_a.key.clone(), shared_install),
+            Some("192.0.2.3"),
+        )
+        .expect("pending a");
+        db.verify_key(
+            &config,
+            &request_for(issued_b.key.clone(), shared_install),
+            Some("192.0.2.4"),
+        )
+        .expect("pending b");
+
+        let mail_a = db
+            .claim_pending_mail_for_device(&issued_a.license_id, shared_install)
+            .expect("claim a")
+            .expect("mail a");
+        assert_eq!(mail_a.recipient, "owner-a@example.com");
+        assert!(!mail_a.body.contains(&issued_a.key));
+        assert!(mail_a.body.contains(&security::redact_license_key(&issued_a.key)));
+
+        let mail_b = db
+            .claim_pending_mail_for_device(&issued_b.license_id, shared_install)
+            .expect("claim b")
+            .expect("mail b");
+        assert_eq!(mail_b.recipient, "owner-b@example.com");
+        assert!(!mail_b.body.contains(&issued_b.key));
+        assert!(mail_b.body.contains(&security::redact_license_key(&issued_b.key)));
+
+        assert_ne!(mail_a.email_id, mail_b.email_id);
+
+        let _ = fs::remove_file(std::path::Path::new(&config.database_path));
+    }
+
 }
