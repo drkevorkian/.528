@@ -1,3 +1,4 @@
+mod outbox_ops;
 mod mail_exec;
 mod mailer;
 mod db_exec;
@@ -307,23 +308,35 @@ impl AppState {
     }
 
     async fn deliver_pending_mail(&self, pending: PendingMail) -> Result<MailDelivery> {
+        let email_id = pending.email_id.clone();
         let config = self.config.clone();
-        let recipient = pending.recipient.clone();
-        let subject = pending.subject.clone();
-        let body = pending.body.clone();
-        let delivery = self
+        let recipient = pending.recipient;
+        let subject = pending.subject;
+        let body = pending.body;
+
+        let delivery = match self
             .mail_exec
             .run(move || Ok(mailer::deliver_email(&recipient, &subject, &body, &config)))
-            .await?;
+            .await
+        {
+            Ok(delivery) => delivery,
+            Err(err) => {
+                let email_id_for_unclaim = email_id.clone();
+                let _ = self
+                    .run_db(move |db| db.unclaim_mail(&email_id_for_unclaim))
+                    .await;
+                return Err(err);
+            }
+        };
 
-        if matches!(delivery, MailDelivery::Delivered | MailDelivery::LoggedOnly) {
-            let email_id = pending.email_id;
-            self.run_db(move |db| {
-                db.mark_notification_sent(&email_id)?;
-                db.mark_notification_delivered(&email_id)?;
-                Ok(())
-            })
-            .await?;
+        match delivery {
+            MailDelivery::Delivered | MailDelivery::LoggedOnly => {
+                self.run_db(move |db| db.mark_mail_accepted(&email_id))
+                    .await?;
+            }
+            MailDelivery::Failed => {
+                self.run_db(move |db| db.unclaim_mail(&email_id)).await?;
+            }
         }
         Ok(delivery)
     }
@@ -344,6 +357,14 @@ impl Database {
         conn.execute_batch(SCHEMA_SQL)
             .context("initialize database schema")?;
         migrate_record_state_columns(&conn)?;
+        conn.execute(
+            "UPDATE email_outbox
+             SET notification_state = 'queued',
+                 state_changed_at_epoch_s = ?1
+             WHERE notification_state = 'sending'
+               AND record_state = 'active'",
+            params![now_epoch_s() as i64],
+        )?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -710,8 +731,9 @@ impl Database {
         );
         let subject = "Was this you? Confirm a new SRS installation".to_string();
         let body = format!(
-            "A new installation requested access.\n\nKey: {}\nIP: {}\nOS: {}/{}\nHostname: {}\n\nConfirm: {}\n\nIf you do nothing for {} hours, the requester will receive a separate basic key.",
-            request.key,
+            "A new installation requested access.\n\nKey ID: {}\nKey hint: {}\nIP: {}\nOS: {}/{}\nHostname: {}\n\nConfirm: {}\n\nIf you do nothing for {} hours, the requester will receive a separate basic key.",
+            key_row.key_id,
+            security::redact_license_key(&request.key),
             effective_ip.clone().unwrap_or_else(|| "unknown".to_string()),
             request.os.family,
             request.os.arch,
@@ -756,32 +778,63 @@ impl Database {
         Ok(response)
     }
 
-    fn pending_mail_for_device(&self, device_install_id: &str) -> Result<Option<PendingMail>> {
+    fn claim_pending_mail_for_device(
+        &self,
+        license_id: &str,
+        device_install_id: &str,
+    ) -> Result<Option<PendingMail>> {
+        let now = now_epoch_s() as i64;
         let conn = self
             .conn
             .lock()
             .map_err(|_| anyhow!("database mutex poisoned"))?;
-        conn.query_row(
-            "SELECT e.email_id, e.recipient, e.subject, e.body
-             FROM email_outbox e
-             JOIN verification_requests v ON v.request_id = e.request_id
-             WHERE v.device_install_id = ?1
-               AND e.notification_state = 'queued'
-               AND e.record_state = 'active'
-             ORDER BY e.created_at_epoch_s DESC
-             LIMIT 1",
-            params![device_install_id],
-            |row| {
-                Ok(PendingMail {
-                    email_id: row.get(0)?,
-                    recipient: row.get(1)?,
-                    subject: row.get(2)?,
-                    body: row.get(3)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
+
+        let pending = conn
+            .query_row(
+                outbox_ops::PENDING_MAIL_SQL,
+                params![device_install_id, license_id, now],
+                |row| {
+                    Ok(PendingMail {
+                        email_id: row.get(0)?,
+                        recipient: row.get(1)?,
+                        subject: row.get(2)?,
+                        body: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
+        if !outbox_ops::claim_queued(&conn, &pending.email_id, now)? {
+            return Ok(None);
+        }
+        Ok(Some(pending))
+    }
+
+    fn claim_mail(&self, email_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        outbox_ops::claim_queued(&conn, email_id, now_epoch_s() as i64)
+    }
+
+    fn mark_mail_accepted(&self, email_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        outbox_ops::mark_accepted(&conn, email_id, now_epoch_s() as i64)
+    }
+
+    fn unclaim_mail(&self, email_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| anyhow!("database mutex poisoned"))?;
+        outbox_ops::unclaim_to_queued(&conn, email_id, now_epoch_s() as i64)
     }
 
     fn admin_snapshot(&self) -> Result<AdminSnapshot> {
@@ -1493,532 +1546,7 @@ impl Database {
         Ok(playback_request_id)
     }
 
-    fn mark_notification_sent(&self, email_id: &str) -> Result<()> {
-        let now = now_epoch_s();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("database mutex poisoned"))?;
-        conn.execute(
-            "UPDATE email_outbox
-             SET sent_at_epoch_s = COALESCE(sent_at_epoch_s, ?1),
-                 notification_state = 'sent',
-                 state_changed_at_epoch_s = ?1
-             WHERE email_id = ?2",
-            params![now as i64, email_id],
-        )?;
-        Ok(())
-    }
 
-    fn mark_notification_delivered(&self, email_id: &str) -> Result<()> {
-        let now = now_epoch_s();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| anyhow!("database mutex poisoned"))?;
-        conn.execute(
-            "UPDATE email_outbox
-             SET sent_at_epoch_s = COALESCE(sent_at_epoch_s, ?1),
-                 delivered_at_epoch_s = COALESCE(delivered_at_epoch_s, ?1),
-                 notification_state = 'delivered',
-                 state_changed_at_epoch_s = ?1
-             WHERE email_id = ?2",
-            params![now as i64, email_id],
-        )?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PendingMail {
-    email_id: String,
-    recipient: String,
-    subject: String,
-    body: String,
-}
-
-#[derive(Debug)]
-struct KeyRow {
-    key_id: String,
-    license_id: String,
-    owner_email: String,
-}
-
-#[derive(Debug)]
-struct InstallationRow {
-    installation_id: String,
-    trusted: bool,
-    session_secret_hash: Option<String>,
-}
-
-#[derive(Debug)]
-struct PendingRequestRow {
-    request_id: String,
-    expires_at_epoch_s: i64,
-    approved_at_epoch_s: Option<i64>,
-}
-
-#[derive(Debug)]
-struct ReplacementOutcome {
-    license_id: String,
-    key_id: String,
-    key_value: String,
-    installation_id: String,
-    session_secret: String,
-}
-
-#[derive(Deserialize)]
-struct IssueForm {
-    email: String,
-}
-
-#[derive(Deserialize)]
-struct AdminFeatureForm {
-    license_id: String,
-    features_csv: String,
-}
-
-#[derive(Deserialize)]
-struct AdminKeyStatusForm {
-    key_id: String,
-    active: String,
-}
-
-async fn index() -> Html<String> {
-    Html(render_index_page(None))
-}
-
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-async fn issue_form(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Form(form): Form<IssueForm>,
-) -> AppResult<Html<String>> {
-    let request = IssueKeyRequest {
-        email: form.email,
-        requested_features: None,
-        registrant_os: user_agent_string(&headers),
-        registrant_ip: Some(addr.ip().to_string()),
-    };
-    let response = state
-        .run_db(move |db| db.issue_license(&request))
-        .await?;
-    Ok(Html(render_index_page(Some(&response))))
-}
-
-async fn issue_json(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-    Json(mut request): Json<IssueKeyRequest>,
-) -> AppResult<Json<IssueKeyResponse>> {
-    request.registrant_ip = Some(addr.ip().to_string());
-    if request.registrant_os.is_none() {
-        request.registrant_os = user_agent_string(&headers);
-    }
-    let response = state
-        .run_db(move |db| db.issue_license(&request))
-        .await?;
-    Ok(Json(response))
-}
-
-async fn verify_json(
-    State(state): State<Arc<AppState>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Json(request): Json<VerifyKeyRequest>,
-) -> AppResult<Json<VerifyKeyResponse>> {
-    let remote_ip = addr.ip().to_string();
-    let config = state.config.clone();
-    let device_install_id = request.device.install_id.clone();
-    let (response, pending_mail) = state
-        .run_db(move |db| {
-            let response = db.verify_key(&config, &request, Some(&remote_ip))?;
-            let pending_mail = db.pending_mail_for_device(&device_install_id)?;
-            Ok((response, pending_mail))
-        })
-        .await?;
-    if let Some(pending_mail) = pending_mail {
-        let _ = state.deliver_pending_mail(pending_mail).await?;
-    }
-    Ok(Json(response))
-}
-
-async fn read_client_notifications_json(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<ClientNotificationReadRequest>,
-) -> AppResult<Json<Vec<ClientNotification>>> {
-    let notifications = state
-        .run_db(move |db| db.read_client_notifications(&request))
-        .await?;
-    Ok(Json(notifications))
-}
-
-async fn report_unsupported_playback_json(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<ClientUnsupportedPlaybackRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    let id = state
-        .run_db(move |db| db.record_unsupported_playback(&request))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: format!("unsupported playback request recorded: {id}"),
-    }))
-}
-
-async fn confirm_request_page(
-    State(state): State<Arc<AppState>>,
-    AxumPath(token): AxumPath<String>,
-) -> AppResult<(HeaderMap, Html<String>)> {
-    let token_for_lookup = token.clone();
-    let license_id = state
-        .run_db(move |db| db.confirmation_license(&token_for_lookup))
-        .await?;
-    let Some(license_id) = license_id else {
-        return Err(AppError::not_found("confirmation token not found or expired"));
-    };
-    let mut headers = HeaderMap::new();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-    headers.insert(
-        header::REFERRER_POLICY,
-        HeaderValue::from_static("no-referrer"),
-    );
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; form-action 'self'; base-uri 'none'"),
-    );
-    Ok((
-        headers,
-        Html(format!(
-            "<html><body><h1>Confirm Installation</h1><p>License {}</p><form method=\"post\" action=\"/confirm/{}\"><button type=\"submit\">Confirm Installation</button></form></body></html>",
-            html_escape(&license_id),
-            html_escape(&token)
-        )),
-    ))
-}
-
-async fn confirm_request_post(
-    State(state): State<Arc<AppState>>,
-    AxumPath(token): AxumPath<String>,
-) -> AppResult<Html<String>> {
-    let confirmed = state
-        .run_db(move |db| db.confirm_request(&token))
-        .await?;
-    match confirmed {
-        Some(license_id) => Ok(Html(format!(
-            "<html><body><h1>Confirmation Recorded</h1><p>License {}</p><p>The next client refresh will trust this installation.</p></body></html>",
-            html_escape(&license_id)
-        ))),
-        None => Err(AppError::not_found("confirmation token not found or expired")),
-    }
-}
-
-async fn admin_dashboard(
-    State(state): State<Arc<AppState>>,
-) -> AppResult<Html<String>> {
-    let snapshot = state.run_db(|db| db.admin_snapshot()).await?;
-    Ok(Html(render_admin_page(&snapshot)))
-}
-
-async fn update_license_features_handler(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<AdminFeatureForm>,
-) -> AppResult<Redirect> {
-    let features = parse_feature_csv(&form.features_csv);
-    let license_id = form.license_id;
-    state
-        .run_db(move |db| db.update_license_features(&license_id, &features))
-        .await?;
-    Ok(Redirect::to("/admin"))
-}
-
-async fn delete_license_handler(
-    State(state): State<Arc<AppState>>,
-    AxumPath(license_id): AxumPath<String>,
-) -> AppResult<Redirect> {
-    state
-        .run_db(move |db| db.delete_license(&license_id))
-        .await?;
-    Ok(Redirect::to("/admin"))
-}
-
-async fn update_key_status_handler(
-    State(state): State<Arc<AppState>>,
-    Form(form): Form<AdminKeyStatusForm>,
-) -> AppResult<Redirect> {
-    let active = matches!(form.active.as_str(), "1" | "true" | "on" | "yes");
-    let key_id = form.key_id;
-    state
-        .run_db(move |db| db.set_key_active(&key_id, active))
-        .await?;
-    Ok(Redirect::to("/admin"))
-}
-
-async fn delete_key_handler(
-    State(state): State<Arc<AppState>>,
-    AxumPath(key_id): AxumPath<String>,
-) -> AppResult<Redirect> {
-    state.run_db(move |db| db.delete_key(&key_id)).await?;
-    Ok(Redirect::to("/admin"))
-}
-
-async fn approve_request_handler(
-    State(state): State<Arc<AppState>>,
-    AxumPath(request_id): AxumPath<String>,
-) -> AppResult<Redirect> {
-    state
-        .run_db(move |db| db.approve_request_by_id(&request_id))
-        .await?;
-    Ok(Redirect::to("/admin"))
-}
-
-async fn delete_request_handler(
-    State(state): State<Arc<AppState>>,
-    AxumPath(request_id): AxumPath<String>,
-) -> AppResult<Redirect> {
-    state
-        .run_db(move |db| db.delete_request(&request_id))
-        .await?;
-    Ok(Redirect::to("/admin"))
-}
-
-async fn delete_installation_handler(
-    State(state): State<Arc<AppState>>,
-    AxumPath(installation_id): AxumPath<String>,
-) -> AppResult<Redirect> {
-    state
-        .run_db(move |db| db.delete_installation(&installation_id))
-        .await?;
-    Ok(Redirect::to("/admin"))
-}
-
-async fn delete_audit_handler(
-    State(state): State<Arc<AppState>>,
-    AxumPath(event_id): AxumPath<String>,
-) -> AppResult<Redirect> {
-    state
-        .run_db(move |db| db.delete_audit(&event_id))
-        .await?;
-    Ok(Redirect::to("/admin"))
-}
-
-async fn admin_snapshot_json(
-    State(state): State<Arc<AppState>>,
-) -> AppResult<Json<AdminSnapshot>> {
-    Ok(Json(state.run_db(|db| db.admin_snapshot()).await?))
-}
-
-async fn create_notification_json(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<AdminCreateNotificationRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    let pending = state
-        .run_db(move |db| db.enqueue_admin_notification(&request))
-        .await?;
-    let email_id = pending.email_id.clone();
-    let delivery = state.deliver_pending_mail(pending).await?;
-    let message = match delivery {
-        MailDelivery::Delivered | MailDelivery::LoggedOnly => {
-            format!("notification queued and delivered: {email_id}")
-        }
-        MailDelivery::Failed => format!("notification queued for retry: {email_id}"),
-    };
-    Ok(Json(AdminActionResponse { ok: true, message }))
-}
-
-async fn update_license_features_json(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<AdminUpdateLicenseFeaturesRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    state
-        .run_db(move |db| db.update_license_features(&request.license_id, &request.features))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: "license features updated".to_string(),
-    }))
-}
-
-async fn delete_license_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(license_id): AxumPath<String>,
-) -> AppResult<Json<AdminActionResponse>> {
-    state
-        .run_db(move |db| db.delete_license(&license_id))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: "license deleted".to_string(),
-    }))
-}
-
-async fn update_license_state_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(license_id): AxumPath<String>,
-    Json(request): Json<AdminUpdateRecordStateRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    let new_state = request.state;
-    state
-        .run_db(move |db| db.set_license_record_state(&license_id, new_state))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: format!("license state updated to {}", new_state.as_str()),
-    }))
-}
-
-async fn update_key_status_json(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<AdminUpdateKeyStatusRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    state
-        .run_db(move |db| db.set_key_active(&request.key_id, request.active))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: "key status updated".to_string(),
-    }))
-}
-
-async fn update_key_state_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(key_id): AxumPath<String>,
-    Json(request): Json<AdminUpdateRecordStateRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    let new_state = request.state;
-    state
-        .run_db(move |db| db.set_key_record_state(&key_id, new_state))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: format!("key state updated to {}", new_state.as_str()),
-    }))
-}
-
-async fn delete_key_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(key_id): AxumPath<String>,
-) -> AppResult<Json<AdminActionResponse>> {
-    state.run_db(move |db| db.delete_key(&key_id)).await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: "key deleted".to_string(),
-    }))
-}
-
-async fn approve_request_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(request_id): AxumPath<String>,
-) -> AppResult<Json<AdminActionResponse>> {
-    state
-        .run_db(move |db| db.approve_request_by_id(&request_id))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: "verification request approved".to_string(),
-    }))
-}
-
-async fn update_request_state_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(request_id): AxumPath<String>,
-    Json(request): Json<AdminUpdateRecordStateRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    let new_state = request.state;
-    state
-        .run_db(move |db| db.set_request_record_state(&request_id, new_state))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: format!(
-            "verification request state updated to {}",
-            new_state.as_str()
-        ),
-    }))
-}
-
-async fn delete_request_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(request_id): AxumPath<String>,
-) -> AppResult<Json<AdminActionResponse>> {
-    state
-        .run_db(move |db| db.delete_request(&request_id))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: "verification request deleted".to_string(),
-    }))
-}
-
-async fn delete_installation_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(installation_id): AxumPath<String>,
-) -> AppResult<Json<AdminActionResponse>> {
-    state
-        .run_db(move |db| db.delete_installation(&installation_id))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: "installation deleted".to_string(),
-    }))
-}
-
-async fn update_installation_state_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(installation_id): AxumPath<String>,
-    Json(request): Json<AdminUpdateRecordStateRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    let new_state = request.state;
-    state
-        .run_db(move |db| db.set_installation_record_state(&installation_id, new_state))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: format!("installation state updated to {}", new_state.as_str()),
-    }))
-}
-
-async fn delete_audit_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(event_id): AxumPath<String>,
-) -> AppResult<Json<AdminActionResponse>> {
-    state
-        .run_db(move |db| db.delete_audit(&event_id))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: "audit event deleted".to_string(),
-    }))
-}
-
-async fn update_audit_state_json(
-    State(state): State<Arc<AppState>>,
-    AxumPath(event_id): AxumPath<String>,
-    Json(request): Json<AdminUpdateRecordStateRequest>,
-) -> AppResult<Json<AdminActionResponse>> {
-    let new_state = request.state;
-    state
-        .run_db(move |db| db.set_audit_record_state(&event_id, new_state))
-        .await?;
-    Ok(Json(AdminActionResponse {
-        ok: true,
-        message: format!("audit state updated to {}", new_state.as_str()),
-    }))
-}
-
-type AppResult<T> = Result<T, AppError>;
-
-struct AppError {
-    status: StatusCode,
-    message: String,
-}
-
-impl AppError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -3266,13 +2794,11 @@ mod tests {
             .expect("create pending request");
 
         let pending_mail = db
-            .pending_mail_for_device("install-b")
+            .claim_pending_mail_for_device(&issued.license_id, "install-b")
             .expect("query pending mail")
             .expect("pending confirmation mail");
-        db.mark_notification_sent(&pending_mail.email_id)
-            .expect("mark confirmation sent");
-        db.mark_notification_delivered(&pending_mail.email_id)
-            .expect("mark confirmation delivered");
+        db.mark_mail_accepted(&pending_mail.email_id)
+            .expect("mark confirmation accepted");
 
         let (token, request_id, sent_at, delivered_at, state_before, record_state_before): (
             String,
@@ -3452,10 +2978,10 @@ mod tests {
                 })
             .expect("create notification");
 
-        db.mark_notification_sent(&pending_mail.email_id)
-            .expect("mark notification sent");
-        db.mark_notification_delivered(&pending_mail.email_id)
-            .expect("mark notification delivered");
+        db.claim_mail(&pending_mail.email_id)
+            .expect("claim notification");
+        db.mark_mail_accepted(&pending_mail.email_id)
+            .expect("mark notification accepted");
 
         let notifications = db
             .read_client_notifications(&ClientNotificationReadRequest {
