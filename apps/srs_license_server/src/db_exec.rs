@@ -18,13 +18,25 @@ pub const DB_PERMIT_LIMIT: usize = 1;
 #[derive(Clone, Debug)]
 pub struct BoundedDbExecutor {
     permits: Arc<Semaphore>,
+    limit: usize,
 }
 
 impl BoundedDbExecutor {
     pub fn new() -> Self {
+        Self::with_limit(DB_PERMIT_LIMIT)
+    }
+
+    /// Separate pools (DB vs SMTP) must not share a semaphore.
+    pub fn with_limit(limit: usize) -> Self {
+        let limit = limit.max(1);
         Self {
-            permits: Arc::new(Semaphore::new(DB_PERMIT_LIMIT)),
+            permits: Arc::new(Semaphore::new(limit)),
+            limit,
         }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     pub fn available_permits(&self) -> usize {
@@ -114,5 +126,12 @@ mod tests {
         }
         assert_eq!(peak.load(Ordering::SeqCst), 1, "permit limit is 1");
         assert_eq!(exec.available_permits(), DB_PERMIT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn with_limit_creates_an_independent_pool() {
+        let mail = BoundedDbExecutor::with_limit(2);
+        assert_eq!(mail.limit(), 2);
+        assert_eq!(mail.available_permits(), 2);
     }
 }
