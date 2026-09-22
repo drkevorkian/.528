@@ -1515,12 +1515,15 @@ async fn issue_form(
     headers: HeaderMap,
     Form(form): Form<IssueForm>,
 ) -> AppResult<Html<String>> {
-    let response = state.db.issue_license(&IssueKeyRequest {
+    let request = IssueKeyRequest {
         email: form.email,
         requested_features: None,
         registrant_os: user_agent_string(&headers),
         registrant_ip: Some(addr.ip().to_string()),
-    })?;
+    };
+    let response = state
+        .run_db(move |db| db.issue_license(&request))
+        .await?;
     Ok(Html(render_index_page(Some(&response))))
 }
 
@@ -1534,7 +1537,10 @@ async fn issue_json(
     if request.registrant_os.is_none() {
         request.registrant_os = user_agent_string(&headers);
     }
-    Ok(Json(state.db.issue_license(&request)?))
+    let response = state
+        .run_db(move |db| db.issue_license(&request))
+        .await?;
+    Ok(Json(response))
 }
 
 async fn verify_json(
@@ -1542,10 +1548,11 @@ async fn verify_json(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(request): Json<VerifyKeyRequest>,
 ) -> AppResult<Json<VerifyKeyResponse>> {
-    let remote_ip = Some(addr.ip().to_string());
+    let remote_ip = addr.ip().to_string();
+    let config = state.config.clone();
     let response = state
-        .db
-        .verify_key(&state.config, &request, remote_ip.as_deref())?;
+        .run_db(move |db| db.verify_key(&config, &request, Some(&remote_ip)))
+        .await?;
     Ok(Json(response))
 }
 
@@ -1553,14 +1560,19 @@ async fn read_client_notifications_json(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ClientNotificationReadRequest>,
 ) -> AppResult<Json<Vec<ClientNotification>>> {
-    Ok(Json(state.db.read_client_notifications(&request)?))
+    let notifications = state
+        .run_db(move |db| db.read_client_notifications(&request))
+        .await?;
+    Ok(Json(notifications))
 }
 
 async fn report_unsupported_playback_json(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ClientUnsupportedPlaybackRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    let id = state.db.record_unsupported_playback(&request)?;
+    let id = state
+        .run_db(move |db| db.record_unsupported_playback(&request))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: format!("unsupported playback request recorded: {id}"),
@@ -1571,7 +1583,10 @@ async fn confirm_request(
     State(state): State<Arc<AppState>>,
     AxumPath(token): AxumPath<String>,
 ) -> AppResult<Html<String>> {
-    match state.db.confirm_request(&token)? {
+    let confirmed = state
+        .run_db(move |db| db.confirm_request(&token))
+        .await?;
+    match confirmed {
         Some(license_id) => Ok(Html(format!(
             "<html><body><h1>Confirmation Recorded</h1><p>License {}</p><p>The next client refresh will trust this installation.</p></body></html>",
             html_escape(&license_id)
@@ -1583,7 +1598,7 @@ async fn confirm_request(
 async fn admin_dashboard(
     State(state): State<Arc<AppState>>,
 ) -> AppResult<Html<String>> {
-    let snapshot = state.db.admin_snapshot()?;
+    let snapshot = state.run_db(|db| db.admin_snapshot()).await?;
     Ok(Html(render_admin_page(&snapshot)))
 }
 
@@ -1591,9 +1606,11 @@ async fn update_license_features_handler(
     State(state): State<Arc<AppState>>,
     Form(form): Form<AdminFeatureForm>,
 ) -> AppResult<Redirect> {
+    let features = parse_feature_csv(&form.features_csv);
+    let license_id = form.license_id;
     state
-        .db
-        .update_license_features(&form.license_id, &parse_feature_csv(&form.features_csv))?;
+        .run_db(move |db| db.update_license_features(&license_id, &features))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
@@ -1601,7 +1618,9 @@ async fn delete_license_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(license_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    state.db.delete_license(&license_id)?;
+    state
+        .run_db(move |db| db.delete_license(&license_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
@@ -1610,7 +1629,10 @@ async fn update_key_status_handler(
     Form(form): Form<AdminKeyStatusForm>,
 ) -> AppResult<Redirect> {
     let active = matches!(form.active.as_str(), "1" | "true" | "on" | "yes");
-    state.db.set_key_active(&form.key_id, active)?;
+    let key_id = form.key_id;
+    state
+        .run_db(move |db| db.set_key_active(&key_id, active))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
@@ -1618,7 +1640,7 @@ async fn delete_key_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(key_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    state.db.delete_key(&key_id)?;
+    state.run_db(move |db| db.delete_key(&key_id)).await?;
     Ok(Redirect::to("/admin"))
 }
 
@@ -1626,7 +1648,9 @@ async fn approve_request_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    state.db.approve_request_by_id(&request_id)?;
+    state
+        .run_db(move |db| db.approve_request_by_id(&request_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
@@ -1634,7 +1658,9 @@ async fn delete_request_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    state.db.delete_request(&request_id)?;
+    state
+        .run_db(move |db| db.delete_request(&request_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
@@ -1642,7 +1668,9 @@ async fn delete_installation_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(installation_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    state.db.delete_installation(&installation_id)?;
+    state
+        .run_db(move |db| db.delete_installation(&installation_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
@@ -1650,23 +1678,26 @@ async fn delete_audit_handler(
     State(state): State<Arc<AppState>>,
     AxumPath(event_id): AxumPath<String>,
 ) -> AppResult<Redirect> {
-    state.db.delete_audit(&event_id)?;
+    state
+        .run_db(move |db| db.delete_audit(&event_id))
+        .await?;
     Ok(Redirect::to("/admin"))
 }
 
 async fn admin_snapshot_json(
     State(state): State<Arc<AppState>>,
 ) -> AppResult<Json<AdminSnapshot>> {
-    Ok(Json(state.db.admin_snapshot()?))
+    Ok(Json(state.run_db(|db| db.admin_snapshot()).await?))
 }
 
 async fn create_notification_json(
     State(state): State<Arc<AppState>>,
     Json(request): Json<AdminCreateNotificationRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
+    let config = state.config.clone();
     let email_id = state
-        .db
-        .create_and_send_notification(&state.config, &request)?;
+        .run_db(move |db| db.create_and_send_notification(&config, &request))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: format!("notification queued and sent: {email_id}"),
@@ -1678,8 +1709,8 @@ async fn update_license_features_json(
     Json(request): Json<AdminUpdateLicenseFeaturesRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
     state
-        .db
-        .update_license_features(&request.license_id, &request.features)?;
+        .run_db(move |db| db.update_license_features(&request.license_id, &request.features))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "license features updated".to_string(),
@@ -1690,7 +1721,9 @@ async fn delete_license_json(
     State(state): State<Arc<AppState>>,
     AxumPath(license_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.delete_license(&license_id)?;
+    state
+        .run_db(move |db| db.delete_license(&license_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "license deleted".to_string(),
@@ -1702,12 +1735,13 @@ async fn update_license_state_json(
     AxumPath(license_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
+    let new_state = request.state;
     state
-        .db
-        .set_license_record_state(&license_id, request.state)?;
+        .run_db(move |db| db.set_license_record_state(&license_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
-        message: format!("license state updated to {}", request.state.as_str()),
+        message: format!("license state updated to {}", new_state.as_str()),
     }))
 }
 
@@ -1715,7 +1749,9 @@ async fn update_key_status_json(
     State(state): State<Arc<AppState>>,
     Json(request): Json<AdminUpdateKeyStatusRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.set_key_active(&request.key_id, request.active)?;
+    state
+        .run_db(move |db| db.set_key_active(&request.key_id, request.active))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "key status updated".to_string(),
@@ -1727,10 +1763,13 @@ async fn update_key_state_json(
     AxumPath(key_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.set_key_record_state(&key_id, request.state)?;
+    let new_state = request.state;
+    state
+        .run_db(move |db| db.set_key_record_state(&key_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
-        message: format!("key state updated to {}", request.state.as_str()),
+        message: format!("key state updated to {}", new_state.as_str()),
     }))
 }
 
@@ -1738,7 +1777,7 @@ async fn delete_key_json(
     State(state): State<Arc<AppState>>,
     AxumPath(key_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.delete_key(&key_id)?;
+    state.run_db(move |db| db.delete_key(&key_id)).await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "key deleted".to_string(),
@@ -1749,7 +1788,9 @@ async fn approve_request_json(
     State(state): State<Arc<AppState>>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.approve_request_by_id(&request_id)?;
+    state
+        .run_db(move |db| db.approve_request_by_id(&request_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "verification request approved".to_string(),
@@ -1761,14 +1802,15 @@ async fn update_request_state_json(
     AxumPath(request_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
+    let new_state = request.state;
     state
-        .db
-        .set_request_record_state(&request_id, request.state)?;
+        .run_db(move |db| db.set_request_record_state(&request_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: format!(
             "verification request state updated to {}",
-            request.state.as_str()
+            new_state.as_str()
         ),
     }))
 }
@@ -1777,7 +1819,9 @@ async fn delete_request_json(
     State(state): State<Arc<AppState>>,
     AxumPath(request_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.delete_request(&request_id)?;
+    state
+        .run_db(move |db| db.delete_request(&request_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "verification request deleted".to_string(),
@@ -1788,7 +1832,9 @@ async fn delete_installation_json(
     State(state): State<Arc<AppState>>,
     AxumPath(installation_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.delete_installation(&installation_id)?;
+    state
+        .run_db(move |db| db.delete_installation(&installation_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "installation deleted".to_string(),
@@ -1800,12 +1846,13 @@ async fn update_installation_state_json(
     AxumPath(installation_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
+    let new_state = request.state;
     state
-        .db
-        .set_installation_record_state(&installation_id, request.state)?;
+        .run_db(move |db| db.set_installation_record_state(&installation_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
-        message: format!("installation state updated to {}", request.state.as_str()),
+        message: format!("installation state updated to {}", new_state.as_str()),
     }))
 }
 
@@ -1813,7 +1860,9 @@ async fn delete_audit_json(
     State(state): State<Arc<AppState>>,
     AxumPath(event_id): AxumPath<String>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.delete_audit(&event_id)?;
+    state
+        .run_db(move |db| db.delete_audit(&event_id))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
         message: "audit event deleted".to_string(),
@@ -1825,10 +1874,13 @@ async fn update_audit_state_json(
     AxumPath(event_id): AxumPath<String>,
     Json(request): Json<AdminUpdateRecordStateRequest>,
 ) -> AppResult<Json<AdminActionResponse>> {
-    state.db.set_audit_record_state(&event_id, request.state)?;
+    let new_state = request.state;
+    state
+        .run_db(move |db| db.set_audit_record_state(&event_id, new_state))
+        .await?;
     Ok(Json(AdminActionResponse {
         ok: true,
-        message: format!("audit state updated to {}", request.state.as_str()),
+        message: format!("audit state updated to {}", new_state.as_str()),
     }))
 }
 
