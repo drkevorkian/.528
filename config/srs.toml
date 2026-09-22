@@ -10,6 +10,12 @@ refresh_interval_s = 3600
 contact_email = "support@localhost"
 help_url = "http://localhost:3000"
 
+[admin]
+# Client-facing URL used by the native srs_admin application.
+# Override with SRS_ADMIN_BASE_URL. Authentication comes from SRS_ADMIN_TOKEN,
+# never from this file.
+base_url = "http://localhost:3000"
+
 [server]
 # Change to 0.0.0.0:3000 (or your preferred interface) when serving remote clients.
 bind_addr = "127.0.0.1:3000"
