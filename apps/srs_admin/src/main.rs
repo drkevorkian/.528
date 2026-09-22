@@ -470,12 +470,16 @@ impl AdminApp {
                 self.issue_license();
             }
 
-            if let Some(issued) = &self.issued_credential {
+            if let Some((license_id, key)) = self
+                .issued_credential
+                .as_ref()
+                .map(|issued| (issued.license_id.clone(), issued.key.clone()))
+            {
                 ui.separator();
                 ui.strong("New credential — copy it now");
-                ui.monospace(format!("License: {}", issued.license_id));
+                ui.monospace(format!("License: {license_id}"));
                 ui.horizontal_wrapped(|ui| {
-                    ui.monospace(&issued.key);
+                    ui.monospace(&key);
                     if ui.button("Clear Credential").clicked() {
                         self.issued_credential = None;
                     }
