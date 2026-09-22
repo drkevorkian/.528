@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::audio_output::AudioOutput;
+use crate::audio_output::{AudioOutput, AudioSink, AudioTelemetry};
 use libsrs_app_services::{
     DecodedAudioChunk, DecodedVideoFrame, PlaybackEvent, PlaybackSession, PlaybackState,
 };
@@ -280,7 +280,7 @@ struct PlaybackWorker {
     dropped_video_frames: u64,
     presented_position_ms: u64,
     presentation_time_slots_ms: VecDeque<u64>,
-    audio_output: Option<AudioOutput>,
+    audio_output: Option<Box<dyn AudioSink>>,
     pending_audio: Option<PendingAudioChunk>,
     audio_epoch: u64,
     audio_epoch_media_start_ms: Option<u64>,
@@ -745,7 +745,7 @@ impl PlaybackWorker {
             let output = AudioOutput::open(chunk.sample_rate, chunk.channels, self.audio_epoch)
                 .map_err(|error| format!("audio output initialization failed: {error:#}"))?;
             self.audio_last_stream_errors = output.telemetry().stream_errors;
-            self.audio_output = Some(output);
+            self.audio_output = Some(Box::new(output));
         }
 
         let Some(audio) = self.audio_output.as_ref() else {
