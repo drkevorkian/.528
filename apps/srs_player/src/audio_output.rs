@@ -19,6 +19,18 @@ pub struct AudioTelemetry {
     pub callback_epoch: u64,
 }
 
+pub(crate) trait AudioSink: Send {
+    fn matches_format(&self, sample_rate: u32, channels: u8) -> bool;
+    fn request_epoch(&self, epoch: u64);
+    fn epoch_ready(&self, epoch: u64) -> bool;
+    fn push_pcm(&mut self, epoch: u64, samples: &[i16]) -> Result<usize>;
+    fn telemetry(&self) -> AudioTelemetry;
+    fn sample_rate(&self) -> u32;
+    fn channels(&self) -> u16;
+    fn pause(&self) -> Result<()>;
+    fn play(&self) -> Result<()>;
+}
+
 pub struct AudioOutput {
     producer: Producer<i16>,
     stream: Stream,
@@ -138,6 +150,44 @@ impl AudioOutput {
 
     pub fn play(&self) -> Result<()> {
         self.stream.play().context("failed to resume audio stream")
+    }
+}
+
+impl AudioSink for AudioOutput {
+    fn matches_format(&self, sample_rate: u32, channels: u8) -> bool {
+        AudioOutput::matches_format(self, sample_rate, channels)
+    }
+
+    fn request_epoch(&self, epoch: u64) {
+        AudioOutput::request_epoch(self, epoch);
+    }
+
+    fn epoch_ready(&self, epoch: u64) -> bool {
+        AudioOutput::epoch_ready(self, epoch)
+    }
+
+    fn push_pcm(&mut self, epoch: u64, samples: &[i16]) -> Result<usize> {
+        AudioOutput::push_pcm(self, epoch, samples)
+    }
+
+    fn telemetry(&self) -> AudioTelemetry {
+        AudioOutput::telemetry(self)
+    }
+
+    fn sample_rate(&self) -> u32 {
+        AudioOutput::sample_rate(self)
+    }
+
+    fn channels(&self) -> u16 {
+        AudioOutput::channels(self)
+    }
+
+    fn pause(&self) -> Result<()> {
+        AudioOutput::pause(self)
+    }
+
+    fn play(&self) -> Result<()> {
+        AudioOutput::play(self)
     }
 }
 
