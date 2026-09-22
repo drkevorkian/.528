@@ -503,11 +503,6 @@ impl PlayerApp {
 
         for _ in 0..MAX_EVENTS_PER_UI_TICK {
             match self.playback.worker.try_recv_event() {
-                Ok(PlaybackWorkerEvent::Snapshot(snapshot)) => {
-                    if snapshot.generation == self.playback.generation {
-                        self.apply_worker_snapshot(snapshot);
-                    }
-                }
                 Ok(PlaybackWorkerEvent::FrameReady { generation }) => {
                     if generation == self.playback.generation {
                         ctx.request_repaint();
@@ -556,6 +551,24 @@ impl PlayerApp {
             self.playback.seek_in_progress = false;
             self.status = "Playback worker disconnected".to_string();
             self.push_notification(self.status.clone());
+        }
+
+        if !disconnected {
+            match self.playback.worker.latest_snapshot() {
+                Ok(snapshot) if snapshot.generation == self.playback.generation => {
+                    self.apply_worker_snapshot(snapshot);
+                }
+                Ok(_) => {}
+                Err(message) => {
+                    if self.playback.worker_state != PlayerState::Error {
+                        self.playback.worker_state = PlayerState::Error;
+                        self.playback.command_pending = false;
+                        self.playback.seek_in_progress = false;
+                        self.status = format!("Playback state handoff error: {message}");
+                        self.push_notification(self.status.clone());
+                    }
+                }
+            }
         }
 
         if self.playback.worker_state != PlayerState::Error {
