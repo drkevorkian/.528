@@ -449,10 +449,41 @@ impl PlaybackWorker {
     fn perform_seek(&mut self, target_ms: u64) {
         let resume_playing = self.state == PlayerState::Playing;
         self.state = PlayerState::Seeking;
-        self.reorder
-            .reset(Some((target_ms / COMPAT_FRAME_DURATION_MS).min(u32::MAX as u64) as u32));
         self.clear_frame_slot();
         self.emit_snapshot();
+
+        let srsv2_compat = self
+            .session
+            .as_ref()
+            .and_then(|session| session.primary_video())
+            .is_some_and(|track| track.codec_id == 3);
+
+        if !srsv2_compat {
+            self.reorder.reset(None);
+            let Some(session) = self.session.as_mut() else {
+                self.fail("seek requested without an open playback session".to_string());
+                return;
+            };
+            if let Err(error) = session.seek_ms(target_ms) {
+                self.fail(error.to_string());
+                return;
+            }
+            self.presented_position_ms = target_ms.min(session.duration_ms());
+            self.state = if resume_playing {
+                PlayerState::Playing
+            } else {
+                PlayerState::Paused
+            };
+            let _ = self.event_tx.try_send(PlaybackWorkerEvent::SeekCompleted {
+                generation: self.generation,
+                presented_position_ms: self.presented_position_ms,
+            });
+            self.emit_snapshot();
+            return;
+        }
+
+        let target_index = (target_ms / COMPAT_FRAME_DURATION_MS).min(u32::MAX as u64) as u32;
+        self.reorder.reset(Some(target_index));
 
         let Some(session) = self.session.as_mut() else {
             self.fail("seek requested without an open playback session".to_string());
@@ -467,7 +498,6 @@ impl PlaybackWorker {
         }
 
         const RECOVERY_STEP_BUDGET: usize = 8192;
-        let target_index = (target_ms / COMPAT_FRAME_DURATION_MS).min(u32::MAX as u64) as u32;
         let mut target_reached = false;
 
         for _ in 0..RECOVERY_STEP_BUDGET {
@@ -522,7 +552,21 @@ impl PlaybackWorker {
     }
 
     fn publish_frame(&mut self, frame: DecodedVideoFrame) {
-        let position_ms = u64::from(frame.frame_index).saturating_mul(COMPAT_FRAME_DURATION_MS);
+        let srsv2_compat = self
+            .session
+            .as_ref()
+            .and_then(|session| session.primary_video())
+            .is_some_and(|track| track.codec_id == 3);
+        let position_ms = if srsv2_compat {
+            u64::from(frame.frame_index).saturating_mul(COMPAT_FRAME_DURATION_MS)
+        } else if frame.timescale_hz == 0 {
+            0
+        } else {
+            frame
+                .pts_ticks
+                .saturating_mul(1000)
+                .saturating_div(u64::from(frame.timescale_hz))
+        };
         let presentation = PresentationFrame {
             generation: self.generation,
             frame,
