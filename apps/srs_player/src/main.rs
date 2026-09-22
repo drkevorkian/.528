@@ -5,8 +5,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use libsrs_app_config::SrsConfig;
-use libsrs_app_services::{
-    AppServices, DecodedVideoFrame, MediaInspection, PlaybackEvent, PlaybackSession, PlaybackState,
+use libsrs_app_services::{AppServices, DecodedVideoFrame, MediaInspection};
+use playback_worker::{
+    PlaybackSnapshot, PlaybackWorkerCommand, PlaybackWorkerEvent, PlaybackWorkerHandle, PlayerState,
 };
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
@@ -61,20 +62,46 @@ enum EditorTab {
 }
 
 struct PlaybackWorkspace {
-    playing: bool,
     position_ms: u64,
     duration_ms: u64,
     skip_ms: u64,
     debug_stats: String,
-    /// Active demux+decode session (`.528` / `.srsm`).
-    session: Option<PlaybackSession>,
+    worker: PlaybackWorkerHandle,
+    generation: u64,
+    worker_state: PlayerState,
+    command_pending: bool,
+    seek_in_progress: bool,
+    pending_seek_ms: Option<u64>,
     preview_texture: Option<egui::TextureHandle>,
     last_frame_crc32c: Option<u32>,
     last_frame_dims: (u32, u32),
 }
 
 impl PlaybackWorkspace {
-    const DECODE_PREVIEW_BANNER: &'static str = "Decode preview: in-app grayscale texture only. No OS audio device or GPU presentation path yet.";
+    const DECODE_PREVIEW_BANNER: &'static str = "Decode preview: worker-thread CPU decode to in-app grayscale texture. No OS audio device or GPU presentation path yet.";
+
+    fn new() -> Self {
+        Self {
+            position_ms: 0,
+            duration_ms: 5_000,
+            skip_ms: 5_000,
+            debug_stats: "worker=closed | decoded=0 | presented=0 | dropped=0 | reorder=0".to_string(),
+            worker: PlaybackWorkerHandle::spawn(),
+            generation: 0,
+            worker_state: PlayerState::Closed,
+            command_pending: false,
+            seek_in_progress: false,
+            pending_seek_ms: None,
+            preview_texture: None,
+            last_frame_crc32c: None,
+            last_frame_dims: (0, 0),
+        }
+    }
+
+    fn next_generation_candidate(&self) -> u64 {
+        let next = self.generation.wrapping_add(1);
+        if next == 0 { 1 } else { next }
+    }
 }
 
 struct EditorWorkspace {
@@ -131,17 +158,7 @@ impl PlayerApp {
             license_snapshot: missing_snapshot("No verification performed yet.".to_string()),
             show_license_popup: false,
             workspace: WorkspaceTab::PlayOnly,
-            playback: PlaybackWorkspace {
-                playing: false,
-                position_ms: 0,
-                duration_ms: 5_000,
-                skip_ms: 5_000,
-                debug_stats: "fps=n/a, dropped=0, queue=0".to_string(),
-                session: None,
-                preview_texture: None,
-                last_frame_crc32c: None,
-                last_frame_dims: (0, 0),
-            },
+            playback: PlaybackWorkspace::new(),
             editor: EditorWorkspace {
                 active_tab: EditorTab::Pipeline,
                 selection_start_ms: 0,
@@ -175,17 +192,7 @@ impl PlayerApp {
             license_snapshot: missing_snapshot("Licensing client unavailable.".to_string()),
             show_license_popup: false,
             workspace: WorkspaceTab::PlayOnly,
-            playback: PlaybackWorkspace {
-                playing: false,
-                position_ms: 0,
-                duration_ms: 5_000,
-                skip_ms: 5_000,
-                debug_stats: "fps=n/a, dropped=0, queue=0".to_string(),
-                session: None,
-                preview_texture: None,
-                last_frame_crc32c: None,
-                last_frame_dims: (0, 0),
-            },
+            playback: PlaybackWorkspace::new(),
             editor: EditorWorkspace {
                 active_tab: EditorTab::Pipeline,
                 selection_start_ms: 0,
@@ -266,31 +273,48 @@ impl PlayerApp {
             self.push_notification("Open requested with empty path.".to_string());
             return;
         }
-        match self.services.inspect_media(&self.input_path) {
+
+        let requested_path = self.input_path.trim().to_string();
+        match self.services.inspect_media(&requested_path) {
             Ok(inspection) => {
-                self.playback.session = None;
-                self.playback.preview_texture = None;
-                self.playback.playing = false;
-                self.playback.last_frame_crc32c = None;
-                self.playback.last_frame_dims = (0, 0);
-                self.playback.duration_ms = inspection.duration_for_ui();
-                self.playback.position_ms = 0;
-                self.playback.playing = false;
-                self.editor.selection_start_ms = 0;
-                self.editor.selection_end_ms = self.playback.duration_ms;
-                self.editor.frame_cursor_ms = 0;
-                self.playback.debug_stats = format!(
-                    "format={} tracks={} packets={:?} frames={:?}",
-                    inspection.format_name,
-                    inspection.tracks.len(),
-                    inspection.packet_count,
-                    inspection.frame_count
-                );
-                self.status = format!("Opened {}", self.input_path);
-                self.current_media = Some(inspection);
-                self.add_recent_file(self.input_path.clone());
-                if self.output_path.is_empty() {
-                    self.output_path = suggest_output_path(&self.input_path);
+                let generation = self.playback.next_generation_candidate();
+                let command = PlaybackWorkerCommand::Open {
+                    generation,
+                    path: PathBuf::from(&requested_path),
+                };
+                match self.playback.worker.try_send(command) {
+                    Ok(()) => {
+                        self.playback.generation = generation;
+                        self.playback.worker_state = PlayerState::Opening;
+                        self.playback.command_pending = true;
+                        self.playback.seek_in_progress = false;
+                        self.playback.pending_seek_ms = None;
+                        self.playback.preview_texture = None;
+                        self.playback.last_frame_crc32c = None;
+                        self.playback.last_frame_dims = (0, 0);
+                        self.playback.duration_ms = inspection.duration_for_ui();
+                        self.playback.position_ms = 0;
+                        self.editor.selection_start_ms = 0;
+                        self.editor.selection_end_ms = self.playback.duration_ms;
+                        self.editor.frame_cursor_ms = 0;
+                        self.playback.debug_stats = format!(
+                            "opening | format={} tracks={} packets={:?} frames={:?}",
+                            inspection.format_name,
+                            inspection.tracks.len(),
+                            inspection.packet_count,
+                            inspection.frame_count
+                        );
+                        self.status = format!("Opening {requested_path} on playback worker");
+                        self.current_media = Some(inspection);
+                        self.add_recent_file(requested_path);
+                        if self.output_path.is_empty() {
+                            self.output_path = suggest_output_path(&self.input_path);
+                        }
+                    }
+                    Err(err) => {
+                        self.push_notification(format!("Playback worker Open queue failed: {err}"));
+                        self.status = "Playback worker unavailable".to_string();
+                    }
                 }
             }
             Err(err) => self.push_notification(format!("Open failed: {err}")),
@@ -298,12 +322,31 @@ impl PlayerApp {
     }
 
     fn close_media(&mut self) {
-        self.current_media = None;
-        self.playback.session = None;
-        self.playback.preview_texture = None;
-        self.playback.playing = false;
-        self.playback.position_ms = 0;
-        self.status = "Closed current media".to_string();
+        let generation = self.playback.next_generation_candidate();
+        match self
+            .playback
+            .worker
+            .try_send(PlaybackWorkerCommand::Close { generation })
+        {
+            Ok(()) => {
+                self.playback.generation = generation;
+                self.playback.worker_state = PlayerState::Closed;
+                self.playback.command_pending = true;
+                self.playback.seek_in_progress = false;
+                self.playback.pending_seek_ms = None;
+                self.current_media = None;
+                self.playback.preview_texture = None;
+                self.playback.last_frame_crc32c = None;
+                self.playback.last_frame_dims = (0, 0);
+                self.playback.position_ms = 0;
+                self.playback.duration_ms = 0;
+                self.editor.frame_cursor_ms = 0;
+                self.status = "Closing current media".to_string();
+            }
+            Err(err) => {
+                self.push_notification(format!("Playback worker Close queue failed: {err}"));
+            }
+        }
     }
 
     fn save_license_key(&mut self) {
@@ -329,59 +372,23 @@ impl PlayerApp {
                 "Playback blocked: this file contains unsupported or license-sensitive codecs."
                     .to_string(),
             );
-            self.playback.playing = false;
             self.status = "Playback blocked by codec policy".to_string();
             return;
         }
-        let path = Path::new(self.input_path.trim());
-        if let Some(session) = self.playback.session.as_mut() {
-            if matches!(session.state(), PlaybackState::EndOfStream) {
-                let _ = session.stop();
+
+        match self
+            .playback
+            .worker
+            .try_send(PlaybackWorkerCommand::Play {
+                generation: self.playback.generation,
+            })
+        {
+            Ok(()) => {
+                self.playback.command_pending = true;
+                self.status = "Play requested".to_string();
+                ctx.request_repaint_after(Duration::from_millis(10));
             }
-            session.play();
-            self.playback.playing = true;
-            self.status = "Playing (decode preview)".to_string();
-            ctx.request_repaint_after(Duration::from_millis(33));
-            return;
-        }
-        match PlaybackSession::open(path) {
-            Ok(mut session) => {
-                self.playback.duration_ms = session.duration_ms().max(self.playback.duration_ms);
-                session.play();
-                match session.decode_next_step() {
-                    Ok(PlaybackEvent::Video(v)) => {
-                        self.apply_decoded_video(ctx, v);
-                        self.playback.session = Some(session);
-                        self.sync_playback_from_session();
-                        self.playback.playing = true;
-                        self.status = "Playing (decode preview)".to_string();
-                        ctx.request_repaint_after(Duration::from_millis(33));
-                    }
-                    Ok(PlaybackEvent::Audio(_)) => {
-                        self.playback.session = Some(session);
-                        self.sync_playback_from_session();
-                        self.playback.playing = true;
-                        self.status = "Playing (decode preview)".to_string();
-                        ctx.request_repaint_after(Duration::from_millis(33));
-                    }
-                    Ok(PlaybackEvent::EndOfStream) => {
-                        self.push_notification(
-                            "Decode preview: stream ended before any A/V packet.".to_string(),
-                        );
-                        self.playback.session = Some(session);
-                        self.playback.playing = false;
-                        self.sync_playback_from_session();
-                    }
-                    Err(err) => {
-                        self.push_notification(format!("Playback decode failed: {err}"));
-                        self.playback.playing = false;
-                    }
-                }
-            }
-            Err(err) => {
-                self.push_notification(format!("Playback open failed: {err}"));
-                self.playback.playing = false;
-            }
+            Err(err) => self.push_notification(format!("Playback worker Play queue failed: {err}")),
         }
     }
 
@@ -430,43 +437,61 @@ impl PlayerApp {
     }
 
     fn pause(&mut self) {
-        self.playback.playing = false;
-        if let Some(s) = self.playback.session.as_mut() {
-            s.pause();
+        match self
+            .playback
+            .worker
+            .try_send(PlaybackWorkerCommand::Pause {
+                generation: self.playback.generation,
+            })
+        {
+            Ok(()) => {
+                self.playback.command_pending = true;
+                self.status = "Pause requested".to_string();
+            }
+            Err(err) => self.push_notification(format!("Playback worker Pause queue failed: {err}")),
         }
-        self.status = "Paused".to_string();
     }
 
     fn stop(&mut self) {
-        self.playback.playing = false;
-        self.playback.preview_texture = None;
-        self.playback.last_frame_crc32c = None;
-        if let Some(s) = self.playback.session.as_mut() {
-            let _ = s.stop();
+        match self
+            .playback
+            .worker
+            .try_send(PlaybackWorkerCommand::Stop {
+                generation: self.playback.generation,
+            })
+        {
+            Ok(()) => {
+                self.playback.command_pending = true;
+                self.playback.pending_seek_ms = None;
+                self.status = "Stop requested".to_string();
+            }
+            Err(err) => self.push_notification(format!("Playback worker Stop queue failed: {err}")),
         }
-        self.playback.position_ms = 0;
-        self.status = "Stopped".to_string();
     }
 
     fn seek_session_ms(&mut self, target_ms: u64) {
-        let Some(s) = self.playback.session.as_mut() else {
-            self.playback.position_ms = target_ms.min(self.playback.duration_ms);
-            self.editor.frame_cursor_ms = self.playback.position_ms;
-            return;
-        };
-        if !s.seek_supported() {
-            self.push_notification(
-                "Seek not supported: rebuildable index has no entries for this file.".to_string(),
-            );
+        if self.current_media.is_none() {
             return;
         }
-        match s.seek_ms(target_ms) {
+
+        let target_ms = target_ms.min(self.playback.duration_ms.max(1));
+        let generation = self.playback.next_generation_candidate();
+        match self.playback.worker.try_send(PlaybackWorkerCommand::Seek {
+            generation,
+            target_ms,
+        }) {
             Ok(()) => {
-                self.playback.position_ms = s.position().as_ms().min(self.playback.duration_ms);
-                self.editor.frame_cursor_ms = self.playback.position_ms;
+                self.playback.generation = generation;
+                self.playback.worker_state = PlayerState::Seeking;
+                self.playback.command_pending = true;
+                self.playback.seek_in_progress = true;
+                self.playback.pending_seek_ms = None;
+                self.playback.position_ms = target_ms;
+                self.editor.frame_cursor_ms = target_ms;
+                self.status = format!("Seeking to {target_ms} ms");
             }
             Err(err) => {
-                self.push_notification(format!("Seek failed: {err}"));
+                self.push_notification(format!("Playback worker Seek queue failed: {err}"));
             }
         }
     }
@@ -477,33 +502,162 @@ impl PlayerApp {
         self.seek_session_ms(next);
     }
 
-    fn update_playback_tick(&mut self, ctx: &egui::Context) {
-        if !self.playback.playing {
+    fn update_playback_worker(&mut self, ctx: &egui::Context) {
+        const MAX_EVENTS_PER_UI_TICK: usize = 64;
+        let mut disconnected = false;
+
+        for _ in 0..MAX_EVENTS_PER_UI_TICK {
+            match self.playback.worker.try_recv_event() {
+                Ok(PlaybackWorkerEvent::Snapshot(snapshot)) => {
+                    if snapshot.generation == self.playback.generation {
+                        self.apply_worker_snapshot(snapshot);
+                    }
+                }
+                Ok(PlaybackWorkerEvent::FrameReady { generation }) => {
+                    if generation == self.playback.generation {
+                        ctx.request_repaint();
+                    }
+                }
+                Ok(PlaybackWorkerEvent::SeekCompleted {
+                    generation,
+                    presented_position_ms,
+                }) => {
+                    if generation == self.playback.generation {
+                        self.playback.seek_in_progress = false;
+                        self.playback.command_pending = false;
+                        self.playback.position_ms =
+                            presented_position_ms.min(self.playback.duration_ms.max(1));
+                        self.editor.frame_cursor_ms = self.playback.position_ms;
+                        self.status =
+                            format!("Seek completed at {} ms", self.playback.position_ms);
+                    }
+                }
+                Ok(PlaybackWorkerEvent::FatalError {
+                    generation,
+                    message,
+                }) => {
+                    if generation == self.playback.generation {
+                        self.playback.worker_state = PlayerState::Error;
+                        self.playback.command_pending = false;
+                        self.playback.seek_in_progress = false;
+                        self.status = format!("Playback error: {message}");
+                        self.push_notification(self.status.clone());
+                    }
+                }
+                Ok(PlaybackWorkerEvent::WorkerStopped) => {
+                    disconnected = true;
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if disconnected && self.playback.worker_state != PlayerState::Error {
+            self.playback.worker_state = PlayerState::Error;
+            self.playback.command_pending = false;
+            self.playback.seek_in_progress = false;
+            self.status = "Playback worker disconnected".to_string();
+            self.push_notification(self.status.clone());
+        }
+
+        if self.playback.worker_state != PlayerState::Error {
+            match self.playback.worker.take_latest_frame() {
+                Ok(Some(presentation)) if presentation.generation == self.playback.generation => {
+                    self.playback.position_ms = presentation
+                        .presented_position_ms
+                        .min(self.playback.duration_ms.max(1));
+                    self.editor.frame_cursor_ms = self.playback.position_ms;
+                    self.apply_decoded_video(ctx, presentation.frame);
+                    ctx.request_repaint();
+                }
+                Ok(Some(_)) | Ok(None) => {}
+                Err(message) => {
+                    self.playback.worker_state = PlayerState::Error;
+                    self.playback.command_pending = false;
+                    self.playback.seek_in_progress = false;
+                    self.status = format!("Playback frame handoff error: {message}");
+                    self.push_notification(self.status.clone());
+                }
+            }
+        }
+
+        if self.playback.command_pending
+            || self.playback.seek_in_progress
+            || matches!(
+                self.playback.worker_state,
+                PlayerState::Opening | PlayerState::Playing | PlayerState::Seeking
+            )
+        {
+            ctx.request_repaint_after(Duration::from_millis(16));
+        }
+    }
+
+    fn apply_worker_snapshot(&mut self, snapshot: PlaybackSnapshot) {
+        if snapshot.generation != self.playback.generation {
             return;
         }
-        let Some(session) = self.playback.session.as_mut() else {
-            return;
+
+        self.playback.worker_state = snapshot.state;
+        self.playback.command_pending = false;
+        self.playback.seek_in_progress = snapshot.seek_in_progress;
+
+        if snapshot.duration_ms > 0 {
+            self.playback.duration_ms = self.playback.duration_ms.max(snapshot.duration_ms);
+        }
+
+        if self.playback.pending_seek_ms.is_none() && !snapshot.seek_in_progress {
+            self.playback.position_ms = snapshot
+                .presented_position_ms
+                .min(self.playback.duration_ms.max(1));
+            self.editor.frame_cursor_ms = self.playback.position_ms;
+        }
+
+        if snapshot.state == PlayerState::Ready
+            && snapshot.presented_position_ms == 0
+            && snapshot.decoded_video_frames == 0
+        {
+            self.playback.preview_texture = None;
+            self.playback.last_frame_crc32c = None;
+            self.playback.last_frame_dims = (0, 0);
+        }
+
+        let crc = self
+            .playback
+            .last_frame_crc32c
+            .map(|value| format!("{value:08x}"))
+            .unwrap_or_else(|| "n/a".to_string());
+        self.playback.debug_stats = format!(
+            "worker={:?} | decoded_v={} decoded_a={} | presented_v={} dropped_v={} | decoded_ms={} presented_ms={} | reorder={} | crc={} | dims={}x{}",
+            snapshot.state,
+            snapshot.decoded_video_frames,
+            snapshot.decoded_audio_chunks,
+            snapshot.presented_video_frames,
+            snapshot.dropped_video_frames,
+            snapshot.decoded_position_ms,
+            snapshot.presented_position_ms,
+            snapshot.reorder_depth,
+            crc,
+            self.playback.last_frame_dims.0,
+            self.playback.last_frame_dims.1
+        );
+
+        self.status = match snapshot.state {
+            PlayerState::Closed => "Closed current media".to_string(),
+            PlayerState::Opening => "Opening media on playback worker".to_string(),
+            PlayerState::Ready => "Ready (worker decode preview)".to_string(),
+            PlayerState::Playing => "Playing (worker decode preview)".to_string(),
+            PlayerState::Paused => "Paused".to_string(),
+            PlayerState::Seeking => "Seeking".to_string(),
+            PlayerState::Ended => "Reached end of media (decode preview)".to_string(),
+            PlayerState::Error => snapshot
+                .last_error
+                .map(|error| format!("Playback error: {error}"))
+                .unwrap_or_else(|| "Playback worker error".to_string()),
         };
-        match session.decode_next_step() {
-            Ok(PlaybackEvent::Video(v)) => {
-                self.apply_decoded_video(ctx, v);
-                self.sync_playback_from_session();
-            }
-            Ok(PlaybackEvent::Audio(_)) => {
-                self.sync_playback_from_session();
-            }
-            Ok(PlaybackEvent::EndOfStream) => {
-                self.playback.playing = false;
-                session.pause();
-                self.status = "Reached end of media (decode preview)".to_string();
-            }
-            Err(err) => {
-                self.playback.playing = false;
-                session.pause();
-                self.push_notification(format!("Decode error: {err}"));
-            }
-        }
-        ctx.request_repaint_after(Duration::from_millis(33));
     }
 
     fn apply_decoded_video(&mut self, ctx: &egui::Context, v: DecodedVideoFrame) {
@@ -512,29 +666,6 @@ impl PlayerApp {
         let gray = egui::ColorImage::from_gray([v.width as usize, v.height as usize], &v.gray8);
         self.playback.preview_texture =
             Some(ctx.load_texture("SRS-528-decode-preview", gray, egui::TextureOptions::LINEAR));
-    }
-
-    fn sync_playback_from_session(&mut self) {
-        let Some(s) = self.playback.session.as_ref() else {
-            return;
-        };
-        self.playback.position_ms = s.position().as_ms().min(self.playback.duration_ms);
-        let crc = self
-            .playback
-            .last_frame_crc32c
-            .map(|c| format!("{c:08x}"))
-            .unwrap_or_else(|| "n/a".to_string());
-        self.playback.debug_stats = format!(
-            "decode-preview | vf={} ac={} | pts_ms={} | seek_idx={} | last_crc32c={} | frame_dims={}x{}",
-            s.decoded_video_frames,
-            s.decoded_audio_chunks,
-            s.position().as_ms(),
-            s.seek_supported(),
-            crc,
-            self.playback.last_frame_dims.0,
-            self.playback.last_frame_dims.1
-        );
-        self.editor.frame_cursor_ms = self.playback.position_ms;
     }
 
     fn run_editor_action(&mut self, action: EditorAction) {
@@ -965,25 +1096,26 @@ impl PlayerApp {
     }
 
     fn render_playback_workspace(&mut self, ui: &mut egui::Ui) {
+        let (state_label, state_color) = match self.playback.worker_state {
+            PlayerState::Closed => ("No session", muted_text()),
+            PlayerState::Opening => ("Opening", accent_amber()),
+            PlayerState::Ready => ("Ready", accent_amber()),
+            PlayerState::Playing => ("Playing", accent_green()),
+            PlayerState::Paused => ("Paused", accent_amber()),
+            PlayerState::Seeking => ("Seeking", accent_violet()),
+            PlayerState::Ended => ("Ended", accent_blue()),
+            PlayerState::Error => ("Error", egui::Color32::from_rgb(220, 92, 92)),
+        };
+
         ui.heading(egui::RichText::new("Playback Workspace").color(accent_blue()));
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             metric_card(
                 ui,
                 "State",
-                if self.playback.playing {
-                    "Playing"
-                } else if self.playback.session.is_some() {
-                    "Paused / idle"
-                } else {
-                    "No session"
-                },
+                state_label,
                 self.status.as_str(),
-                if self.playback.playing {
-                    accent_green()
-                } else {
-                    accent_amber()
-                },
+                state_color,
             );
             metric_card(
                 ui,
@@ -1023,7 +1155,14 @@ impl PlayerApp {
                 .text("Seek (ms)"),
             );
             if slider_resp.changed() {
-                self.seek_session_ms(self.playback.position_ms);
+                self.playback.pending_seek_ms = Some(self.playback.position_ms);
+            }
+            let commit_seek = slider_resp.drag_stopped()
+                || (slider_resp.changed() && slider_resp.clicked());
+            if commit_seek {
+                if let Some(target_ms) = self.playback.pending_seek_ms.take() {
+                    self.seek_session_ms(target_ms);
+                }
             }
         });
 
@@ -1331,7 +1470,7 @@ impl PlayerApp {
 
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.update_playback_tick(ctx);
+        self.update_playback_worker(ctx);
         self.maybe_auto_refresh_license(ctx);
         self.render_top_bar(ctx);
         self.render_side_panel(ctx);
@@ -1684,8 +1823,7 @@ mod tests {
         let mut app = PlayerApp::fallback("test".to_string());
         let ctx = Context::default();
         app.play(&ctx);
-        assert!(!app.playback.playing);
-        assert!(app.playback.session.is_none());
+        assert_ne!(app.playback.worker_state, PlayerState::Playing);
     }
 
     #[test]
@@ -1710,7 +1848,6 @@ mod tests {
         app.input_path = "/nonexistent/path/playback_test.528".into();
         let ctx = Context::default();
         app.play(&ctx);
-        assert!(!app.playback.playing);
-        assert!(app.playback.session.is_none());
+        assert_ne!(app.playback.worker_state, PlayerState::Playing);
     }
 }
