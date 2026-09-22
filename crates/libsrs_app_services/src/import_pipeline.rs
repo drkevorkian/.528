@@ -1,6 +1,6 @@
 //! Normalized import: `MediaDecoder` → `NativeEncoderSink` (mux + native codec frames).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
 
@@ -9,7 +9,7 @@ use libsrs_audio::{
     decode_frame_with_stream_version, encode_frame as audio_encode_frame, AudioFrame,
     STREAM_VERSION_V2,
 };
-use libsrs_compat::{ProbeResult, SourcePacket};
+use libsrs_compat::ProbeResult;
 use libsrs_container::{FileHeader, TrackDescriptor, TrackKind};
 use libsrs_contract::MediaKind;
 use libsrs_mux::MuxWriter;
@@ -53,17 +53,31 @@ pub(crate) fn run_native_import(
 
     let mut ingestor = pipeline.create_ingestor();
     ingestor.open_path(input)?;
-    let mut packets: Vec<SourcePacket> = Vec::new();
+
+    // Pass 1 validates that every probed A/V track actually has packet data without retaining
+    // packet payloads. This preserves the old validation behavior while keeping the FFmpeg path
+    // bounded to the demuxer's internal buffers plus a single SourcePacket at a time.
+    let mut seen_streams = HashSet::new();
+    let mut packet_count = 0usize;
     while let Some(p) = ingestor.read_packet()? {
-        packets.push(p);
+        seen_streams.insert(p.packet.stream_id.0);
+        packet_count = packet_count
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("import packet count overflow"))?;
     }
-    ingestor.close()?;
-    if packets.is_empty() {
+    if packet_count == 0 {
+        ingestor.close()?;
         return Ok(0);
     }
-    let n = packets.len();
 
-    let (tracks, stream_to_mux) = build_import_mux_tracks(&probe, &packets, video_codec)?;
+    let (tracks, stream_to_mux) =
+        build_import_mux_tracks(&probe, &seen_streams, video_codec)?;
+
+    // Rewind the same open source instead of closing and reopening it. That avoids a TOCTOU
+    // window where an attacker or concurrent process could replace the file between validation
+    // and transcoding.
+    ingestor.seek_ms(0)?;
+
     let video_raw = input_ext.as_deref() == Some("srsv");
     let audio_raw = input_ext.as_deref() == Some("srsa");
     let mut decoder = NativeSrsMediaDecoder::from_probe(&probe, video_raw, audio_raw)?;
@@ -80,7 +94,8 @@ pub(crate) fn run_native_import(
         .find(|t| t.kind == MediaKind::Audio)
         .map(|t| t.id.0);
 
-    for p in packets {
+    let mut transcoded = 0usize;
+    while let Some(p) = ingestor.read_packet()? {
         let pkt = p.packet;
         let stream = pkt.stream_id.0;
         if Some(stream) == video_id {
@@ -96,9 +111,22 @@ pub(crate) fn run_native_import(
                 .map(|t| timestamp_to_mux_ticks(t, sink.audio_timescale));
             sink.push_audio(&frame, pts)?;
         }
+        transcoded = transcoded
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("import packet count overflow"))?;
     }
+    ingestor.close()?;
+
+    // A successful rewind must reproduce the same packet count. Treat a mismatch as an input
+    // consistency failure instead of silently finalizing a partial output.
+    if transcoded != packet_count {
+        return Err(anyhow!(
+            "import source changed during processing: scanned {packet_count} packets, transcoded {transcoded}"
+        ));
+    }
+
     sink.finalize_mux()?;
-    Ok(n)
+    Ok(transcoded)
 }
 
 fn timestamp_to_mux_ticks(ts: libsrs_contract::Timestamp, timescale: u32) -> u64 {
@@ -114,7 +142,7 @@ fn timestamp_to_mux_ticks(ts: libsrs_contract::Timestamp, timescale: u32) -> u64
 
 fn build_import_mux_tracks(
     probe: &ProbeResult,
-    packets: &[SourcePacket],
+    seen_streams: &HashSet<u32>,
     video_codec: Native528VideoCodec,
 ) -> Result<(Vec<TrackDescriptor>, HashMap<u32, u16>)> {
     const DEFAULT_IMPORT_AUDIO_SAMPLE_RATE: u32 = 48_000;
@@ -131,7 +159,7 @@ fn build_import_mux_tracks(
     let mut next_mux_id = 1u16;
 
     if let Some(v) = vt {
-        if !packets.iter().any(|p| p.packet.stream_id.0 == v.id.0) {
+        if !seen_streams.contains(&v.id.0) {
             return Err(anyhow!("no video packets for import"));
         }
         let width = v
@@ -168,7 +196,7 @@ fn build_import_mux_tracks(
     }
 
     if let Some(a) = at {
-        if !packets.iter().any(|p| p.packet.stream_id.0 == a.id.0) {
+        if !seen_streams.contains(&a.id.0) {
             return Err(anyhow!("no audio packets for import"));
         }
         let sample_rate = a
