@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
 
     let listener = TcpListener::bind(bind_addr)
         .await
-        .with_context(|| format!("bind {}", bind_addr))?;
+        .with_context(|| format!("bind {bind_addr}"))?;
     info!("srs_license_server listening on {}", bind_addr);
     axum::serve(
         listener,
@@ -2779,24 +2779,23 @@ fn render_admin_page(snapshot: &AdminSnapshot) -> String {
         </style></head><body>\
             <h1>SRS License Server Admin</h1>\
             <p>Local-only admin dashboard. Use this GUI on the Gentoo server to inspect and edit licensing state.</p>\
-            <div class='panel'><h2>Database Stats</h2>{}</div>\
+            <div class='panel'><h2>Database Stats</h2>{stats}</div>\
             <div class='panel'><h2>Licenses And Feature Editing</h2>\
-                <table><thead><tr><th>License</th><th>Owner Email</th><th>Active Keys</th><th>Edit Features</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>License</th><th>Owner Email</th><th>Active Keys</th><th>Edit Features</th></tr></thead><tbody>{licenses}</tbody></table>\
             </div>\
             <div class='panel'><h2>Keys</h2>\
-                <table><thead><tr><th>Key Id</th><th>License</th><th>Key</th><th>Version</th><th>Status</th><th>Created</th><th>Edit</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>Key Id</th><th>License</th><th>Key</th><th>Version</th><th>Status</th><th>Created</th><th>Edit</th></tr></thead><tbody>{keys}</tbody></table>\
             </div>\
             <div class='panel'><h2>Connected Installations And Verification Status</h2>\
-                <table><thead><tr><th>Installation</th><th>License</th><th>Device</th><th>Last IP</th><th>First IP</th><th>OS</th><th>Hostname</th><th>Status</th><th>Seen</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>Installation</th><th>License</th><th>Device</th><th>Last IP</th><th>First IP</th><th>OS</th><th>Hostname</th><th>Status</th><th>Seen</th></tr></thead><tbody>{installations}</tbody></table>\
             </div>\
             <div class='panel'><h2>Pending Verification Requests</h2>\
-                <table><thead><tr><th>Request</th><th>License</th><th>Device</th><th>Requested IP</th><th>Requested OS</th><th>Hostname</th><th>Status</th><th>Action</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>Request</th><th>License</th><th>Device</th><th>Requested IP</th><th>Requested OS</th><th>Hostname</th><th>Status</th><th>Action</th></tr></thead><tbody>{pending_requests}</tbody></table>\
             </div>\
             <div class='panel'><h2>Recent Audit And Connection Log</h2>\
-                <table><thead><tr><th>Event Id</th><th>Time</th><th>License</th><th>Event</th><th>Key</th><th>Installation</th><th>Payload</th></tr></thead><tbody>{}</tbody></table>\
+                <table><thead><tr><th>Event Id</th><th>Time</th><th>License</th><th>Event</th><th>Key</th><th>Installation</th><th>Payload</th></tr></thead><tbody>{audits}</tbody></table>\
             </div>\
-        </body></html>",
-        stats, licenses, keys, installations, pending_requests, audits
+        </body></html>"
     )
 }
 
