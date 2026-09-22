@@ -526,18 +526,22 @@ impl PlaybackWorker {
             presented_position_ms: position_ms,
         };
 
-        match self.frame_slot.lock() {
+        let frame_slot_poisoned = match self.frame_slot.lock() {
             Ok(mut slot) => {
                 if slot.replace(presentation).is_some() {
                     self.dropped_video_frames = self.dropped_video_frames.saturating_add(1);
                 }
+                false
             }
             Err(poisoned) => {
                 let mut slot = poisoned.into_inner();
                 slot.take();
-                self.fail("playback frame slot mutex was poisoned".to_string());
-                return;
+                true
             }
+        };
+        if frame_slot_poisoned {
+            self.fail("playback frame slot mutex was poisoned".to_string());
+            return;
         }
 
         self.presented_position_ms = position_ms;
