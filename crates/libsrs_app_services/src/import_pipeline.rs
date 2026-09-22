@@ -70,8 +70,7 @@ pub(crate) fn run_native_import(
         return Ok(0);
     }
 
-    let (tracks, stream_to_mux) =
-        build_import_mux_tracks(&probe, &seen_streams, video_codec)?;
+    let (tracks, stream_to_mux) = build_import_mux_tracks(&probe, &seen_streams, video_codec)?;
 
     // Rewind the same open source instead of closing and reopening it. That avoids a TOCTOU
     // window where an attacker or concurrent process could replace the file between validation
