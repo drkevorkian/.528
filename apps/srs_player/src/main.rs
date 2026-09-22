@@ -1820,6 +1820,32 @@ mod tests {
     }
 
     #[test]
+    fn stale_worker_snapshot_cannot_mutate_ui_state() {
+        let mut app = PlayerApp::fallback("test".to_string());
+        app.playback.generation = 5;
+        app.playback.worker_state = PlayerState::Ready;
+        app.playback.position_ms = 111;
+
+        app.apply_worker_snapshot(PlaybackSnapshot {
+            generation: 4,
+            state: PlayerState::Playing,
+            duration_ms: 1_000,
+            presented_position_ms: 900,
+            decoded_position_ms: 900,
+            decoded_video_frames: 12,
+            decoded_audio_chunks: 0,
+            presented_video_frames: 12,
+            dropped_video_frames: 0,
+            reorder_depth: 0,
+            seek_in_progress: false,
+            last_error: None,
+        });
+
+        assert_eq!(app.playback.worker_state, PlayerState::Ready);
+        assert_eq!(app.playback.position_ms, 111);
+    }
+
+    #[test]
     fn play_without_opened_media_never_sets_playing() {
         let mut app = PlayerApp::fallback("test".to_string());
         let ctx = Context::default();
