@@ -412,7 +412,11 @@ impl PlaybackWorker {
 
     fn playback_step(&mut self) {
         if let Some(frame) = self.reorder.pop_ready() {
-            self.publish_frame(frame);
+            let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
+                self.fail("presentation frame became ready without a timestamp slot".to_string());
+                return;
+            };
+            self.publish_frame_at_position(frame, position_ms);
             return;
         }
 
@@ -426,26 +430,43 @@ impl PlaybackWorker {
 
         match event {
             Ok(PlaybackEvent::Video(frame)) => {
+                let slot_ms = frame_position_ms(&frame);
                 if let Err(error) = self.reorder.push(frame) {
                     self.fail(error);
                     return;
                 }
+                if self.presentation_time_slots_ms.len() >= MAX_PRESENTATION_REORDER_FRAMES + 1 {
+                    self.fail("presentation timestamp-slot queue exceeded reorder bound".to_string());
+                    return;
+                }
+                self.presentation_time_slots_ms.push_back(slot_ms);
                 if let Some(frame) = self.reorder.pop_ready() {
-                    self.publish_frame(frame);
+                    let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
+                        self.fail("presentation frame became ready without a timestamp slot".to_string());
+                        return;
+                    };
+                    self.publish_frame_at_position(frame, position_ms);
                 }
                 self.emit_snapshot();
             }
             Ok(PlaybackEvent::Audio(_)) => self.emit_snapshot(),
             Ok(PlaybackEvent::EndOfStream) => {
                 if let Some(frame) = self.reorder.pop_ready() {
-                    self.publish_frame(frame);
+                    let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
+                        self.fail("EOS presentation frame missing timestamp slot".to_string());
+                        return;
+                    };
+                    self.publish_frame_at_position(frame, position_ms);
                     return;
                 }
                 match self.reorder.finish_eos() {
-                    Ok(()) => {
+                    Ok(()) if self.presentation_time_slots_ms.is_empty() => {
                         self.state = PlayerState::Ended;
                         self.emit_snapshot();
                     }
+                    Ok(()) => self.fail(
+                        "end of stream left unmatched presentation timestamp slots".to_string(),
+                    ),
                     Err(error) => self.fail(error),
                 }
             }
