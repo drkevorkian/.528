@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+cpal = "0.18.2"
 eframe = "0.33"
 egui = "0.33"
 libsrs_app_config = { version = "0.1.0", path = "../../crates/libsrs_app_config" }
@@ -14,3 +15,4 @@ libsrs_app_services = { version = "0.1.0", path = "../../crates/libsrs_app_servi
 libsrs_licensing_client = { version = "0.1.0", path = "../../crates/libsrs_licensing_client" }
 libsrs_licensing_proto = { path = "../../crates/libsrs_licensing_proto" }
 rfd = "0.17.2"
+rtrb = "0.4.0"
