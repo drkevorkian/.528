@@ -908,6 +908,8 @@ impl PlaybackWorker {
                 )
             });
 
+        let audio_telemetry = self.audio_output.as_ref().map(|audio| audio.telemetry());
+
         PlaybackSnapshot {
             generation: self.generation,
             state: self.state,
@@ -920,6 +922,10 @@ impl PlaybackWorker {
             dropped_video_frames: self.dropped_video_frames,
             reorder_depth: self.reorder.depth(),
             seek_in_progress: self.state == PlayerState::Seeking,
+            audio_media_position_ms: self.audio_media_position_ms(),
+            audio_consumed_samples: audio_telemetry.map_or(0, |telemetry| telemetry.consumed_samples),
+            audio_underrun_samples: audio_telemetry.map_or(0, |telemetry| telemetry.underrun_samples),
+            audio_stream_errors: audio_telemetry.map_or(0, |telemetry| telemetry.stream_errors),
             last_error: None,
         }
     }
@@ -949,6 +955,17 @@ impl PlaybackWorker {
             generation: self.generation,
             message,
         });
+    }
+}
+
+fn audio_chunk_position_ms(chunk: &DecodedAudioChunk) -> u64 {
+    if chunk.timescale_hz == 0 {
+        0
+    } else {
+        chunk
+            .pts_ticks
+            .saturating_mul(1_000)
+            .saturating_div(u64::from(chunk.timescale_hz))
     }
 }
 
