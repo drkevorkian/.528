@@ -62,6 +62,12 @@ impl SrsConfig {
         if let Ok(value) = env::var("SRS_SERVER_DATABASE_PATH") {
             self.server.database_path = value;
         }
+        if let Ok(value) = env::var("SRS_SERVER_MODE") {
+            self.server.operating_mode = value;
+        }
+        if let Ok(value) = env::var("SRS_ADMIN_TOKEN") {
+            self.server.admin_token = Some(value);
+        }
         if let Ok(value) = env::var("SRS_SERVER_SIGNING_KEY_SEED_B64") {
             self.server.signing_key_seed_b64 = Some(value);
         }
@@ -148,6 +154,10 @@ pub struct ServerConfig {
     pub confirmation_window_hours: u64,
     #[serde(default = "default_token_ttl_hours")]
     pub token_ttl_hours: u64,
+    #[serde(default = "default_operating_mode")]
+    pub operating_mode: String,
+    #[serde(default)]
+    pub admin_token: Option<String>,
     #[serde(default)]
     pub signing_key_seed_b64: Option<String>,
     #[serde(default)]
@@ -168,6 +178,8 @@ impl Default for ServerConfig {
             database_path: default_database_path(),
             confirmation_window_hours: default_confirmation_window_hours(),
             token_ttl_hours: default_token_ttl_hours(),
+            operating_mode: default_operating_mode(),
+            admin_token: None,
             signing_key_seed_b64: Some(LOCALHOST_DEV_SIGNING_KEY_SEED_B64.to_string()),
             mail_from: None,
             smtp_server: None,
@@ -178,6 +190,20 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn is_production(&self) -> bool {
+        self.operating_mode.eq_ignore_ascii_case("production")
+    }
+
+    pub fn uses_published_dev_signing_seed(&self) -> bool {
+        self.signing_key_seed() == LOCALHOST_DEV_SIGNING_KEY_SEED_B64
+    }
+
+    pub fn bind_is_loopback_only(&self) -> bool {
+        let bind = self.bind_addr.trim();
+        let host = bind.rsplit_once(':').map(|(host, _)| host).unwrap_or(bind);
+        matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    }
+
     pub fn signing_key_seed(&self) -> &str {
         self.signing_key_seed_b64
             .as_deref()
@@ -253,6 +279,10 @@ pub fn default_token_ttl_hours() -> u64 {
     24
 }
 
+pub fn default_operating_mode() -> String {
+    "development".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +298,21 @@ mod tests {
     fn default_public_key_is_derived_from_dev_seed() {
         let derived = default_public_key_b64();
         assert!(!derived.is_empty());
+    }
+
+    #[test]
+    fn default_server_is_development_loopback_with_dev_seed() {
+        let server = ServerConfig::default();
+        assert!(!server.is_production());
+        assert!(server.bind_is_loopback_only());
+        assert!(server.uses_published_dev_signing_seed());
+        assert!(server.admin_token.is_none());
+    }
+
+    #[test]
+    fn production_mode_is_case_insensitive() {
+        let mut server = ServerConfig::default();
+        server.operating_mode = "PrOdUcTiOn".to_string();
+        assert!(server.is_production());
     }
 }
