@@ -16,6 +16,8 @@ pub struct SrsConfig {
     #[serde(default)]
     pub client: ClientConfig,
     #[serde(default)]
+    pub admin: AdminClientConfig,
+    #[serde(default)]
     pub server: ServerConfig,
 }
 
@@ -52,6 +54,9 @@ impl SrsConfig {
         }
         if let Ok(value) = env::var("SRS_LICENSE_PUBLIC_KEY_B64") {
             self.client.public_key_b64 = value;
+        }
+        if let Ok(value) = env::var("SRS_ADMIN_BASE_URL") {
+            self.admin.base_url = value;
         }
         if let Ok(value) = env::var("SRS_SERVER_BIND_ADDR") {
             self.server.bind_addr = value;
@@ -120,6 +125,20 @@ impl Default for ClientConfig {
             refresh_interval_s: default_refresh_interval_s(),
             contact_email: default_contact_email(),
             help_url: default_help_url(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminClientConfig {
+    #[serde(default = "default_admin_base_url")]
+    pub base_url: String,
+}
+
+impl Default for AdminClientConfig {
+    fn default() -> Self {
+        Self {
+            base_url: default_admin_base_url(),
         }
     }
 }
@@ -237,6 +256,10 @@ pub fn default_backup_url() -> String {
     DEFAULT_BACKUP_URL.to_string()
 }
 
+pub fn default_admin_base_url() -> String {
+    DEFAULT_PRIMARY_URL.to_string()
+}
+
 pub fn default_public_key_b64() -> String {
     let signing_key = decode_signing_key(LOCALHOST_DEV_SIGNING_KEY_SEED_B64)
         .expect("static dev signing seed must be valid");
@@ -292,6 +315,7 @@ mod tests {
         let config = SrsConfig::default();
         assert_eq!(config.client.primary_url, DEFAULT_PRIMARY_URL);
         assert_eq!(config.client.backup_url, DEFAULT_BACKUP_URL);
+        assert_eq!(config.admin.base_url, DEFAULT_PRIMARY_URL);
     }
 
     #[test]
