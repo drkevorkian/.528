@@ -454,7 +454,7 @@ impl AdminApp {
             self.last_refresh.elapsed().as_secs()
         ));
         if let Some(error) = self.last_client_error {
-            ui.label(format!("Connection state: {:?}", error));
+            ui.label(format!("Connection state: {error:?}"));
         } else {
             ui.label("Connection state: connected");
         }
@@ -1279,7 +1279,7 @@ fn format_feature_list(features: &[LicensedFeature]) -> String {
 
 fn request_status_text(request: &AdminPendingRequestRecord) -> String {
     if let Some(approved_at) = request.approved_at_epoch_s {
-        format!("approved at {}", approved_at)
+        format!("approved at {approved_at}")
     } else {
         format!("pending until {}", request.expires_at_epoch_s)
     }
