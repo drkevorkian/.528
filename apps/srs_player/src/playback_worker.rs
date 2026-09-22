@@ -80,7 +80,6 @@ pub enum PlaybackWorkerCommand {
 
 #[derive(Debug, Clone)]
 pub enum PlaybackWorkerEvent {
-    Snapshot(PlaybackSnapshot),
     FrameReady {
         generation: u64,
     },
@@ -99,6 +98,7 @@ pub struct PlaybackWorkerHandle {
     command_tx: SyncSender<PlaybackWorkerCommand>,
     event_rx: Receiver<PlaybackWorkerEvent>,
     frame_slot: Arc<Mutex<Option<PresentationFrame>>>,
+    snapshot_slot: Arc<Mutex<PlaybackSnapshot>>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -108,15 +108,22 @@ impl PlaybackWorkerHandle {
         let (command_tx, command_rx) = mpsc::sync_channel(COMMAND_CAPACITY);
         let (event_tx, event_rx) = mpsc::sync_channel(EVENT_CAPACITY);
         let frame_slot = Arc::new(Mutex::new(None));
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         let worker_slot = Arc::clone(&frame_slot);
+        let worker_snapshot_slot = Arc::clone(&snapshot_slot);
         let worker_shutdown = Arc::clone(&shutdown);
         let thread = thread::Builder::new()
             .name("srs-playback-worker".to_string())
             .spawn(move || {
-                let mut worker =
-                    PlaybackWorker::new(command_rx, event_tx, worker_slot, worker_shutdown);
+                let mut worker = PlaybackWorker::new(
+                    command_rx,
+                    event_tx,
+                    worker_slot,
+                    worker_snapshot_slot,
+                    worker_shutdown,
+                );
                 worker.run();
             })
             .ok();
@@ -125,6 +132,7 @@ impl PlaybackWorkerHandle {
             command_tx,
             event_rx,
             frame_slot,
+            snapshot_slot,
             shutdown,
             thread,
         }
@@ -139,6 +147,16 @@ impl PlaybackWorkerHandle {
 
     pub fn try_recv_event(&self) -> Result<PlaybackWorkerEvent, TryRecvError> {
         self.event_rx.try_recv()
+    }
+
+    pub fn latest_snapshot(&self) -> Result<PlaybackSnapshot, String> {
+        match self.snapshot_slot.lock() {
+            Ok(snapshot) => Ok(snapshot.clone()),
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
+                Err("playback snapshot mutex was poisoned".to_string())
+            }
+        }
     }
 
     pub fn take_latest_frame(&self) -> Result<Option<PresentationFrame>, String> {
@@ -234,6 +252,7 @@ struct PlaybackWorker {
     command_rx: Receiver<PlaybackWorkerCommand>,
     event_tx: SyncSender<PlaybackWorkerEvent>,
     frame_slot: Arc<Mutex<Option<PresentationFrame>>>,
+    snapshot_slot: Arc<Mutex<PlaybackSnapshot>>,
     shutdown: Arc<AtomicBool>,
     session: Option<PlaybackSession>,
     generation: u64,
@@ -250,12 +269,14 @@ impl PlaybackWorker {
         command_rx: Receiver<PlaybackWorkerCommand>,
         event_tx: SyncSender<PlaybackWorkerEvent>,
         frame_slot: Arc<Mutex<Option<PresentationFrame>>>,
+        snapshot_slot: Arc<Mutex<PlaybackSnapshot>>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         Self {
             command_rx,
             event_tx,
             frame_slot,
+            snapshot_slot,
             shutdown,
             session: None,
             generation: 0,
@@ -694,22 +715,30 @@ impl PlaybackWorker {
     }
 
     fn emit_snapshot(&self) {
-        let _ = self
-            .event_tx
-            .try_send(PlaybackWorkerEvent::Snapshot(self.snapshot()));
+        self.store_snapshot(self.snapshot());
+    }
+
+    fn store_snapshot(&self, snapshot: PlaybackSnapshot) {
+        match self.snapshot_slot.lock() {
+            Ok(mut slot) => *slot = snapshot,
+            Err(poisoned) => {
+                // The slot contains plain owned state. Recover the inner value and overwrite it
+                // so the worker never panics or blocks on a poisoned UI-facing state mutex.
+                *poisoned.into_inner() = snapshot;
+            }
+        }
     }
 
     fn fail(&mut self, message: String) {
         self.state = PlayerState::Error;
         let mut snapshot = self.snapshot();
         snapshot.last_error = Some(message.clone());
+        // Authoritative failure state is persisted before the optional discrete notification.
+        self.store_snapshot(snapshot);
         let _ = self.event_tx.try_send(PlaybackWorkerEvent::FatalError {
             generation: self.generation,
             message,
         });
-        let _ = self
-            .event_tx
-            .try_send(PlaybackWorkerEvent::Snapshot(snapshot));
     }
 }
 
