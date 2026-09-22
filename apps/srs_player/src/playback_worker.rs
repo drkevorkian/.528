@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::audio_output::{AudioOutput, AudioSink, AudioTelemetry};
 use libsrs_app_services::{
@@ -15,6 +15,9 @@ const COMMAND_CAPACITY: usize = 16;
 const EVENT_CAPACITY: usize = 16;
 const PLAYBACK_TICK: Duration = Duration::from_millis(33);
 const MAX_PRESENTATION_REORDER_FRAMES: usize = 4;
+const MAX_HELD_PRESENTATION_FRAMES: usize = 8;
+const PRESENT_EARLY_TOLERANCE_MS: u64 = 5;
+const PRESENT_LATE_DROP_THRESHOLD_MS: u64 = 150;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
@@ -264,6 +267,135 @@ struct PendingAudioChunk {
     channels: u8,
     samples: Vec<i16>,
     offset: usize,
+}
+
+#[derive(Debug)]
+struct ScheduledPresentation {
+    generation: u64,
+    frame: DecodedVideoFrame,
+    position_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentationDecision {
+    Hold,
+    Present,
+    DropLate,
+}
+
+#[derive(Debug, Default)]
+struct PresentationScheduler {
+    held: VecDeque<ScheduledPresentation>,
+    eos_pending: bool,
+}
+
+impl PresentationScheduler {
+    fn reset(&mut self) {
+        self.held.clear();
+        self.eos_pending = false;
+    }
+
+    fn enqueue(&mut self, item: ScheduledPresentation) -> Result<(), String> {
+        if self.held.len() >= MAX_HELD_PRESENTATION_FRAMES {
+            return Err("presentation queue reached its bounded capacity".to_string());
+        }
+        if let Some(last) = self.held.back() {
+            if item.position_ms < last.position_ms {
+                return Err(format!(
+                    "presentation queue timestamp regressed from {} ms to {} ms",
+                    last.position_ms, item.position_ms
+                ));
+            }
+        }
+        self.held.push_back(item);
+        Ok(())
+    }
+
+    fn purge_generation(&mut self, generation: u64) {
+        self.held.retain(|item| item.generation == generation);
+    }
+
+    fn decision(&self, master_ms: u64) -> Option<PresentationDecision> {
+        let item = self.held.front()?;
+        if item.position_ms > master_ms.saturating_add(PRESENT_EARLY_TOLERANCE_MS) {
+            return Some(PresentationDecision::Hold);
+        }
+        let lateness_ms = master_ms.saturating_sub(item.position_ms);
+        if lateness_ms > PRESENT_LATE_DROP_THRESHOLD_MS {
+            Some(PresentationDecision::DropLate)
+        } else {
+            Some(PresentationDecision::Present)
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<ScheduledPresentation> {
+        self.held.pop_front()
+    }
+
+    fn is_full(&self) -> bool {
+        self.held.len() >= MAX_HELD_PRESENTATION_FRAMES
+    }
+
+    fn is_empty(&self) -> bool {
+        self.held.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.held.len()
+    }
+
+    fn mark_eos(&mut self) {
+        self.eos_pending = true;
+    }
+
+    fn can_finish_eos(&self) -> bool {
+        self.eos_pending && self.held.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FallbackClock {
+    anchor_media_ms: u64,
+    anchor_instant: Instant,
+    paused_media_ms: Option<u64>,
+}
+
+impl FallbackClock {
+    fn new(anchor_media_ms: u64, now: Instant) -> Self {
+        Self {
+            anchor_media_ms,
+            anchor_instant: now,
+            paused_media_ms: None,
+        }
+    }
+
+    fn reset(&mut self, anchor_media_ms: u64, now: Instant) {
+        self.anchor_media_ms = anchor_media_ms;
+        self.anchor_instant = now;
+        self.paused_media_ms = None;
+    }
+
+    fn media_time_ms(&self, now: Instant) -> u64 {
+        if let Some(paused) = self.paused_media_ms {
+            return paused;
+        }
+        let elapsed_ms = now
+            .saturating_duration_since(self.anchor_instant)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.anchor_media_ms.saturating_add(elapsed_ms)
+    }
+
+    fn pause(&mut self, now: Instant) {
+        self.paused_media_ms = Some(self.media_time_ms(now));
+    }
+
+    fn resume(&mut self, now: Instant) {
+        if let Some(paused) = self.paused_media_ms.take() {
+            self.anchor_media_ms = paused;
+            self.anchor_instant = now;
+        }
+    }
 }
 
 struct PlaybackWorker {
