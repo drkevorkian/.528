@@ -480,14 +480,15 @@ impl PlaybackWorker {
         self.clear_frame_slot();
         self.emit_snapshot();
 
-        let srsv2_compat = self
+        let srsv2_reordered = self
             .session
             .as_ref()
             .and_then(|session| session.primary_video())
             .is_some_and(|track| track.codec_id == 3);
 
-        if !srsv2_compat {
+        if !srsv2_reordered {
             self.reorder.reset(None);
+            self.presentation_time_slots_ms.clear();
             let Some(session) = self.session.as_mut() else {
                 self.fail("seek requested without an open playback session".to_string());
                 return;
@@ -510,8 +511,12 @@ impl PlaybackWorker {
             return;
         }
 
-        let target_index = (target_ms / COMPAT_FRAME_DURATION_MS).min(u32::MAX as u64) as u32;
-        self.reorder.reset(Some(target_index));
+        // Current native SRSV2 B-frame streams use frame_index as display identity, while packet
+        // PTS advances in file/decode order. Recover from the previous keyframe, reorder by
+        // frame_index, and pair the observed decode-order timestamp slots with display-ready
+        // frames. This avoids inventing a fixed frame cadence.
+        self.reorder.reset(None);
+        self.presentation_time_slots_ms.clear();
 
         let Some(session) = self.session.as_mut() else {
             self.fail("seek requested without an open playback session".to_string());
@@ -526,24 +531,50 @@ impl PlaybackWorker {
         }
 
         const RECOVERY_STEP_BUDGET: usize = 8192;
-        let mut target_reached = false;
+        let mut selected: Option<(DecodedVideoFrame, u64)> = None;
 
         for _ in 0..RECOVERY_STEP_BUDGET {
             if self.shutdown.load(Ordering::Acquire) {
                 break;
             }
+
             match session.decode_next_step() {
                 Ok(PlaybackEvent::Video(frame)) => {
-                    if frame.frame_index >= target_index {
-                        target_reached = true;
-                    }
+                    let slot_ms = frame_position_ms(&frame);
                     if let Err(error) = self.reorder.push(frame) {
                         session.decoded_video_frames = saved_video;
                         session.decoded_audio_chunks = saved_audio;
                         self.fail(error);
                         return;
                     }
-                    if target_reached && self.reorder.pending.contains_key(&target_index) {
+                    if self.presentation_time_slots_ms.len()
+                        >= MAX_PRESENTATION_REORDER_FRAMES + 1
+                    {
+                        session.decoded_video_frames = saved_video;
+                        session.decoded_audio_chunks = saved_audio;
+                        self.fail(
+                            "seek recovery timestamp-slot queue exceeded reorder bound".to_string(),
+                        );
+                        return;
+                    }
+                    self.presentation_time_slots_ms.push_back(slot_ms);
+
+                    while let Some(frame) = self.reorder.pop_ready() {
+                        let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
+                            session.decoded_video_frames = saved_video;
+                            session.decoded_audio_chunks = saved_audio;
+                            self.fail(
+                                "seek recovery produced frame without timestamp slot".to_string(),
+                            );
+                            return;
+                        };
+                        if position_ms >= target_ms {
+                            selected = Some((frame, position_ms));
+                            break;
+                        }
+                    }
+
+                    if selected.is_some() {
                         break;
                     }
                 }
@@ -561,12 +592,12 @@ impl PlaybackWorker {
         session.decoded_video_frames = saved_video;
         session.decoded_audio_chunks = saved_audio;
 
-        if !target_reached {
-            self.fail("seek recovery did not reach requested presentation floor".to_string());
+        let Some((frame, position_ms)) = selected else {
+            self.fail("seek recovery did not reach requested presentation time".to_string());
             return;
-        }
+        };
 
-        self.presented_position_ms = u64::from(target_index).saturating_mul(COMPAT_FRAME_DURATION_MS);
+        self.publish_frame_at_position(frame, position_ms);
         self.state = if resume_playing {
             PlayerState::Playing
         } else {
@@ -579,22 +610,8 @@ impl PlaybackWorker {
         self.emit_snapshot();
     }
 
-    fn publish_frame(&mut self, frame: DecodedVideoFrame) {
-        let srsv2_compat = self
-            .session
-            .as_ref()
-            .and_then(|session| session.primary_video())
-            .is_some_and(|track| track.codec_id == 3);
-        let position_ms = if srsv2_compat {
-            u64::from(frame.frame_index).saturating_mul(COMPAT_FRAME_DURATION_MS)
-        } else if frame.timescale_hz == 0 {
-            0
-        } else {
-            frame
-                .pts_ticks
-                .saturating_mul(1000)
-                .saturating_div(u64::from(frame.timescale_hz))
-        };
+    fn publish_frame_at_position(&mut self, frame: DecodedVideoFrame, position_ms: u64) {
+
         let presentation = PresentationFrame {
             generation: self.generation,
             frame,
@@ -685,6 +702,17 @@ impl PlaybackWorker {
         let _ = self
             .event_tx
             .try_send(PlaybackWorkerEvent::Snapshot(snapshot));
+    }
+}
+
+fn frame_position_ms(frame: &DecodedVideoFrame) -> u64 {
+    if frame.timescale_hz == 0 {
+        0
+    } else {
+        frame
+            .pts_ticks
+            .saturating_mul(1000)
+            .saturating_div(u64::from(frame.timescale_hz))
     }
 }
 
