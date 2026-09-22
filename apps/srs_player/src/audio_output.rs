@@ -1,0 +1,426 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context, Result};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
+use rtrb::{Consumer, Producer, RingBuffer};
+
+const MIN_RING_SAMPLES: usize = 4_096;
+const MAX_RING_SAMPLES: usize = 1_048_576;
+const TARGET_BUFFER_MS: u64 = 500;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AudioTelemetry {
+    pub consumed_samples: u64,
+    pub underrun_samples: u64,
+    pub stream_errors: u64,
+    pub requested_epoch: u64,
+    pub callback_epoch: u64,
+}
+
+pub struct AudioOutput {
+    producer: Producer<i16>,
+    stream: Stream,
+    requested_epoch: Arc<AtomicU64>,
+    callback_epoch: Arc<AtomicU64>,
+    consumed_samples: Arc<AtomicU64>,
+    underrun_samples: Arc<AtomicU64>,
+    stream_errors: Arc<AtomicU64>,
+    sample_rate: u32,
+    channels: u16,
+}
+
+impl AudioOutput {
+    pub fn open(sample_rate: u32, channels: u8, initial_epoch: u64) -> Result<Self> {
+        if sample_rate == 0 {
+            return Err(anyhow!("decoded audio sample rate must be non-zero"));
+        }
+        if channels == 0 {
+            return Err(anyhow!("decoded audio channel count must be non-zero"));
+        }
+
+        let channels = u16::from(channels);
+        let host = cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow!("no default audio output device available"))?;
+
+        let supported = select_exact_config(&device, sample_rate, channels)?;
+        let sample_format = supported.sample_format();
+        let stream_config = supported.config();
+
+        let capacity = ring_capacity_samples(sample_rate, channels)?;
+        let (producer, consumer) = RingBuffer::<i16>::new(capacity);
+
+        let requested_epoch = Arc::new(AtomicU64::new(initial_epoch));
+        let callback_epoch = Arc::new(AtomicU64::new(initial_epoch));
+        let consumed_samples = Arc::new(AtomicU64::new(0));
+        let underrun_samples = Arc::new(AtomicU64::new(0));
+        let stream_errors = Arc::new(AtomicU64::new(0));
+
+        let stream = build_stream_for_format(
+            &device,
+            stream_config,
+            sample_format,
+            consumer,
+            Arc::clone(&requested_epoch),
+            Arc::clone(&callback_epoch),
+            Arc::clone(&consumed_samples),
+            Arc::clone(&underrun_samples),
+            Arc::clone(&stream_errors),
+        )?;
+        stream
+            .play()
+            .context("failed to start audio output stream")?;
+
+        Ok(Self {
+            producer,
+            stream,
+            requested_epoch,
+            callback_epoch,
+            consumed_samples,
+            underrun_samples,
+            stream_errors,
+            sample_rate,
+            channels,
+        })
+    }
+
+    pub fn matches_format(&self, sample_rate: u32, channels: u8) -> bool {
+        self.sample_rate == sample_rate && self.channels == u16::from(channels)
+    }
+
+    pub fn request_epoch(&self, epoch: u64) {
+        self.requested_epoch.store(epoch, Ordering::Release);
+    }
+
+    pub fn epoch_ready(&self, epoch: u64) -> bool {
+        self.callback_epoch.load(Ordering::Acquire) == epoch
+            && self.requested_epoch.load(Ordering::Acquire) == epoch
+    }
+
+    pub fn push_pcm(&mut self, epoch: u64, samples: &[i16]) -> Result<usize> {
+        if !self.epoch_ready(epoch) {
+            return Ok(0);
+        }
+        Ok(self.producer.push_partial_slice(samples))
+    }
+
+    pub fn available_slots(&self) -> usize {
+        self.producer.slots()
+    }
+
+    pub fn telemetry(&self) -> AudioTelemetry {
+        AudioTelemetry {
+            consumed_samples: self.consumed_samples.load(Ordering::Relaxed),
+            underrun_samples: self.underrun_samples.load(Ordering::Relaxed),
+            stream_errors: self.stream_errors.load(Ordering::Relaxed),
+            requested_epoch: self.requested_epoch.load(Ordering::Acquire),
+            callback_epoch: self.callback_epoch.load(Ordering::Acquire),
+        }
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    pub fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    pub fn pause(&self) -> Result<()> {
+        self.stream.pause().context("failed to pause audio stream")
+    }
+
+    pub fn play(&self) -> Result<()> {
+        self.stream.play().context("failed to resume audio stream")
+    }
+}
+
+fn ring_capacity_samples(sample_rate: u32, channels: u16) -> Result<usize> {
+    let samples = u64::from(sample_rate)
+        .checked_mul(u64::from(channels))
+        .and_then(|value| value.checked_mul(TARGET_BUFFER_MS))
+        .map(|value| value / 1_000)
+        .ok_or_else(|| anyhow!("audio ring capacity overflow"))?;
+    let samples = usize::try_from(samples).context("audio ring capacity does not fit usize")?;
+    Ok(samples.clamp(MIN_RING_SAMPLES, MAX_RING_SAMPLES))
+}
+
+fn select_exact_config(
+    device: &cpal::Device,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<SupportedStreamConfig> {
+    let mut candidates = device
+        .supported_output_configs()
+        .context("failed to enumerate supported audio output configurations")?
+        .filter(|range| range.channels() == channels && is_supported_pcm_format(range.sample_format()))
+        .filter_map(|range| range.try_with_sample_rate(sample_rate))
+        .collect::<Vec<_>>();
+
+    candidates.sort_by_key(|config| sample_format_rank(config.sample_format()));
+    candidates
+        .pop()
+        .ok_or_else(|| anyhow!(
+            "audio device has no supported PCM configuration for {sample_rate} Hz / {channels} channels"
+        ))
+}
+
+fn is_supported_pcm_format(format: SampleFormat) -> bool {
+    matches!(
+        format,
+        SampleFormat::F32
+            | SampleFormat::F64
+            | SampleFormat::I8
+            | SampleFormat::I16
+            | SampleFormat::I32
+            | SampleFormat::I64
+            | SampleFormat::U8
+            | SampleFormat::U16
+            | SampleFormat::U32
+            | SampleFormat::U64
+    )
+}
+
+fn sample_format_rank(format: SampleFormat) -> u8 {
+    match format {
+        SampleFormat::F32 => 10,
+        SampleFormat::F64 => 9,
+        SampleFormat::I32 => 8,
+        SampleFormat::I16 => 7,
+        SampleFormat::U32 => 6,
+        SampleFormat::U16 => 5,
+        SampleFormat::I8 => 4,
+        SampleFormat::U8 => 3,
+        SampleFormat::I64 => 2,
+        SampleFormat::U64 => 1,
+        _ => 0,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_stream_for_format(
+    device: &cpal::Device,
+    config: StreamConfig,
+    sample_format: SampleFormat,
+    consumer: Consumer<i16>,
+    requested_epoch: Arc<AtomicU64>,
+    callback_epoch: Arc<AtomicU64>,
+    consumed_samples: Arc<AtomicU64>,
+    underrun_samples: Arc<AtomicU64>,
+    stream_errors: Arc<AtomicU64>,
+) -> Result<Stream> {
+    macro_rules! build {
+        ($sample:ty) => {{
+            build_typed_stream::<$sample>(
+                device,
+                config,
+                consumer,
+                requested_epoch,
+                callback_epoch,
+                consumed_samples,
+                underrun_samples,
+                stream_errors,
+            )
+        }};
+    }
+
+    match sample_format {
+        SampleFormat::F32 => build!(f32),
+        SampleFormat::F64 => build!(f64),
+        SampleFormat::I8 => build!(i8),
+        SampleFormat::I16 => build!(i16),
+        SampleFormat::I32 => build!(i32),
+        SampleFormat::I64 => build!(i64),
+        SampleFormat::U8 => build!(u8),
+        SampleFormat::U16 => build!(u16),
+        SampleFormat::U32 => build!(u32),
+        SampleFormat::U64 => build!(u64),
+        other => Err(anyhow!("unsupported PCM device sample format: {other}")),
+    }
+}
+
+trait FromPcmI16: SizedSample {
+    fn from_pcm_i16(sample: i16) -> Self;
+    fn silence() -> Self;
+}
+
+macro_rules! impl_signed_pcm {
+    ($ty:ty, $shift:expr) => {
+        impl FromPcmI16 for $ty {
+            fn from_pcm_i16(sample: i16) -> Self {
+                (sample as $ty) << $shift
+            }
+            fn silence() -> Self {
+                0
+            }
+        }
+    };
+}
+
+impl FromPcmI16 for i16 {
+    fn from_pcm_i16(sample: i16) -> Self {
+        sample
+    }
+    fn silence() -> Self {
+        0
+    }
+}
+impl_signed_pcm!(i32, 16);
+impl_signed_pcm!(i64, 48);
+
+impl FromPcmI16 for i8 {
+    fn from_pcm_i16(sample: i16) -> Self {
+        (sample >> 8) as i8
+    }
+    fn silence() -> Self {
+        0
+    }
+}
+
+impl FromPcmI16 for f32 {
+    fn from_pcm_i16(sample: i16) -> Self {
+        f32::from(sample) / 32_768.0
+    }
+    fn silence() -> Self {
+        0.0
+    }
+}
+
+impl FromPcmI16 for f64 {
+    fn from_pcm_i16(sample: i16) -> Self {
+        f64::from(sample) / 32_768.0
+    }
+    fn silence() -> Self {
+        0.0
+    }
+}
+
+impl FromPcmI16 for u8 {
+    fn from_pcm_i16(sample: i16) -> Self {
+        ((i32::from(sample) + 32_768) >> 8) as u8
+    }
+    fn silence() -> Self {
+        128
+    }
+}
+
+impl FromPcmI16 for u16 {
+    fn from_pcm_i16(sample: i16) -> Self {
+        (i32::from(sample) + 32_768) as u16
+    }
+    fn silence() -> Self {
+        32_768
+    }
+}
+
+impl FromPcmI16 for u32 {
+    fn from_pcm_i16(sample: i16) -> Self {
+        ((i64::from(sample) + 32_768) as u32) << 16
+    }
+    fn silence() -> Self {
+        1_u32 << 31
+    }
+}
+
+impl FromPcmI16 for u64 {
+    fn from_pcm_i16(sample: i16) -> Self {
+        ((i128::from(sample) + 32_768) as u64) << 48
+    }
+    fn silence() -> Self {
+        1_u64 << 63
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_typed_stream<T>(
+    device: &cpal::Device,
+    config: StreamConfig,
+    mut consumer: Consumer<i16>,
+    requested_epoch: Arc<AtomicU64>,
+    callback_epoch: Arc<AtomicU64>,
+    consumed_samples: Arc<AtomicU64>,
+    underrun_samples: Arc<AtomicU64>,
+    stream_errors: Arc<AtomicU64>,
+) -> Result<Stream>
+where
+    T: FromPcmI16 + Send + 'static,
+{
+    let callback_stream_errors = Arc::clone(&stream_errors);
+    device
+        .build_output_stream(
+            config,
+            move |output: &mut [T], _| {
+                let requested = requested_epoch.load(Ordering::Acquire);
+                let active = callback_epoch.load(Ordering::Acquire);
+                if requested != active {
+                    while consumer.pop().is_ok() {}
+                    callback_epoch.store(requested, Ordering::Release);
+                    for sample in output.iter_mut() {
+                        *sample = T::silence();
+                    }
+                    return;
+                }
+
+                let mut consumed = 0_u64;
+                let mut underrun = 0_u64;
+                for sample in output.iter_mut() {
+                    match consumer.pop() {
+                        Ok(value) => {
+                            *sample = T::from_pcm_i16(value);
+                            consumed = consumed.saturating_add(1);
+                        }
+                        Err(_) => {
+                            *sample = T::silence();
+                            underrun = underrun.saturating_add(1);
+                        }
+                    }
+                }
+                if consumed != 0 {
+                    consumed_samples.fetch_add(consumed, Ordering::Relaxed);
+                }
+                if underrun != 0 {
+                    underrun_samples.fetch_add(underrun, Ordering::Relaxed);
+                }
+            },
+            move |_error| {
+                callback_stream_errors.fetch_add(1, Ordering::Relaxed);
+            },
+            None,
+        )
+        .context("failed to build exact-format audio output stream")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capacity_is_bounded() {
+        assert_eq!(ring_capacity_samples(8_000, 1).expect("capacity"), MIN_RING_SAMPLES);
+        assert_eq!(
+            ring_capacity_samples(768_000, 64).expect("capacity"),
+            MAX_RING_SAMPLES
+        );
+    }
+
+    #[test]
+    fn integer_conversions_preserve_silence_and_extremes() {
+        assert_eq!(i16::from_pcm_i16(i16::MIN), i16::MIN);
+        assert_eq!(u16::from_pcm_i16(i16::MIN), 0);
+        assert_eq!(u16::from_pcm_i16(0), 32_768);
+        assert_eq!(u16::from_pcm_i16(i16::MAX), u16::MAX);
+        assert_eq!(i32::from_pcm_i16(i16::MIN), i32::MIN);
+        assert_eq!(u32::from_pcm_i16(i16::MIN), 0);
+    }
+
+    #[test]
+    fn float_conversions_are_normalized() {
+        assert_eq!(f32::from_pcm_i16(0), 0.0);
+        assert_eq!(f64::from_pcm_i16(0), 0.0);
+        assert!(f32::from_pcm_i16(i16::MAX) < 1.0);
+        assert_eq!(f32::from_pcm_i16(i16::MIN), -1.0);
+    }
+}
