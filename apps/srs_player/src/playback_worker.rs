@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
@@ -11,7 +11,6 @@ use libsrs_app_services::{DecodedVideoFrame, PlaybackEvent, PlaybackSession, Pla
 const COMMAND_CAPACITY: usize = 16;
 const EVENT_CAPACITY: usize = 16;
 const PLAYBACK_TICK: Duration = Duration::from_millis(33);
-const COMPAT_FRAME_DURATION_MS: u64 = 40;
 const MAX_PRESENTATION_REORDER_FRAMES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +255,7 @@ struct PlaybackWorker {
     presented_video_frames: u64,
     dropped_video_frames: u64,
     presented_position_ms: u64,
+    presentation_time_slots_ms: VecDeque<u64>,
 }
 
 impl PlaybackWorker {
@@ -277,6 +277,9 @@ impl PlaybackWorker {
             presented_video_frames: 0,
             dropped_video_frames: 0,
             presented_position_ms: 0,
+            presentation_time_slots_ms: VecDeque::with_capacity(
+                MAX_PRESENTATION_REORDER_FRAMES + 1,
+            ),
         }
     }
 
@@ -321,6 +324,7 @@ impl PlaybackWorker {
                 // path so an Open failure cannot leave old content playable under a new generation.
                 self.session = None;
                 self.reorder.reset(None);
+                self.presentation_time_slots_ms.clear();
                 self.clear_frame_slot();
                 self.presented_video_frames = 0;
                 self.dropped_video_frames = 0;
@@ -350,6 +354,7 @@ impl PlaybackWorker {
                         return true;
                     }
                     self.reorder.reset(None);
+                    self.presentation_time_slots_ms.clear();
                 }
                 session.play();
                 self.state = PlayerState::Playing;
@@ -376,6 +381,7 @@ impl PlaybackWorker {
                     }
                 }
                 self.reorder.reset(None);
+                self.presentation_time_slots_ms.clear();
                 self.clear_frame_slot();
                 self.presented_position_ms = 0;
                 self.state = PlayerState::Ready;
@@ -385,6 +391,7 @@ impl PlaybackWorker {
                 self.generation = generation;
                 self.session = None;
                 self.reorder.reset(None);
+                self.presentation_time_slots_ms.clear();
                 self.clear_frame_slot();
                 self.presented_position_ms = 0;
                 self.state = PlayerState::Closed;
