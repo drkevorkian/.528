@@ -104,7 +104,10 @@ impl AudioOutput {
         if !self.epoch_ready(epoch) {
             return Ok(0);
         }
-        Ok(self.producer.push_partial_slice(samples))
+        let (remaining_head, remaining_tail) = self.producer.push_partial_slice(samples);
+        Ok(samples
+            .len()
+            .saturating_sub(remaining_head.len().saturating_add(remaining_tail.len())))
     }
 
     pub fn available_slots(&self) -> usize {
