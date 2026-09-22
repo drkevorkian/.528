@@ -11,7 +11,11 @@ use libsrs_licensing_proto::{
     AdminUpdateKeyStatusRequest, AdminUpdateLicenseFeaturesRequest, AdminUpdateRecordStateRequest,
     IssueKeyRequest, LicensedFeature, NotificationDeliveryState,
 };
-use worker::{AdminClientError, AdminCommand, AdminEvent, AdminWorker};
+use worker::{
+    validate_admin_endpoint, AdminClientError, AdminCommand, AdminEndpointSecurity, AdminEvent,
+    AdminWorker,
+};
+use zeroize::Zeroizing;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
@@ -24,6 +28,7 @@ fn main() -> eframe::Result<()> {
 
 struct AdminApp {
     base_url: String,
+    endpoint_security: Option<AdminEndpointSecurity>,
     worker: Option<AdminWorker>,
     snapshot: Option<AdminSnapshot>,
     refresh_pending: bool,
@@ -67,6 +72,8 @@ impl AdminApp {
         }
 
         let base_url = config.admin.base_url;
+        let endpoint_security = validate_admin_endpoint(&base_url)
+            .map_err(|error| anyhow::anyhow!(error.user_message()))?;
         let worker = AdminWorker::spawn(
             base_url.clone(),
             admin_token,
@@ -78,6 +85,7 @@ impl AdminApp {
         let now = Instant::now();
         let mut app = Self {
             base_url,
+            endpoint_security: Some(endpoint_security),
             worker: Some(worker),
             snapshot: None,
             refresh_pending: false,
@@ -111,6 +119,7 @@ impl AdminApp {
         let now = Instant::now();
         Self {
             base_url: "http://127.0.0.1:3000".to_string(),
+            endpoint_security: None,
             worker: None,
             snapshot: None,
             refresh_pending: false,
@@ -310,7 +319,7 @@ impl AdminApp {
                     Ok(issued) => {
                         self.issued_credential = Some(IssuedCredential {
                             license_id: issued.license_id,
-                            key: issued.key,
+                            key: Zeroizing::new(issued.key),
                         });
                         self.push_notification(
                             "License issued. Copy the credential from the issuance panel, then clear it."
@@ -427,6 +436,12 @@ impl AdminApp {
         ui.heading("Current State");
         ui.label(format!("Server endpoint: {}", self.base_url));
         ui.label(format!(
+            "Transport security: {}",
+            self.endpoint_security
+                .map(AdminEndpointSecurity::label)
+                .unwrap_or("unavailable")
+        ));
+        ui.label(format!(
             "Auto-refresh: {}",
             if self.auto_refresh {
                 "enabled"
@@ -525,7 +540,7 @@ impl AdminApp {
                 ui.strong("New credential — copy it now");
                 ui.monospace(format!("License: {}", issued.license_id));
                 ui.horizontal_wrapped(|ui| {
-                    ui.monospace(&issued.key);
+                    ui.monospace(issued.key.as_str());
                     if ui.button("Clear Credential").clicked() {
                         clear_issued_credential = true;
                     }
@@ -1266,7 +1281,7 @@ fn request_status_text(request: &AdminPendingRequestRecord) -> String {
 
 struct IssuedCredential {
     license_id: String,
-    key: String,
+    key: Zeroizing<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
