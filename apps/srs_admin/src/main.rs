@@ -958,7 +958,10 @@ impl AdminApp {
             .fill(egui::Color32::from_rgb(28, 33, 41))
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
-                ui.heading("Create Notification");
+                ui.heading("Queue Notification");
+                ui.label(
+                    "Submitting queues the notification for delivery. The monitor below is the source of truth for queued, delivered, and read state.",
+                );
                 ui.horizontal(|ui| {
                     ui.label("License");
                     egui::ComboBox::from_id_salt("notification_license")
@@ -1001,13 +1004,16 @@ impl AdminApp {
                     [ui.available_width(), 90.0],
                     egui::TextEdit::multiline(&mut self.notification_body),
                 );
-                if ui.button("Create And Send Notification").clicked() {
+                if ui.button("Queue Notification").clicked() {
                     self.create_notification();
                 }
             });
 
         ui.separator();
         ui.heading("Notification Monitor");
+        ui.label(
+            "Queued means delivery is still pending or awaiting retry; Delivered means the delivery worker accepted it as delivered/logged; Read means the client consumed it.",
+        );
         egui::ScrollArea::vertical()
             .id_salt("admin_notifications_tab_scroll")
             .max_height(360.0)
