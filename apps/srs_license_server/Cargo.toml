@@ -20,3 +20,6 @@ tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "net", "s
 tracing.workspace = true
 tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
 uuid = { version = "1.20.0", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
