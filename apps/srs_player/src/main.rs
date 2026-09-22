@@ -6,11 +6,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use eframe::egui;
 use libsrs_app_config::SrsConfig;
 use libsrs_app_services::{AppServices, DecodedVideoFrame, MediaInspection};
+use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
+use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
     PlaybackSnapshot, PlaybackWorkerCommand, PlaybackWorkerEvent, PlaybackWorkerHandle, PlayerState,
 };
-use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
-use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use rfd::FileDialog;
 
 fn main() -> eframe::Result<()> {
@@ -85,7 +85,8 @@ impl PlaybackWorkspace {
             position_ms: 0,
             duration_ms: 5_000,
             skip_ms: 5_000,
-            debug_stats: "worker=closed | decoded=0 | presented=0 | dropped=0 | reorder=0".to_string(),
+            debug_stats: "worker=closed | decoded=0 | presented=0 | dropped=0 | reorder=0"
+                .to_string(),
             worker: PlaybackWorkerHandle::spawn(),
             generation: 0,
             worker_state: PlayerState::Closed,
@@ -100,7 +101,11 @@ impl PlaybackWorkspace {
 
     fn next_generation_candidate(&self) -> u64 {
         let next = self.generation.wrapping_add(1);
-        if next == 0 { 1 } else { next }
+        if next == 0 {
+            1
+        } else {
+            next
+        }
     }
 }
 
@@ -376,13 +381,9 @@ impl PlayerApp {
             return;
         }
 
-        match self
-            .playback
-            .worker
-            .try_send(PlaybackWorkerCommand::Play {
-                generation: self.playback.generation,
-            })
-        {
+        match self.playback.worker.try_send(PlaybackWorkerCommand::Play {
+            generation: self.playback.generation,
+        }) {
             Ok(()) => {
                 self.playback.command_pending = true;
                 self.status = "Play requested".to_string();
@@ -437,29 +438,23 @@ impl PlayerApp {
     }
 
     fn pause(&mut self) {
-        match self
-            .playback
-            .worker
-            .try_send(PlaybackWorkerCommand::Pause {
-                generation: self.playback.generation,
-            })
-        {
+        match self.playback.worker.try_send(PlaybackWorkerCommand::Pause {
+            generation: self.playback.generation,
+        }) {
             Ok(()) => {
                 self.playback.command_pending = true;
                 self.status = "Pause requested".to_string();
             }
-            Err(err) => self.push_notification(format!("Playback worker Pause queue failed: {err}")),
+            Err(err) => {
+                self.push_notification(format!("Playback worker Pause queue failed: {err}"))
+            }
         }
     }
 
     fn stop(&mut self) {
-        match self
-            .playback
-            .worker
-            .try_send(PlaybackWorkerCommand::Stop {
-                generation: self.playback.generation,
-            })
-        {
+        match self.playback.worker.try_send(PlaybackWorkerCommand::Stop {
+            generation: self.playback.generation,
+        }) {
             Ok(()) => {
                 self.playback.command_pending = true;
                 self.playback.pending_seek_ms = None;
@@ -528,8 +523,7 @@ impl PlayerApp {
                         self.playback.position_ms =
                             presented_position_ms.min(self.playback.duration_ms.max(1));
                         self.editor.frame_cursor_ms = self.playback.position_ms;
-                        self.status =
-                            format!("Seek completed at {} ms", self.playback.position_ms);
+                        self.status = format!("Seek completed at {} ms", self.playback.position_ms);
                     }
                 }
                 Ok(PlaybackWorkerEvent::FatalError {
@@ -1110,13 +1104,7 @@ impl PlayerApp {
         ui.heading(egui::RichText::new("Playback Workspace").color(accent_blue()));
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
-            metric_card(
-                ui,
-                "State",
-                state_label,
-                self.status.as_str(),
-                state_color,
-            );
+            metric_card(ui, "State", state_label, self.status.as_str(), state_color);
             metric_card(
                 ui,
                 "Position",
@@ -1157,8 +1145,8 @@ impl PlayerApp {
             if slider_resp.changed() {
                 self.playback.pending_seek_ms = Some(self.playback.position_ms);
             }
-            let commit_seek = slider_resp.drag_stopped()
-                || (slider_resp.changed() && slider_resp.clicked());
+            let commit_seek =
+                slider_resp.drag_stopped() || (slider_resp.changed() && slider_resp.clicked());
             if commit_seek {
                 if let Some(target_ms) = self.playback.pending_seek_ms.take() {
                     self.seek_session_ms(target_ms);
