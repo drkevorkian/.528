@@ -18,7 +18,6 @@ pub const DB_PERMIT_LIMIT: usize = 1;
 #[derive(Clone, Debug)]
 pub struct BoundedDbExecutor {
     permits: Arc<Semaphore>,
-    limit: usize,
 }
 
 impl BoundedDbExecutor {
@@ -31,14 +30,10 @@ impl BoundedDbExecutor {
         let limit = limit.max(1);
         Self {
             permits: Arc::new(Semaphore::new(limit)),
-            limit,
         }
     }
 
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-
+    #[cfg(test)]
     pub fn available_permits(&self) -> usize {
         self.permits.available_permits()
     }
@@ -131,7 +126,6 @@ mod tests {
     #[tokio::test]
     async fn with_limit_creates_an_independent_pool() {
         let mail = BoundedDbExecutor::with_limit(2);
-        assert_eq!(mail.limit(), 2);
         assert_eq!(mail.available_permits(), 2);
     }
 }
