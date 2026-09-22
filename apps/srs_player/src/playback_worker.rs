@@ -69,26 +69,12 @@ pub struct PresentationFrame {
 
 #[derive(Debug)]
 pub enum PlaybackWorkerCommand {
-    Open {
-        generation: u64,
-        path: PathBuf,
-    },
-    Play {
-        generation: u64,
-    },
-    Pause {
-        generation: u64,
-    },
-    Stop {
-        generation: u64,
-    },
-    Close {
-        generation: u64,
-    },
-    Seek {
-        generation: u64,
-        target_ms: u64,
-    },
+    Open { generation: u64, path: PathBuf },
+    Play { generation: u64 },
+    Pause { generation: u64 },
+    Stop { generation: u64 },
+    Close { generation: u64 },
+    Seek { generation: u64, target_ms: u64 },
     Shutdown,
 }
 
@@ -129,7 +115,8 @@ impl PlaybackWorkerHandle {
         let thread = thread::Builder::new()
             .name("srs-playback-worker".to_string())
             .spawn(move || {
-                let mut worker = PlaybackWorker::new(command_rx, event_tx, worker_slot, worker_shutdown);
+                let mut worker =
+                    PlaybackWorker::new(command_rx, event_tx, worker_slot, worker_shutdown);
                 worker.run();
             })
             .ok();
@@ -451,7 +438,9 @@ impl PlaybackWorker {
                 }
                 if let Some(frame) = self.reorder.pop_ready() {
                     let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
-                        self.fail("presentation frame became ready without a timestamp slot".to_string());
+                        self.fail(
+                            "presentation frame became ready without a timestamp slot".to_string(),
+                        );
                         return;
                     };
                     self.publish_frame_at_position(frame, position_ms);
@@ -629,7 +618,6 @@ impl PlaybackWorker {
     }
 
     fn publish_frame_at_position(&mut self, frame: DecodedVideoFrame, position_ms: u64) {
-
         let presentation = PresentationFrame {
             generation: self.generation,
             frame,
@@ -715,12 +703,10 @@ impl PlaybackWorker {
         self.state = PlayerState::Error;
         let mut snapshot = self.snapshot();
         snapshot.last_error = Some(message.clone());
-        let _ = self
-            .event_tx
-            .try_send(PlaybackWorkerEvent::FatalError {
-                generation: self.generation,
-                message,
-            });
+        let _ = self.event_tx.try_send(PlaybackWorkerEvent::FatalError {
+            generation: self.generation,
+            message,
+        });
         let _ = self
             .event_tx
             .try_send(PlaybackWorkerEvent::Snapshot(snapshot));
@@ -738,10 +724,7 @@ fn frame_position_ms(frame: &DecodedVideoFrame) -> u64 {
     }
 }
 
-fn push_bounded_time_slot_ms(
-    slots: &mut VecDeque<u64>,
-    slot_ms: u64,
-) -> Result<(), String> {
+fn push_bounded_time_slot_ms(slots: &mut VecDeque<u64>, slot_ms: u64) -> Result<(), String> {
     if slots.len() >= MAX_PRESENTATION_REORDER_FRAMES + 1 {
         return Err("presentation timestamp-slot queue exceeded reorder bound".to_string());
     }
