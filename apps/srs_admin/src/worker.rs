@@ -124,7 +124,8 @@ impl AdminWorker {
 
 impl Drop for AdminWorker {
     fn drop(&mut self) {
-        let _ = self.command_tx.send(AdminCommand::Shutdown);
+        // Never block the UI thread during window shutdown if the bounded queue is full.
+        let _ = self.command_tx.try_send(AdminCommand::Shutdown);
     }
 }
 
