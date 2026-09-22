@@ -2047,7 +2047,8 @@ struct AppError {
     status: StatusCode,
     message: String,
 }
-impl AppError {    fn not_found(message: impl Into<String>) -> Self {
+impl AppError {
+    fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             message: message.into(),
