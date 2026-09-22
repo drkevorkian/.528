@@ -114,7 +114,7 @@ pub struct AdminWorker {
 impl AdminWorker {
     pub fn spawn(
         base_url: String,
-        bearer_token: Zeroizing<String>,
+        bearer_token: String,
         connect_timeout: Duration,
         request_timeout: Duration,
     ) -> Result<Self, String> {
@@ -173,7 +173,7 @@ impl Drop for AdminWorker {
 fn run_worker(
     client: Client,
     base_url: String,
-    bearer_token: String,
+    bearer_token: Zeroizing<String>,
     command_rx: Receiver<AdminCommand>,
     event_tx: SyncSender<AdminEvent>,
 ) {
@@ -213,7 +213,7 @@ fn run_worker(
             ),
             AdminCommand::SetRecordState { path, request } => AdminEvent::Action(
                 send_json::<AdminActionResponse>(
-                    authorized(client.post(format!("{base_url}/{path}")), &bearer_token)
+                    authorized(client.post(format!("{base_url}/{path}")), bearer_token.as_str())
                         .json(&request),
                 ),
             ),
