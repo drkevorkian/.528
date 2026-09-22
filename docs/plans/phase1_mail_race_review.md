@@ -42,3 +42,19 @@ if claimed:
 
 Do not merge until claim + license-scoped select are in `verify_json` / `create_notification_json`.
 Codec still frozen. Wait for CI on the draft PR.
+
+
+## Delivery guarantee
+
+The outbox is intentionally **at-least-once**, not exactly-once.
+
+A process crash after the SMTP server accepts a message but before `mark_accepted` commits can leave the row in the internal `sending` state. Server startup resets stale `sending` rows to `queued` so delivery is not permanently lost. A subsequent retry can therefore duplicate that message.
+
+Exactly-once SMTP delivery cannot be guaranteed by this local database alone because SMTP acceptance and the SQLite status update are not one atomic transaction. The Phase 1 priority is:
+
+- never lose a queued notification silently;
+- prevent ordinary concurrent double-send races with atomic claiming;
+- recover stale claims after restart;
+- accept the narrow crash-window duplicate risk.
+
+If a future mail provider supports a durable external idempotency key, that can tighten the guarantee without coupling SMTP I/O to the SQLite transaction.
