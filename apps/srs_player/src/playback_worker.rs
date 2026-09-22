@@ -923,8 +923,10 @@ impl PlaybackWorker {
             reorder_depth: self.reorder.depth(),
             seek_in_progress: self.state == PlayerState::Seeking,
             audio_media_position_ms: self.audio_media_position_ms(),
-            audio_consumed_samples: audio_telemetry.map_or(0, |telemetry| telemetry.consumed_samples),
-            audio_underrun_samples: audio_telemetry.map_or(0, |telemetry| telemetry.underrun_samples),
+            audio_consumed_samples: audio_telemetry
+                .map_or(0, |telemetry| telemetry.consumed_samples),
+            audio_underrun_samples: audio_telemetry
+                .map_or(0, |telemetry| telemetry.underrun_samples),
             audio_stream_errors: audio_telemetry.map_or(0, |telemetry| telemetry.stream_errors),
             last_error: None,
         }
@@ -1000,9 +1002,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
 
-    fn worker_with_snapshot_slot(
-        snapshot_slot: Arc<Mutex<PlaybackSnapshot>>,
-    ) -> PlaybackWorker {
+    fn worker_with_snapshot_slot(snapshot_slot: Arc<Mutex<PlaybackSnapshot>>) -> PlaybackWorker {
         let (_command_tx, command_rx) = mpsc::sync_channel(1);
         let (event_tx, _event_rx) = mpsc::sync_channel(1);
         PlaybackWorker::new(
@@ -1077,7 +1077,9 @@ mod tests {
             if !self.epoch_ready(epoch) {
                 return Ok(0);
             }
-            Ok(samples.len().min(self.state.max_write.load(Ordering::Relaxed)))
+            Ok(samples
+                .len()
+                .min(self.state.max_write.load(Ordering::Relaxed)))
         }
 
         fn telemetry(&self) -> AudioTelemetry {
@@ -1116,11 +1118,7 @@ mod tests {
     ) -> Arc<FakeAudioState> {
         let state = FakeAudioState::new(epoch, max_write);
         worker.audio_epoch = epoch;
-        worker.audio_output = Some(Box::new(FakeAudioSink::new(
-            Arc::clone(&state),
-            48_000,
-            2,
-        )));
+        worker.audio_output = Some(Box::new(FakeAudioSink::new(Arc::clone(&state), 48_000, 2)));
         state
     }
 
@@ -1314,7 +1312,9 @@ mod tests {
         worker.audio_last_stream_errors = 3;
         worker.pending_audio = Some(pending_audio(&[1, 2]));
 
-        assert!(!worker.flush_pending_audio().expect("historical error ignored"));
+        assert!(!worker
+            .flush_pending_audio()
+            .expect("historical error ignored"));
 
         state.stream_errors.store(4, Ordering::Relaxed);
         let error = worker
