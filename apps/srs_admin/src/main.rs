@@ -73,7 +73,7 @@ impl AdminApp {
 
         let base_url = config.admin.base_url;
         let endpoint_security = validate_admin_endpoint(&base_url)
-            .map_err(|error| anyhow::anyhow!(error.user_message()))?;
+            .map_err(|error| anyhow::anyhow!("{}", error.user_message()))?;
         let worker = AdminWorker::spawn(
             base_url.clone(),
             admin_token,
