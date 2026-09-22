@@ -1445,10 +1445,7 @@ mod tests {
             1_250
         );
         clock.pause(base + Duration::from_millis(300));
-        assert_eq!(
-            clock.media_time_ms(base + Duration::from_secs(30)),
-            1_300
-        );
+        assert_eq!(clock.media_time_ms(base + Duration::from_secs(30)), 1_300);
 
         clock.resume(base + Duration::from_secs(30));
         assert_eq!(
@@ -1593,7 +1590,9 @@ mod tests {
             timescale_hz: 1_000,
             samples_interleaved: vec![1, 2, 3, 4],
         };
-        worker.queue_audio_chunk(chunk).expect("queue post-seek PCM");
+        worker
+            .queue_audio_chunk(chunk)
+            .expect("queue post-seek PCM");
 
         assert_eq!(worker.audio_epoch_media_start_ms, Some(10_500));
         assert_eq!(worker.audio_media_position_ms(), Some(10_500));
