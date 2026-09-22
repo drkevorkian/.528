@@ -998,6 +998,7 @@ fn push_bounded_time_slot_ms(slots: &mut VecDeque<u64>, slot_ms: u64) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
     fn worker_with_snapshot_slot(
         snapshot_slot: Arc<Mutex<PlaybackSnapshot>>,
