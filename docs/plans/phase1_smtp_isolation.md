@@ -1,25 +1,59 @@
-# SMTP isolation (AI B)
+# Phase 1 SMTP isolation status
 
-Problem: `create_and_send_notification` and `verify_key` call `deliver_email` while still conceptually inside the single DB executor job, so a hung SMTP server stalls every license request.
+SMTP delivery is now isolated from the SQLite executor on `ai/phase0-baseline-security`.
 
-## Required handler shape
+## Current execution model
 
 ```text
-run_db  { enqueue outbox row as queued + audit; commit; drop mutex }
-run_mail { deliver_email(...) }     // BoundedMailExecutor, limit 2
-run_db  { if Delivered | LoggedOnly -> mark sent+delivered; if Failed -> leave queued }
+run_db
+  -> enqueue outbox row as queued
+  -> write audit record
+  -> commit
+
+run_mail
+  -> bounded blocking mail pool (2 permits)
+  -> SMTP or redacted local-log fallback
+
+run_db
+  -> on Delivered / LoggedOnly: mark sent + delivered
+  -> on Failed: leave queued for retry
 ```
 
-Do **not** mark `sent` before SMTP returns. Failed delivery must leave `notification_state = queued`.
+The DB executor and mail executor use separate semaphore pools. A slow SMTP server therefore does not consume the single SQLite execution permit.
 
-Call sites to split:
-- `Database::create_and_send_notification`
-- `Database::verify_key` confirmation-mail tail
+## Security properties
 
-`deliver_email` moves to `mailer.rs`. Logs must not contain SMTP password, full recipient local-part secrets, or message body (confirmation tokens live there).
+- SMTP passwords are not logged.
+- Confirmation-message bodies are not logged.
+- Confirmation URLs/tokens are not written to audit payloads.
+- Recipient logging redacts the local part.
+- SMTP protocol errors are reduced to non-sensitive status logging.
+- Failed SMTP delivery leaves the notification queued instead of falsely marking it sent.
+- Admin snapshots expose notification recipient/subject/state but not body content.
 
-`db_exec.rs` needs `BoundedDbExecutor::with_limit` so mail can share the type without sharing the permit pool.
+## Confirmation flow
 
-Tests: `mail_exec` inflight cap; `mailer::redact_addr`.
+Verification creates a queued confirmation email. The client response reports that confirmation mail was **queued**, not necessarily delivered.
 
-Do not merge until A wires `mod mail_exec; mod mailer;` and the two call sites. Codec untouched.
+The confirmation endpoint is split:
+
+- `GET /confirm/{token}`: read-only preview for an active, unexpired capability token.
+- `POST /confirm/{token}`: performs the approval mutation.
+
+The preview response uses `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, and a restrictive CSP with `form-action 'self'`.
+
+The unguessable confirmation token is itself the one-time capability required for POST; this flow does not rely on an ambient browser administrator cookie.
+
+## Verification still required
+
+The branch must pass CI / local verification before merge:
+
+```bash
+cargo fmt --all --check
+cargo check --workspace
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo check -p libsrs_compat --features ffmpeg
+```
+
+Do not merge this phase based on static review alone.
