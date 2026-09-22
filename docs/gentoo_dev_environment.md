@@ -6,7 +6,7 @@ Establish a reproducible **Gentoo Linux** baseline for this Rust workspace: tool
 
 Workspace facts:
 
-- **MSRV:** `1.78` (`rust-version` in root `Cargo.toml`).
+- **MSRV:** `1.88` (`rust-version` in root `Cargo.toml`). This matches the minimum required by the checked-in egui/eframe 0.33.x GUI stack.
 - **Toolchain file:** `rust-toolchain.toml` pins **`stable`** with components **`rustfmt`** and **`clippy`** (rustup uses these when present).
 
 ## Required Gentoo packages (Portage)
@@ -99,6 +99,7 @@ The `var/` directory is tracked with **`var/.gitkeep`** only; runtime contents a
 
 ## Known Gentoo pitfalls
 
+- **Rust older than 1.88:** the checked-in egui/eframe 0.33.x GUI dependencies require Rust 1.88 or newer; upgrade the active toolchain rather than downgrading the GUI stack.
 - **Missing rustfmt/clippy** on system Rust: enable **`rustfmt`** / **`clippy`** USE flags on **`dev-lang/rust`**, or use **rustup** with `rust-toolchain.toml`.
 - **Mixing Portage Rust and rustup:** two toolchains on `PATH` can disagree; pick one primary **`rustc`** / **`cargo`** and verify with **`which rustc`**.
 - **USE flags:** Gentoo `dev-lang/rust` without **`llvm`** / **`rustfmt`** / **`clippy`** as needed breaks CI-like checks.
