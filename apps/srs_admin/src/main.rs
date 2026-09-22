@@ -1,3 +1,5 @@
+mod worker;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::time::{Duration, Instant};
@@ -5,13 +7,11 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use libsrs_app_config::SrsConfig;
 use libsrs_licensing_proto::{
-    AdminActionResponse, AdminCreateNotificationRequest, AdminPendingRequestRecord,
-    AdminRecordState, AdminSnapshot, AdminUpdateKeyStatusRequest,
-    AdminUpdateLicenseFeaturesRequest, AdminUpdateRecordStateRequest, LicensedFeature,
-    NotificationDeliveryState,
+    AdminCreateNotificationRequest, AdminPendingRequestRecord, AdminRecordState, AdminSnapshot,
+    AdminUpdateKeyStatusRequest, AdminUpdateLicenseFeaturesRequest, AdminUpdateRecordStateRequest,
+    IssueKeyRequest, LicensedFeature, NotificationDeliveryState,
 };
-use reqwest::blocking::Client;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
+use worker::{AdminClientError, AdminCommand, AdminEvent, AdminWorker};
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
@@ -24,8 +24,11 @@ fn main() -> eframe::Result<()> {
 
 struct AdminApp {
     base_url: String,
-    client: Option<Client>,
+    worker: Option<AdminWorker>,
     snapshot: Option<AdminSnapshot>,
+    refresh_pending: bool,
+    refresh_failure_count: u32,
+    next_refresh_at: Instant,
     license_presets: BTreeMap<String, LicensePreset>,
     license_features: BTreeMap<String, Vec<LicensedFeature>>,
     pending_delete: Option<DeleteTarget>,
@@ -34,6 +37,10 @@ struct AdminApp {
     notification_recipient: String,
     notification_subject: String,
     notification_body: String,
+    issue_email: String,
+    issue_preset: LicensePreset,
+    issue_features: Vec<LicensedFeature>,
+    issued_credential: Option<IssuedCredential>,
     status: String,
     notifications: Vec<String>,
     auto_refresh: bool,
@@ -49,26 +56,29 @@ impl AdminApp {
         let config = SrsConfig::load()?;
         let admin_token = env::var("SRS_ADMIN_TOKEN")
             .map_err(|_| anyhow::anyhow!("SRS_ADMIN_TOKEN is required for the admin application"))?;
-        let admin_token = admin_token.trim();
-        if admin_token.is_empty() {
+        if admin_token.trim().is_empty() {
             return Err(anyhow::anyhow!(
                 "SRS_ADMIN_TOKEN is required for the admin application"
             ));
         }
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {admin_token}"))?,
-        );
-        let client = Client::builder()
-            .default_headers(headers)
-            .connect_timeout(Duration::from_millis(config.client.connect_timeout_ms))
-            .timeout(Duration::from_millis(config.client.request_timeout_ms))
-            .build()?;
+
+        let base_url = config.admin.base_url;
+        let worker = AdminWorker::spawn(
+            base_url.clone(),
+            admin_token,
+            Duration::from_millis(config.client.connect_timeout_ms),
+            Duration::from_millis(config.client.request_timeout_ms),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        let now = Instant::now();
         let mut app = Self {
-            base_url: config.admin.base_url,
-            client: Some(client),
+            base_url,
+            worker: Some(worker),
             snapshot: None,
+            refresh_pending: false,
+            refresh_failure_count: 0,
+            next_refresh_at: now,
             license_presets: BTreeMap::new(),
             license_features: BTreeMap::new(),
             pending_delete: None,
@@ -77,20 +87,28 @@ impl AdminApp {
             notification_recipient: String::new(),
             notification_subject: String::new(),
             notification_body: String::new(),
+            issue_email: String::new(),
+            issue_preset: LicensePreset::Basic,
+            issue_features: LicensedFeature::basic_defaults(),
+            issued_credential: None,
             status: "Connecting to licensing server".to_string(),
             notifications: vec![],
             auto_refresh: true,
-            last_refresh: Instant::now() - Duration::from_secs(60),
+            last_refresh: now,
         };
         app.refresh_snapshot();
         Ok(app)
     }
 
     fn fallback(message: String) -> Self {
+        let now = Instant::now();
         Self {
             base_url: "http://127.0.0.1:3000".to_string(),
-            client: None,
+            worker: None,
             snapshot: None,
+            refresh_pending: false,
+            refresh_failure_count: 0,
+            next_refresh_at: now + Duration::from_secs(30),
             license_presets: BTreeMap::new(),
             license_features: BTreeMap::new(),
             pending_delete: None,
@@ -99,64 +117,35 @@ impl AdminApp {
             notification_recipient: String::new(),
             notification_subject: String::new(),
             notification_body: String::new(),
+            issue_email: String::new(),
+            issue_preset: LicensePreset::Basic,
+            issue_features: LicensedFeature::basic_defaults(),
+            issued_credential: None,
             status: format!("Admin UI degraded: {message}"),
             notifications: vec![message],
             auto_refresh: false,
-            last_refresh: Instant::now(),
+            last_refresh: now,
         }
     }
 
     fn refresh_snapshot(&mut self) {
-        let Some(client) = &self.client else {
-            self.push_notification("HTTP client unavailable.".to_string());
+        if self.refresh_pending {
+            return;
+        }
+        let Some(worker) = &self.worker else {
+            self.push_notification("Administrator HTTP worker unavailable.".to_string());
             return;
         };
-        let url = format!(
-            "{}/api/v1/admin/snapshot",
-            self.base_url.trim_end_matches('/')
-        );
-        match client.get(&url).send() {
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => match response.json::<AdminSnapshot>() {
-                    Ok(snapshot) => {
-                        self.status = "Admin snapshot refreshed".to_string();
-                        self.last_refresh = Instant::now();
-                        self.license_presets = snapshot
-                            .licenses
-                            .iter()
-                            .map(|license| {
-                                (
-                                    license.license_id.clone(),
-                                    LicensePreset::from_features(&license.features),
-                                )
-                            })
-                            .collect();
-                        self.license_features = snapshot
-                            .licenses
-                            .iter()
-                            .map(|license| (license.license_id.clone(), license.features.clone()))
-                            .collect();
-                        if self.notification_license_id.is_empty() {
-                            if let Some(first) = snapshot.licenses.first() {
-                                self.notification_license_id = first.license_id.clone();
-                                self.notification_recipient = first.owner_email.clone();
-                            }
-                        }
-                        self.snapshot = Some(snapshot);
-                    }
-                    Err(err) => self.push_notification(format!("Failed to decode snapshot: {err}")),
-                },
-                Err(err) => self.push_notification(format!("Snapshot request failed: {err}")),
-            },
-            Err(err) => self.push_notification(format!("Admin server unreachable: {err}")),
+        match worker.send(AdminCommand::RefreshSnapshot) {
+            Ok(()) => {
+                self.refresh_pending = true;
+                self.status = "Refreshing administrator snapshot".to_string();
+            }
+            Err(message) => self.push_notification(message),
         }
     }
 
     fn update_license_features(&mut self, license_id: &str) {
-        let Some(client) = &self.client else {
-            self.push_notification("HTTP client unavailable.".to_string());
-            return;
-        };
         let Some(preset) = self.license_presets.get(license_id).copied() else {
             self.push_notification("No license preset found for license.".to_string());
             return;
@@ -173,44 +162,21 @@ impl AdminApp {
                     .unwrap_or_else(LicensedFeature::basic_defaults),
             },
         };
-        let url = format!(
-            "{}/api/v1/admin/licenses/features",
-            self.base_url.trim_end_matches('/')
-        );
-        self.send_action(client.post(url).json(&request), "Updated license features.");
+        self.send_command(AdminCommand::UpdateLicenseFeatures(request));
     }
 
     fn update_key_status(&mut self, key_id: &str, active: bool) {
-        let Some(client) = &self.client else {
-            self.push_notification("HTTP client unavailable.".to_string());
-            return;
-        };
-        let request = AdminUpdateKeyStatusRequest {
+        self.send_command(AdminCommand::UpdateKeyStatus(AdminUpdateKeyStatusRequest {
             key_id: key_id.to_string(),
             active,
-        };
-        let url = format!(
-            "{}/api/v1/admin/keys/status",
-            self.base_url.trim_end_matches('/')
-        );
-        self.send_action(client.post(url).json(&request), "Updated key status.");
+        }));
     }
 
     fn set_record_state(&mut self, target: &DeleteTarget, state: AdminRecordState) {
-        let Some(client) = &self.client else {
-            self.push_notification("HTTP client unavailable.".to_string());
-            return;
-        };
-        let url = format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            target.state_api_path()
-        );
-        let request = AdminUpdateRecordStateRequest { state };
-        self.send_action(
-            client.post(url).json(&request),
-            &format!("Updated {} to {}.", target.describe(), state.as_str()),
-        );
+        self.send_command(AdminCommand::SetRecordState {
+            path: target.state_api_path(),
+            request: AdminUpdateRecordStateRequest { state },
+        });
     }
 
     fn delete_record(&mut self, target: DeleteTarget) {
@@ -223,69 +189,148 @@ impl AdminApp {
             return;
         }
 
-        let Some(client) = &self.client else {
-            self.push_notification("HTTP client unavailable.".to_string());
-            return;
-        };
-        let url = format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            target.state_api_path()
-        );
         self.pending_delete = None;
-        self.send_action(
-            client.post(url).json(&AdminUpdateRecordStateRequest {
+        self.send_command(AdminCommand::SetRecordState {
+            path: target.state_api_path(),
+            request: AdminUpdateRecordStateRequest {
                 state: AdminRecordState::Deleted,
-            }),
-            &format!("Deleted {}.", target.describe()),
-        );
+            },
+        });
     }
 
     fn approve_request(&mut self, request_id: &str) {
-        let Some(client) = &self.client else {
-            self.push_notification("HTTP client unavailable.".to_string());
-            return;
-        };
-        let url = format!(
-            "{}/api/v1/admin/requests/{}/approve",
-            self.base_url.trim_end_matches('/'),
-            request_id
-        );
-        self.send_action(client.post(url), "Approved verification request.");
+        self.send_command(AdminCommand::ApproveRequest {
+            request_id: request_id.to_string(),
+        });
     }
 
     fn create_notification(&mut self) {
-        let Some(client) = &self.client else {
-            self.push_notification("HTTP client unavailable.".to_string());
-            return;
-        };
         let request = AdminCreateNotificationRequest {
             license_id: self.notification_license_id.trim().to_string(),
             recipient: self.notification_recipient.trim().to_string(),
             subject: self.notification_subject.trim().to_string(),
             body: self.notification_body.trim().to_string(),
         };
-        let url = format!(
-            "{}/api/v1/admin/notifications/create",
-            self.base_url.trim_end_matches('/')
-        );
-        self.send_action(client.post(url).json(&request), "Created notification.");
+        self.send_command(AdminCommand::CreateNotification(request));
     }
 
-    fn send_action(&mut self, request: reqwest::blocking::RequestBuilder, success_message: &str) {
-        match request.send() {
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => match response.json::<AdminActionResponse>() {
+    fn issue_license(&mut self) {
+        let email = self.issue_email.trim();
+        if email.is_empty() {
+            self.push_notification("Enter an owner email before issuing a license.".to_string());
+            return;
+        }
+
+        let features = match self.issue_preset {
+            LicensePreset::Basic => LicensedFeature::basic_defaults(),
+            LicensePreset::Editor => LicensedFeature::editor_defaults(),
+            LicensePreset::Custom => normalize_feature_selection(self.issue_features.clone()),
+        };
+        self.issued_credential = None;
+        self.send_command(AdminCommand::IssueLicense(IssueKeyRequest {
+            email: email.to_string(),
+            requested_features: Some(features),
+            registrant_os: Some(std::env::consts::OS.to_string()),
+            registrant_ip: None,
+        }));
+    }
+
+    fn send_command(&mut self, command: AdminCommand) {
+        let Some(worker) = &self.worker else {
+            self.push_notification("Administrator HTTP worker unavailable.".to_string());
+            return;
+        };
+        if let Err(message) = worker.send(command) {
+            self.push_notification(message);
+        }
+    }
+
+    fn drain_worker_events(&mut self) {
+        loop {
+            let event = self.worker.as_ref().and_then(AdminWorker::try_recv);
+            let Some(event) = event else {
+                break;
+            };
+
+            match event {
+                AdminEvent::Snapshot(result) => {
+                    self.refresh_pending = false;
+                    match result {
+                        Ok(snapshot) => self.apply_snapshot(snapshot),
+                        Err(error) => self.handle_client_error(error, true),
+                    }
+                }
+                AdminEvent::Action(result) => match result {
                     Ok(action) => {
                         self.push_notification(action.message);
-                        self.status = success_message.to_string();
                         self.refresh_snapshot();
                     }
-                    Err(err) => self.push_notification(format!("Action decode failed: {err}")),
+                    Err(error) => self.handle_client_error(error, false),
                 },
-                Err(err) => self.push_notification(format!("Action failed: {err}")),
-            },
-            Err(err) => self.push_notification(format!("Action request failed: {err}")),
+                AdminEvent::Issued(result) => match result {
+                    Ok(issued) => {
+                        self.issued_credential = Some(IssuedCredential {
+                            license_id: issued.license_id,
+                            key: issued.key,
+                        });
+                        self.push_notification(
+                            "License issued. Copy the credential from the issuance panel, then clear it."
+                                .to_string(),
+                        );
+                        self.issue_email.clear();
+                        self.refresh_snapshot();
+                    }
+                    Err(error) => self.handle_client_error(error, false),
+                },
+            }
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: AdminSnapshot) {
+        self.status = "Admin snapshot refreshed".to_string();
+        self.last_refresh = Instant::now();
+        self.refresh_failure_count = 0;
+        self.next_refresh_at = self.last_refresh + Duration::from_secs(5);
+        self.license_presets = snapshot
+            .licenses
+            .iter()
+            .map(|license| {
+                (
+                    license.license_id.clone(),
+                    LicensePreset::from_features(&license.features),
+                )
+            })
+            .collect();
+        self.license_features = snapshot
+            .licenses
+            .iter()
+            .map(|license| (license.license_id.clone(), license.features.clone()))
+            .collect();
+        if self.notification_license_id.is_empty() {
+            if let Some(first) = snapshot.licenses.first() {
+                self.notification_license_id = first.license_id.clone();
+                self.notification_recipient = first.owner_email.clone();
+            }
+        }
+        self.snapshot = Some(snapshot);
+    }
+
+    fn handle_client_error(&mut self, error: AdminClientError, from_refresh: bool) {
+        if from_refresh {
+            self.refresh_failure_count = self.refresh_failure_count.saturating_add(1);
+            let exponent = self.refresh_failure_count.saturating_sub(1).min(4);
+            let delay_secs = 5u64.saturating_mul(1u64 << exponent).min(60);
+            self.next_refresh_at = Instant::now() + Duration::from_secs(delay_secs);
+        }
+        self.push_notification(error.user_message().to_string());
+
+        if matches!(
+            error,
+            AdminClientError::AuthenticationRequired
+                | AdminClientError::Forbidden
+                | AdminClientError::SecurityFailure
+        ) {
+            self.auto_refresh = false;
         }
     }
 
@@ -298,10 +343,11 @@ impl AdminApp {
     }
 
     fn maybe_auto_refresh(&mut self, ctx: &egui::Context) {
-        if self.auto_refresh && self.last_refresh.elapsed() >= Duration::from_secs(5) {
+        self.drain_worker_events();
+        if self.auto_refresh && !self.refresh_pending && Instant::now() >= self.next_refresh_at {
             self.refresh_snapshot();
         }
-        ctx.request_repaint_after(Duration::from_secs(1));
+        ctx.request_repaint_after(Duration::from_millis(250));
     }
 
     fn render_top_bar(&mut self, ctx: &egui::Context) {
@@ -309,7 +355,10 @@ impl AdminApp {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("SRS Admin");
                 ui.label(format!("Server: {}", self.base_url));
-                if ui.button("Refresh").clicked() {
+                if ui
+                    .add_enabled(!self.refresh_pending, egui::Button::new("Refresh"))
+                    .clicked()
+                {
                     self.refresh_snapshot();
                 }
                 ui.checkbox(&mut self.auto_refresh, "Auto-refresh");
@@ -329,7 +378,7 @@ impl AdminApp {
 
     fn render_overview(&self, ui: &mut egui::Ui) {
         ui.heading("Overview");
-        ui.label("Quick operational summary for the local licensing server.");
+        ui.label("Quick operational summary for the licensing server.");
         ui.separator();
         self.render_stats(ui);
         ui.separator();
@@ -379,6 +428,65 @@ impl AdminApp {
 
     fn render_licenses(&mut self, ui: &mut egui::Ui) {
         ui.heading("Licenses");
+
+        egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.heading("Issue License");
+            ui.label("Issuance is authenticated and administrator-only.");
+            ui.horizontal(|ui| {
+                ui.label("Owner email");
+                ui.add_sized(
+                    [320.0, 24.0],
+                    egui::TextEdit::singleline(&mut self.issue_email),
+                );
+            });
+
+            let preset_before = self.issue_preset;
+            ui.horizontal(|ui| {
+                ui.label("License type");
+                egui::ComboBox::from_id_salt("issue_license_preset")
+                    .selected_text(self.issue_preset.label())
+                    .show_ui(ui, |ui| {
+                        for option in LicensePreset::all() {
+                            ui.selectable_value(&mut self.issue_preset, option, option.label());
+                        }
+                    });
+            });
+            if self.issue_preset != preset_before {
+                self.issue_features = match self.issue_preset {
+                    LicensePreset::Basic => LicensedFeature::basic_defaults(),
+                    LicensePreset::Editor => LicensedFeature::editor_defaults(),
+                    LicensePreset::Custom => normalize_feature_selection(self.issue_features.clone()),
+                };
+            }
+            if self.issue_preset == LicensePreset::Custom {
+                ui.menu_button("Custom Features", |ui| {
+                    ui.set_min_width(240.0);
+                    edit_custom_features_ui(ui, &mut self.issue_features);
+                });
+                ui.label(format_feature_list(&self.issue_features));
+            }
+
+            if ui.button("Issue License").clicked() {
+                self.issue_license();
+            }
+
+            if let Some(issued) = &self.issued_credential {
+                ui.separator();
+                ui.strong("New credential — copy it now");
+                ui.monospace(format!("License: {}", issued.license_id));
+                ui.horizontal_wrapped(|ui| {
+                    ui.monospace(&issued.key);
+                    if ui.button("Clear Credential").clicked() {
+                        self.issued_credential = None;
+                    }
+                });
+                ui.label(
+                    "This credential is intentionally not retained in normal administrator snapshots.",
+                );
+            }
+        });
+
+        ui.add_space(8.0);
         let Some(snapshot) = &self.snapshot else {
             ui.label("No license data.");
             return;
@@ -1096,6 +1204,11 @@ fn request_status_text(request: &AdminPendingRequestRecord) -> String {
     } else {
         format!("pending until {}", request.expires_at_epoch_s)
     }
+}
+
+struct IssuedCredential {
+    license_id: String,
+    key: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
