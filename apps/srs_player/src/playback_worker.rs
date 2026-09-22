@@ -1013,6 +1013,125 @@ mod tests {
         )
     }
 
+    struct FakeAudioState {
+        requested_epoch: AtomicU64,
+        callback_epoch: AtomicU64,
+        consumed_samples: AtomicU64,
+        underrun_samples: AtomicU64,
+        stream_errors: AtomicU64,
+        max_write: std::sync::atomic::AtomicUsize,
+        paused: AtomicBool,
+    }
+
+    impl FakeAudioState {
+        fn new(epoch: u64, max_write: usize) -> Arc<Self> {
+            Arc::new(Self {
+                requested_epoch: AtomicU64::new(epoch),
+                callback_epoch: AtomicU64::new(epoch),
+                consumed_samples: AtomicU64::new(0),
+                underrun_samples: AtomicU64::new(0),
+                stream_errors: AtomicU64::new(0),
+                max_write: std::sync::atomic::AtomicUsize::new(max_write),
+                paused: AtomicBool::new(false),
+            })
+        }
+
+        fn acknowledge_requested_epoch(&self) {
+            let requested = self.requested_epoch.load(Ordering::Acquire);
+            self.callback_epoch.store(requested, Ordering::Release);
+        }
+    }
+
+    struct FakeAudioSink {
+        state: Arc<FakeAudioState>,
+        sample_rate: u32,
+        channels: u16,
+    }
+
+    impl FakeAudioSink {
+        fn new(state: Arc<FakeAudioState>, sample_rate: u32, channels: u16) -> Self {
+            Self {
+                state,
+                sample_rate,
+                channels,
+            }
+        }
+    }
+
+    impl AudioSink for FakeAudioSink {
+        fn matches_format(&self, sample_rate: u32, channels: u8) -> bool {
+            self.sample_rate == sample_rate && self.channels == u16::from(channels)
+        }
+
+        fn request_epoch(&self, epoch: u64) {
+            self.state.requested_epoch.store(epoch, Ordering::Release);
+        }
+
+        fn epoch_ready(&self, epoch: u64) -> bool {
+            self.state.requested_epoch.load(Ordering::Acquire) == epoch
+                && self.state.callback_epoch.load(Ordering::Acquire) == epoch
+        }
+
+        fn push_pcm(&mut self, epoch: u64, samples: &[i16]) -> anyhow::Result<usize> {
+            if !self.epoch_ready(epoch) {
+                return Ok(0);
+            }
+            Ok(samples.len().min(self.state.max_write.load(Ordering::Relaxed)))
+        }
+
+        fn telemetry(&self) -> AudioTelemetry {
+            AudioTelemetry {
+                consumed_samples: self.state.consumed_samples.load(Ordering::Relaxed),
+                underrun_samples: self.state.underrun_samples.load(Ordering::Relaxed),
+                stream_errors: self.state.stream_errors.load(Ordering::Relaxed),
+                requested_epoch: self.state.requested_epoch.load(Ordering::Acquire),
+                callback_epoch: self.state.callback_epoch.load(Ordering::Acquire),
+            }
+        }
+
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn channels(&self) -> u16 {
+            self.channels
+        }
+
+        fn pause(&self) -> anyhow::Result<()> {
+            self.state.paused.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        fn play(&self) -> anyhow::Result<()> {
+            self.state.paused.store(false, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    fn install_fake_audio(
+        worker: &mut PlaybackWorker,
+        epoch: u64,
+        max_write: usize,
+    ) -> Arc<FakeAudioState> {
+        let state = FakeAudioState::new(epoch, max_write);
+        worker.audio_epoch = epoch;
+        worker.audio_output = Some(Box::new(FakeAudioSink::new(
+            Arc::clone(&state),
+            48_000,
+            2,
+        )));
+        state
+    }
+
+    fn pending_audio(samples: &[i16]) -> PendingAudioChunk {
+        PendingAudioChunk {
+            sample_rate: 48_000,
+            channels: 2,
+            samples: samples.to_vec(),
+            offset: 0,
+        }
+    }
+
     fn frame(index: u32) -> DecodedVideoFrame {
         DecodedVideoFrame {
             width: 2,
@@ -1097,6 +1216,129 @@ mod tests {
         };
         assert_eq!(snapshot.generation, 9);
         assert_eq!(snapshot.state, PlayerState::Error);
+    }
+
+    #[test]
+    fn audio_epoch_change_clears_pending_pcm_and_disarms_clock() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 5, usize::MAX);
+        worker.pending_audio = Some(pending_audio(&[1, 2, 3]));
+        worker.audio_epoch_armed = true;
+        worker.audio_epoch_consumed_base = 123;
+
+        worker.advance_audio_epoch(Some(4_000));
+
+        assert!(worker.pending_audio.is_none());
+        assert_eq!(worker.audio_epoch, 6);
+        assert_eq!(worker.audio_epoch_media_start_ms, Some(4_000));
+        assert!(!worker.audio_epoch_armed);
+        assert_eq!(worker.audio_epoch_consumed_base, 0);
+        assert_eq!(state.requested_epoch.load(Ordering::Acquire), 6);
+        assert_eq!(state.callback_epoch.load(Ordering::Acquire), 5);
+    }
+
+    #[test]
+    fn unacknowledged_audio_epoch_refuses_pcm_and_clock_remains_unarmed() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let _state = install_fake_audio(&mut worker, 10, usize::MAX);
+        worker.pending_audio = Some(pending_audio(&[1, 2, 3, 4]));
+        worker.advance_audio_epoch(Some(9_000));
+        worker.pending_audio = Some(pending_audio(&[1, 2, 3, 4]));
+
+        assert!(!worker.flush_pending_audio().expect("epoch wait"));
+        assert_eq!(worker.pending_audio.as_ref().map(|p| p.offset), Some(0));
+        assert!(!worker.audio_epoch_armed);
+        assert_eq!(worker.audio_media_position_ms(), None);
+    }
+
+    #[test]
+    fn acknowledged_epoch_captures_fresh_consumed_sample_baseline() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 20, usize::MAX);
+        state.consumed_samples.store(96_000, Ordering::Relaxed);
+        worker.advance_audio_epoch(Some(10_000));
+        worker.pending_audio = Some(pending_audio(&[1, 2, 3, 4]));
+        state.acknowledge_requested_epoch();
+
+        assert!(worker.flush_pending_audio().expect("flush after ack"));
+        assert!(worker.audio_epoch_armed);
+        assert_eq!(worker.audio_epoch_consumed_base, 96_000);
+        assert_eq!(worker.audio_media_position_ms(), Some(10_000));
+
+        state.consumed_samples.store(144_000, Ordering::Relaxed);
+        assert_eq!(worker.audio_media_position_ms(), Some(10_500));
+    }
+
+    #[test]
+    fn partial_audio_write_retains_pending_pcm_until_drained() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 30, 2);
+        worker.pending_audio = Some(pending_audio(&[1, 2, 3, 4, 5]));
+
+        assert!(!worker.flush_pending_audio().expect("partial flush"));
+        assert_eq!(worker.pending_audio.as_ref().map(|p| p.offset), Some(2));
+
+        state.max_write.store(3, Ordering::Relaxed);
+        assert!(worker.flush_pending_audio().expect("final flush"));
+        assert!(worker.pending_audio.is_none());
+    }
+
+    #[test]
+    fn pre_seek_consumed_samples_do_not_shift_post_seek_audio_clock() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 40, usize::MAX);
+        state.consumed_samples.store(960_000, Ordering::Relaxed);
+
+        worker.advance_audio_epoch(Some(30_000));
+        worker.pending_audio = Some(pending_audio(&[1, 2]));
+        state.acknowledge_requested_epoch();
+        assert!(worker.flush_pending_audio().expect("arm seek epoch"));
+        assert_eq!(worker.audio_media_position_ms(), Some(30_000));
+
+        state.consumed_samples.store(1_056_000, Ordering::Relaxed);
+        assert_eq!(worker.audio_media_position_ms(), Some(31_000));
+    }
+
+    #[test]
+    fn stream_error_only_fails_when_counter_increases() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 50, 0);
+        state.stream_errors.store(3, Ordering::Relaxed);
+        worker.audio_last_stream_errors = 3;
+        worker.pending_audio = Some(pending_audio(&[1, 2]));
+
+        assert!(!worker.flush_pending_audio().expect("historical error ignored"));
+
+        state.stream_errors.store(4, Ordering::Relaxed);
+        let error = worker
+            .flush_pending_audio()
+            .expect_err("new stream error must fail");
+        assert!(error.contains("device/runtime error"));
+    }
+
+    #[test]
+    fn paused_seek_clock_stays_unarmed_until_epoch_acknowledgement() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 60, usize::MAX);
+        state.paused.store(true, Ordering::Release);
+
+        worker.advance_audio_epoch(Some(12_345));
+        worker.pending_audio = Some(pending_audio(&[1, 2, 3, 4]));
+
+        assert!(!worker.flush_pending_audio().expect("paused epoch wait"));
+        assert_eq!(worker.audio_media_position_ms(), None);
+
+        state.paused.store(false, Ordering::Release);
+        state.acknowledge_requested_epoch();
+        assert!(worker.flush_pending_audio().expect("resume and arm"));
+        assert_eq!(worker.audio_media_position_ms(), Some(12_345));
     }
 
     #[test]
