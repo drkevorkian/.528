@@ -29,6 +29,8 @@ struct AdminApp {
     refresh_pending: bool,
     refresh_failure_count: u32,
     next_refresh_at: Instant,
+    mutation_pending: bool,
+    issue_pending: bool,
     license_presets: BTreeMap<String, LicensePreset>,
     license_features: BTreeMap<String, Vec<LicensedFeature>>,
     pending_delete: Option<DeleteTarget>,
@@ -79,6 +81,8 @@ impl AdminApp {
             refresh_pending: false,
             refresh_failure_count: 0,
             next_refresh_at: now,
+            mutation_pending: false,
+            issue_pending: false,
             license_presets: BTreeMap::new(),
             license_features: BTreeMap::new(),
             pending_delete: None,
@@ -109,6 +113,8 @@ impl AdminApp {
             refresh_pending: false,
             refresh_failure_count: 0,
             next_refresh_at: now + Duration::from_secs(30),
+            mutation_pending: false,
+            issue_pending: false,
             license_presets: BTreeMap::new(),
             license_features: BTreeMap::new(),
             pending_delete: None,
@@ -162,18 +168,18 @@ impl AdminApp {
                     .unwrap_or_else(LicensedFeature::basic_defaults),
             },
         };
-        self.send_command(AdminCommand::UpdateLicenseFeatures(request));
+        self.send_mutation_command(AdminCommand::UpdateLicenseFeatures(request));
     }
 
     fn update_key_status(&mut self, key_id: &str, active: bool) {
-        self.send_command(AdminCommand::UpdateKeyStatus(AdminUpdateKeyStatusRequest {
+        self.send_mutation_command(AdminCommand::UpdateKeyStatus(AdminUpdateKeyStatusRequest {
             key_id: key_id.to_string(),
             active,
         }));
     }
 
     fn set_record_state(&mut self, target: &DeleteTarget, state: AdminRecordState) {
-        self.send_command(AdminCommand::SetRecordState {
+        self.send_mutation_command(AdminCommand::SetRecordState {
             path: target.state_api_path(),
             request: AdminUpdateRecordStateRequest { state },
         });
@@ -190,7 +196,7 @@ impl AdminApp {
         }
 
         self.pending_delete = None;
-        self.send_command(AdminCommand::SetRecordState {
+        self.send_mutation_command(AdminCommand::SetRecordState {
             path: target.state_api_path(),
             request: AdminUpdateRecordStateRequest {
                 state: AdminRecordState::Deleted,
@@ -199,7 +205,7 @@ impl AdminApp {
     }
 
     fn approve_request(&mut self, request_id: &str) {
-        self.send_command(AdminCommand::ApproveRequest {
+        self.send_mutation_command(AdminCommand::ApproveRequest {
             request_id: request_id.to_string(),
         });
     }
@@ -211,7 +217,7 @@ impl AdminApp {
             subject: self.notification_subject.trim().to_string(),
             body: self.notification_body.trim().to_string(),
         };
-        self.send_command(AdminCommand::CreateNotification(request));
+        self.send_mutation_command(AdminCommand::CreateNotification(request));
     }
 
     fn issue_license(&mut self) {
@@ -226,22 +232,46 @@ impl AdminApp {
             LicensePreset::Editor => LicensedFeature::editor_defaults(),
             LicensePreset::Custom => normalize_feature_selection(self.issue_features.clone()),
         };
-        self.issued_credential = None;
-        self.send_command(AdminCommand::IssueLicense(IssueKeyRequest {
-            email,
-            requested_features: Some(features),
-            registrant_os: Some(std::env::consts::OS.to_string()),
-            registrant_ip: None,
-        }));
-    }
-
-    fn send_command(&mut self, command: AdminCommand) {
+        if self.issue_pending {
+            return;
+        }
         let Some(worker) = &self.worker else {
             self.push_notification("Administrator HTTP worker unavailable.".to_string());
             return;
         };
-        if let Err(message) = worker.send(command) {
-            self.push_notification(message);
+
+        self.issued_credential = None;
+        match worker.send(AdminCommand::IssueLicense(IssueKeyRequest {
+            email,
+            requested_features: Some(features),
+            registrant_os: Some(std::env::consts::OS.to_string()),
+            registrant_ip: None,
+        })) {
+            Ok(()) => {
+                self.issue_pending = true;
+                self.status = "Issuing license".to_string();
+            }
+            Err(message) => self.push_notification(message),
+        }
+    }
+
+    fn send_mutation_command(&mut self, command: AdminCommand) {
+        if self.mutation_pending {
+            self.push_notification(
+                "An administrator mutation is already in progress.".to_string(),
+            );
+            return;
+        }
+        let Some(worker) = &self.worker else {
+            self.push_notification("Administrator HTTP worker unavailable.".to_string());
+            return;
+        };
+        match worker.send(command) {
+            Ok(()) => {
+                self.mutation_pending = true;
+                self.status = "Applying administrator change".to_string();
+            }
+            Err(message) => self.push_notification(message),
         }
     }
 
@@ -260,14 +290,19 @@ impl AdminApp {
                         Err(error) => self.handle_client_error(error, true),
                     }
                 }
-                AdminEvent::Action(result) => match result {
+                AdminEvent::Action(result) => {
+                    self.mutation_pending = false;
+                    match result {
                     Ok(action) => {
                         self.push_notification(action.message);
                         self.refresh_snapshot();
                     }
                     Err(error) => self.handle_client_error(error, false),
-                },
-                AdminEvent::Issued(result) => match result {
+                    }
+                }
+                AdminEvent::Issued(result) => {
+                    self.issue_pending = false;
+                    match result {
                     Ok(issued) => {
                         self.issued_credential = Some(IssuedCredential {
                             license_id: issued.license_id,
@@ -281,7 +316,8 @@ impl AdminApp {
                         self.refresh_snapshot();
                     }
                     Err(error) => self.handle_client_error(error, false),
-                },
+                    }
+                }
             }
         }
     }
@@ -466,7 +502,10 @@ impl AdminApp {
                 ui.label(format_feature_list(&self.issue_features));
             }
 
-            if ui.button("Issue License").clicked() {
+            if ui
+                .add_enabled(!self.issue_pending, egui::Button::new("Issue License"))
+                .clicked()
+            {
                 self.issue_license();
             }
 
