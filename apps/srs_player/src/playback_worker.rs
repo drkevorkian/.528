@@ -198,12 +198,12 @@ impl PresentationReorder {
         self.pending.len()
     }
 
-    fn push(&mut self, frame: DecodedVideoFrame) -> Result<(), String> {
+    fn push(&mut self, frame: DecodedVideoFrame) -> Result<bool, String> {
         let index = frame.frame_index;
         let next = self.next_display_index.get_or_insert(index);
 
         if index < *next {
-            return Ok(());
+            return Ok(false);
         }
         let gap = index.saturating_sub(*next) as usize;
         if gap > MAX_PRESENTATION_REORDER_FRAMES {
@@ -220,7 +220,7 @@ impl PresentationReorder {
                 self.pending.len()
             ));
         }
-        Ok(())
+        Ok(true)
     }
 
     fn pop_ready(&mut self) -> Option<DecodedVideoFrame> {
@@ -431,15 +431,24 @@ impl PlaybackWorker {
         match event {
             Ok(PlaybackEvent::Video(frame)) => {
                 let slot_ms = frame_position_ms(&frame);
-                if let Err(error) = self.reorder.push(frame) {
+                let accepted = match self.reorder.push(frame) {
+                    Ok(accepted) => accepted,
+                    Err(error) => {
+                        self.fail(error);
+                        return;
+                    }
+                };
+                if !accepted {
+                    self.fail(
+                        "displayable frame arrived after its presentation index was already passed"
+                            .to_string(),
+                    );
+                    return;
+                }
+                if let Err(error) = self.push_time_slot_ms(slot_ms) {
                     self.fail(error);
                     return;
                 }
-                if self.presentation_time_slots_ms.len() >= MAX_PRESENTATION_REORDER_FRAMES + 1 {
-                    self.fail("presentation timestamp-slot queue exceeded reorder bound".to_string());
-                    return;
-                }
-                self.presentation_time_slots_ms.push_back(slot_ms);
                 if let Some(frame) = self.reorder.pop_ready() {
                     let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
                         self.fail("presentation frame became ready without a timestamp slot".to_string());
@@ -541,23 +550,30 @@ impl PlaybackWorker {
             match session.decode_next_step() {
                 Ok(PlaybackEvent::Video(frame)) => {
                     let slot_ms = frame_position_ms(&frame);
-                    if let Err(error) = self.reorder.push(frame) {
+                    let accepted = match self.reorder.push(frame) {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            session.decoded_video_frames = saved_video;
+                            session.decoded_audio_chunks = saved_audio;
+                            self.fail(error);
+                            return;
+                        }
+                    };
+                    if !accepted {
+                        session.decoded_video_frames = saved_video;
+                        session.decoded_audio_chunks = saved_audio;
+                        self.fail(
+                            "seek recovery saw a display frame older than the presentation cursor"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    if let Err(error) = self.push_time_slot_ms(slot_ms) {
                         session.decoded_video_frames = saved_video;
                         session.decoded_audio_chunks = saved_audio;
                         self.fail(error);
                         return;
                     }
-                    if self.presentation_time_slots_ms.len()
-                        >= MAX_PRESENTATION_REORDER_FRAMES + 1
-                    {
-                        session.decoded_video_frames = saved_video;
-                        session.decoded_audio_chunks = saved_audio;
-                        self.fail(
-                            "seek recovery timestamp-slot queue exceeded reorder bound".to_string(),
-                        );
-                        return;
-                    }
-                    self.presentation_time_slots_ms.push_back(slot_ms);
 
                     while let Some(frame) = self.reorder.pop_ready() {
                         let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
@@ -642,6 +658,21 @@ impl PlaybackWorker {
             generation: self.generation,
         });
         self.emit_snapshot();
+    }
+
+    fn push_time_slot_ms(&mut self, slot_ms: u64) -> Result<(), String> {
+        if self.presentation_time_slots_ms.len() >= MAX_PRESENTATION_REORDER_FRAMES + 1 {
+            return Err("presentation timestamp-slot queue exceeded reorder bound".to_string());
+        }
+        if let Some(previous) = self.presentation_time_slots_ms.back().copied() {
+            if slot_ms < previous {
+                return Err(format!(
+                    "presentation timestamp regressed from {previous} ms to {slot_ms} ms"
+                ));
+            }
+        }
+        self.presentation_time_slots_ms.push_back(slot_ms);
+        Ok(())
     }
 
     fn clear_frame_slot(&self) {
@@ -777,6 +808,14 @@ mod tests {
         assert_eq!((second.frame_index, slots.pop_front()), (1, Some(33)));
         assert_eq!((third.frame_index, slots.pop_front()), (2, Some(66)));
         assert!(slots.is_empty());
+    }
+
+    #[test]
+    fn reorder_marks_already_presented_frame_as_discarded() {
+        let mut reorder = PresentationReorder::new();
+        assert!(reorder.push(frame(0)).expect("frame 0 accepted"));
+        assert_eq!(reorder.pop_ready().map(|f| f.frame_index), Some(0));
+        assert!(!reorder.push(frame(0)).expect("old frame is discarded"));
     }
 
     #[test]
