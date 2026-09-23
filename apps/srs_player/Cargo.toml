@@ -8,7 +8,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 cpal = "0.18.2"
-eframe = "0.33"
+eframe = { version = "0.33", features = ["wgpu"] }
 egui = "0.33"
 libsrs_app_config = { version = "0.1.0", path = "../../crates/libsrs_app_config" }
 libsrs_app_services = { version = "0.1.0", path = "../../crates/libsrs_app_services" }
