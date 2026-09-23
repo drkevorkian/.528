@@ -7,6 +7,12 @@ use eframe::{
 use libsrs_app_services::{MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuPresenterHealth {
+    Healthy,
+    BackendUnavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GpuSubmitOutcome {
     Accepted,
     StaleGeneration,
@@ -27,16 +33,33 @@ struct PendingUpload {
     gray8: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct PresenterShared {
     current_generation: u64,
     pending: Option<PendingUpload>,
     replaced_pending_frames: u64,
+    health: GpuPresenterHealth,
+}
+
+impl Default for PresenterShared {
+    fn default() -> Self {
+        Self {
+            current_generation: 0,
+            pending: None,
+            replaced_pending_frames: 0,
+            health: GpuPresenterHealth::Healthy,
+        }
+    }
 }
 
 impl PresenterShared {
     fn set_generation(&mut self, generation: u64) {
         self.current_generation = generation;
+        self.pending = None;
+    }
+
+    fn mark_backend_unavailable(&mut self) {
+        self.health = GpuPresenterHealth::BackendUnavailable;
         self.pending = None;
     }
 
@@ -95,6 +118,13 @@ impl GpuVideoPresenter {
         Some(Self {
             shared: Arc::new(Mutex::new(PresenterShared::default())),
         })
+    }
+
+    pub(crate) fn health(&self) -> Result<GpuPresenterHealth, String> {
+        self.shared
+            .lock()
+            .map(|shared| shared.health)
+            .map_err(|_| "GPU presenter state lock poisoned".to_string())
     }
 
     pub(crate) fn set_generation(&self, generation: u64) -> Result<(), String> {
@@ -201,6 +231,9 @@ impl egui_wgpu::CallbackTrait for VideoPaintCallback {
             return Vec::new();
         };
         let Some(resources) = callback_resources.get_mut::<GpuVideoResources>() else {
+            if let Ok(mut shared) = self.shared.lock() {
+                shared.mark_backend_unavailable();
+            }
             return Vec::new();
         };
 
@@ -215,6 +248,9 @@ impl egui_wgpu::CallbackTrait for VideoPaintCallback {
         callback_resources: &egui_wgpu::CallbackResources,
     ) {
         let Some(resources) = callback_resources.get::<GpuVideoResources>() else {
+            if let Ok(mut shared) = self.shared.lock() {
+                shared.mark_backend_unavailable();
+            }
             return;
         };
         resources.paint(render_pass);
@@ -386,6 +422,19 @@ impl GpuVideoResources {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_unavailable_health_discards_pending_upload() {
+        let mut shared = PresenterShared::default();
+        shared.set_generation(5);
+        shared.submit(5, 2, 2, vec![1; 4]).expect("submit");
+        assert!(shared.pending.is_some());
+
+        shared.mark_backend_unavailable();
+
+        assert_eq!(shared.health, GpuPresenterHealth::BackendUnavailable);
+        assert!(shared.pending.is_none());
+    }
 
     #[test]
     fn same_dimensions_reuse_gpu_texture_allocation() {
