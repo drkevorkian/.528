@@ -1,0 +1,431 @@
+use std::sync::{Arc, Mutex};
+
+use eframe::{
+    egui,
+    egui_wgpu::{self, wgpu},
+};
+use libsrs_app_services::{MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuSubmitOutcome {
+    Accepted,
+    StaleGeneration,
+}
+
+#[derive(Debug)]
+struct PendingUpload {
+    generation: u64,
+    width: u32,
+    height: u32,
+    gray8: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct PresenterShared {
+    current_generation: u64,
+    pending: Option<PendingUpload>,
+    replaced_pending_frames: u64,
+}
+
+impl PresenterShared {
+    fn set_generation(&mut self, generation: u64) {
+        self.current_generation = generation;
+        self.pending = None;
+    }
+
+    fn submit(
+        &mut self,
+        generation: u64,
+        width: u32,
+        height: u32,
+        gray8: Vec<u8>,
+    ) -> Result<GpuSubmitOutcome, String> {
+        validate_upload(width, height, gray8.len())?;
+        if generation != self.current_generation {
+            return Ok(GpuSubmitOutcome::StaleGeneration);
+        }
+
+        if self.pending.replace(PendingUpload {
+            generation,
+            width,
+            height,
+            gray8,
+        }).is_some()
+        {
+            self.replaced_pending_frames = self.replaced_pending_frames.saturating_add(1);
+        }
+        Ok(GpuSubmitOutcome::Accepted)
+    }
+
+    fn take_pending(&mut self) -> Option<PendingUpload> {
+        let upload = self.pending.take()?;
+        if upload.generation == self.current_generation {
+            Some(upload)
+        } else {
+            None
+        }
+    }
+}
+
+pub(crate) struct GpuVideoPresenter {
+    shared: Arc<Mutex<PresenterShared>>,
+}
+
+impl GpuVideoPresenter {
+    pub(crate) fn from_creation_context(cc: &eframe::CreationContext<'_>) -> Option<Self> {
+        let render_state = cc.wgpu_render_state.as_ref()?;
+        let resources =
+            GpuVideoResources::new(&render_state.device, render_state.target_format);
+
+        render_state
+            .renderer
+            .write()
+            .callback_resources
+            .insert(resources);
+
+        Some(Self {
+            shared: Arc::new(Mutex::new(PresenterShared::default())),
+        })
+    }
+
+    pub(crate) fn set_generation(&self, generation: u64) -> Result<(), String> {
+        self.shared
+            .lock()
+            .map_err(|_| "GPU presenter state lock poisoned".to_string())?
+            .set_generation(generation);
+        Ok(())
+    }
+
+    pub(crate) fn submit_frame(
+        &self,
+        generation: u64,
+        width: u32,
+        height: u32,
+        gray8: Vec<u8>,
+    ) -> Result<GpuSubmitOutcome, String> {
+        self.shared
+            .lock()
+            .map_err(|_| "GPU presenter state lock poisoned".to_string())?
+            .submit(generation, width, height, gray8)
+    }
+
+    pub(crate) fn paint(&self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
+        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+        ui.painter()
+            .add(egui_wgpu::Callback::new_paint_callback(
+                rect,
+                VideoPaintCallback {
+                    shared: Arc::clone(&self.shared),
+                },
+            ));
+        response
+    }
+}
+
+fn validate_upload(width: u32, height: u32, len: usize) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("GPU upload dimensions must be non-zero".to_string());
+    }
+    if width > MAX_VIDEO_SIDE || height > MAX_VIDEO_SIDE {
+        return Err(format!(
+            "GPU upload dimensions {width}x{height} exceed side cap {MAX_VIDEO_SIDE}"
+        ));
+    }
+
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| "GPU upload pixel-count overflow".to_string())?;
+    if pixels > MAX_VIDEO_PIXELS {
+        return Err(format!(
+            "GPU upload pixel count {pixels} exceeds cap {MAX_VIDEO_PIXELS}"
+        ));
+    }
+    let expected = usize::try_from(pixels)
+        .map_err(|_| "GPU upload pixel count does not fit usize".to_string())?;
+    if len != expected {
+        return Err(format!(
+            "GPU upload byte length {len} does not match {width}x{height} ({expected} bytes)"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocationDecision {
+    Reuse,
+    Reallocate,
+}
+
+fn allocation_decision(existing: Option<(u32, u32)>, incoming: (u32, u32)) -> AllocationDecision {
+    if existing == Some(incoming) {
+        AllocationDecision::Reuse
+    } else {
+        AllocationDecision::Reallocate
+    }
+}
+
+struct VideoPaintCallback {
+    shared: Arc<Mutex<PresenterShared>>,
+}
+
+impl egui_wgpu::CallbackTrait for VideoPaintCallback {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let upload = self
+            .shared
+            .lock()
+            .ok()
+            .and_then(|mut shared| shared.take_pending());
+        let Some(upload) = upload else {
+            return Vec::new();
+        };
+        let Some(resources) = callback_resources.get_mut::<GpuVideoResources>() else {
+            return Vec::new();
+        };
+
+        resources.upload(device, queue, upload);
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        let Some(resources) = callback_resources.get::<GpuVideoResources>() else {
+            return;
+        };
+        resources.paint(render_pass);
+    }
+}
+
+struct GpuVideoResources {
+    pipeline: wgpu::RenderPipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    texture: Option<wgpu::Texture>,
+    bind_group: Option<wgpu::BindGroup>,
+    dimensions: Option<(u32, u32)>,
+}
+
+impl GpuVideoResources {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("srs-player-video-shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("video_presenter.wgsl").into()),
+        });
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("srs-player-video-bind-group-layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("srs-player-video-pipeline-layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("srs-player-video-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("srs-player-video-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+            sampler,
+            texture: None,
+            bind_group: None,
+            dimensions: None,
+        }
+    }
+
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, upload: PendingUpload) {
+        let incoming = (upload.width, upload.height);
+        if allocation_decision(self.dimensions, incoming) == AllocationDecision::Reallocate {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("srs-player-video-r8"),
+                size: wgpu::Extent3d {
+                    width: upload.width,
+                    height: upload.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("srs-player-video-bind-group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.texture = Some(texture);
+            self.bind_group = Some(bind_group);
+            self.dimensions = Some(incoming);
+        }
+
+        let Some(texture) = self.texture.as_ref() else {
+            return;
+        };
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &upload.gray8,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(upload.width),
+                rows_per_image: Some(upload.height),
+            },
+            wgpu::Extent3d {
+                width: upload.width,
+                height: upload.height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>) {
+        let Some(bind_group) = self.bind_group.as_ref() else {
+            return;
+        };
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, bind_group, &[]);
+        render_pass.draw(0..4, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_dimensions_reuse_gpu_texture_allocation() {
+        assert_eq!(
+            allocation_decision(Some((1920, 1080)), (1920, 1080)),
+            AllocationDecision::Reuse
+        );
+    }
+
+    #[test]
+    fn resolution_change_reallocates_gpu_texture_once_needed() {
+        assert_eq!(
+            allocation_decision(Some((1920, 1080)), (1280, 720)),
+            AllocationDecision::Reallocate
+        );
+        assert_eq!(
+            allocation_decision(None, (1280, 720)),
+            AllocationDecision::Reallocate
+        );
+    }
+
+    #[test]
+    fn stale_generation_never_enters_gpu_upload_slot() {
+        let mut shared = PresenterShared::default();
+        shared.set_generation(8);
+        assert_eq!(
+            shared
+                .submit(7, 2, 2, vec![0; 4])
+                .expect("validated stale submit"),
+            GpuSubmitOutcome::StaleGeneration
+        );
+        assert!(shared.pending.is_none());
+    }
+
+    #[test]
+    fn newer_frame_replaces_pending_upload_without_growing_queue() {
+        let mut shared = PresenterShared::default();
+        shared.set_generation(4);
+        assert_eq!(
+            shared.submit(4, 2, 2, vec![1; 4]).expect("first"),
+            GpuSubmitOutcome::Accepted
+        );
+        assert_eq!(
+            shared.submit(4, 2, 2, vec![2; 4]).expect("second"),
+            GpuSubmitOutcome::Accepted
+        );
+        assert_eq!(shared.replaced_pending_frames, 1);
+        assert_eq!(shared.pending.as_ref().expect("pending").gray8, vec![2; 4]);
+    }
+
+    #[test]
+    fn hostile_gpu_upload_dimensions_are_rejected_before_allocation() {
+        assert!(validate_upload(0, 1, 0).is_err());
+        assert!(validate_upload(MAX_VIDEO_SIDE + 1, 1, 0).is_err());
+        assert!(validate_upload(2, 2, 3).is_err());
+        assert!(validate_upload(2, 2, 4).is_ok());
+    }
+}
