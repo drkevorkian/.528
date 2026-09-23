@@ -10,8 +10,8 @@ use libsrs_app_services::{AppServices, DecodedVideoFrame, MediaInspection};
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
-    MasterClockSource, PlaybackSnapshot, PlaybackWorkerCommand, PlaybackWorkerEvent,
-    PlaybackWorkerHandle, PlayerState,
+    AudioDeviceState, MasterClockSource, PlaybackSnapshot, PlaybackWorkerCommand,
+    PlaybackWorkerEvent, PlaybackWorkerHandle, PlayerState,
 };
 use rfd::FileDialog;
 
@@ -640,8 +640,9 @@ impl PlayerApp {
             .map(|value| format!("{value:08x}"))
             .unwrap_or_else(|| "n/a".to_string());
         self.playback.debug_stats = format!(
-            "worker={:?} | eos_draining={} | clock={:?} audio_clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_master_ms={:?} audio_consumed_ms={:?} audible_est_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
+            "worker={:?} | audio_device={:?} eos_draining={} | clock={:?} audio_clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_master_ms={:?} audio_consumed_ms={:?} audible_est_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
             snapshot.state,
+            snapshot.audio_device_state,
             snapshot.eos_draining,
             snapshot.master_clock_source,
             snapshot.audio_clock_type,
@@ -668,7 +669,18 @@ impl PlayerApp {
             self.playback.last_frame_dims.1
         );
 
-        self.status = match snapshot.state {
+        self.status = if matches!(
+            snapshot.audio_device_state,
+            AudioDeviceState::Recovering | AudioDeviceState::Unavailable
+        ) && snapshot.state == PlayerState::Playing
+        {
+            "Recovering audio device…".to_string()
+        } else if snapshot.audio_device_state == AudioDeviceState::Failed
+            && snapshot.state == PlayerState::Playing
+        {
+            "Audio unavailable — video continuing".to_string()
+        } else {
+            match snapshot.state {
             PlayerState::Closed => "Closed current media".to_string(),
             PlayerState::Opening => "Opening media on playback worker".to_string(),
             PlayerState::Ready => "Ready (worker decode preview)".to_string(),
@@ -681,6 +693,7 @@ impl PlayerApp {
                 .last_error
                 .map(|error| format!("Playback error: {error}"))
                 .unwrap_or_else(|| "Playback worker error".to_string()),
+            }
         };
     }
 
@@ -1864,6 +1877,7 @@ mod tests {
             master_media_ms: 0,
             master_clock_source: MasterClockSource::Fallback,
             audio_clock_type: None,
+            audio_device_state: AudioDeviceState::Active,
             held_frame_count: 0,
             av_skew_ms: 0,
             late_presentation_drops: 0,
