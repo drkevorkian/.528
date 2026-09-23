@@ -79,6 +79,7 @@ struct PlaybackWorkspace {
     preview_texture: Option<egui::TextureHandle>,
     last_frame_crc32c: Option<u32>,
     last_frame_dims: (u32, u32),
+    fullscreen: bool,
 }
 
 impl PlaybackWorkspace {
@@ -100,6 +101,7 @@ impl PlaybackWorkspace {
             preview_texture: None,
             last_frame_crc32c: None,
             last_frame_dims: (0, 0),
+            fullscreen: false,
         }
     }
 
@@ -737,6 +739,123 @@ impl PlayerApp {
         Ok(())
     }
 
+    fn set_fullscreen(&mut self, ctx: &egui::Context, enabled: bool) {
+        if self.playback.fullscreen == enabled {
+            return;
+        }
+        self.playback.fullscreen = enabled;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
+        ctx.request_repaint();
+    }
+
+    fn handle_fullscreen_shortcuts(&mut self, ctx: &egui::Context) {
+        let (escape_pressed, f_pressed, wants_keyboard) = ctx.input(|input| {
+            (
+                input.key_pressed(egui::Key::Escape),
+                input.key_pressed(egui::Key::F),
+                input.wants_keyboard_input(),
+            )
+        });
+
+        if self.playback.fullscreen && escape_pressed {
+            self.set_fullscreen(ctx, false);
+        } else if f_pressed
+            && !wants_keyboard
+            && self.playback.preview_texture.is_some()
+            && self.current_media.is_some()
+        {
+            self.set_fullscreen(ctx, !self.playback.fullscreen);
+        }
+    }
+
+    fn render_fullscreen_playback(&mut self, ctx: &egui::Context) {
+        let mut exit_fullscreen = false;
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                let available = ui.available_size();
+                if let Some(texture) = &self.playback.preview_texture {
+                    let display_size = aspect_fit_size(
+                        self.playback.last_frame_dims,
+                        available.max(egui::vec2(1.0, 1.0)),
+                    );
+                    ui.with_layout(
+                        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+                        |ui| {
+                            let response = ui.add(
+                                egui::Image::new(texture)
+                                    .fit_to_exact_size(display_size)
+                                    .sense(egui::Sense::click()),
+                            );
+                            if response.double_clicked() {
+                                exit_fullscreen = true;
+                            }
+                        },
+                    );
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new("No decoded video frame yet.")
+                                .color(egui::Color32::WHITE),
+                        );
+                    });
+                }
+            });
+
+        let mut play_requested = false;
+        let mut pause_requested = false;
+        let mut stop_requested = false;
+        egui::Area::new("fullscreen_playback_controls".into())
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+            .show(ctx, |ui| {
+                egui::Frame::group(ui.style())
+                    .fill(egui::Color32::from_black_alpha(190))
+                    .stroke(egui::Stroke::new(1.0, panel_stroke()))
+                    .inner_margin(egui::Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} ms  •  {:?}",
+                                    self.playback.position_ms, self.playback.worker_state
+                                ))
+                                .color(egui::Color32::WHITE),
+                            );
+                            if ui.button("Play").clicked() {
+                                play_requested = true;
+                            }
+                            if ui.button("Pause").clicked() {
+                                pause_requested = true;
+                            }
+                            if ui.button("Stop").clicked() {
+                                stop_requested = true;
+                            }
+                            if ui.button("Exit Fullscreen").clicked() {
+                                exit_fullscreen = true;
+                            }
+                        });
+                        ui.label(
+                            egui::RichText::new("F / double-click toggles • Esc exits")
+                                .size(11.0)
+                                .color(muted_text()),
+                        );
+                    });
+            });
+
+        if play_requested {
+            self.play(ctx);
+        }
+        if pause_requested {
+            self.pause();
+        }
+        if stop_requested {
+            self.stop();
+        }
+        if exit_fullscreen {
+            self.set_fullscreen(ctx, false);
+        }
+    }
+
     fn run_editor_action(&mut self, action: EditorAction) {
         let Some(claims) = self.editor_claims() else {
             self.push_notification(self.license_snapshot.message.clone());
@@ -1231,12 +1350,27 @@ impl PlayerApp {
 
         ui.add_space(8.0);
 
+        let mut fullscreen_requested = false;
         styled_section(ui, "Decode preview (528)", |ui| {
             ui.label(
                 egui::RichText::new(PlaybackWorkspace::DECODE_PREVIEW_BANNER).color(accent_amber()),
             );
-            if let Some(tex) = &self.playback.preview_texture {
-                ui.image(tex);
+            if let Some(texture) = &self.playback.preview_texture {
+                let available = egui::vec2(ui.available_width().max(1.0), 480.0);
+                let display_size = aspect_fit_size(self.playback.last_frame_dims, available);
+                let response = ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(display_size)
+                        .sense(egui::Sense::click()),
+                );
+                if response.double_clicked() {
+                    fullscreen_requested = true;
+                }
+                ui.label(
+                    egui::RichText::new("Double-click video or press F for fullscreen")
+                        .size(11.0)
+                        .color(muted_text()),
+                );
             } else {
                 ui.label(egui::RichText::new("No decoded video frame yet.").color(muted_text()));
             }
@@ -1258,6 +1392,10 @@ impl PlayerApp {
                 ),
             );
         });
+        if fullscreen_requested {
+            let ctx = ui.ctx().clone();
+            self.set_fullscreen(&ctx, true);
+        }
 
         ui.add_space(8.0);
 
@@ -1534,12 +1672,18 @@ impl PlayerApp {
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_playback_worker(ctx);
+        self.handle_fullscreen_shortcuts(ctx);
         self.maybe_auto_refresh_license(ctx);
-        self.render_top_bar(ctx);
-        self.render_side_panel(ctx);
-        self.render_workspace(ctx);
-        self.render_license_popup(ctx);
-        self.render_notification_toasts(ctx);
+
+        if self.playback.fullscreen {
+            self.render_fullscreen_playback(ctx);
+        } else {
+            self.render_top_bar(ctx);
+            self.render_side_panel(ctx);
+            self.render_workspace(ctx);
+            self.render_license_popup(ctx);
+            self.render_notification_toasts(ctx);
+        }
     }
 }
 
@@ -1577,6 +1721,25 @@ fn suggest_output_path(input: &str) -> String {
 enum TextureUpdateKind {
     Reuse,
     Reallocate,
+}
+
+fn aspect_fit_size(source: (u32, u32), available: egui::Vec2) -> egui::Vec2 {
+    if source.0 == 0
+        || source.1 == 0
+        || !available.x.is_finite()
+        || !available.y.is_finite()
+        || available.x <= 0.0
+        || available.y <= 0.0
+    {
+        return egui::Vec2::ZERO;
+    }
+
+    let source_width = source.0 as f32;
+    let source_height = source.1 as f32;
+    let scale = (available.x / source_width)
+        .min(available.y / source_height)
+        .max(0.0);
+    egui::vec2(source_width * scale, source_height * scale)
 }
 
 fn texture_update_kind(existing: Option<[usize; 2]>, incoming: [usize; 2]) -> TextureUpdateKind {
