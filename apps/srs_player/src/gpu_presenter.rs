@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU8, AtomicU64, Ordering},
+    Arc, Mutex,
+};
 
 use eframe::{
     egui,
@@ -9,7 +12,102 @@ use libsrs_app_services::{MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GpuPresenterHealth {
     Healthy,
+    SurfaceRecovering,
     BackendUnavailable,
+}
+
+#[derive(Debug)]
+pub(crate) struct GpuPresentationHealth {
+    state: AtomicU8,
+    recovery_generation: AtomicU64,
+    surface_error_count: AtomicU64,
+}
+
+impl Default for GpuPresentationHealth {
+    fn default() -> Self {
+        Self {
+            state: AtomicU8::new(GpuPresenterHealth::Healthy as u8),
+            recovery_generation: AtomicU64::new(0),
+            surface_error_count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl GpuPresentationHealth {
+    pub(crate) fn state(&self) -> GpuPresenterHealth {
+        match self.state.load(Ordering::Acquire) {
+            value if value == GpuPresenterHealth::Healthy as u8 => GpuPresenterHealth::Healthy,
+            value if value == GpuPresenterHealth::SurfaceRecovering as u8 => {
+                GpuPresenterHealth::SurfaceRecovering
+            }
+            _ => GpuPresenterHealth::BackendUnavailable,
+        }
+    }
+
+    pub(crate) fn recovery_generation(&self) -> u64 {
+        self.recovery_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn surface_error_count(&self) -> u64 {
+        self.surface_error_count.load(Ordering::Relaxed)
+    }
+
+    fn mark_surface_recovering(&self) {
+        self.surface_error_count.fetch_add(1, Ordering::Relaxed);
+        self.recovery_generation.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .store(GpuPresenterHealth::SurfaceRecovering as u8, Ordering::Release);
+    }
+
+    fn note_transient_surface_error(&self) {
+        self.surface_error_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn mark_backend_unavailable(&self) {
+        self.surface_error_count.fetch_add(1, Ordering::Relaxed);
+        self.recovery_generation.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .store(GpuPresenterHealth::BackendUnavailable as u8, Ordering::Release);
+    }
+
+    fn mark_presenter_unavailable(&self) {
+        self.recovery_generation.fetch_add(1, Ordering::AcqRel);
+        self.state
+            .store(GpuPresenterHealth::BackendUnavailable as u8, Ordering::Release);
+    }
+
+    fn mark_healthy_after_fresh_paint(&self, upload_generation: u64) {
+        if self.state() == GpuPresenterHealth::SurfaceRecovering
+            && self.recovery_generation() == upload_generation
+        {
+            self.state
+                .store(GpuPresenterHealth::Healthy as u8, Ordering::Release);
+        }
+    }
+}
+
+pub(crate) fn handle_surface_error(
+    health: &GpuPresentationHealth,
+    error: wgpu::SurfaceError,
+) -> egui_wgpu::SurfaceErrorAction {
+    match error {
+        wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost => {
+            health.mark_surface_recovering();
+            egui_wgpu::SurfaceErrorAction::RecreateSurface
+        }
+        wgpu::SurfaceError::Timeout => {
+            health.note_transient_surface_error();
+            egui_wgpu::SurfaceErrorAction::SkipFrame
+        }
+        wgpu::SurfaceError::OutOfMemory => {
+            health.mark_backend_unavailable();
+            egui_wgpu::SurfaceErrorAction::SkipFrame
+        }
+        _ => {
+            health.mark_backend_unavailable();
+            egui_wgpu::SurfaceErrorAction::SkipFrame
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +126,7 @@ pub(crate) struct GpuSubmitFailure {
 #[derive(Debug)]
 struct PendingUpload {
     generation: u64,
+    recovery_generation: u64,
     width: u32,
     height: u32,
     gray8: Vec<u8>,
@@ -66,6 +165,7 @@ impl PresenterShared {
     fn submit(
         &mut self,
         generation: u64,
+        recovery_generation: u64,
         width: u32,
         height: u32,
         gray8: Vec<u8>,
@@ -79,6 +179,7 @@ impl PresenterShared {
 
         if self.pending.replace(PendingUpload {
             generation,
+            recovery_generation,
             width,
             height,
             gray8,
@@ -101,11 +202,18 @@ impl PresenterShared {
 
 pub(crate) struct GpuVideoPresenter {
     shared: Arc<Mutex<PresenterShared>>,
+    health: Arc<GpuPresentationHealth>,
 }
 
 impl GpuVideoPresenter {
-    pub(crate) fn from_creation_context(cc: &eframe::CreationContext<'_>) -> Option<Self> {
-        let render_state = cc.wgpu_render_state.as_ref()?;
+    pub(crate) fn from_creation_context(
+        cc: &eframe::CreationContext<'_>,
+        health: Arc<GpuPresentationHealth>,
+    ) -> Option<Self> {
+        let Some(render_state) = cc.wgpu_render_state.as_ref() else {
+            health.mark_presenter_unavailable();
+            return None;
+        };
         let resources =
             GpuVideoResources::new(&render_state.device, render_state.target_format);
 
@@ -117,14 +225,25 @@ impl GpuVideoPresenter {
 
         Some(Self {
             shared: Arc::new(Mutex::new(PresenterShared::default())),
+            health,
         })
     }
 
     pub(crate) fn health(&self) -> Result<GpuPresenterHealth, String> {
-        self.shared
+        let shared_health = self
+            .shared
             .lock()
             .map(|shared| shared.health)
-            .map_err(|_| "GPU presenter state lock poisoned".to_string())
+            .map_err(|_| "GPU presenter state lock poisoned".to_string())?;
+        if shared_health == GpuPresenterHealth::BackendUnavailable {
+            Ok(shared_health)
+        } else {
+            Ok(self.health.state())
+        }
+    }
+
+    pub(crate) fn surface_error_count(&self) -> u64 {
+        self.health.surface_error_count()
     }
 
     pub(crate) fn set_generation(&self, generation: u64) -> Result<(), String> {
@@ -151,7 +270,13 @@ impl GpuVideoPresenter {
                 });
             }
         };
-        shared.submit(generation, width, height, gray8)
+        shared.submit(
+            generation,
+            self.health.recovery_generation(),
+            width,
+            height,
+            gray8,
+        )
     }
 
     pub(crate) fn paint(&self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
@@ -161,6 +286,7 @@ impl GpuVideoPresenter {
                 rect,
                 VideoPaintCallback {
                     shared: Arc::clone(&self.shared),
+                    health: Arc::clone(&self.health),
                 },
             ));
         response
@@ -211,6 +337,7 @@ fn allocation_decision(existing: Option<(u32, u32)>, incoming: (u32, u32)) -> Al
 
 struct VideoPaintCallback {
     shared: Arc<Mutex<PresenterShared>>,
+    health: Arc<GpuPresentationHealth>,
 }
 
 impl egui_wgpu::CallbackTrait for VideoPaintCallback {
@@ -231,6 +358,7 @@ impl egui_wgpu::CallbackTrait for VideoPaintCallback {
             return Vec::new();
         };
         let Some(resources) = callback_resources.get_mut::<GpuVideoResources>() else {
+            self.health.mark_presenter_unavailable();
             if let Ok(mut shared) = self.shared.lock() {
                 shared.mark_backend_unavailable();
             }
@@ -248,12 +376,16 @@ impl egui_wgpu::CallbackTrait for VideoPaintCallback {
         callback_resources: &egui_wgpu::CallbackResources,
     ) {
         let Some(resources) = callback_resources.get::<GpuVideoResources>() else {
+            self.health.mark_presenter_unavailable();
             if let Ok(mut shared) = self.shared.lock() {
                 shared.mark_backend_unavailable();
             }
             return;
         };
-        resources.paint(render_pass);
+        if let Some(upload_generation) = resources.paint(render_pass) {
+            self.health
+                .mark_healthy_after_fresh_paint(upload_generation);
+        }
     }
 }
 
@@ -264,6 +396,7 @@ struct GpuVideoResources {
     texture: Option<wgpu::Texture>,
     bind_group: Option<wgpu::BindGroup>,
     dimensions: Option<(u32, u32)>,
+    last_upload_recovery_generation: Option<u64>,
 }
 
 impl GpuVideoResources {
@@ -345,11 +478,13 @@ impl GpuVideoResources {
             texture: None,
             bind_group: None,
             dimensions: None,
+            last_upload_recovery_generation: None,
         }
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, upload: PendingUpload) {
         let incoming = (upload.width, upload.height);
+        self.last_upload_recovery_generation = Some(upload.recovery_generation);
         if allocation_decision(self.dimensions, incoming) == AllocationDecision::Reallocate {
             let texture = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("srs-player-video-r8"),
@@ -409,13 +544,12 @@ impl GpuVideoResources {
         );
     }
 
-    fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>) {
-        let Some(bind_group) = self.bind_group.as_ref() else {
-            return;
-        };
+    fn paint(&self, render_pass: &mut wgpu::RenderPass<'_>) -> Option<u64> {
+        let bind_group = self.bind_group.as_ref()?;
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, bind_group, &[]);
         render_pass.draw(0..4, 0..1);
+        self.last_upload_recovery_generation
     }
 }
 
@@ -424,10 +558,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn lost_surface_enters_recovery_and_requests_reconfigure() {
+        let health = GpuPresentationHealth::default();
+        let action = handle_surface_error(&health, wgpu::SurfaceError::Lost);
+
+        assert!(matches!(
+            action,
+            egui_wgpu::SurfaceErrorAction::RecreateSurface
+        ));
+        assert_eq!(health.state(), GpuPresenterHealth::SurfaceRecovering);
+        assert_eq!(health.surface_error_count(), 1);
+        assert_eq!(health.recovery_generation(), 1);
+    }
+
+    #[test]
+    fn timeout_skips_frame_without_disabling_presenter() {
+        let health = GpuPresentationHealth::default();
+        let action = handle_surface_error(&health, wgpu::SurfaceError::Timeout);
+
+        assert!(matches!(action, egui_wgpu::SurfaceErrorAction::SkipFrame));
+        assert_eq!(health.state(), GpuPresenterHealth::Healthy);
+        assert_eq!(health.surface_error_count(), 1);
+        assert_eq!(health.recovery_generation(), 0);
+    }
+
+    #[test]
+    fn out_of_memory_marks_gpu_presenter_unavailable() {
+        let health = GpuPresentationHealth::default();
+        let action = handle_surface_error(&health, wgpu::SurfaceError::OutOfMemory);
+
+        assert!(matches!(action, egui_wgpu::SurfaceErrorAction::SkipFrame));
+        assert_eq!(health.state(), GpuPresenterHealth::BackendUnavailable);
+        assert_eq!(health.surface_error_count(), 1);
+    }
+
+    #[test]
+    fn surface_recovery_requires_fresh_matching_generation_paint() {
+        let health = GpuPresentationHealth::default();
+        health.mark_surface_recovering();
+        let generation = health.recovery_generation();
+
+        health.mark_healthy_after_fresh_paint(generation.saturating_sub(1));
+        assert_eq!(health.state(), GpuPresenterHealth::SurfaceRecovering);
+
+        health.mark_healthy_after_fresh_paint(generation);
+        assert_eq!(health.state(), GpuPresenterHealth::Healthy);
+    }
+
+    #[test]
     fn backend_unavailable_health_discards_pending_upload() {
         let mut shared = PresenterShared::default();
         shared.set_generation(5);
-        shared.submit(5, 2, 2, vec![1; 4]).expect("submit");
+        shared.submit(5, 0, 2, 2, vec![1; 4]).expect("submit");
         assert!(shared.pending.is_some());
 
         shared.mark_backend_unavailable();
@@ -462,7 +644,7 @@ mod tests {
         shared.set_generation(8);
         assert_eq!(
             shared
-                .submit(7, 2, 2, vec![0; 4])
+                .submit(7, 0, 2, 2, vec![0; 4])
                 .expect("validated stale submit"),
             GpuSubmitOutcome::StaleGeneration
         );
@@ -474,11 +656,11 @@ mod tests {
         let mut shared = PresenterShared::default();
         shared.set_generation(4);
         assert_eq!(
-            shared.submit(4, 2, 2, vec![1; 4]).expect("first"),
+            shared.submit(4, 0, 2, 2, vec![1; 4]).expect("first"),
             GpuSubmitOutcome::Accepted
         );
         assert_eq!(
-            shared.submit(4, 2, 2, vec![2; 4]).expect("second"),
+            shared.submit(4, 0, 2, 2, vec![2; 4]).expect("second"),
             GpuSubmitOutcome::Accepted
         );
         assert_eq!(shared.replaced_pending_frames, 1);
