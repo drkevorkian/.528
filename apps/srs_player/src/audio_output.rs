@@ -124,7 +124,9 @@ pub struct AudioTelemetry {
 
 pub(crate) trait AudioSink: Send {
     fn matches_format(&self, sample_rate: u32, channels: u8) -> bool;
-    fn request_epoch(&self, epoch: u64);
+    fn source_sample_rate(&self) -> u32;
+    fn adapt_pcm(&mut self, samples: &[i16]) -> Result<Vec<i16>>;
+    fn request_epoch(&mut self, epoch: u64);
     fn epoch_ready(&self, epoch: u64) -> bool;
     fn push_pcm(&mut self, epoch: u64, samples: &[i16]) -> Result<usize>;
     fn telemetry(&self) -> AudioTelemetry;
@@ -453,7 +455,15 @@ impl AudioSink for AudioOutput {
         AudioOutput::matches_format(self, sample_rate, channels)
     }
 
-    fn request_epoch(&self, epoch: u64) {
+    fn source_sample_rate(&self) -> u32 {
+        AudioOutput::source_sample_rate(self)
+    }
+
+    fn adapt_pcm(&mut self, samples: &[i16]) -> Result<Vec<i16>> {
+        AudioOutput::adapt_pcm(self, samples)
+    }
+
+    fn request_epoch(&mut self, epoch: u64) {
         AudioOutput::request_epoch(self, epoch);
     }
 
