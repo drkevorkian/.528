@@ -21,6 +21,12 @@ const PRESENT_LATE_DROP_THRESHOLD_MS: u64 = 150;
 const DECODE_BURST_BUDGET: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterClockSource {
+    Audio,
+    Fallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
     Closed,
     Opening,
@@ -49,6 +55,11 @@ pub struct PlaybackSnapshot {
     pub audio_consumed_samples: u64,
     pub audio_underrun_samples: u64,
     pub audio_stream_errors: u64,
+    pub master_media_ms: u64,
+    pub master_clock_source: MasterClockSource,
+    pub held_frame_count: usize,
+    pub av_skew_ms: i64,
+    pub late_presentation_drops: u64,
     pub last_error: Option<String>,
 }
 
@@ -70,6 +81,11 @@ impl Default for PlaybackSnapshot {
             audio_consumed_samples: 0,
             audio_underrun_samples: 0,
             audio_stream_errors: 0,
+            master_media_ms: 0,
+            master_clock_source: MasterClockSource::Fallback,
+            held_frame_count: 0,
+            av_skew_ms: 0,
+            late_presentation_drops: 0,
             last_error: None,
         }
     }
@@ -434,6 +450,8 @@ impl PlaybackWorker {
         shutdown: Arc<AtomicBool>,
     ) -> Self {
         let now = Instant::now();
+        let mut fallback_clock = FallbackClock::new(0, now);
+        fallback_clock.pause(now);
         Self {
             command_rx,
             event_tx,
@@ -458,7 +476,7 @@ impl PlaybackWorker {
             audio_epoch_armed: false,
             audio_last_stream_errors: 0,
             scheduler: PresentationScheduler::default(),
-            fallback_clock: FallbackClock::new(0, now),
+            fallback_clock,
             late_presentation_drops: 0,
         }
     }
@@ -523,6 +541,7 @@ impl PlaybackWorker {
                 self.clear_frame_slot();
                 self.presented_video_frames = 0;
                 self.dropped_video_frames = 0;
+                self.late_presentation_drops = 0;
                 self.presented_position_ms = 0;
                 self.state = PlayerState::Opening;
                 self.emit_snapshot();
@@ -1145,9 +1164,19 @@ impl PlaybackWorker {
         )
     }
 
+    fn master_clock(&self, now: Instant) -> (u64, MasterClockSource) {
+        if let Some(audio_ms) = self.audio_media_position_ms() {
+            (audio_ms, MasterClockSource::Audio)
+        } else {
+            (
+                self.fallback_clock.media_time_ms(now),
+                MasterClockSource::Fallback,
+            )
+        }
+    }
+
     fn master_media_position_ms(&self, now: Instant) -> u64 {
-        self.audio_media_position_ms()
-            .unwrap_or_else(|| self.fallback_clock.media_time_ms(now))
+        self.master_clock(now).0
     }
 
     fn publish_frame_at_position(&mut self, frame: DecodedVideoFrame, position_ms: u64) {
@@ -1211,6 +1240,7 @@ impl PlaybackWorker {
             });
 
         let audio_telemetry = self.audio_output.as_ref().map(|audio| audio.telemetry());
+        let (master_media_ms, master_clock_source) = self.master_clock(Instant::now());
 
         PlaybackSnapshot {
             generation: self.generation,
@@ -1230,6 +1260,11 @@ impl PlaybackWorker {
             audio_underrun_samples: audio_telemetry
                 .map_or(0, |telemetry| telemetry.underrun_samples),
             audio_stream_errors: audio_telemetry.map_or(0, |telemetry| telemetry.stream_errors),
+            master_media_ms,
+            master_clock_source,
+            held_frame_count: self.scheduler.len(),
+            av_skew_ms: signed_media_delta(self.presented_position_ms, master_media_ms),
+            late_presentation_drops: self.late_presentation_drops,
             last_error: None,
         }
     }
@@ -1273,6 +1308,11 @@ fn audio_chunk_position_ms(chunk: &DecodedAudioChunk) -> Option<u64> {
                 .saturating_div(u64::from(chunk.timescale_hz)),
         )
     }
+}
+
+fn signed_media_delta(lhs_ms: u64, rhs_ms: u64) -> i64 {
+    let delta = i128::from(lhs_ms) - i128::from(rhs_ms);
+    delta.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 fn frame_position_ms(frame: &DecodedVideoFrame) -> u64 {
