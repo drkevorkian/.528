@@ -6,9 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::audio_output::{
-    AudioOutput, AudioSink, AudioStreamIssue, AudioStreamIssueEvent, AudioTelemetry,
-};
+use crate::audio_output::{AudioOutput, AudioSink, AudioStreamIssue, AudioStreamIssueEvent};
 use libsrs_app_services::{
     DecodedAudioChunk, DecodedVideoFrame, PlaybackEvent, PlaybackSession, PlaybackState,
 };
@@ -1402,13 +1400,10 @@ impl PlaybackWorker {
                 return (audio_ms, MasterClockSource::Audio);
             }
         }
-        {
-            (audio_ms, MasterClockSource::Audio)
-            (
-                self.fallback_clock.media_time_ms(now),
-                MasterClockSource::Fallback,
-            )
-        }
+        (
+            self.fallback_clock.media_time_ms(now),
+            MasterClockSource::Fallback,
+        )
     }
 
     fn master_media_position_ms(&self, now: Instant) -> u64 {
@@ -1717,8 +1712,8 @@ mod tests {
             Ok(written)
         }
 
-        fn telemetry(&self) -> AudioTelemetry {
-            AudioTelemetry {
+        fn telemetry(&self) -> crate::audio_output::AudioTelemetry {
+            crate::audio_output::AudioTelemetry {
                 consumed_samples: self.state.consumed_samples.load(Ordering::Relaxed),
                 underrun_samples: self.state.underrun_samples.load(Ordering::Relaxed),
                 stream_errors: self.state.stream_errors.load(Ordering::Relaxed),
