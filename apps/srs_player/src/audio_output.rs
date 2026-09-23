@@ -402,11 +402,13 @@ fn build_stream_for_format(
     timing_generation: Arc<AtomicU64>,
     audible_anchor: Arc<AudibleAnchorSnapshot>,
 ) -> Result<Stream> {
+    let channels = usize::from(config.channels);
     macro_rules! build {
         ($sample:ty) => {{
             build_typed_stream::<$sample>(
                 device,
                 config,
+                channels,
                 consumer,
                 requested_epoch,
                 callback_epoch,
@@ -530,6 +532,7 @@ impl FromPcmI16 for u64 {
 fn build_typed_stream<T>(
     device: &cpal::Device,
     config: StreamConfig,
+    channels: usize,
     mut consumer: Consumer<i16>,
     requested_epoch: Arc<AtomicU64>,
     callback_epoch: Arc<AtomicU64>,
@@ -563,6 +566,11 @@ where
                 }
 
                 let available = consumer.slots().min(output.len());
+                let available = if channels == 0 {
+                    0
+                } else {
+                    available - (available % channels)
+                };
                 let consumed_before = consumed_samples.load(Ordering::Relaxed);
                 let consumed = if available == 0 {
                     0
@@ -624,6 +632,22 @@ fn fill_silence<T: FromPcmI16>(output: &mut [T]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn callback_consumption_alignment_preserves_channel_frames() {
+        fn aligned(available: usize, channels: usize) -> usize {
+            if channels == 0 {
+                0
+            } else {
+                available - (available % channels)
+            }
+        }
+
+        assert_eq!(aligned(5, 2), 4);
+        assert_eq!(aligned(8, 2), 8);
+        assert_eq!(aligned(10, 6), 6);
+        assert_eq!(aligned(2, 6), 0);
+    }
 
     #[test]
     fn audible_anchor_snapshot_preserves_full_u128_stream_time() {
