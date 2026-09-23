@@ -100,6 +100,7 @@ pub struct AudioOutput {
     stream_errors: Arc<AtomicU64>,
     timing_generation: Arc<AtomicU64>,
     audible_anchor: Arc<AudibleAnchorSnapshot>,
+    audible_floor_samples: AtomicU64,
     ring_capacity: usize,
     sample_rate: u32,
     channels: u16,
@@ -162,6 +163,7 @@ impl AudioOutput {
             stream_errors,
             timing_generation,
             audible_anchor,
+            audible_floor_samples: AtomicU64::new(0),
             ring_capacity: capacity,
             sample_rate,
             channels,
@@ -211,6 +213,10 @@ impl AudioOutput {
     }
 
     pub fn invalidate_audible_anchor(&self) {
+        self.audible_floor_samples.store(
+            self.consumed_samples.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         self.timing_generation.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -224,14 +230,18 @@ impl AudioOutput {
         let secs = u64::try_from(anchor.playback_nanos / 1_000_000_000).ok()?;
         let nanos = (anchor.playback_nanos % 1_000_000_000) as u32;
         let playback = cpal::StreamInstant::new(secs, nanos);
-        estimate_audible_samples(
+        let estimate = estimate_audible_samples(
             anchor.consumed_samples_before_buffer,
             playback,
             self.stream.now(),
             self.consumed_samples.load(Ordering::Acquire),
             self.sample_rate,
             self.channels,
-        )
+        )?;
+        let previous = self
+            .audible_floor_samples
+            .fetch_max(estimate, Ordering::AcqRel);
+        Some(previous.max(estimate))
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -677,6 +687,18 @@ mod tests {
             estimate_audible_samples(96_000, playback, now, 120_000, 48_000, 2),
             Some(120_000)
         );
+    }
+
+    #[test]
+    fn audible_estimate_candidate_can_be_clamped_monotonically() {
+        let floor = AtomicU64::new(90_000);
+        let estimate = 80_000;
+        let previous = floor.fetch_max(estimate, Ordering::AcqRel);
+        assert_eq!(previous.max(estimate), 90_000);
+
+        let estimate = 100_000;
+        let previous = floor.fetch_max(estimate, Ordering::AcqRel);
+        assert_eq!(previous.max(estimate), 100_000);
     }
 
     #[test]
