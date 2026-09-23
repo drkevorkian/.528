@@ -60,6 +60,8 @@ pub struct PlaybackSnapshot {
     pub held_frame_count: usize,
     pub av_skew_ms: i64,
     pub late_presentation_drops: u64,
+    pub eos_draining: bool,
+    pub audio_buffered_samples: usize,
     pub last_error: Option<String>,
 }
 
@@ -86,6 +88,8 @@ impl Default for PlaybackSnapshot {
             held_frame_count: 0,
             av_skew_ms: 0,
             late_presentation_drops: 0,
+            eos_draining: false,
+            audio_buffered_samples: 0,
             last_error: None,
         }
     }
@@ -1277,6 +1281,11 @@ impl PlaybackWorker {
             held_frame_count: self.scheduler.len(),
             av_skew_ms: signed_media_delta(self.presented_position_ms, master_media_ms),
             late_presentation_drops: self.late_presentation_drops,
+            eos_draining: self.scheduler.eos_pending,
+            audio_buffered_samples: self
+                .audio_output
+                .as_ref()
+                .map_or(0, |audio| audio.buffered_samples()),
             last_error: None,
         }
     }
