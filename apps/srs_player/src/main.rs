@@ -18,7 +18,13 @@ use playback_worker::{
 use rfd::FileDialog;
 
 fn main() -> eframe::Result<()> {
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        multisampling: 0,
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        ..Default::default()
+    };
     eframe::run_native(
         "SRS Player",
         options,
