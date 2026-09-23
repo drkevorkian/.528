@@ -10,6 +10,7 @@ use libsrs_app_config::SrsConfig;
 use libsrs_app_services::{
     AppServices, DecodedVideoFrame, MediaInspection, MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE,
 };
+use gpu_presenter::{GpuSubmitOutcome, GpuVideoPresenter};
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
@@ -31,7 +32,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             apply_player_theme(&cc.egui_ctx);
-            Ok(Box::new(PlayerApp::bootstrap()))
+            Ok(Box::new(PlayerApp::bootstrap(cc)))
         }),
     )
 }
@@ -72,6 +73,37 @@ enum EditorTab {
     FrameTools,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VideoPresentationBackend {
+    Gpu,
+    CpuFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuSubmissionState {
+    Unavailable,
+    Accepted,
+    StaleGeneration,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramePresentationRoute {
+    Gpu,
+    CpuFallback,
+    Ignore,
+}
+
+fn frame_presentation_route(state: GpuSubmissionState) -> FramePresentationRoute {
+    match state {
+        GpuSubmissionState::Accepted => FramePresentationRoute::Gpu,
+        GpuSubmissionState::StaleGeneration => FramePresentationRoute::Ignore,
+        GpuSubmissionState::Unavailable | GpuSubmissionState::Failed => {
+            FramePresentationRoute::CpuFallback
+        }
+    }
+}
+
 struct PlaybackWorkspace {
     position_ms: u64,
     duration_ms: u64,
@@ -83,6 +115,8 @@ struct PlaybackWorkspace {
     command_pending: bool,
     seek_in_progress: bool,
     pending_seek_ms: Option<u64>,
+    gpu_presenter: Option<GpuVideoPresenter>,
+    video_backend: Option<VideoPresentationBackend>,
     preview_texture: Option<egui::TextureHandle>,
     last_frame_crc32c: Option<u32>,
     last_frame_dims: (u32, u32),
@@ -90,7 +124,7 @@ struct PlaybackWorkspace {
 }
 
 impl PlaybackWorkspace {
-    const DECODE_PREVIEW_BANNER: &'static str = "Playback preview: worker-thread CPU decode with persistent in-app texture updates. Dedicated WGPU video presentation is the next rendering slice.";
+    const DECODE_PREVIEW_BANNER: &'static str = "Playback preview: worker-thread decode with GPU-first R8Unorm presentation and bounded CPU texture fallback.";
 
     fn new() -> Self {
         Self {
@@ -105,6 +139,8 @@ impl PlaybackWorkspace {
             command_pending: false,
             seek_in_progress: false,
             pending_seek_ms: None,
+            gpu_presenter: None,
+            video_backend: None,
             preview_texture: None,
             last_frame_crc32c: None,
             last_frame_dims: (0, 0),
@@ -118,6 +154,21 @@ impl PlaybackWorkspace {
             1
         } else {
             next
+        }
+    }
+
+    fn clear_video_surface(&mut self) {
+        self.video_backend = None;
+        self.preview_texture = None;
+        self.last_frame_crc32c = None;
+        self.last_frame_dims = (0, 0);
+    }
+
+    fn has_video_surface(&self) -> bool {
+        match self.video_backend {
+            Some(VideoPresentationBackend::Gpu) => self.gpu_presenter.is_some(),
+            Some(VideoPresentationBackend::CpuFallback) => self.preview_texture.is_some(),
+            None => false,
         }
     }
 }
@@ -153,8 +204,11 @@ impl NotificationEntry {
 }
 
 impl PlayerApp {
-    fn bootstrap() -> Self {
-        Self::try_bootstrap().unwrap_or_else(|err| Self::fallback(err.to_string()))
+    fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
+        let gpu_presenter = GpuVideoPresenter::from_creation_context(cc);
+        let mut app = Self::try_bootstrap().unwrap_or_else(|err| Self::fallback(err.to_string()));
+        app.playback.gpu_presenter = gpu_presenter;
+        app
     }
 
     fn try_bootstrap() -> anyhow::Result<Self> {
@@ -280,6 +334,29 @@ impl PlayerApp {
         ctx.request_repaint_after(auto_refresh_repaint_delay(until_next));
     }
 
+    fn sync_gpu_generation(&mut self, generation: u64, clear_surface: bool) {
+        if clear_surface {
+            self.playback.clear_video_surface();
+        }
+
+        let error = self
+            .playback
+            .gpu_presenter
+            .as_ref()
+            .and_then(|presenter| presenter.set_generation(generation).err());
+        if let Some(message) = error {
+            self.playback.gpu_presenter = None;
+            self.playback.video_backend = if self.playback.preview_texture.is_some() {
+                Some(VideoPresentationBackend::CpuFallback)
+            } else {
+                None
+            };
+            self.push_notification(format!(
+                "GPU video presenter disabled; CPU fallback active: {message}"
+            ));
+        }
+    }
+
     fn seconds_until_auto_refresh(&self) -> u64 {
         self.next_auto_refresh_at
             .saturating_duration_since(Instant::now())
@@ -303,13 +380,11 @@ impl PlayerApp {
                 match self.playback.worker.try_send(command) {
                     Ok(()) => {
                         self.playback.generation = generation;
+                        self.sync_gpu_generation(generation, true);
                         self.playback.worker_state = PlayerState::Opening;
                         self.playback.command_pending = true;
                         self.playback.seek_in_progress = false;
                         self.playback.pending_seek_ms = None;
-                        self.playback.preview_texture = None;
-                        self.playback.last_frame_crc32c = None;
-                        self.playback.last_frame_dims = (0, 0);
                         self.playback.duration_ms = inspection.duration_for_ui();
                         self.playback.position_ms = 0;
                         self.editor.selection_start_ms = 0;
@@ -348,14 +423,12 @@ impl PlayerApp {
         {
             Ok(()) => {
                 self.playback.generation = generation;
+                self.sync_gpu_generation(generation, true);
                 self.playback.worker_state = PlayerState::Closed;
                 self.playback.command_pending = true;
                 self.playback.seek_in_progress = false;
                 self.playback.pending_seek_ms = None;
                 self.current_media = None;
-                self.playback.preview_texture = None;
-                self.playback.last_frame_crc32c = None;
-                self.playback.last_frame_dims = (0, 0);
                 self.playback.position_ms = 0;
                 self.playback.duration_ms = 0;
                 self.editor.frame_cursor_ms = 0;
@@ -469,6 +542,7 @@ impl PlayerApp {
             generation: self.playback.generation,
         }) {
             Ok(()) => {
+                self.sync_gpu_generation(self.playback.generation, false);
                 self.playback.command_pending = true;
                 self.playback.pending_seek_ms = None;
                 self.status = "Stop requested".to_string();
@@ -490,6 +564,7 @@ impl PlayerApp {
         }) {
             Ok(()) => {
                 self.playback.generation = generation;
+                self.sync_gpu_generation(generation, true);
                 self.playback.worker_state = PlayerState::Seeking;
                 self.playback.command_pending = true;
                 self.playback.seek_in_progress = true;
@@ -646,9 +721,7 @@ impl PlayerApp {
             && snapshot.presented_position_ms == 0
             && snapshot.decoded_video_frames == 0
         {
-            self.playback.preview_texture = None;
-            self.playback.last_frame_crc32c = None;
-            self.playback.last_frame_dims = (0, 0);
+            self.playback.clear_video_surface();
         }
 
         let crc = self
@@ -720,30 +793,112 @@ impl PlayerApp {
         v: DecodedVideoFrame,
     ) -> Result<(), String> {
         let dims = validate_preview_frame(&v)?;
-        self.playback.last_frame_crc32c = Some(v.payload_crc32c);
-        self.playback.last_frame_dims = (v.width, v.height);
-        let gray = egui::ColorImage::from_gray(dims, &v.gray8);
+        let width = v.width;
+        let height = v.height;
+        let crc32c = v.payload_crc32c;
+        let mut gray8 = Some(v.gray8);
 
-        let existing_dims = self
-            .playback
-            .preview_texture
-            .as_ref()
-            .map(egui::TextureHandle::size);
-        match texture_update_kind(existing_dims, dims) {
-            TextureUpdateKind::Reuse => {
-                if let Some(texture) = self.playback.preview_texture.as_mut() {
-                    texture.set(gray, egui::TextureOptions::LINEAR);
+        let submission = if let Some(presenter) = self.playback.gpu_presenter.as_ref() {
+            let pixels = gray8.take().expect("validated frame pixels are present");
+            match presenter.submit_frame(
+                self.playback.generation,
+                width,
+                height,
+                pixels,
+            ) {
+                Ok(GpuSubmitOutcome::Accepted) => (GpuSubmissionState::Accepted, None, None),
+                Ok(GpuSubmitOutcome::StaleGeneration) => {
+                    (GpuSubmissionState::StaleGeneration, None, None)
                 }
+                Err(failure) => (
+                    GpuSubmissionState::Failed,
+                    Some(failure.gray8),
+                    Some(failure.message),
+                ),
             }
-            TextureUpdateKind::Reallocate => {
-                self.playback.preview_texture = Some(ctx.load_texture(
-                    "SRS-528-decode-preview",
-                    gray,
-                    egui::TextureOptions::LINEAR,
-                ));
+        } else {
+            (GpuSubmissionState::Unavailable, gray8.take(), None)
+        };
+
+        match frame_presentation_route(submission.0) {
+            FramePresentationRoute::Gpu => {
+                self.playback.last_frame_crc32c = Some(crc32c);
+                self.playback.last_frame_dims = (width, height);
+                self.playback.video_backend = Some(VideoPresentationBackend::Gpu);
+                self.playback.preview_texture = None;
+            }
+            FramePresentationRoute::Ignore => {}
+            FramePresentationRoute::CpuFallback => {
+                if let Some(message) = submission.2 {
+                    self.playback.gpu_presenter = None;
+                    self.push_notification(format!(
+                        "GPU video submission failed; CPU fallback active: {message}"
+                    ));
+                }
+
+                let pixels = submission
+                    .1
+                    .ok_or_else(|| "CPU fallback frame data was unavailable".to_string())?;
+                let gray = egui::ColorImage::from_gray(dims, &pixels);
+                let existing_dims = self
+                    .playback
+                    .preview_texture
+                    .as_ref()
+                    .map(egui::TextureHandle::size);
+                match texture_update_kind(existing_dims, dims) {
+                    TextureUpdateKind::Reuse => {
+                        if let Some(texture) = self.playback.preview_texture.as_mut() {
+                            texture.set(gray, egui::TextureOptions::LINEAR);
+                        }
+                    }
+                    TextureUpdateKind::Reallocate => {
+                        self.playback.preview_texture = Some(ctx.load_texture(
+                            "SRS-528-decode-preview",
+                            gray,
+                            egui::TextureOptions::LINEAR,
+                        ));
+                    }
+                }
+                self.playback.last_frame_crc32c = Some(crc32c);
+                self.playback.last_frame_dims = (width, height);
+                self.playback.video_backend = Some(VideoPresentationBackend::CpuFallback);
             }
         }
         Ok(())
+    }
+
+    fn paint_current_video(
+        &self,
+        ui: &mut egui::Ui,
+        available: egui::Vec2,
+    ) -> Option<egui::Response> {
+        if !self.playback.has_video_surface() {
+            return None;
+        }
+        let display_size = aspect_fit_size(self.playback.last_frame_dims, available);
+        if display_size == egui::Vec2::ZERO {
+            return None;
+        }
+
+        match self.playback.video_backend {
+            Some(VideoPresentationBackend::Gpu) => self
+                .playback
+                .gpu_presenter
+                .as_ref()
+                .map(|presenter| presenter.paint(ui, display_size)),
+            Some(VideoPresentationBackend::CpuFallback) => self
+                .playback
+                .preview_texture
+                .as_ref()
+                .map(|texture| {
+                    ui.add(
+                        egui::Image::new(texture)
+                            .fit_to_exact_size(display_size)
+                            .sense(egui::Sense::click()),
+                    )
+                }),
+            None => None,
+        }
     }
 
     fn set_fullscreen(&mut self, ctx: &egui::Context, enabled: bool) {
@@ -768,7 +923,7 @@ impl PlayerApp {
             self.set_fullscreen(ctx, false);
         } else if f_pressed
             && !wants_keyboard
-            && self.playback.preview_texture.is_some()
+            && self.playback.has_video_surface()
             && self.current_media.is_some()
         {
             self.set_fullscreen(ctx, !self.playback.fullscreen);
@@ -781,21 +936,17 @@ impl PlayerApp {
             .frame(egui::Frame::NONE.fill(egui::Color32::BLACK))
             .show(ctx, |ui| {
                 let available = ui.available_size();
-                if let Some(texture) = &self.playback.preview_texture {
-                    let display_size = aspect_fit_size(
-                        self.playback.last_frame_dims,
-                        egui::vec2(available.x.max(1.0), available.y.max(1.0)),
-                    );
+                if self.playback.has_video_surface() {
                     ui.with_layout(
                         egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
                         |ui| {
-                            let response = ui.add(
-                                egui::Image::new(texture)
-                                    .fit_to_exact_size(display_size)
-                                    .sense(egui::Sense::click()),
-                            );
-                            if response.double_clicked() {
-                                exit_fullscreen = true;
+                            if let Some(response) = self.paint_current_video(
+                                ui,
+                                egui::vec2(available.x.max(1.0), available.y.max(1.0)),
+                            ) {
+                                if response.double_clicked() {
+                                    exit_fullscreen = true;
+                                }
                             }
                         },
                     );
@@ -1362,16 +1513,12 @@ impl PlayerApp {
             ui.label(
                 egui::RichText::new(PlaybackWorkspace::DECODE_PREVIEW_BANNER).color(accent_amber()),
             );
-            if let Some(texture) = &self.playback.preview_texture {
+            if self.playback.has_video_surface() {
                 let available = egui::vec2(ui.available_width().max(1.0), 480.0);
-                let display_size = aspect_fit_size(self.playback.last_frame_dims, available);
-                let response = ui.add(
-                    egui::Image::new(texture)
-                        .fit_to_exact_size(display_size)
-                        .sense(egui::Sense::click()),
-                );
-                if response.double_clicked() {
-                    fullscreen_requested = true;
+                if let Some(response) = self.paint_current_video(ui, available) {
+                    if response.double_clicked() {
+                        fullscreen_requested = true;
+                    }
                 }
                 ui.label(
                     egui::RichText::new("Double-click video or press F for fullscreen")
@@ -2025,6 +2172,26 @@ mod tests {
             payload_crc32c: 0,
             gray8: vec![0; len],
         }
+    }
+
+    #[test]
+    fn gpu_routing_uses_gpu_only_for_accepted_submission() {
+        assert_eq!(
+            frame_presentation_route(GpuSubmissionState::Accepted),
+            FramePresentationRoute::Gpu
+        );
+        assert_eq!(
+            frame_presentation_route(GpuSubmissionState::Unavailable),
+            FramePresentationRoute::CpuFallback
+        );
+        assert_eq!(
+            frame_presentation_route(GpuSubmissionState::Failed),
+            FramePresentationRoute::CpuFallback
+        );
+        assert_eq!(
+            frame_presentation_route(GpuSubmissionState::StaleGeneration),
+            FramePresentationRoute::Ignore
+        );
     }
 
     #[test]
