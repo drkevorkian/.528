@@ -1358,6 +1358,21 @@ mod tests {
         )
     }
 
+    fn worker_with_command_sender(
+        snapshot_slot: Arc<Mutex<PlaybackSnapshot>>,
+    ) -> (PlaybackWorker, SyncSender<PlaybackWorkerCommand>) {
+        let (command_tx, command_rx) = mpsc::sync_channel(4);
+        let (event_tx, _event_rx) = mpsc::sync_channel(4);
+        let worker = PlaybackWorker::new(
+            command_rx,
+            event_tx,
+            Arc::new(Mutex::new(None)),
+            snapshot_slot,
+            Arc::new(AtomicBool::new(false)),
+        );
+        (worker, command_tx)
+    }
+
     struct FakeAudioState {
         requested_epoch: AtomicU64,
         callback_epoch: AtomicU64,
@@ -1673,6 +1688,186 @@ mod tests {
             clock.media_time_ms(base + Duration::from_secs(1) + Duration::from_millis(75)),
             9_075
         );
+    }
+
+    #[test]
+    fn runtime_timeout_tracks_front_frame_media_deadline() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let base = Instant::now();
+        worker.fallback_clock.reset(0, base);
+        worker
+            .scheduler
+            .enqueue(scheduled(0, 0, 100))
+            .expect("enqueue");
+
+        assert_eq!(worker.next_playback_timeout(base), PLAYBACK_TICK);
+        assert_eq!(
+            worker.next_playback_timeout(base + Duration::from_millis(80)),
+            Duration::from_millis(15)
+        );
+        assert_eq!(
+            worker.next_playback_timeout(base + Duration::from_millis(95)),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn runtime_burst_handles_pending_command_before_decode() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let (mut worker, command_tx) = worker_with_command_sender(snapshot_slot);
+        worker.generation = 7;
+        worker.state = PlayerState::Playing;
+
+        command_tx
+            .try_send(PlaybackWorkerCommand::Pause { generation: 7 })
+            .expect("queue pause");
+
+        assert!(worker.playback_burst());
+        assert_eq!(worker.state, PlayerState::Paused);
+    }
+
+    #[test]
+    fn runtime_full_scheduler_backpressures_without_decoder_access() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        worker.state = PlayerState::Playing;
+        worker.generation = 1;
+
+        for index in 0..MAX_HELD_PRESENTATION_FRAMES {
+            worker
+                .scheduler
+                .enqueue(scheduled(1, index as u32, 1_000 + index as u64))
+                .expect("fill scheduler");
+        }
+
+        assert!(worker.playback_burst());
+        assert_eq!(worker.state, PlayerState::Playing);
+        assert_eq!(worker.scheduler.len(), MAX_HELD_PRESENTATION_FRAMES);
+    }
+
+    #[test]
+    fn runtime_late_frame_drop_updates_diagnostics_without_publishing() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let base = Instant::now();
+        worker.generation = 1;
+        worker.state = PlayerState::Playing;
+        worker.fallback_clock.reset(0, base);
+        worker
+            .scheduler
+            .enqueue(scheduled(1, 0, 100))
+            .expect("enqueue");
+
+        worker.service_due_presentations(base + Duration::from_millis(300));
+
+        assert!(worker.scheduler.is_empty());
+        assert_eq!(worker.late_presentation_drops, 1);
+        assert_eq!(worker.presented_video_frames, 0);
+        assert!(worker
+            .frame_slot
+            .lock()
+            .expect("frame slot")
+            .as_ref()
+            .is_none());
+    }
+
+    #[test]
+    fn runtime_due_frame_publishes_at_frame_pts_not_master_time() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let base = Instant::now();
+        worker.generation = 1;
+        worker.state = PlayerState::Playing;
+        worker.fallback_clock.reset(0, base);
+        worker
+            .scheduler
+            .enqueue(scheduled(1, 0, 100))
+            .expect("enqueue");
+
+        worker.service_due_presentations(base + Duration::from_millis(95));
+
+        assert_eq!(worker.presented_position_ms, 100);
+        let slot = worker.frame_slot.lock().expect("frame slot");
+        assert_eq!(
+            slot.as_ref().map(|presentation| presentation.presented_position_ms),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn runtime_eos_refills_after_full_queue_then_finishes_when_drained() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let base = Instant::now();
+        worker.generation = 1;
+        worker.state = PlayerState::Playing;
+        worker.fallback_clock.reset(0, base);
+
+        for index in 0..MAX_HELD_PRESENTATION_FRAMES {
+            worker
+                .scheduler
+                .enqueue(scheduled(1, index as u32, 1_000 + index as u64))
+                .expect("fill scheduler");
+        }
+
+        worker.reorder.push(frame(8)).expect("buffer EOS frame");
+        worker.push_time_slot_ms(2_000).expect("timestamp slot");
+        worker.scheduler.mark_eos();
+
+        worker.service_due_presentations(base);
+        assert_eq!(worker.state, PlayerState::Playing);
+        assert_eq!(worker.reorder.depth(), 1);
+
+        worker.scheduler.pop_front();
+        worker.service_due_presentations(base);
+        assert_eq!(worker.reorder.depth(), 0);
+        assert_eq!(worker.scheduler.len(), MAX_HELD_PRESENTATION_FRAMES);
+        assert_eq!(worker.state, PlayerState::Playing);
+
+        worker.fallback_clock.reset(3_000, base);
+        worker.service_due_presentations(base);
+        assert_eq!(worker.state, PlayerState::Ended);
+        assert!(worker.scheduler.is_empty());
+        assert!(worker.presentation_time_slots_ms.is_empty());
+    }
+
+    #[test]
+    fn runtime_master_clock_uses_audio_only_when_epoch_is_armed() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let base = Instant::now();
+        worker.fallback_clock.reset(700, base);
+        worker.fallback_clock.pause(base);
+
+        let (_, fallback_source) = worker.master_clock(base);
+        assert_eq!(fallback_source, MasterClockSource::Fallback);
+
+        let _state = install_fake_audio(&mut worker, 80, usize::MAX);
+        worker.audio_epoch_media_start_ms = Some(1_500);
+        worker.audio_epoch_consumed_base = 0;
+        worker.audio_epoch_armed = true;
+
+        let (master_ms, source) = worker.master_clock(base);
+        assert_eq!(source, MasterClockSource::Audio);
+        assert_eq!(master_ms, 1_500);
+    }
+
+    #[test]
+    fn snapshot_keeps_visible_position_separate_from_master_clock() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let now = Instant::now();
+        worker.presented_position_ms = 123;
+        worker.fallback_clock.reset(1_000, now);
+        worker.fallback_clock.pause(now);
+
+        let snapshot = worker.snapshot();
+
+        assert_eq!(snapshot.presented_position_ms, 123);
+        assert_eq!(snapshot.master_media_ms, 1_000);
+        assert_eq!(snapshot.master_clock_source, MasterClockSource::Fallback);
+        assert_eq!(snapshot.av_skew_ms, -877);
     }
 
     #[test]
