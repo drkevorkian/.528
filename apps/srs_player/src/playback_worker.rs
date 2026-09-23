@@ -1634,6 +1634,8 @@ mod tests {
         consumed_samples: AtomicU64,
         underrun_samples: AtomicU64,
         stream_errors: AtomicU64,
+        stream_issue_sequence: AtomicU64,
+        stream_issue_code: AtomicU64,
         estimated_audible_samples: AtomicU64,
         audible_anchor_valid: AtomicBool,
         buffered_samples: std::sync::atomic::AtomicUsize,
@@ -1649,6 +1651,8 @@ mod tests {
                 consumed_samples: AtomicU64::new(0),
                 underrun_samples: AtomicU64::new(0),
                 stream_errors: AtomicU64::new(0),
+                stream_issue_sequence: AtomicU64::new(0),
+                stream_issue_code: AtomicU64::new(0),
                 estimated_audible_samples: AtomicU64::new(0),
                 audible_anchor_valid: AtomicBool::new(false),
                 buffered_samples: std::sync::atomic::AtomicUsize::new(0),
@@ -1660,6 +1664,12 @@ mod tests {
         fn acknowledge_requested_epoch(&self) {
             let requested = self.requested_epoch.load(Ordering::Acquire);
             self.callback_epoch.store(requested, Ordering::Release);
+        }
+
+        fn publish_issue(&self, issue: AudioStreamIssue) {
+            self.stream_issue_code.store(issue as u64, Ordering::Relaxed);
+            self.stream_issue_sequence.fetch_add(1, Ordering::Release);
+            self.stream_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1715,6 +1725,23 @@ mod tests {
                 requested_epoch: self.state.requested_epoch.load(Ordering::Acquire),
                 callback_epoch: self.state.callback_epoch.load(Ordering::Acquire),
             }
+        }
+
+        fn latest_stream_issue(&self) -> Option<AudioStreamIssueEvent> {
+            let sequence = self.state.stream_issue_sequence.load(Ordering::Acquire);
+            if sequence == 0 {
+                return None;
+            }
+            let issue = match self.state.stream_issue_code.load(Ordering::Acquire) {
+                1 => AudioStreamIssue::DeviceBusy,
+                2 => AudioStreamIssue::DeviceChanged,
+                3 => AudioStreamIssue::DeviceNotAvailable,
+                4 => AudioStreamIssue::RealtimeDenied,
+                5 => AudioStreamIssue::StreamInvalidated,
+                6 => AudioStreamIssue::Xrun,
+                _ => AudioStreamIssue::Fatal,
+            };
+            Some(AudioStreamIssueEvent { sequence, issue })
         }
 
         fn estimated_audible_samples(&self) -> Option<u64> {
@@ -2315,23 +2342,84 @@ mod tests {
     }
 
     #[test]
-    fn stream_error_only_fails_when_counter_increases() {
+    fn route_change_is_non_destructive_and_keeps_audio_authoritative() {
         let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
         let mut worker = worker_with_snapshot_slot(snapshot_slot);
-        let state = install_fake_audio(&mut worker, 50, 0);
-        state.stream_errors.store(3, Ordering::Relaxed);
-        worker.audio_last_stream_errors = 3;
-        worker.pending_audio = Some(pending_audio(&[1, 2]));
+        let state = install_fake_audio(&mut worker, 50, usize::MAX);
+        worker.audio_epoch_media_start_ms = Some(1_000);
+        worker.audio_epoch_armed = true;
+        state.consumed_samples.store(96_000, Ordering::Relaxed);
+        state.publish_issue(AudioStreamIssue::DeviceChanged);
 
-        assert!(!worker
-            .flush_pending_audio()
-            .expect("historical error ignored"));
+        worker.service_audio_stream_health(Instant::now());
 
-        state.stream_errors.store(4, Ordering::Relaxed);
-        let error = worker
-            .flush_pending_audio()
-            .expect_err("new stream error must fail");
-        assert!(error.contains("device/runtime error"));
+        assert!(worker.audio_output.is_some());
+        assert_eq!(worker.audio_device_state, AudioDeviceState::Rerouted);
+        assert_eq!(
+            worker.master_clock(Instant::now()).1,
+            MasterClockSource::Audio
+        );
+    }
+
+    #[test]
+    fn stream_invalidation_discards_old_audio_and_falls_back_for_recovery() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 51, usize::MAX);
+        worker.state = PlayerState::Playing;
+        worker.audio_epoch_media_start_ms = Some(2_000);
+        worker.audio_epoch_armed = true;
+        state.consumed_samples.store(96_000, Ordering::Relaxed);
+        worker.pending_audio = Some(pending_audio(&[1, 2, 3, 4]));
+        let before_epoch = worker.audio_epoch;
+        let now = Instant::now();
+
+        worker.handle_audio_stream_issue(
+            AudioStreamIssueEvent {
+                sequence: 1,
+                issue: AudioStreamIssue::StreamInvalidated,
+            },
+            now,
+        );
+
+        assert!(worker.audio_output.is_none());
+        assert!(worker.pending_audio.is_none());
+        assert_eq!(worker.audio_epoch, before_epoch.wrapping_add(1));
+        assert_eq!(worker.audio_device_state, AudioDeviceState::Recovering);
+        assert!(worker.audio_recovery.is_some());
+        assert_eq!(worker.master_clock(now).1, MasterClockSource::Fallback);
+    }
+
+    #[test]
+    fn non_destructive_audio_issues_do_not_request_rebuild() {
+        assert_eq!(
+            recovery_action(AudioStreamIssue::DeviceChanged),
+            AudioRecoveryAction::MarkRerouted
+        );
+        assert_eq!(
+            recovery_action(AudioStreamIssue::RealtimeDenied),
+            AudioRecoveryAction::Ignore
+        );
+        assert_eq!(
+            recovery_action(AudioStreamIssue::Xrun),
+            AudioRecoveryAction::Ignore
+        );
+        assert_eq!(
+            recovery_action(AudioStreamIssue::StreamInvalidated),
+            AudioRecoveryAction::Rebuild
+        );
+        assert_eq!(
+            recovery_action(AudioStreamIssue::DeviceNotAvailable),
+            AudioRecoveryAction::Rebuild
+        );
+    }
+
+    #[test]
+    fn audio_recovery_backoff_is_bounded() {
+        assert_eq!(audio_retry_delay(0), Duration::from_millis(100));
+        assert_eq!(audio_retry_delay(1), Duration::from_millis(200));
+        assert_eq!(audio_retry_delay(4), Duration::from_millis(1_600));
+        assert_eq!(audio_retry_delay(20), Duration::from_millis(1_600));
     }
 
     #[test]
