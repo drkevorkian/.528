@@ -10,8 +10,8 @@ use libsrs_app_services::{AppServices, DecodedVideoFrame, MediaInspection};
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
-    AudioClockType, MasterClockSource, PlaybackSnapshot, PlaybackWorkerCommand,
-    PlaybackWorkerEvent, PlaybackWorkerHandle, PlayerState,
+    MasterClockSource, PlaybackSnapshot, PlaybackWorkerCommand, PlaybackWorkerEvent,
+    PlaybackWorkerHandle, PlayerState,
 };
 use rfd::FileDialog;
 
