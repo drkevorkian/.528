@@ -749,13 +749,13 @@ impl PlayerApp {
     }
 
     fn handle_fullscreen_shortcuts(&mut self, ctx: &egui::Context) {
-        let (escape_pressed, f_pressed, wants_keyboard) = ctx.input(|input| {
+        let (escape_pressed, f_pressed) = ctx.input(|input| {
             (
                 input.key_pressed(egui::Key::Escape),
                 input.key_pressed(egui::Key::F),
-                input.wants_keyboard_input(),
             )
         });
+        let wants_keyboard = ctx.wants_keyboard_input();
 
         if self.playback.fullscreen && escape_pressed {
             self.set_fullscreen(ctx, false);
@@ -777,7 +777,7 @@ impl PlayerApp {
                 if let Some(texture) = &self.playback.preview_texture {
                     let display_size = aspect_fit_size(
                         self.playback.last_frame_dims,
-                        available.max(egui::vec2(1.0, 1.0)),
+                        egui::vec2(available.x.max(1.0), available.y.max(1.0)),
                     );
                     ui.with_layout(
                         egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
@@ -2018,6 +2018,43 @@ mod tests {
             payload_crc32c: 0,
             gray8: vec![0; len],
         }
+    }
+
+    #[test]
+    fn aspect_fit_preserves_wide_video_ratio() {
+        let fitted = aspect_fit_size((1920, 1080), egui::vec2(1000.0, 1000.0));
+        assert!((fitted.x - 1000.0).abs() < 0.01);
+        assert!((fitted.y - 562.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn aspect_fit_preserves_tall_video_ratio() {
+        let fitted = aspect_fit_size((1080, 1920), egui::vec2(1000.0, 500.0));
+        assert!((fitted.x - 281.25).abs() < 0.01);
+        assert!((fitted.y - 500.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn aspect_fit_rejects_zero_source_geometry() {
+        assert_eq!(
+            aspect_fit_size((0, 1080), egui::vec2(1000.0, 500.0)),
+            egui::Vec2::ZERO
+        );
+    }
+
+    #[test]
+    fn fullscreen_toggle_does_not_change_playback_state() {
+        let mut app = PlayerApp::fallback("test".to_string());
+        let ctx = Context::default();
+        app.playback.worker_state = PlayerState::Paused;
+
+        app.set_fullscreen(&ctx, true);
+        assert!(app.playback.fullscreen);
+        assert_eq!(app.playback.worker_state, PlayerState::Paused);
+
+        app.set_fullscreen(&ctx, false);
+        assert!(!app.playback.fullscreen);
+        assert_eq!(app.playback.worker_state, PlayerState::Paused);
     }
 
     #[test]
