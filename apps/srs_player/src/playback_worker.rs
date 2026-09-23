@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::audio_output::{AudioOutput, AudioSink, AudioTelemetry};
+use crate::audio_output::{
+    AudioOutput, AudioSink, AudioStreamIssue, AudioStreamIssueEvent, AudioTelemetry,
+};
 use libsrs_app_services::{
     DecodedAudioChunk, DecodedVideoFrame, PlaybackEvent, PlaybackSession, PlaybackState,
 };
@@ -19,6 +21,8 @@ const MAX_HELD_PRESENTATION_FRAMES: usize = 8;
 const PRESENT_EARLY_TOLERANCE_MS: u64 = 5;
 const PRESENT_LATE_DROP_THRESHOLD_MS: u64 = 150;
 const DECODE_BURST_BUDGET: usize = 16;
+const MAX_AUDIO_RECOVERY_ATTEMPTS: u8 = 5;
+const AUDIO_RECOVERY_BASE_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MasterClockSource {
@@ -30,6 +34,39 @@ pub enum MasterClockSource {
 pub enum AudioClockType {
     AudibleEstimate,
     ConsumedFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioDeviceState {
+    Active,
+    Rerouted,
+    Recovering,
+    Unavailable,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioRecoveryAction {
+    Ignore,
+    MarkRerouted,
+    Rebuild,
+    Terminal,
+}
+
+fn recovery_action(issue: AudioStreamIssue) -> AudioRecoveryAction {
+    match issue {
+        AudioStreamIssue::DeviceChanged => AudioRecoveryAction::MarkRerouted,
+        AudioStreamIssue::RealtimeDenied | AudioStreamIssue::Xrun => AudioRecoveryAction::Ignore,
+        AudioStreamIssue::DeviceBusy
+        | AudioStreamIssue::DeviceNotAvailable
+        | AudioStreamIssue::StreamInvalidated => AudioRecoveryAction::Rebuild,
+        AudioStreamIssue::Fatal => AudioRecoveryAction::Terminal,
+    }
+}
+
+fn audio_retry_delay(attempt: u8) -> Duration {
+    let shift = u32::from(attempt.min(4));
+    AUDIO_RECOVERY_BASE_DELAY.saturating_mul(1_u32 << shift)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +103,7 @@ pub struct PlaybackSnapshot {
     pub master_media_ms: u64,
     pub master_clock_source: MasterClockSource,
     pub audio_clock_type: Option<AudioClockType>,
+    pub audio_device_state: AudioDeviceState,
     pub held_frame_count: usize,
     pub av_skew_ms: i64,
     pub late_presentation_drops: u64,
@@ -97,6 +135,7 @@ impl Default for PlaybackSnapshot {
             master_media_ms: 0,
             master_clock_source: MasterClockSource::Fallback,
             audio_clock_type: None,
+            audio_device_state: AudioDeviceState::Active,
             held_frame_count: 0,
             av_skew_ms: 0,
             late_presentation_drops: 0,
@@ -431,6 +470,14 @@ impl FallbackClock {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AudioRecoveryPlan {
+    sample_rate: u32,
+    channels: u8,
+    attempts: u8,
+    retry_at: Instant,
+}
+
 struct PlaybackWorker {
     command_rx: Receiver<PlaybackWorkerCommand>,
     event_tx: SyncSender<PlaybackWorkerEvent>,
@@ -452,6 +499,9 @@ struct PlaybackWorker {
     audio_epoch_consumed_base: u64,
     audio_epoch_armed: bool,
     audio_last_stream_errors: u64,
+    audio_last_issue_sequence: u64,
+    audio_device_state: AudioDeviceState,
+    audio_recovery: Option<AudioRecoveryPlan>,
     scheduler: PresentationScheduler,
     fallback_clock: FallbackClock,
     late_presentation_drops: u64,
@@ -491,6 +541,9 @@ impl PlaybackWorker {
             audio_epoch_consumed_base: 0,
             audio_epoch_armed: false,
             audio_last_stream_errors: 0,
+            audio_last_issue_sequence: 0,
+            audio_device_state: AudioDeviceState::Active,
+            audio_recovery: None,
             scheduler: PresentationScheduler::default(),
             fallback_clock,
             late_presentation_drops: 0,
@@ -499,6 +552,7 @@ impl PlaybackWorker {
 
     fn run(&mut self) {
         while !self.shutdown.load(Ordering::Acquire) {
+            self.service_audio_stream_health(Instant::now());
             if self.state == PlayerState::Playing {
                 self.service_due_presentations(Instant::now());
                 if self.state != PlayerState::Playing {
@@ -834,6 +888,8 @@ impl PlaybackWorker {
                 return false;
             }
 
+            self.service_audio_stream_health(Instant::now());
+
             match self.command_rx.try_recv() {
                 Ok(command) => return self.handle_command(command),
                 Err(TryRecvError::Disconnected) => return false,
@@ -1064,6 +1120,9 @@ impl PlaybackWorker {
         self.audio_epoch_consumed_base = 0;
         self.audio_epoch_armed = false;
         self.audio_last_stream_errors = 0;
+        self.audio_last_issue_sequence = 0;
+        self.audio_device_state = AudioDeviceState::Active;
+        self.audio_recovery = None;
     }
 
     fn advance_audio_epoch(&mut self, media_start_ms: Option<u64>) {
@@ -1082,10 +1141,23 @@ impl PlaybackWorker {
             return Err("audio chunk arrived while previous PCM is still pending".to_string());
         }
 
+        if self.audio_output.is_none()
+            && matches!(
+                self.audio_device_state,
+                AudioDeviceState::Recovering | AudioDeviceState::Unavailable | AudioDeviceState::Failed
+            )
+        {
+            return Ok(());
+        }
+
         if self.audio_output.is_none() {
             let output = AudioOutput::open(chunk.sample_rate, chunk.channels, self.audio_epoch)
                 .map_err(|error| format!("audio output initialization failed: {error:#}"))?;
             self.audio_last_stream_errors = output.telemetry().stream_errors;
+            self.audio_last_issue_sequence = output
+                .latest_stream_issue()
+                .map_or(0, |event| event.sequence);
+            self.audio_device_state = AudioDeviceState::Active;
             self.audio_output = Some(Box::new(output));
         }
 
@@ -1134,10 +1206,7 @@ impl PlaybackWorker {
         }
 
         let telemetry = audio.telemetry();
-        if telemetry.stream_errors > self.audio_last_stream_errors {
-            self.audio_last_stream_errors = telemetry.stream_errors;
-            return Err("audio output stream reported a device/runtime error".to_string());
-        }
+        self.audio_last_stream_errors = telemetry.stream_errors;
 
         if !self.audio_epoch_armed && self.audio_epoch_media_start_ms.is_some() {
             self.audio_epoch_consumed_base = telemetry.consumed_samples;
@@ -1204,10 +1273,137 @@ impl PlaybackWorker {
             .or_else(|| self.audio_consumed_media_position_ms())
     }
 
+    fn handle_audio_stream_issue(&mut self, event: AudioStreamIssueEvent, now: Instant) {
+        if event.sequence <= self.audio_last_issue_sequence {
+            return;
+        }
+        self.audio_last_issue_sequence = event.sequence;
+
+        match recovery_action(event.issue) {
+            AudioRecoveryAction::Ignore => {}
+            AudioRecoveryAction::MarkRerouted => {
+                self.audio_device_state = AudioDeviceState::Rerouted;
+                self.emit_snapshot();
+            }
+            AudioRecoveryAction::Rebuild => self.begin_audio_recovery(now),
+            AudioRecoveryAction::Terminal => {
+                let anchor = self
+                    .audio_media_position_ms()
+                    .unwrap_or_else(|| self.fallback_clock.media_time_ms(now));
+                self.pending_audio = None;
+                self.audio_output = None;
+                self.audio_recovery = None;
+                self.audio_device_state = AudioDeviceState::Failed;
+                self.audio_epoch = self.audio_epoch.wrapping_add(1);
+                self.audio_epoch_media_start_ms = Some(anchor);
+                self.audio_epoch_consumed_base = 0;
+                self.audio_epoch_armed = false;
+                self.fallback_clock.reset(anchor, now);
+                if self.state != PlayerState::Playing {
+                    self.fallback_clock.pause(now);
+                }
+                self.emit_snapshot();
+            }
+        }
+    }
+
+    fn begin_audio_recovery(&mut self, now: Instant) {
+        let Some(audio) = self.audio_output.as_ref() else {
+            return;
+        };
+        let Ok(channels) = u8::try_from(audio.channels()) else {
+            self.audio_device_state = AudioDeviceState::Failed;
+            self.audio_output = None;
+            self.pending_audio = None;
+            self.emit_snapshot();
+            return;
+        };
+        let sample_rate = audio.sample_rate();
+        let anchor = self
+            .audio_media_position_ms()
+            .unwrap_or_else(|| self.fallback_clock.media_time_ms(now));
+
+        self.pending_audio = None;
+        self.audio_output = None;
+        self.audio_epoch = self.audio_epoch.wrapping_add(1);
+        self.audio_epoch_media_start_ms = Some(anchor);
+        self.audio_epoch_consumed_base = 0;
+        self.audio_epoch_armed = false;
+        self.audio_device_state = AudioDeviceState::Recovering;
+        self.audio_recovery = Some(AudioRecoveryPlan {
+            sample_rate,
+            channels,
+            attempts: 0,
+            retry_at: now,
+        });
+        self.fallback_clock.reset(anchor, now);
+        if self.state != PlayerState::Playing {
+            self.fallback_clock.pause(now);
+        }
+        self.emit_snapshot();
+    }
+
+    fn service_audio_stream_health(&mut self, now: Instant) {
+        let issue = self
+            .audio_output
+            .as_ref()
+            .and_then(|audio| audio.latest_stream_issue());
+        if let Some(event) = issue {
+            self.handle_audio_stream_issue(event, now);
+        }
+
+        let Some(mut recovery) = self.audio_recovery else {
+            return;
+        };
+        if now < recovery.retry_at {
+            return;
+        }
+        if recovery.attempts >= MAX_AUDIO_RECOVERY_ATTEMPTS {
+            self.audio_recovery = None;
+            self.audio_device_state = AudioDeviceState::Unavailable;
+            self.emit_snapshot();
+            return;
+        }
+
+        recovery.attempts = recovery.attempts.saturating_add(1);
+        match AudioOutput::open(recovery.sample_rate, recovery.channels, self.audio_epoch) {
+            Ok(output) => {
+                if self.state != PlayerState::Playing {
+                    if output.pause().is_err() {
+                        recovery.retry_at = now + audio_retry_delay(recovery.attempts);
+                        self.audio_recovery = Some(recovery);
+                        return;
+                    }
+                }
+                self.audio_last_stream_errors = output.telemetry().stream_errors;
+                self.audio_last_issue_sequence = output
+                    .latest_stream_issue()
+                    .map_or(0, |event| event.sequence);
+                self.audio_output = Some(Box::new(output));
+                self.audio_recovery = None;
+                self.audio_device_state = AudioDeviceState::Active;
+                self.emit_snapshot();
+            }
+            Err(_) => {
+                recovery.retry_at = now + audio_retry_delay(recovery.attempts);
+                self.audio_recovery = Some(recovery);
+                self.audio_device_state = AudioDeviceState::Recovering;
+            }
+        }
+    }
+
     fn master_clock(&self, now: Instant) -> (u64, MasterClockSource) {
-        if let Some(audio_ms) = self.audio_media_position_ms() {
+        let audio_authoritative = matches!(
+            self.audio_device_state,
+            AudioDeviceState::Active | AudioDeviceState::Rerouted
+        );
+        if audio_authoritative {
+            if let Some(audio_ms) = self.audio_media_position_ms() {
+                return (audio_ms, MasterClockSource::Audio);
+            }
+        }
+        {
             (audio_ms, MasterClockSource::Audio)
-        } else {
             (
                 self.fallback_clock.media_time_ms(now),
                 MasterClockSource::Fallback,
@@ -1315,6 +1511,7 @@ impl PlaybackWorker {
             master_media_ms,
             master_clock_source,
             audio_clock_type,
+            audio_device_state: self.audio_device_state,
             held_frame_count: self.scheduler.len(),
             av_skew_ms: signed_media_delta(self.presented_position_ms, master_media_ms),
             late_presentation_drops: self.late_presentation_drops,
