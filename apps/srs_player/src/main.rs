@@ -3,10 +3,14 @@ mod gpu_presenter;
 mod playback_worker;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use gpu_presenter::{GpuPresenterHealth, GpuSubmitOutcome, GpuVideoPresenter};
+use gpu_presenter::{
+    handle_surface_error, GpuPresentationHealth, GpuPresenterHealth, GpuSubmitOutcome,
+    GpuVideoPresenter,
+};
 use libsrs_app_config::SrsConfig;
 use libsrs_app_services::{
     AppServices, DecodedVideoFrame, MediaInspection, MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE,
@@ -20,19 +24,30 @@ use playback_worker::{
 use rfd::FileDialog;
 
 fn main() -> eframe::Result<()> {
+    let gpu_health = Arc::new(GpuPresentationHealth::default());
+    let surface_health = Arc::clone(&gpu_health);
+    let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
+    wgpu_options.on_surface_error = Arc::new(move |error| {
+        handle_surface_error(&surface_health, error)
+    });
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         multisampling: 0,
         depth_buffer: 0,
         stencil_buffer: 0,
+        wgpu_options,
         ..Default::default()
     };
     eframe::run_native(
         "SRS Player",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             apply_player_theme(&cc.egui_ctx);
-            Ok(Box::new(PlayerApp::bootstrap(cc)))
+            Ok(Box::new(PlayerApp::bootstrap(
+                cc,
+                Arc::clone(&gpu_health),
+            )))
         }),
     )
 }
@@ -204,8 +219,11 @@ impl NotificationEntry {
 }
 
 impl PlayerApp {
-    fn bootstrap(cc: &eframe::CreationContext<'_>) -> Self {
-        let gpu_presenter = GpuVideoPresenter::from_creation_context(cc);
+    fn bootstrap(
+        cc: &eframe::CreationContext<'_>,
+        gpu_health: Arc<GpuPresentationHealth>,
+    ) -> Self {
+        let gpu_presenter = GpuVideoPresenter::from_creation_context(cc, gpu_health);
         let mut app = Self::try_bootstrap().unwrap_or_else(|err| Self::fallback(err.to_string()));
         app.playback.gpu_presenter = gpu_presenter;
         app
@@ -724,14 +742,27 @@ impl PlayerApp {
             self.playback.clear_video_surface();
         }
 
+        let gpu_health = self
+            .playback
+            .gpu_presenter
+            .as_ref()
+            .and_then(|presenter| presenter.health().ok());
+        let gpu_surface_errors = self
+            .playback
+            .gpu_presenter
+            .as_ref()
+            .map_or(0, GpuVideoPresenter::surface_error_count);
+
         let crc = self
             .playback
             .last_frame_crc32c
             .map(|value| format!("{value:08x}"))
             .unwrap_or_else(|| "n/a".to_string());
         self.playback.debug_stats = format!(
-            "worker={:?} | audio_device={:?} eos_draining={} | clock={:?} audio_clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_master_ms={:?} audio_consumed_ms={:?} audible_est_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
+            "worker={:?} | gpu={:?} gpu_surface_err={} | audio_device={:?} eos_draining={} | clock={:?} audio_clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_master_ms={:?} audio_consumed_ms={:?} audible_est_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
             snapshot.state,
+            gpu_health,
+            gpu_surface_errors,
             snapshot.audio_device_state,
             snapshot.eos_draining,
             snapshot.master_clock_source,
@@ -800,7 +831,7 @@ impl PlayerApp {
 
         let submission = if let Some(presenter) = self.playback.gpu_presenter.as_ref() {
             match presenter.health() {
-                Ok(GpuPresenterHealth::Healthy) => {
+                Ok(GpuPresenterHealth::Healthy | GpuPresenterHealth::SurfaceRecovering) => {
                     let pixels = gray8.take().expect("validated frame pixels are present");
                     match presenter.submit_frame(self.playback.generation, width, height, pixels) {
                         Ok(GpuSubmitOutcome::Accepted) => {
