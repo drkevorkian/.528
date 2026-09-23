@@ -1156,16 +1156,13 @@ impl PlaybackWorker {
         Ok(done)
     }
 
-    fn audio_media_position_ms(&self) -> Option<u64> {
+    fn media_ms_from_audio_samples(&self, cumulative_samples: u64) -> Option<u64> {
         if !self.audio_epoch_armed {
             return None;
         }
         let start_ms = self.audio_epoch_media_start_ms?;
         let audio = self.audio_output.as_ref()?;
-        let telemetry = audio.telemetry();
-        let played_samples = telemetry
-            .consumed_samples
-            .saturating_sub(self.audio_epoch_consumed_base);
+        let played_samples = cumulative_samples.saturating_sub(self.audio_epoch_consumed_base);
         let samples_per_second =
             u64::from(audio.sample_rate()).checked_mul(u64::from(audio.channels()))?;
         if samples_per_second == 0 {
@@ -1178,6 +1175,21 @@ impl PlaybackWorker {
                     .saturating_div(samples_per_second),
             ),
         )
+    }
+
+    fn audio_consumed_media_position_ms(&self) -> Option<u64> {
+        let audio = self.audio_output.as_ref()?;
+        self.media_ms_from_audio_samples(audio.telemetry().consumed_samples)
+    }
+
+    fn estimated_audible_media_position_ms(&self) -> Option<u64> {
+        let audio = self.audio_output.as_ref()?;
+        self.media_ms_from_audio_samples(audio.estimated_audible_samples()?)
+    }
+
+    fn audio_media_position_ms(&self) -> Option<u64> {
+        self.estimated_audible_media_position_ms()
+            .or_else(|| self.audio_consumed_media_position_ms())
     }
 
     fn master_clock(&self, now: Instant) -> (u64, MasterClockSource) {
