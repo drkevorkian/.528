@@ -16,3 +16,4 @@ libsrs_licensing_client = { version = "0.1.0", path = "../../crates/libsrs_licen
 libsrs_licensing_proto = { path = "../../crates/libsrs_licensing_proto" }
 rfd = "0.17.2"
 rtrb = "0.4.0"
+rubato = { version = "5.0.0", default-features = false }
