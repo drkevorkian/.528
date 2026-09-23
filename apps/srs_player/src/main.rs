@@ -10,7 +10,8 @@ use libsrs_app_services::{AppServices, DecodedVideoFrame, MediaInspection};
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
-    PlaybackSnapshot, PlaybackWorkerCommand, PlaybackWorkerEvent, PlaybackWorkerHandle, PlayerState,
+    MasterClockSource, PlaybackSnapshot, PlaybackWorkerCommand, PlaybackWorkerEvent,
+    PlaybackWorkerHandle, PlayerState,
 };
 use rfd::FileDialog;
 
@@ -639,14 +640,19 @@ impl PlayerApp {
             .map(|value| format!("{value:08x}"))
             .unwrap_or_else(|| "n/a".to_string());
         self.playback.debug_stats = format!(
-            "worker={:?} | decoded_v={} decoded_a={} | presented_v={} dropped_v={} | decoded_ms={} presented_ms={} audio_ms={:?} | audio_samples={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
+            "worker={:?} | clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} | decoded_v={} decoded_a={} presented_v={} dropped_v={} decoded_ms={} audio_ms={:?} | audio_samples={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
             snapshot.state,
+            snapshot.master_clock_source,
+            snapshot.master_media_ms,
+            snapshot.presented_position_ms,
+            snapshot.av_skew_ms,
+            snapshot.held_frame_count,
+            snapshot.late_presentation_drops,
             snapshot.decoded_video_frames,
             snapshot.decoded_audio_chunks,
             snapshot.presented_video_frames,
             snapshot.dropped_video_frames,
             snapshot.decoded_position_ms,
-            snapshot.presented_position_ms,
             snapshot.audio_media_position_ms,
             snapshot.audio_consumed_samples,
             snapshot.audio_underrun_samples,
@@ -1847,6 +1853,11 @@ mod tests {
             audio_consumed_samples: 0,
             audio_underrun_samples: 0,
             audio_stream_errors: 0,
+            master_media_ms: 0,
+            master_clock_source: MasterClockSource::Fallback,
+            held_frame_count: 0,
+            av_skew_ms: 0,
+            late_presentation_drops: 0,
             last_error: None,
         });
 
