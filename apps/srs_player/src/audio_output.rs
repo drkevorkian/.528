@@ -5,10 +5,13 @@ use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Async, FixedAsync, Resampler, Resizable, SincInterpolationParameters};
 
 const MIN_RING_SAMPLES: usize = 4_096;
 const MAX_RING_SAMPLES: usize = 1_048_576;
 const TARGET_BUFFER_MS: u64 = 500;
+const RESAMPLE_MAX_CHUNK_FRAMES: usize = 8_192;
 
 #[derive(Debug, Clone, Copy)]
 struct AudibleAnchor {
@@ -135,6 +138,100 @@ pub(crate) trait AudioSink: Send {
     fn play(&self) -> Result<()>;
 }
 
+struct PcmRateAdapter {
+    source_rate: u32,
+    output_rate: u32,
+    channels: usize,
+    resampler: Async<f64>,
+}
+
+impl PcmRateAdapter {
+    fn new(source_rate: u32, output_rate: u32, channels: usize) -> Result<Self> {
+        if source_rate == 0 || output_rate == 0 || channels == 0 {
+            return Err(anyhow!("invalid PCM resampler format"));
+        }
+        let ratio = f64::from(output_rate) / f64::from(source_rate);
+        let resampler = Async::<f64>::new_sinc(
+            ratio,
+            1.0,
+            &SincInterpolationParameters::default(),
+            RESAMPLE_MAX_CHUNK_FRAMES,
+            channels,
+            FixedAsync::Input,
+        )
+        .map_err(|error| anyhow!("failed to create PCM resampler: {error}"))?;
+        Ok(Self {
+            source_rate,
+            output_rate,
+            channels,
+            resampler,
+        })
+    }
+
+    fn reset(&mut self) {
+        self.resampler.reset();
+    }
+
+    fn process(&mut self, samples: &[i16]) -> Result<Vec<i16>> {
+        if samples.is_empty() {
+            return Ok(Vec::new());
+        }
+        if samples.len() % self.channels != 0 {
+            return Err(anyhow!(
+                "interleaved PCM sample count {} is not divisible by {} channels",
+                samples.len(),
+                self.channels
+            ));
+        }
+
+        let total_frames = samples.len() / self.channels;
+        let mut output_pcm = Vec::new();
+        let mut frame_offset = 0;
+
+        while frame_offset < total_frames {
+            let frames = (total_frames - frame_offset).min(RESAMPLE_MAX_CHUNK_FRAMES);
+            self.resampler
+                .set_chunk_size(frames)
+                .map_err(|error| anyhow!("failed to resize PCM resampler chunk: {error}"))?;
+
+            let sample_start = frame_offset
+                .checked_mul(self.channels)
+                .ok_or_else(|| anyhow!("PCM resampler input offset overflow"))?;
+            let sample_end = sample_start
+                .checked_add(
+                    frames
+                        .checked_mul(self.channels)
+                        .ok_or_else(|| anyhow!("PCM resampler chunk size overflow"))?,
+                )
+                .ok_or_else(|| anyhow!("PCM resampler input range overflow"))?;
+
+            let input = samples[sample_start..sample_end]
+                .iter()
+                .map(|&sample| f64::from(sample) / 32_768.0)
+                .collect::<Vec<_>>();
+            let adapter = InterleavedSlice::new(&input, self.channels, frames)
+                .map_err(|error| anyhow!("failed to wrap PCM resampler input: {error}"))?;
+            let output = self
+                .resampler
+                .process(&adapter, None)
+                .map_err(|error| anyhow!("PCM resampling failed: {error}"))?;
+
+            output_pcm.extend(output.take_data().into_iter().map(f64_to_i16));
+            frame_offset += frames;
+        }
+
+        Ok(output_pcm)
+    }
+}
+
+fn f64_to_i16(sample: f64) -> i16 {
+    if !sample.is_finite() {
+        return 0;
+    }
+    let scaled = (sample.clamp(-1.0, 1.0) * 32_768.0).round();
+    scaled.clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+}
+
 pub struct AudioOutput {
     producer: Producer<i16>,
     stream: Stream,
@@ -149,8 +246,10 @@ pub struct AudioOutput {
     audible_anchor: Arc<AudibleAnchorSnapshot>,
     audible_floor_samples: AtomicU64,
     ring_capacity: usize,
+    source_sample_rate: u32,
     sample_rate: u32,
     channels: u16,
+    rate_adapter: Option<PcmRateAdapter>,
 }
 
 impl AudioOutput {
@@ -168,11 +267,12 @@ impl AudioOutput {
             .default_output_device()
             .ok_or_else(|| anyhow!("no default audio output device available"))?;
 
-        let supported = select_exact_config(&device, sample_rate, channels)?;
+        let supported = select_best_config(&device, sample_rate, channels)?;
         let sample_format = supported.sample_format();
         let stream_config = supported.config();
+        let output_sample_rate = stream_config.sample_rate;
 
-        let capacity = ring_capacity_samples(sample_rate, channels)?;
+        let capacity = ring_capacity_samples(output_sample_rate, channels)?;
         let (producer, consumer) = RingBuffer::<i16>::new(capacity);
 
         let requested_epoch = Arc::new(AtomicU64::new(initial_epoch));
@@ -218,17 +318,41 @@ impl AudioOutput {
             audible_anchor,
             audible_floor_samples: AtomicU64::new(0),
             ring_capacity: capacity,
-            sample_rate,
+            source_sample_rate: sample_rate,
+            sample_rate: output_sample_rate,
             channels,
+            rate_adapter: if output_sample_rate == sample_rate {
+                None
+            } else {
+                Some(PcmRateAdapter::new(
+                    sample_rate,
+                    output_sample_rate,
+                    usize::from(channels),
+                )?)
+            },
         })
     }
 
     pub fn matches_format(&self, sample_rate: u32, channels: u8) -> bool {
-        self.sample_rate == sample_rate && self.channels == u16::from(channels)
+        self.source_sample_rate == sample_rate && self.channels == u16::from(channels)
     }
 
-    pub fn request_epoch(&self, epoch: u64) {
+    pub fn source_sample_rate(&self) -> u32 {
+        self.source_sample_rate
+    }
+
+    pub fn adapt_pcm(&mut self, samples: &[i16]) -> Result<Vec<i16>> {
+        match self.rate_adapter.as_mut() {
+            Some(adapter) => adapter.process(samples),
+            None => Ok(samples.to_vec()),
+        }
+    }
+
+    pub fn request_epoch(&mut self, epoch: u64) {
         self.invalidate_audible_anchor();
+        if let Some(adapter) = self.rate_adapter.as_mut() {
+            adapter.reset();
+        }
         self.requested_epoch.store(epoch, Ordering::Release);
     }
 
@@ -412,25 +536,33 @@ fn ring_capacity_samples(sample_rate: u32, channels: u16) -> Result<usize> {
     Ok(samples.clamp(MIN_RING_SAMPLES, MAX_RING_SAMPLES))
 }
 
-fn select_exact_config(
+fn select_best_config(
     device: &cpal::Device,
     sample_rate: u32,
     channels: u16,
 ) -> Result<SupportedStreamConfig> {
-    let mut candidates = device
+    let candidates = device
         .supported_output_configs()
         .context("failed to enumerate supported audio output configurations")?
         .filter(|range| {
             range.channels() == channels && is_supported_pcm_format(range.sample_format())
         })
-        .filter_map(|range| range.try_with_sample_rate(sample_rate))
+        .filter_map(|range| {
+            let selected_rate = sample_rate.clamp(range.min_sample_rate(), range.max_sample_rate());
+            range.try_with_sample_rate(selected_rate)
+        })
         .collect::<Vec<_>>();
 
-    candidates.sort_by_key(|config| sample_format_rank(config.sample_format()));
     candidates
-        .pop()
+        .into_iter()
+        .min_by_key(|config| {
+            (
+                config.sample_rate().abs_diff(sample_rate),
+                u8::MAX - sample_format_rank(config.sample_format()),
+            )
+        })
         .ok_or_else(|| anyhow!(
-            "audio device has no supported PCM configuration for {sample_rate} Hz / {channels} channels"
+            "audio device has no supported PCM configuration for {channels} channels"
         ))
 }
 
