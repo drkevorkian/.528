@@ -27,9 +27,8 @@ fn main() -> eframe::Result<()> {
     let gpu_health = Arc::new(GpuPresentationHealth::default());
     let surface_health = Arc::clone(&gpu_health);
     let mut wgpu_options = eframe::egui_wgpu::WgpuConfiguration::default();
-    wgpu_options.on_surface_error = Arc::new(move |error| {
-        handle_surface_error(&surface_health, error)
-    });
+    wgpu_options.on_surface_error =
+        Arc::new(move |error| handle_surface_error(&surface_health, error));
 
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -44,10 +43,7 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(move |cc| {
             apply_player_theme(&cc.egui_ctx);
-            Ok(Box::new(PlayerApp::bootstrap(
-                cc,
-                Arc::clone(&gpu_health),
-            )))
+            Ok(Box::new(PlayerApp::bootstrap(cc, Arc::clone(&gpu_health))))
         }),
     )
 }
@@ -219,10 +215,7 @@ impl NotificationEntry {
 }
 
 impl PlayerApp {
-    fn bootstrap(
-        cc: &eframe::CreationContext<'_>,
-        gpu_health: Arc<GpuPresentationHealth>,
-    ) -> Self {
+    fn bootstrap(cc: &eframe::CreationContext<'_>, gpu_health: Arc<GpuPresentationHealth>) -> Self {
         let gpu_presenter = GpuVideoPresenter::from_creation_context(cc, gpu_health);
         let mut app = Self::try_bootstrap().unwrap_or_else(|err| Self::fallback(err.to_string()));
         app.playback.gpu_presenter = gpu_presenter;
