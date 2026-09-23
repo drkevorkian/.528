@@ -25,6 +25,7 @@ pub(crate) trait AudioSink: Send {
     fn epoch_ready(&self, epoch: u64) -> bool;
     fn push_pcm(&mut self, epoch: u64, samples: &[i16]) -> Result<usize>;
     fn telemetry(&self) -> AudioTelemetry;
+    fn buffered_samples(&self) -> usize;
     fn sample_rate(&self) -> u32;
     fn channels(&self) -> u16;
     fn pause(&self) -> Result<()>;
@@ -39,6 +40,7 @@ pub struct AudioOutput {
     consumed_samples: Arc<AtomicU64>,
     underrun_samples: Arc<AtomicU64>,
     stream_errors: Arc<AtomicU64>,
+    ring_capacity: usize,
     sample_rate: u32,
     channels: u16,
 }
@@ -94,6 +96,7 @@ impl AudioOutput {
             consumed_samples,
             underrun_samples,
             stream_errors,
+            ring_capacity: capacity,
             sample_rate,
             channels,
         })
@@ -124,6 +127,10 @@ impl AudioOutput {
 
     pub fn available_slots(&self) -> usize {
         self.producer.slots()
+    }
+
+    pub fn buffered_samples(&self) -> usize {
+        self.ring_capacity.saturating_sub(self.producer.slots())
     }
 
     pub fn telemetry(&self) -> AudioTelemetry {
@@ -172,6 +179,10 @@ impl AudioSink for AudioOutput {
 
     fn telemetry(&self) -> AudioTelemetry {
         AudioOutput::telemetry(self)
+    }
+
+    fn buffered_samples(&self) -> usize {
+        AudioOutput::buffered_samples(self)
     }
 
     fn sample_rate(&self) -> u32 {
