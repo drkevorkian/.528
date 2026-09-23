@@ -681,18 +681,18 @@ impl PlayerApp {
             "Audio unavailable — video continuing".to_string()
         } else {
             match snapshot.state {
-            PlayerState::Closed => "Closed current media".to_string(),
-            PlayerState::Opening => "Opening media on playback worker".to_string(),
-            PlayerState::Ready => "Ready (worker decode preview)".to_string(),
-            PlayerState::Playing if snapshot.eos_draining => "Finishing playback…".to_string(),
-            PlayerState::Playing => "Playing (worker decode preview)".to_string(),
-            PlayerState::Paused => "Paused".to_string(),
-            PlayerState::Seeking => "Seeking".to_string(),
-            PlayerState::Ended => "Reached end of media (decode preview)".to_string(),
-            PlayerState::Error => snapshot
-                .last_error
-                .map(|error| format!("Playback error: {error}"))
-                .unwrap_or_else(|| "Playback worker error".to_string()),
+                PlayerState::Closed => "Closed current media".to_string(),
+                PlayerState::Opening => "Opening media on playback worker".to_string(),
+                PlayerState::Ready => "Ready (worker decode preview)".to_string(),
+                PlayerState::Playing if snapshot.eos_draining => "Finishing playback…".to_string(),
+                PlayerState::Playing => "Playing (worker decode preview)".to_string(),
+                PlayerState::Paused => "Paused".to_string(),
+                PlayerState::Seeking => "Seeking".to_string(),
+                PlayerState::Ended => "Reached end of media (decode preview)".to_string(),
+                PlayerState::Error => snapshot
+                    .last_error
+                    .map(|error| format!("Playback error: {error}"))
+                    .unwrap_or_else(|| "Playback worker error".to_string()),
             }
         };
     }
