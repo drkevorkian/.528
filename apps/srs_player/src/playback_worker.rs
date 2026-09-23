@@ -52,6 +52,8 @@ pub struct PlaybackSnapshot {
     pub reorder_depth: usize,
     pub seek_in_progress: bool,
     pub audio_media_position_ms: Option<u64>,
+    pub audio_consumed_media_ms: Option<u64>,
+    pub estimated_audible_media_ms: Option<u64>,
     pub audio_consumed_samples: u64,
     pub audio_underrun_samples: u64,
     pub audio_stream_errors: u64,
@@ -80,6 +82,8 @@ impl Default for PlaybackSnapshot {
             reorder_depth: 0,
             seek_in_progress: false,
             audio_media_position_ms: None,
+            audio_consumed_media_ms: None,
+            estimated_audible_media_ms: None,
             audio_consumed_samples: 0,
             audio_underrun_samples: 0,
             audio_stream_errors: 0,
@@ -1283,6 +1287,8 @@ impl PlaybackWorker {
             reorder_depth: self.reorder.depth(),
             seek_in_progress: self.state == PlayerState::Seeking,
             audio_media_position_ms: self.audio_media_position_ms(),
+            audio_consumed_media_ms: self.audio_consumed_media_position_ms(),
+            estimated_audible_media_ms: self.estimated_audible_media_position_ms(),
             audio_consumed_samples: audio_telemetry
                 .map_or(0, |telemetry| telemetry.consumed_samples),
             audio_underrun_samples: audio_telemetry
@@ -1929,6 +1935,31 @@ mod tests {
         let (master_ms, source) = worker.master_clock(base);
         assert_eq!(source, MasterClockSource::Audio);
         assert_eq!(master_ms, 1_500);
+    }
+
+    #[test]
+    fn runtime_audio_clock_prefers_audible_estimate_and_falls_back_to_consumed_pcm() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 90, usize::MAX);
+        worker.audio_epoch_media_start_ms = Some(0);
+        worker.audio_epoch_consumed_base = 0;
+        worker.audio_epoch_armed = true;
+        state.consumed_samples.store(96_000, Ordering::Relaxed);
+        state
+            .estimated_audible_samples
+            .store(48_000, Ordering::Relaxed);
+        state.audible_anchor_valid.store(true, Ordering::Release);
+
+        assert_eq!(worker.audio_consumed_media_position_ms(), Some(1_000));
+        assert_eq!(worker.estimated_audible_media_position_ms(), Some(500));
+        assert_eq!(worker.audio_media_position_ms(), Some(500));
+
+        if let Some(audio) = worker.audio_output.as_ref() {
+            audio.invalidate_audible_anchor();
+        }
+        assert_eq!(worker.estimated_audible_media_position_ms(), None);
+        assert_eq!(worker.audio_media_position_ms(), Some(1_000));
     }
 
     #[test]
