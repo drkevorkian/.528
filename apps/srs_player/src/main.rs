@@ -10,8 +10,8 @@ use libsrs_app_services::{AppServices, DecodedVideoFrame, MediaInspection};
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
-    AudioDeviceState, MasterClockSource, PlaybackSnapshot, PlaybackWorkerCommand,
-    PlaybackWorkerEvent, PlaybackWorkerHandle, PlayerState,
+    AudioDeviceState, PlaybackSnapshot, PlaybackWorkerCommand, PlaybackWorkerEvent,
+    PlaybackWorkerHandle, PlayerState,
 };
 use rfd::FileDialog;
 
@@ -1875,7 +1875,7 @@ mod tests {
             audio_underrun_samples: 0,
             audio_stream_errors: 0,
             master_media_ms: 0,
-            master_clock_source: MasterClockSource::Fallback,
+            master_clock_source: playback_worker::MasterClockSource::Fallback,
             audio_clock_type: None,
             audio_device_state: AudioDeviceState::Active,
             held_frame_count: 0,
