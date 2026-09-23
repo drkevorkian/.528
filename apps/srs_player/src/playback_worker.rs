@@ -18,6 +18,7 @@ const MAX_PRESENTATION_REORDER_FRAMES: usize = 4;
 const MAX_HELD_PRESENTATION_FRAMES: usize = 8;
 const PRESENT_EARLY_TOLERANCE_MS: u64 = 5;
 const PRESENT_LATE_DROP_THRESHOLD_MS: u64 = 150;
+const DECODE_BURST_BUDGET: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
@@ -465,13 +466,23 @@ impl PlaybackWorker {
     fn run(&mut self) {
         while !self.shutdown.load(Ordering::Acquire) {
             if self.state == PlayerState::Playing {
-                match self.command_rx.recv_timeout(PLAYBACK_TICK) {
+                self.service_due_presentations(Instant::now());
+                if self.state != PlayerState::Playing {
+                    continue;
+                }
+
+                let timeout = self.next_playback_timeout(Instant::now());
+                match self.command_rx.recv_timeout(timeout) {
                     Ok(command) => {
                         if !self.handle_command(command) {
                             break;
                         }
                     }
-                    Err(RecvTimeoutError::Timeout) => self.playback_step(),
+                    Err(RecvTimeoutError::Timeout) => {
+                        if !self.playback_burst() {
+                            break;
+                        }
+                    }
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             } else {
@@ -506,7 +517,9 @@ impl PlaybackWorker {
                 self.reorder.reset(None);
                 self.presentation_time_slots_ms.clear();
                 self.scheduler.reset();
-                self.fallback_clock.reset(0, Instant::now());
+                let now = Instant::now();
+                self.fallback_clock.reset(0, now);
+                self.fallback_clock.pause(now);
                 self.clear_frame_slot();
                 self.presented_video_frames = 0;
                 self.dropped_video_frames = 0;
@@ -586,7 +599,9 @@ impl PlaybackWorker {
                 self.reorder.reset(None);
                 self.presentation_time_slots_ms.clear();
                 self.scheduler.reset();
-                self.fallback_clock.reset(0, Instant::now());
+                let now = Instant::now();
+                self.fallback_clock.reset(0, now);
+                self.fallback_clock.pause(now);
                 self.clear_frame_slot();
                 self.presented_position_ms = 0;
                 self.advance_audio_epoch(Some(0));
@@ -606,7 +621,9 @@ impl PlaybackWorker {
                 self.reorder.reset(None);
                 self.presentation_time_slots_ms.clear();
                 self.scheduler.reset();
-                self.fallback_clock.reset(0, Instant::now());
+                let now = Instant::now();
+                self.fallback_clock.reset(0, now);
+                self.fallback_clock.pause(now);
                 self.clear_frame_slot();
                 self.presented_position_ms = 0;
                 self.state = PlayerState::Closed;
@@ -625,38 +642,76 @@ impl PlaybackWorker {
         true
     }
 
-    fn playback_step(&mut self) {
-        match self.flush_pending_audio() {
-            Ok(true) => {}
-            Ok(false) => {
-                self.emit_snapshot();
-                return;
-            }
-            Err(error) => {
-                self.fail(error);
-                return;
-            }
-        }
-
-        if let Some(frame) = self.reorder.pop_ready() {
-            let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
-                self.fail("presentation frame became ready without a timestamp slot".to_string());
-                return;
-            };
-            self.publish_frame_at_position(frame, position_ms);
-            return;
-        }
-
-        let event = {
-            let Some(session) = self.session.as_mut() else {
-                self.fail("playback session disappeared".to_string());
-                return;
-            };
-            session.decode_next_step()
+    fn next_playback_timeout(&self, now: Instant) -> Duration {
+        let Some(front) = self.scheduler.held.front() else {
+            return PLAYBACK_TICK;
         };
+        let master_ms = self.master_media_position_ms(now);
+        let due_master_ms = front.position_ms.saturating_sub(PRESENT_EARLY_TOLERANCE_MS);
+        if due_master_ms <= master_ms {
+            Duration::ZERO
+        } else {
+            PLAYBACK_TICK.min(Duration::from_millis(due_master_ms - master_ms))
+        }
+    }
 
+    fn enqueue_ready_presentations(&mut self) -> Result<(), String> {
+        while !self.scheduler.is_full() {
+            let Some(frame) = self.reorder.pop_ready() else {
+                break;
+            };
+            let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
+                return Err("presentation frame became ready without a timestamp slot".to_string());
+            };
+            self.scheduler.enqueue(ScheduledPresentation {
+                generation: self.generation,
+                frame,
+                position_ms,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn service_due_presentations(&mut self, now: Instant) {
+        self.scheduler.purge_generation(self.generation);
+
+        loop {
+            let master_ms = self.master_media_position_ms(now);
+            match self.scheduler.decision(master_ms) {
+                Some(PresentationDecision::Hold) | None => break,
+                Some(PresentationDecision::Present) => {
+                    let Some(item) = self.scheduler.pop_front() else {
+                        break;
+                    };
+                    if item.generation != self.generation {
+                        continue;
+                    }
+                    self.publish_frame_at_position(item.frame, item.position_ms);
+                    if self.state == PlayerState::Error {
+                        return;
+                    }
+                }
+                Some(PresentationDecision::DropLate) => {
+                    let Some(item) = self.scheduler.pop_front() else {
+                        break;
+                    };
+                    if item.generation == self.generation {
+                        self.late_presentation_drops =
+                            self.late_presentation_drops.saturating_add(1);
+                    }
+                }
+            }
+        }
+
+        if self.scheduler.can_finish_eos() {
+            self.state = PlayerState::Ended;
+            self.emit_snapshot();
+        }
+    }
+
+    fn handle_decode_event(&mut self, event: PlaybackEvent) {
         match event {
-            Ok(PlaybackEvent::Video(frame)) => {
+            PlaybackEvent::Video(frame) => {
                 let slot_ms = frame_position_ms(&frame);
                 let accepted = match self.reorder.push(frame) {
                     Ok(accepted) => accepted,
@@ -676,37 +731,31 @@ impl PlaybackWorker {
                     self.fail(error);
                     return;
                 }
-                if let Some(frame) = self.reorder.pop_ready() {
-                    let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
-                        self.fail(
-                            "presentation frame became ready without a timestamp slot".to_string(),
-                        );
-                        return;
-                    };
-                    self.publish_frame_at_position(frame, position_ms);
+                if let Err(error) = self.enqueue_ready_presentations() {
+                    self.fail(error);
+                    return;
                 }
                 self.emit_snapshot();
             }
-            Ok(PlaybackEvent::Audio(chunk)) => {
+            PlaybackEvent::Audio(chunk) => {
                 if let Err(error) = self.queue_audio_chunk(chunk) {
                     self.fail(error);
                     return;
                 }
                 self.emit_snapshot();
             }
-            Ok(PlaybackEvent::EndOfStream) => {
-                if let Some(frame) = self.reorder.pop_ready() {
-                    let Some(position_ms) = self.presentation_time_slots_ms.pop_front() else {
-                        self.fail("EOS presentation frame missing timestamp slot".to_string());
-                        return;
-                    };
-                    self.publish_frame_at_position(frame, position_ms);
+            PlaybackEvent::EndOfStream => {
+                if let Err(error) = self.enqueue_ready_presentations() {
+                    self.fail(error);
                     return;
                 }
                 match self.reorder.finish_eos() {
                     Ok(()) if self.presentation_time_slots_ms.is_empty() => {
-                        self.state = PlayerState::Ended;
-                        self.emit_snapshot();
+                        self.scheduler.mark_eos();
+                        self.service_due_presentations(Instant::now());
+                        if self.state == PlayerState::Playing {
+                            self.emit_snapshot();
+                        }
                     }
                     Ok(()) => self.fail(
                         "end of stream left unmatched presentation timestamp slots".to_string(),
@@ -714,18 +763,92 @@ impl PlaybackWorker {
                     Err(error) => self.fail(error),
                 }
             }
-            Err(error) => self.fail(error.to_string()),
         }
+    }
+
+    fn playback_burst(&mut self) -> bool {
+        for _ in 0..DECODE_BURST_BUDGET {
+            if self.shutdown.load(Ordering::Acquire) {
+                return false;
+            }
+
+            match self.command_rx.try_recv() {
+                Ok(command) => return self.handle_command(command),
+                Err(TryRecvError::Disconnected) => return false,
+                Err(TryRecvError::Empty) => {}
+            }
+
+            self.service_due_presentations(Instant::now());
+            if self.state != PlayerState::Playing {
+                return true;
+            }
+
+            if self.scheduler.eos_pending || self.scheduler.is_full() {
+                self.emit_snapshot();
+                return true;
+            }
+
+            match self.flush_pending_audio() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.emit_snapshot();
+                    return true;
+                }
+                Err(error) => {
+                    self.fail(error);
+                    return true;
+                }
+            }
+
+            self.service_due_presentations(Instant::now());
+            if self.state != PlayerState::Playing
+                || self.scheduler.eos_pending
+                || self.scheduler.is_full()
+            {
+                return true;
+            }
+
+            if let Err(error) = self.enqueue_ready_presentations() {
+                self.fail(error);
+                return true;
+            }
+            self.service_due_presentations(Instant::now());
+            if self.state != PlayerState::Playing
+                || self.scheduler.eos_pending
+                || self.scheduler.is_full()
+            {
+                return true;
+            }
+
+            let event = {
+                let Some(session) = self.session.as_mut() else {
+                    self.fail("playback session disappeared".to_string());
+                    return true;
+                };
+                session.decode_next_step()
+            };
+
+            match event {
+                Ok(event) => self.handle_decode_event(event),
+                Err(error) => self.fail(error.to_string()),
+            }
+
+            if self.state != PlayerState::Playing {
+                return true;
+            }
+        }
+
+        self.emit_snapshot();
+        true
     }
 
     fn perform_seek(&mut self, target_ms: u64) {
         let resume_playing = self.state == PlayerState::Playing;
         self.advance_audio_epoch(Some(target_ms));
         self.scheduler.reset();
-        self.fallback_clock.reset(target_ms, Instant::now());
-        if !resume_playing {
-            self.fallback_clock.pause(Instant::now());
-        }
+        let seek_clock_now = Instant::now();
+        self.fallback_clock.reset(target_ms, seek_clock_now);
+        self.fallback_clock.pause(seek_clock_now);
         self.state = PlayerState::Seeking;
         self.clear_frame_slot();
         self.emit_snapshot();
@@ -749,6 +872,7 @@ impl PlaybackWorker {
             }
             self.presented_position_ms = target_ms.min(session.duration_ms());
             self.state = if resume_playing {
+                self.fallback_clock.resume(Instant::now());
                 PlayerState::Playing
             } else {
                 PlayerState::Paused
@@ -858,6 +982,7 @@ impl PlaybackWorker {
 
         self.publish_frame_at_position(frame, position_ms);
         self.state = if resume_playing {
+            self.fallback_clock.resume(Instant::now());
             PlayerState::Playing
         } else {
             PlayerState::Paused
