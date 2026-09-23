@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
-use gpu_presenter::{GpuSubmitOutcome, GpuVideoPresenter};
+use gpu_presenter::{GpuPresenterHealth, GpuSubmitOutcome, GpuVideoPresenter};
 use libsrs_app_config::SrsConfig;
 use libsrs_app_services::{
     AppServices, DecodedVideoFrame, MediaInspection, MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE,
@@ -799,16 +799,32 @@ impl PlayerApp {
         let mut gray8 = Some(v.gray8);
 
         let submission = if let Some(presenter) = self.playback.gpu_presenter.as_ref() {
-            let pixels = gray8.take().expect("validated frame pixels are present");
-            match presenter.submit_frame(self.playback.generation, width, height, pixels) {
-                Ok(GpuSubmitOutcome::Accepted) => (GpuSubmissionState::Accepted, None, None),
-                Ok(GpuSubmitOutcome::StaleGeneration) => {
-                    (GpuSubmissionState::StaleGeneration, None, None)
+            match presenter.health() {
+                Ok(GpuPresenterHealth::Healthy) => {
+                    let pixels = gray8.take().expect("validated frame pixels are present");
+                    match presenter.submit_frame(self.playback.generation, width, height, pixels) {
+                        Ok(GpuSubmitOutcome::Accepted) => {
+                            (GpuSubmissionState::Accepted, None, None)
+                        }
+                        Ok(GpuSubmitOutcome::StaleGeneration) => {
+                            (GpuSubmissionState::StaleGeneration, None, None)
+                        }
+                        Err(failure) => (
+                            GpuSubmissionState::Failed,
+                            Some(failure.gray8),
+                            Some(failure.message),
+                        ),
+                    }
                 }
-                Err(failure) => (
+                Ok(GpuPresenterHealth::BackendUnavailable) => (
+                    GpuSubmissionState::Unavailable,
+                    gray8.take(),
+                    Some("GPU presenter backend became unavailable".to_string()),
+                ),
+                Err(message) => (
                     GpuSubmissionState::Failed,
-                    Some(failure.gray8),
-                    Some(failure.message),
+                    gray8.take(),
+                    Some(message),
                 ),
             }
         } else {
@@ -827,7 +843,7 @@ impl PlayerApp {
                 if let Some(message) = submission.2 {
                     self.playback.gpu_presenter = None;
                     self.push_notification(format!(
-                        "GPU video submission failed; CPU fallback active: {message}"
+                        "GPU video presenter disabled; CPU fallback active: {message}"
                     ));
                 }
 
