@@ -640,21 +640,23 @@ impl PlayerApp {
             .map(|value| format!("{value:08x}"))
             .unwrap_or_else(|| "n/a".to_string());
         self.playback.debug_stats = format!(
-            "worker={:?} | clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} | decoded_v={} decoded_a={} presented_v={} dropped_v={} decoded_ms={} audio_ms={:?} | audio_samples={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
+            "worker={:?} | eos_draining={} | clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
             snapshot.state,
+            snapshot.eos_draining,
             snapshot.master_clock_source,
             snapshot.master_media_ms,
             snapshot.presented_position_ms,
             snapshot.av_skew_ms,
             snapshot.held_frame_count,
             snapshot.late_presentation_drops,
+            snapshot.dropped_video_frames,
             snapshot.decoded_video_frames,
             snapshot.decoded_audio_chunks,
             snapshot.presented_video_frames,
-            snapshot.dropped_video_frames,
             snapshot.decoded_position_ms,
             snapshot.audio_media_position_ms,
             snapshot.audio_consumed_samples,
+            snapshot.audio_buffered_samples,
             snapshot.audio_underrun_samples,
             snapshot.audio_stream_errors,
             snapshot.reorder_depth,
@@ -667,6 +669,7 @@ impl PlayerApp {
             PlayerState::Closed => "Closed current media".to_string(),
             PlayerState::Opening => "Opening media on playback worker".to_string(),
             PlayerState::Ready => "Ready (worker decode preview)".to_string(),
+            PlayerState::Playing if snapshot.eos_draining => "Finishing playback…".to_string(),
             PlayerState::Playing => "Playing (worker decode preview)".to_string(),
             PlayerState::Paused => "Paused".to_string(),
             PlayerState::Seeking => "Seeking".to_string(),
@@ -1858,6 +1861,8 @@ mod tests {
             held_frame_count: 0,
             av_skew_ms: 0,
             late_presentation_drops: 0,
+            eos_draining: false,
+            audio_buffered_samples: 0,
             last_error: None,
         });
 
