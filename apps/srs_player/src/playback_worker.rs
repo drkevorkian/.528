@@ -745,10 +745,23 @@ impl PlaybackWorker {
                 }
             }
 
+            let audio_drained = self.pending_audio.is_none()
+                && self
+                    .audio_output
+                    .as_ref()
+                    .map_or(true, |audio| audio.buffered_samples() == 0);
+
             if self.scheduler.is_empty()
                 && self.reorder.depth() == 0
                 && self.presentation_time_slots_ms.is_empty()
+                && audio_drained
             {
+                if let Some(audio) = self.audio_output.as_ref() {
+                    if let Err(error) = audio.pause() {
+                        self.fail(error.to_string());
+                        return;
+                    }
+                }
                 self.state = PlayerState::Ended;
                 self.emit_snapshot();
             }
@@ -1379,6 +1392,7 @@ mod tests {
         consumed_samples: AtomicU64,
         underrun_samples: AtomicU64,
         stream_errors: AtomicU64,
+        buffered_samples: std::sync::atomic::AtomicUsize,
         max_write: std::sync::atomic::AtomicUsize,
         paused: AtomicBool,
     }
@@ -1391,6 +1405,7 @@ mod tests {
                 consumed_samples: AtomicU64::new(0),
                 underrun_samples: AtomicU64::new(0),
                 stream_errors: AtomicU64::new(0),
+                buffered_samples: std::sync::atomic::AtomicUsize::new(0),
                 max_write: std::sync::atomic::AtomicUsize::new(max_write),
                 paused: AtomicBool::new(false),
             })
@@ -1436,9 +1451,13 @@ mod tests {
             if !self.epoch_ready(epoch) {
                 return Ok(0);
             }
-            Ok(samples
+            let written = samples
                 .len()
-                .min(self.state.max_write.load(Ordering::Relaxed)))
+                .min(self.state.max_write.load(Ordering::Relaxed));
+            self.state
+                .buffered_samples
+                .fetch_add(written, Ordering::Relaxed);
+            Ok(written)
         }
 
         fn telemetry(&self) -> AudioTelemetry {
@@ -1449,6 +1468,10 @@ mod tests {
                 requested_epoch: self.state.requested_epoch.load(Ordering::Acquire),
                 callback_epoch: self.state.callback_epoch.load(Ordering::Acquire),
             }
+        }
+
+        fn buffered_samples(&self) -> usize {
+            self.state.buffered_samples.load(Ordering::Relaxed)
         }
 
         fn sample_rate(&self) -> u32 {
@@ -1830,6 +1853,25 @@ mod tests {
         assert_eq!(worker.state, PlayerState::Ended);
         assert!(worker.scheduler.is_empty());
         assert!(worker.presentation_time_slots_ms.is_empty());
+    }
+
+    #[test]
+    fn runtime_eos_waits_for_audio_ring_to_drain() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        worker.generation = 1;
+        worker.state = PlayerState::Playing;
+        let state = install_fake_audio(&mut worker, 81, usize::MAX);
+        state.buffered_samples.store(256, Ordering::Relaxed);
+        worker.scheduler.mark_eos();
+
+        worker.service_due_presentations(Instant::now());
+        assert_eq!(worker.state, PlayerState::Playing);
+
+        state.buffered_samples.store(0, Ordering::Relaxed);
+        worker.service_due_presentations(Instant::now());
+        assert_eq!(worker.state, PlayerState::Ended);
+        assert!(state.paused.load(Ordering::Acquire));
     }
 
     #[test]
