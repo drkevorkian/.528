@@ -1698,7 +1698,15 @@ mod tests {
             self.sample_rate == sample_rate && self.channels == u16::from(channels)
         }
 
-        fn request_epoch(&self, epoch: u64) {
+        fn source_sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn adapt_pcm(&mut self, samples: &[i16]) -> anyhow::Result<Vec<i16>> {
+            Ok(samples.to_vec())
+        }
+
+        fn request_epoch(&mut self, epoch: u64) {
             self.state.audible_anchor_valid.store(false, Ordering::Release);
             self.state.requested_epoch.store(epoch, Ordering::Release);
         }
