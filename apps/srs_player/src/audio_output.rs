@@ -532,6 +532,7 @@ where
         .build_output_stream(
             config,
             move |output: &mut [T], info| {
+                let callback_timing_generation = timing_generation.load(Ordering::Acquire);
                 let requested = requested_epoch.load(Ordering::Acquire);
                 let active = callback_epoch.load(Ordering::Acquire);
                 if requested != active {
@@ -576,7 +577,7 @@ where
                     audible_anchor.publish(AudibleAnchor {
                         playback_nanos: playback,
                         consumed_samples_before_buffer: consumed_before,
-                        timing_generation: timing_generation.load(Ordering::Acquire),
+                        timing_generation: callback_timing_generation,
                     });
                 }
                 let underrun = output.len().saturating_sub(consumed);
