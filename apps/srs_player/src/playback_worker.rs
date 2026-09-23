@@ -419,6 +419,9 @@ struct PlaybackWorker {
     audio_epoch_consumed_base: u64,
     audio_epoch_armed: bool,
     audio_last_stream_errors: u64,
+    scheduler: PresentationScheduler,
+    fallback_clock: FallbackClock,
+    late_presentation_drops: u64,
 }
 
 impl PlaybackWorker {
@@ -429,6 +432,7 @@ impl PlaybackWorker {
         snapshot_slot: Arc<Mutex<PlaybackSnapshot>>,
         shutdown: Arc<AtomicBool>,
     ) -> Self {
+        let now = Instant::now();
         Self {
             command_rx,
             event_tx,
@@ -452,6 +456,9 @@ impl PlaybackWorker {
             audio_epoch_consumed_base: 0,
             audio_epoch_armed: false,
             audio_last_stream_errors: 0,
+            scheduler: PresentationScheduler::default(),
+            fallback_clock: FallbackClock::new(0, now),
+            late_presentation_drops: 0,
         }
     }
 
@@ -498,6 +505,8 @@ impl PlaybackWorker {
                 self.reset_audio_for_open();
                 self.reorder.reset(None);
                 self.presentation_time_slots_ms.clear();
+                self.scheduler.reset();
+                self.fallback_clock.reset(0, Instant::now());
                 self.clear_frame_slot();
                 self.presented_video_frames = 0;
                 self.dropped_video_frames = 0;
@@ -530,8 +539,11 @@ impl PlaybackWorker {
                     }
                     self.reorder.reset(None);
                     self.presentation_time_slots_ms.clear();
+                    self.scheduler.reset();
+                    self.fallback_clock.reset(0, Instant::now());
                     self.advance_audio_epoch(Some(0));
                 }
+                self.fallback_clock.resume(Instant::now());
                 if let Some(audio) = self.audio_output.as_ref() {
                     if let Err(error) = audio.play() {
                         self.fail(error.to_string());
@@ -551,6 +563,7 @@ impl PlaybackWorker {
                 if let Some(session) = self.session.as_mut() {
                     session.pause();
                 }
+                self.fallback_clock.pause(Instant::now());
                 if let Some(audio) = self.audio_output.as_ref() {
                     if let Err(error) = audio.pause() {
                         self.fail(error.to_string());
@@ -572,6 +585,8 @@ impl PlaybackWorker {
                 }
                 self.reorder.reset(None);
                 self.presentation_time_slots_ms.clear();
+                self.scheduler.reset();
+                self.fallback_clock.reset(0, Instant::now());
                 self.clear_frame_slot();
                 self.presented_position_ms = 0;
                 self.advance_audio_epoch(Some(0));
@@ -590,6 +605,8 @@ impl PlaybackWorker {
                 self.reset_audio_for_open();
                 self.reorder.reset(None);
                 self.presentation_time_slots_ms.clear();
+                self.scheduler.reset();
+                self.fallback_clock.reset(0, Instant::now());
                 self.clear_frame_slot();
                 self.presented_position_ms = 0;
                 self.state = PlayerState::Closed;
@@ -704,6 +721,11 @@ impl PlaybackWorker {
     fn perform_seek(&mut self, target_ms: u64) {
         let resume_playing = self.state == PlayerState::Playing;
         self.advance_audio_epoch(Some(target_ms));
+        self.scheduler.reset();
+        self.fallback_clock.reset(target_ms, Instant::now());
+        if !resume_playing {
+            self.fallback_clock.pause(Instant::now());
+        }
         self.state = PlayerState::Seeking;
         self.clear_frame_slot();
         self.emit_snapshot();
@@ -897,7 +919,7 @@ impl PlaybackWorker {
         // defines the real playable media anchor for this epoch. This avoids carrying a
         // requested timestamp forward when the demux/codec resumes at a later audio PTS.
         if !self.audio_epoch_armed {
-            self.audio_epoch_media_start_ms = Some(audio_chunk_position_ms(&chunk));
+            self.audio_epoch_media_start_ms = audio_chunk_position_ms(&chunk);
         }
 
         self.pending_audio = Some(PendingAudioChunk {
@@ -930,7 +952,7 @@ impl PlaybackWorker {
             return Err("audio output stream reported a device/runtime error".to_string());
         }
 
-        if !self.audio_epoch_armed {
+        if !self.audio_epoch_armed && self.audio_epoch_media_start_ms.is_some() {
             self.audio_epoch_consumed_base = telemetry.consumed_samples;
             self.audio_epoch_armed = true;
         }
@@ -981,6 +1003,11 @@ impl PlaybackWorker {
                     .saturating_div(samples_per_second),
             ),
         )
+    }
+
+    fn master_media_position_ms(&self, now: Instant) -> u64 {
+        self.audio_media_position_ms()
+            .unwrap_or_else(|| self.fallback_clock.media_time_ms(now))
     }
 
     fn publish_frame_at_position(&mut self, frame: DecodedVideoFrame, position_ms: u64) {
@@ -1095,14 +1122,16 @@ impl PlaybackWorker {
     }
 }
 
-fn audio_chunk_position_ms(chunk: &DecodedAudioChunk) -> u64 {
+fn audio_chunk_position_ms(chunk: &DecodedAudioChunk) -> Option<u64> {
     if chunk.timescale_hz == 0 {
-        0
+        None
     } else {
-        chunk
-            .pts_ticks
-            .saturating_mul(1_000)
-            .saturating_div(u64::from(chunk.timescale_hz))
+        Some(
+            chunk
+                .pts_ticks
+                .saturating_mul(1_000)
+                .saturating_div(u64::from(chunk.timescale_hz)),
+        )
     }
 }
 
