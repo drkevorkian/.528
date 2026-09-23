@@ -27,6 +27,12 @@ pub enum MasterClockSource {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioClockType {
+    AudibleEstimate,
+    ConsumedFallback,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlayerState {
     Closed,
     Opening,
@@ -59,6 +65,7 @@ pub struct PlaybackSnapshot {
     pub audio_stream_errors: u64,
     pub master_media_ms: u64,
     pub master_clock_source: MasterClockSource,
+    pub audio_clock_type: Option<AudioClockType>,
     pub held_frame_count: usize,
     pub av_skew_ms: i64,
     pub late_presentation_drops: u64,
@@ -89,6 +96,7 @@ impl Default for PlaybackSnapshot {
             audio_stream_errors: 0,
             master_media_ms: 0,
             master_clock_source: MasterClockSource::Fallback,
+            audio_clock_type: None,
             held_frame_count: 0,
             av_skew_ms: 0,
             late_presentation_drops: 0,
@@ -1272,6 +1280,16 @@ impl PlaybackWorker {
             });
 
         let audio_telemetry = self.audio_output.as_ref().map(|audio| audio.telemetry());
+        let estimated_audible_media_ms = self.estimated_audible_media_position_ms();
+        let audio_consumed_media_ms = self.audio_consumed_media_position_ms();
+        let audio_media_position_ms = estimated_audible_media_ms.or(audio_consumed_media_ms);
+        let audio_clock_type = if estimated_audible_media_ms.is_some() {
+            Some(AudioClockType::AudibleEstimate)
+        } else if audio_consumed_media_ms.is_some() {
+            Some(AudioClockType::ConsumedFallback)
+        } else {
+            None
+        };
         let (master_media_ms, master_clock_source) = self.master_clock(Instant::now());
 
         PlaybackSnapshot {
@@ -1286,9 +1304,9 @@ impl PlaybackWorker {
             dropped_video_frames: self.dropped_video_frames,
             reorder_depth: self.reorder.depth(),
             seek_in_progress: self.state == PlayerState::Seeking,
-            audio_media_position_ms: self.audio_media_position_ms(),
-            audio_consumed_media_ms: self.audio_consumed_media_position_ms(),
-            estimated_audible_media_ms: self.estimated_audible_media_position_ms(),
+            audio_media_position_ms,
+            audio_consumed_media_ms,
+            estimated_audible_media_ms,
             audio_consumed_samples: audio_telemetry
                 .map_or(0, |telemetry| telemetry.consumed_samples),
             audio_underrun_samples: audio_telemetry
@@ -1296,6 +1314,7 @@ impl PlaybackWorker {
             audio_stream_errors: audio_telemetry.map_or(0, |telemetry| telemetry.stream_errors),
             master_media_ms,
             master_clock_source,
+            audio_clock_type,
             held_frame_count: self.scheduler.len(),
             av_skew_ms: signed_media_delta(self.presented_position_ms, master_media_ms),
             late_presentation_drops: self.late_presentation_drops,
