@@ -1400,6 +1400,8 @@ mod tests {
         consumed_samples: AtomicU64,
         underrun_samples: AtomicU64,
         stream_errors: AtomicU64,
+        estimated_audible_samples: AtomicU64,
+        audible_anchor_valid: AtomicBool,
         buffered_samples: std::sync::atomic::AtomicUsize,
         max_write: std::sync::atomic::AtomicUsize,
         paused: AtomicBool,
@@ -1413,6 +1415,8 @@ mod tests {
                 consumed_samples: AtomicU64::new(0),
                 underrun_samples: AtomicU64::new(0),
                 stream_errors: AtomicU64::new(0),
+                estimated_audible_samples: AtomicU64::new(0),
+                audible_anchor_valid: AtomicBool::new(false),
                 buffered_samples: std::sync::atomic::AtomicUsize::new(0),
                 max_write: std::sync::atomic::AtomicUsize::new(max_write),
                 paused: AtomicBool::new(false),
@@ -1476,6 +1480,17 @@ mod tests {
                 requested_epoch: self.state.requested_epoch.load(Ordering::Acquire),
                 callback_epoch: self.state.callback_epoch.load(Ordering::Acquire),
             }
+        }
+
+        fn estimated_audible_samples(&self) -> Option<u64> {
+            self.state
+                .audible_anchor_valid
+                .load(Ordering::Acquire)
+                .then(|| self.state.estimated_audible_samples.load(Ordering::Relaxed))
+        }
+
+        fn invalidate_audible_anchor(&self) {
+            self.state.audible_anchor_valid.store(false, Ordering::Release);
         }
 
         fn buffered_samples(&self) -> usize {
