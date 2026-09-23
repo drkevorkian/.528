@@ -1469,6 +1469,7 @@ mod tests {
         }
 
         fn request_epoch(&self, epoch: u64) {
+            self.state.audible_anchor_valid.store(false, Ordering::Release);
             self.state.requested_epoch.store(epoch, Ordering::Release);
         }
 
@@ -1524,6 +1525,7 @@ mod tests {
         }
 
         fn pause(&self) -> anyhow::Result<()> {
+            self.state.audible_anchor_valid.store(false, Ordering::Release);
             self.state.paused.store(true, Ordering::Release);
             Ok(())
         }
@@ -1935,6 +1937,37 @@ mod tests {
         let (master_ms, source) = worker.master_clock(base);
         assert_eq!(source, MasterClockSource::Audio);
         assert_eq!(master_ms, 1_500);
+    }
+
+    #[test]
+    fn runtime_epoch_change_invalidates_audible_anchor() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let state = install_fake_audio(&mut worker, 91, usize::MAX);
+        state.audible_anchor_valid.store(true, Ordering::Release);
+
+        worker.advance_audio_epoch(Some(4_000));
+
+        assert!(!state.audible_anchor_valid.load(Ordering::Acquire));
+        assert_eq!(worker.estimated_audible_media_position_ms(), None);
+    }
+
+    #[test]
+    fn runtime_pause_invalidates_audible_anchor_until_fresh_callback() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let (mut worker, command_tx) = worker_with_command_sender(snapshot_slot);
+        worker.generation = 9;
+        worker.state = PlayerState::Playing;
+        let state = install_fake_audio(&mut worker, 92, usize::MAX);
+        state.audible_anchor_valid.store(true, Ordering::Release);
+
+        command_tx
+            .try_send(PlaybackWorkerCommand::Pause { generation: 9 })
+            .expect("queue pause");
+        assert!(worker.playback_burst());
+
+        assert_eq!(worker.state, PlayerState::Paused);
+        assert!(!state.audible_anchor_valid.load(Ordering::Acquire));
     }
 
     #[test]
