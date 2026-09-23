@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
+use gpu_presenter::{GpuSubmitOutcome, GpuVideoPresenter};
 use libsrs_app_config::SrsConfig;
 use libsrs_app_services::{
     AppServices, DecodedVideoFrame, MediaInspection, MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE,
 };
-use gpu_presenter::{GpuSubmitOutcome, GpuVideoPresenter};
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
@@ -800,12 +800,7 @@ impl PlayerApp {
 
         let submission = if let Some(presenter) = self.playback.gpu_presenter.as_ref() {
             let pixels = gray8.take().expect("validated frame pixels are present");
-            match presenter.submit_frame(
-                self.playback.generation,
-                width,
-                height,
-                pixels,
-            ) {
+            match presenter.submit_frame(self.playback.generation, width, height, pixels) {
                 Ok(GpuSubmitOutcome::Accepted) => (GpuSubmissionState::Accepted, None, None),
                 Ok(GpuSubmitOutcome::StaleGeneration) => {
                     (GpuSubmissionState::StaleGeneration, None, None)
@@ -886,17 +881,15 @@ impl PlayerApp {
                 .gpu_presenter
                 .as_ref()
                 .map(|presenter| presenter.paint(ui, display_size)),
-            Some(VideoPresentationBackend::CpuFallback) => self
-                .playback
-                .preview_texture
-                .as_ref()
-                .map(|texture| {
+            Some(VideoPresentationBackend::CpuFallback) => {
+                self.playback.preview_texture.as_ref().map(|texture| {
                     ui.add(
                         egui::Image::new(texture)
                             .fit_to_exact_size(display_size)
                             .sense(egui::Sense::click()),
                     )
-                }),
+                })
+            }
             None => None,
         }
     }
