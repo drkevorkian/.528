@@ -1602,6 +1602,30 @@ mod tests {
     }
 
     #[test]
+    fn zero_timescale_audio_never_arms_authoritative_clock() {
+        let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
+        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let _state = install_fake_audio(&mut worker, 69, usize::MAX);
+
+        let chunk = DecodedAudioChunk {
+            sample_rate: 48_000,
+            channels: 2,
+            frame_index: 0,
+            pts_ticks: 123_456,
+            dts_ticks: 123_456,
+            timescale_hz: 0,
+            samples_interleaved: vec![1, 2, 3, 4],
+        };
+        worker
+            .queue_audio_chunk(chunk)
+            .expect("zero-timescale PCM may remain playable");
+
+        assert_eq!(worker.audio_epoch_media_start_ms, None);
+        assert!(!worker.audio_epoch_armed);
+        assert_eq!(worker.audio_media_position_ms(), None);
+    }
+
+    #[test]
     fn first_post_seek_audio_pts_replaces_requested_epoch_anchor() {
         let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
         let mut worker = worker_with_snapshot_slot(snapshot_slot);
