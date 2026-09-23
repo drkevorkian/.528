@@ -13,6 +13,13 @@ pub(crate) enum GpuSubmitOutcome {
 }
 
 #[derive(Debug)]
+pub(crate) struct GpuSubmitFailure {
+    pub(crate) message: String,
+    pub(crate) gray8: Vec<u8>,
+}
+
+
+#[derive(Debug)]
 struct PendingUpload {
     generation: u64,
     width: u32,
@@ -39,8 +46,10 @@ impl PresenterShared {
         width: u32,
         height: u32,
         gray8: Vec<u8>,
-    ) -> Result<GpuSubmitOutcome, String> {
-        validate_upload(width, height, gray8.len())?;
+    ) -> Result<GpuSubmitOutcome, GpuSubmitFailure> {
+        if let Err(message) = validate_upload(width, height, gray8.len()) {
+            return Err(GpuSubmitFailure { message, gray8 });
+        }
         if generation != self.current_generation {
             return Ok(GpuSubmitOutcome::StaleGeneration);
         }
@@ -102,11 +111,17 @@ impl GpuVideoPresenter {
         width: u32,
         height: u32,
         gray8: Vec<u8>,
-    ) -> Result<GpuSubmitOutcome, String> {
-        self.shared
-            .lock()
-            .map_err(|_| "GPU presenter state lock poisoned".to_string())?
-            .submit(generation, width, height, gray8)
+    ) -> Result<GpuSubmitOutcome, GpuSubmitFailure> {
+        let mut shared = match self.shared.lock() {
+            Ok(shared) => shared,
+            Err(_) => {
+                return Err(GpuSubmitFailure {
+                    message: "GPU presenter state lock poisoned".to_string(),
+                    gray8,
+                });
+            }
+        };
+        shared.submit(generation, width, height, gray8)
     }
 
     pub(crate) fn paint(&self, ui: &mut egui::Ui, size: egui::Vec2) -> egui::Response {
