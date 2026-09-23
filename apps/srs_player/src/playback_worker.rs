@@ -1753,7 +1753,7 @@ mod tests {
     #[test]
     fn runtime_full_scheduler_backpressures_without_decoder_access() {
         let snapshot_slot = Arc::new(Mutex::new(PlaybackSnapshot::default()));
-        let mut worker = worker_with_snapshot_slot(snapshot_slot);
+        let (mut worker, _command_tx) = worker_with_command_sender(snapshot_slot);
         worker.state = PlayerState::Playing;
         worker.generation = 1;
 
