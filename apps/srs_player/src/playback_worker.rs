@@ -1129,7 +1129,7 @@ impl PlaybackWorker {
         self.audio_epoch_media_start_ms = media_start_ms;
         self.audio_epoch_consumed_base = 0;
         self.audio_epoch_armed = false;
-        if let Some(audio) = self.audio_output.as_ref() {
+        if let Some(audio) = self.audio_output.as_mut() {
             audio.request_epoch(self.audio_epoch);
         }
     }
@@ -1159,18 +1159,27 @@ impl PlaybackWorker {
             self.audio_output = Some(Box::new(output));
         }
 
-        let Some(audio) = self.audio_output.as_ref() else {
-            return Err("audio output disappeared after initialization".to_string());
+        let (output_sample_rate, output_channels, adapted_samples) = {
+            let Some(audio) = self.audio_output.as_mut() else {
+                return Err("audio output disappeared after initialization".to_string());
+            };
+            if !audio.matches_format(chunk.sample_rate, chunk.channels) {
+                return Err(format!(
+                    "decoded audio format changed from {} Hz / {} channels to {} Hz / {} channels",
+                    audio.source_sample_rate(),
+                    audio.channels(),
+                    chunk.sample_rate,
+                    chunk.channels
+                ));
+            }
+
+            let adapted_samples = audio
+                .adapt_pcm(&chunk.samples_interleaved)
+                .map_err(|error| format!("audio sample-rate adaptation failed: {error:#}"))?;
+            let output_channels = u8::try_from(audio.channels())
+                .map_err(|_| "audio output channel count no longer fits u8".to_string())?;
+            (audio.sample_rate(), output_channels, adapted_samples)
         };
-        if !audio.matches_format(chunk.sample_rate, chunk.channels) {
-            return Err(format!(
-                "decoded audio format changed from {} Hz / {} channels to {} Hz / {} channels",
-                audio.sample_rate(),
-                audio.channels(),
-                chunk.sample_rate,
-                chunk.channels
-            ));
-        }
 
         // A seek target expresses user intent, but the first accepted decoded audio packet
         // defines the real playable media anchor for this epoch. This avoids carrying a
@@ -1180,9 +1189,9 @@ impl PlaybackWorker {
         }
 
         self.pending_audio = Some(PendingAudioChunk {
-            sample_rate: chunk.sample_rate,
-            channels: chunk.channels,
-            samples: chunk.samples_interleaved,
+            sample_rate: output_sample_rate,
+            channels: output_channels,
+            samples: adapted_samples,
             offset: 0,
         });
 
@@ -1316,7 +1325,7 @@ impl PlaybackWorker {
             self.emit_snapshot();
             return;
         };
-        let sample_rate = audio.sample_rate();
+        let sample_rate = audio.source_sample_rate();
         let anchor = self
             .audio_media_position_ms()
             .unwrap_or_else(|| self.fallback_clock.media_time_ms(now));
