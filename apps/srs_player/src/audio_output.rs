@@ -10,6 +10,62 @@ const MIN_RING_SAMPLES: usize = 4_096;
 const MAX_RING_SAMPLES: usize = 1_048_576;
 const TARGET_BUFFER_MS: u64 = 500;
 
+#[derive(Debug, Clone, Copy)]
+struct AudibleAnchor {
+    playback_nanos: u128,
+    consumed_samples_before_buffer: u64,
+    timing_generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct AudibleAnchorSnapshot {
+    sequence: AtomicU64,
+    playback_nanos_hi: AtomicU64,
+    playback_nanos_lo: AtomicU64,
+    consumed_samples_before_buffer: AtomicU64,
+    timing_generation: AtomicU64,
+}
+
+impl AudibleAnchorSnapshot {
+    fn publish(&self, anchor: AudibleAnchor) {
+        let odd = self.sequence.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        debug_assert_eq!(odd & 1, 1);
+        self.playback_nanos_hi
+            .store((anchor.playback_nanos >> 64) as u64, Ordering::Relaxed);
+        self.playback_nanos_lo
+            .store(anchor.playback_nanos as u64, Ordering::Relaxed);
+        self.consumed_samples_before_buffer
+            .store(anchor.consumed_samples_before_buffer, Ordering::Relaxed);
+        self.timing_generation
+            .store(anchor.timing_generation, Ordering::Relaxed);
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+
+    fn read(&self) -> Option<AudibleAnchor> {
+        for _ in 0..3 {
+            let first = self.sequence.load(Ordering::Acquire);
+            if first & 1 != 0 {
+                continue;
+            }
+            let hi = self.playback_nanos_hi.load(Ordering::Relaxed);
+            let lo = self.playback_nanos_lo.load(Ordering::Relaxed);
+            let consumed_samples_before_buffer = self
+                .consumed_samples_before_buffer
+                .load(Ordering::Relaxed);
+            let timing_generation = self.timing_generation.load(Ordering::Relaxed);
+            let second = self.sequence.load(Ordering::Acquire);
+            if first == second && second & 1 == 0 && second != 0 {
+                return Some(AudibleAnchor {
+                    playback_nanos: (u128::from(hi) << 64) | u128::from(lo),
+                    consumed_samples_before_buffer,
+                    timing_generation,
+                });
+            }
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AudioTelemetry {
     pub consumed_samples: u64,
@@ -25,6 +81,8 @@ pub(crate) trait AudioSink: Send {
     fn epoch_ready(&self, epoch: u64) -> bool;
     fn push_pcm(&mut self, epoch: u64, samples: &[i16]) -> Result<usize>;
     fn telemetry(&self) -> AudioTelemetry;
+    fn estimated_audible_samples(&self) -> Option<u64>;
+    fn invalidate_audible_anchor(&self);
     fn buffered_samples(&self) -> usize;
     fn sample_rate(&self) -> u32;
     fn channels(&self) -> u16;
@@ -40,6 +98,8 @@ pub struct AudioOutput {
     consumed_samples: Arc<AtomicU64>,
     underrun_samples: Arc<AtomicU64>,
     stream_errors: Arc<AtomicU64>,
+    timing_generation: Arc<AtomicU64>,
+    audible_anchor: Arc<AudibleAnchorSnapshot>,
     ring_capacity: usize,
     sample_rate: u32,
     channels: u16,
@@ -72,6 +132,8 @@ impl AudioOutput {
         let consumed_samples = Arc::new(AtomicU64::new(0));
         let underrun_samples = Arc::new(AtomicU64::new(0));
         let stream_errors = Arc::new(AtomicU64::new(0));
+        let timing_generation = Arc::new(AtomicU64::new(1));
+        let audible_anchor = Arc::new(AudibleAnchorSnapshot::default());
 
         let stream = build_stream_for_format(
             &device,
@@ -83,6 +145,8 @@ impl AudioOutput {
             Arc::clone(&consumed_samples),
             Arc::clone(&underrun_samples),
             Arc::clone(&stream_errors),
+            Arc::clone(&timing_generation),
+            Arc::clone(&audible_anchor),
         )?;
         stream
             .play()
@@ -96,6 +160,8 @@ impl AudioOutput {
             consumed_samples,
             underrun_samples,
             stream_errors,
+            timing_generation,
+            audible_anchor,
             ring_capacity: capacity,
             sample_rate,
             channels,
@@ -107,6 +173,7 @@ impl AudioOutput {
     }
 
     pub fn request_epoch(&self, epoch: u64) {
+        self.invalidate_audible_anchor();
         self.requested_epoch.store(epoch, Ordering::Release);
     }
 
@@ -143,6 +210,39 @@ impl AudioOutput {
         }
     }
 
+    pub fn invalidate_audible_anchor(&self) {
+        self.timing_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn estimated_audible_samples(&self) -> Option<u64> {
+        let anchor = self.audible_anchor.read()?;
+        let generation = self.timing_generation.load(Ordering::Acquire);
+        if anchor.timing_generation != generation {
+            return None;
+        }
+
+        let secs = u64::try_from(anchor.playback_nanos / 1_000_000_000).ok()?;
+        let nanos = (anchor.playback_nanos % 1_000_000_000) as u32;
+        let playback = cpal::StreamInstant::new(secs, nanos);
+        let now = self.stream.now();
+        let elapsed = now.checked_duration_since(playback)?;
+        let sample_rate = u64::from(self.sample_rate);
+        let channels = u64::from(self.channels);
+        let samples_per_second = sample_rate.checked_mul(channels)?;
+        let elapsed_samples = u64::try_from(
+            elapsed
+                .as_nanos()
+                .saturating_mul(u128::from(samples_per_second))
+                / 1_000_000_000,
+        )
+        .ok()?;
+        let candidate = anchor
+            .consumed_samples_before_buffer
+            .saturating_add(elapsed_samples);
+        let consumed = self.consumed_samples.load(Ordering::Acquire);
+        Some(candidate.min(consumed))
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
@@ -152,6 +252,7 @@ impl AudioOutput {
     }
 
     pub fn pause(&self) -> Result<()> {
+        self.invalidate_audible_anchor();
         self.stream.pause().context("failed to pause audio stream")
     }
 
@@ -179,6 +280,14 @@ impl AudioSink for AudioOutput {
 
     fn telemetry(&self) -> AudioTelemetry {
         AudioOutput::telemetry(self)
+    }
+
+    fn estimated_audible_samples(&self) -> Option<u64> {
+        AudioOutput::estimated_audible_samples(self)
+    }
+
+    fn invalidate_audible_anchor(&self) {
+        AudioOutput::invalidate_audible_anchor(self);
     }
 
     fn buffered_samples(&self) -> usize {
@@ -275,6 +384,8 @@ fn build_stream_for_format(
     consumed_samples: Arc<AtomicU64>,
     underrun_samples: Arc<AtomicU64>,
     stream_errors: Arc<AtomicU64>,
+    timing_generation: Arc<AtomicU64>,
+    audible_anchor: Arc<AudibleAnchorSnapshot>,
 ) -> Result<Stream> {
     macro_rules! build {
         ($sample:ty) => {{
@@ -287,6 +398,8 @@ fn build_stream_for_format(
                 consumed_samples,
                 underrun_samples,
                 stream_errors,
+                timing_generation,
+                audible_anchor,
             )
         }};
     }
@@ -408,6 +521,8 @@ fn build_typed_stream<T>(
     consumed_samples: Arc<AtomicU64>,
     underrun_samples: Arc<AtomicU64>,
     stream_errors: Arc<AtomicU64>,
+    timing_generation: Arc<AtomicU64>,
+    audible_anchor: Arc<AudibleAnchorSnapshot>,
 ) -> Result<Stream>
 where
     T: FromPcmI16 + Send + 'static,
@@ -416,7 +531,7 @@ where
     device
         .build_output_stream(
             config,
-            move |output: &mut [T], _| {
+            move |output: &mut [T], info| {
                 let requested = requested_epoch.load(Ordering::Acquire);
                 let active = callback_epoch.load(Ordering::Acquire);
                 if requested != active {
@@ -432,6 +547,7 @@ where
                 }
 
                 let available = consumer.slots().min(output.len());
+                let consumed_before = consumed_samples.load(Ordering::Relaxed);
                 let consumed = if available == 0 {
                     0
                 } else {
@@ -456,6 +572,12 @@ where
                 }
                 if consumed != 0 {
                     consumed_samples.fetch_add(consumed as u64, Ordering::Relaxed);
+                    let playback = info.timestamp().playback.as_nanos();
+                    audible_anchor.publish(AudibleAnchor {
+                        playback_nanos: playback,
+                        consumed_samples_before_buffer: consumed_before,
+                        timing_generation: timing_generation.load(Ordering::Acquire),
+                    });
                 }
                 let underrun = output.len().saturating_sub(consumed);
                 if underrun != 0 {
