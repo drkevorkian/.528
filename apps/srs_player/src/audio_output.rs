@@ -49,9 +49,8 @@ impl AudibleAnchorSnapshot {
             }
             let hi = self.playback_nanos_hi.load(Ordering::SeqCst);
             let lo = self.playback_nanos_lo.load(Ordering::SeqCst);
-            let consumed_samples_before_buffer = self
-                .consumed_samples_before_buffer
-                .load(Ordering::SeqCst);
+            let consumed_samples_before_buffer =
+                self.consumed_samples_before_buffer.load(Ordering::SeqCst);
             let timing_generation = self.timing_generation.load(Ordering::SeqCst);
             let second = self.sequence.load(Ordering::SeqCst);
             if first == second && second & 1 == 0 && second != 0 {
@@ -354,7 +353,9 @@ fn select_exact_config(
     let mut candidates = device
         .supported_output_configs()
         .context("failed to enumerate supported audio output configurations")?
-        .filter(|range| range.channels() == channels && is_supported_pcm_format(range.sample_format()))
+        .filter(|range| {
+            range.channels() == channels && is_supported_pcm_format(range.sample_format())
+        })
         .filter_map(|range| range.try_with_sample_rate(sample_rate))
         .collect::<Vec<_>>();
 
@@ -590,10 +591,7 @@ where
                             let (head, tail) = chunk.as_slices();
                             let head_len = head.len();
                             copy_pcm_to_output(head, &mut output[..head_len]);
-                            copy_pcm_to_output(
-                                tail,
-                                &mut output[head_len..head_len + tail.len()],
-                            );
+                            copy_pcm_to_output(tail, &mut output[head_len..head_len + tail.len()]);
                             chunk.commit_all();
                             available
                         }
@@ -713,7 +711,10 @@ mod tests {
 
     #[test]
     fn capacity_is_bounded() {
-        assert_eq!(ring_capacity_samples(8_000, 1).expect("capacity"), MIN_RING_SAMPLES);
+        assert_eq!(
+            ring_capacity_samples(8_000, 1).expect("capacity"),
+            MIN_RING_SAMPLES
+        );
         assert_eq!(
             ring_capacity_samples(768_000, 64).expect("capacity"),
             MAX_RING_SAMPLES
