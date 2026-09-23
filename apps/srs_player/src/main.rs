@@ -821,11 +821,7 @@ impl PlayerApp {
                     gray8.take(),
                     Some("GPU presenter backend became unavailable".to_string()),
                 ),
-                Err(message) => (
-                    GpuSubmissionState::Failed,
-                    gray8.take(),
-                    Some(message),
-                ),
+                Err(message) => (GpuSubmissionState::Failed, gray8.take(), Some(message)),
             }
         } else {
             (GpuSubmissionState::Unavailable, gray8.take(), None)
