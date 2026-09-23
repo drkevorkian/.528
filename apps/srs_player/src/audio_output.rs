@@ -28,32 +28,32 @@ struct AudibleAnchorSnapshot {
 
 impl AudibleAnchorSnapshot {
     fn publish(&self, anchor: AudibleAnchor) {
-        let odd = self.sequence.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        let odd = self.sequence.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
         debug_assert_eq!(odd & 1, 1);
         self.playback_nanos_hi
-            .store((anchor.playback_nanos >> 64) as u64, Ordering::Relaxed);
+            .store((anchor.playback_nanos >> 64) as u64, Ordering::SeqCst);
         self.playback_nanos_lo
-            .store(anchor.playback_nanos as u64, Ordering::Relaxed);
+            .store(anchor.playback_nanos as u64, Ordering::SeqCst);
         self.consumed_samples_before_buffer
-            .store(anchor.consumed_samples_before_buffer, Ordering::Relaxed);
+            .store(anchor.consumed_samples_before_buffer, Ordering::SeqCst);
         self.timing_generation
-            .store(anchor.timing_generation, Ordering::Relaxed);
-        self.sequence.fetch_add(1, Ordering::Release);
+            .store(anchor.timing_generation, Ordering::SeqCst);
+        self.sequence.fetch_add(1, Ordering::SeqCst);
     }
 
     fn read(&self) -> Option<AudibleAnchor> {
         for _ in 0..3 {
-            let first = self.sequence.load(Ordering::Acquire);
+            let first = self.sequence.load(Ordering::SeqCst);
             if first & 1 != 0 {
                 continue;
             }
-            let hi = self.playback_nanos_hi.load(Ordering::Relaxed);
-            let lo = self.playback_nanos_lo.load(Ordering::Relaxed);
+            let hi = self.playback_nanos_hi.load(Ordering::SeqCst);
+            let lo = self.playback_nanos_lo.load(Ordering::SeqCst);
             let consumed_samples_before_buffer = self
                 .consumed_samples_before_buffer
-                .load(Ordering::Relaxed);
-            let timing_generation = self.timing_generation.load(Ordering::Relaxed);
-            let second = self.sequence.load(Ordering::Acquire);
+                .load(Ordering::SeqCst);
+            let timing_generation = self.timing_generation.load(Ordering::SeqCst);
+            let second = self.sequence.load(Ordering::SeqCst);
             if first == second && second & 1 == 0 && second != 0 {
                 return Some(AudibleAnchor {
                     playback_nanos: (u128::from(hi) << 64) | u128::from(lo),
