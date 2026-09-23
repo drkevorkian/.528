@@ -1,4 +1,5 @@
 mod audio_output;
+mod gpu_presenter;
 mod playback_worker;
 
 use std::path::{Path, PathBuf};
