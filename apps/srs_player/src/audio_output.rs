@@ -6,7 +6,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{ErrorKind, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
-use rubato::{Async, FixedAsync, Resampler, Resizable, SincInterpolationParameters};
+use rubato::{Async, FixedAsync, PolynomialDegree, Resampler, Resizable};
 
 const MIN_RING_SAMPLES: usize = 4_096;
 const MAX_RING_SAMPLES: usize = 1_048_576;
@@ -145,6 +145,7 @@ struct PcmRateAdapter {
     output_rate: u32,
     channels: usize,
     resampler: Async<f64>,
+    delay_frames_left: usize,
 }
 
 impl PcmRateAdapter {
@@ -153,25 +154,28 @@ impl PcmRateAdapter {
             return Err(anyhow!("invalid PCM resampler format"));
         }
         let ratio = f64::from(output_rate) / f64::from(source_rate);
-        let resampler = Async::<f64>::new_sinc(
+        let resampler = Async::<f64>::new_poly(
             ratio,
             1.0,
-            &SincInterpolationParameters::default(),
+            PolynomialDegree::Cubic,
             RESAMPLE_MAX_CHUNK_FRAMES,
             channels,
             FixedAsync::Input,
         )
         .map_err(|error| anyhow!("failed to create PCM resampler: {error}"))?;
+        let delay_frames_left = resampler.output_delay();
         Ok(Self {
             source_rate,
             output_rate,
             channels,
             resampler,
+            delay_frames_left,
         })
     }
 
     fn reset(&mut self) {
         self.resampler.reset();
+        self.delay_frames_left = self.resampler.output_delay();
     }
 
     fn process(&mut self, samples: &[i16]) -> Result<Vec<i16>> {
@@ -217,8 +221,18 @@ impl PcmRateAdapter {
                 .resampler
                 .process(&adapter, None)
                 .map_err(|error| anyhow!("PCM resampling failed: {error}"))?;
+            let mut output = output.take_data();
+            let output_frames = output.len() / self.channels;
+            let trim_frames = self.delay_frames_left.min(output_frames);
+            if trim_frames != 0 {
+                let trim_samples = trim_frames
+                    .checked_mul(self.channels)
+                    .ok_or_else(|| anyhow!("PCM resampler delay trim overflow"))?;
+                output.drain(..trim_samples);
+                self.delay_frames_left -= trim_frames;
+            }
 
-            output_pcm.extend(output.take_data().into_iter().map(f64_to_i16));
+            output_pcm.extend(output.into_iter().map(f64_to_i16));
             frame_offset += frames;
         }
 
