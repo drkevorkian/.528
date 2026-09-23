@@ -6,7 +6,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
 use libsrs_app_config::SrsConfig;
-use libsrs_app_services::{AppServices, DecodedVideoFrame, MediaInspection};
+use libsrs_app_services::{
+    AppServices, DecodedVideoFrame, MediaInspection, MAX_VIDEO_PIXELS, MAX_VIDEO_SIDE,
+};
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
@@ -80,7 +82,7 @@ struct PlaybackWorkspace {
 }
 
 impl PlaybackWorkspace {
-    const DECODE_PREVIEW_BANNER: &'static str = "Decode preview: worker-thread CPU decode to in-app grayscale texture. No OS audio device or GPU presentation path yet.";
+    const DECODE_PREVIEW_BANNER: &'static str = "Playback preview: worker-thread CPU decode with persistent in-app texture updates. Dedicated WGPU video presentation is the next rendering slice.";
 
     fn new() -> Self {
         Self {
@@ -580,7 +582,13 @@ impl PlayerApp {
                         .presented_position_ms
                         .min(self.playback.duration_ms.max(1));
                     self.editor.frame_cursor_ms = self.playback.position_ms;
-                    self.apply_decoded_video(ctx, presentation.frame);
+                    if let Err(message) = self.apply_decoded_video(ctx, presentation.frame) {
+                        self.playback.worker_state = PlayerState::Error;
+                        self.playback.command_pending = false;
+                        self.playback.seek_in_progress = false;
+                        self.status = format!("Playback frame rejected: {message}");
+                        self.push_notification(self.status.clone());
+                    }
                     ctx.request_repaint();
                 }
                 Ok(Some(_)) | Ok(None) => {}
@@ -697,12 +705,36 @@ impl PlayerApp {
         };
     }
 
-    fn apply_decoded_video(&mut self, ctx: &egui::Context, v: DecodedVideoFrame) {
+    fn apply_decoded_video(
+        &mut self,
+        ctx: &egui::Context,
+        v: DecodedVideoFrame,
+    ) -> Result<(), String> {
+        let dims = validate_preview_frame(&v)?;
         self.playback.last_frame_crc32c = Some(v.payload_crc32c);
         self.playback.last_frame_dims = (v.width, v.height);
-        let gray = egui::ColorImage::from_gray([v.width as usize, v.height as usize], &v.gray8);
-        self.playback.preview_texture =
-            Some(ctx.load_texture("SRS-528-decode-preview", gray, egui::TextureOptions::LINEAR));
+        let gray = egui::ColorImage::from_gray(dims, &v.gray8);
+
+        let existing_dims = self
+            .playback
+            .preview_texture
+            .as_ref()
+            .map(egui::TextureHandle::size);
+        match texture_update_kind(existing_dims, dims) {
+            TextureUpdateKind::Reuse => {
+                if let Some(texture) = self.playback.preview_texture.as_mut() {
+                    texture.set(gray, egui::TextureOptions::LINEAR);
+                }
+            }
+            TextureUpdateKind::Reallocate => {
+                self.playback.preview_texture = Some(ctx.load_texture(
+                    "SRS-528-decode-preview",
+                    gray,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn run_editor_action(&mut self, action: EditorAction) {
@@ -1539,6 +1571,54 @@ impl EditorAction {
 fn suggest_output_path(input: &str) -> String {
     let path = Path::new(input);
     path.with_extension("528").display().to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextureUpdateKind {
+    Reuse,
+    Reallocate,
+}
+
+fn texture_update_kind(existing: Option<[usize; 2]>, incoming: [usize; 2]) -> TextureUpdateKind {
+    if existing == Some(incoming) {
+        TextureUpdateKind::Reuse
+    } else {
+        TextureUpdateKind::Reallocate
+    }
+}
+
+fn validate_preview_frame(frame: &DecodedVideoFrame) -> Result<[usize; 2], String> {
+    if frame.width == 0 || frame.height == 0 {
+        return Err("decoded frame dimensions must be non-zero".to_string());
+    }
+    if frame.width > MAX_VIDEO_SIDE || frame.height > MAX_VIDEO_SIDE {
+        return Err(format!(
+            "decoded frame dimensions {}x{} exceed side cap {}",
+            frame.width, frame.height, MAX_VIDEO_SIDE
+        ));
+    }
+
+    let pixel_count = u64::from(frame.width)
+        .checked_mul(u64::from(frame.height))
+        .ok_or_else(|| "decoded frame pixel-count overflow".to_string())?;
+    if pixel_count > MAX_VIDEO_PIXELS {
+        return Err(format!(
+            "decoded frame pixel count {pixel_count} exceeds cap {MAX_VIDEO_PIXELS}"
+        ));
+    }
+
+    let expected = usize::try_from(pixel_count)
+        .map_err(|_| "decoded frame pixel count does not fit usize".to_string())?;
+    if frame.gray8.len() != expected {
+        return Err(format!(
+            "decoded gray8 length {} does not match {}x{} ({expected} pixels)",
+            frame.gray8.len(),
+            frame.width,
+            frame.height
+        ));
+    }
+
+    Ok([frame.width as usize, frame.height as usize])
 }
 
 fn missing_snapshot(message: String) -> LicenseSnapshot {
