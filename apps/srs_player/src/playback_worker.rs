@@ -732,8 +732,7 @@ impl PlaybackWorker {
                 match self.reorder.finish_eos() {
                     Ok(()) if !self.presentation_time_slots_ms.is_empty() => {
                         self.fail(
-                            "end of stream left unmatched presentation timestamp slots"
-                                .to_string(),
+                            "end of stream left unmatched presentation timestamp slots".to_string(),
                         );
                         return;
                     }
@@ -1813,7 +1812,8 @@ mod tests {
         assert_eq!(worker.presented_position_ms, 100);
         let slot = worker.frame_slot.lock().expect("frame slot");
         assert_eq!(
-            slot.as_ref().map(|presentation| presentation.presented_position_ms),
+            slot.as_ref()
+                .map(|presentation| presentation.presented_position_ms),
             Some(100)
         );
     }
