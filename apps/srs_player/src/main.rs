@@ -1844,6 +1844,65 @@ mod tests {
         }
     }
 
+    fn decoded_frame(width: u32, height: u32, len: usize) -> DecodedVideoFrame {
+        DecodedVideoFrame {
+            width,
+            height,
+            frame_index: 0,
+            pts_ticks: 0,
+            dts_ticks: 0,
+            timescale_hz: 1_000,
+            payload_crc32c: 0,
+            gray8: vec![0; len],
+        }
+    }
+
+    #[test]
+    fn same_resolution_reuses_preview_texture_allocation() {
+        assert_eq!(
+            texture_update_kind(Some([1920, 1080]), [1920, 1080]),
+            TextureUpdateKind::Reuse
+        );
+    }
+
+    #[test]
+    fn resolution_change_reallocates_preview_texture() {
+        assert_eq!(
+            texture_update_kind(Some([1920, 1080]), [1280, 720]),
+            TextureUpdateKind::Reallocate
+        );
+        assert_eq!(
+            texture_update_kind(None, [1280, 720]),
+            TextureUpdateKind::Reallocate
+        );
+    }
+
+    #[test]
+    fn preview_validation_rejects_zero_and_oversized_dimensions() {
+        let zero = decoded_frame(0, 1, 0);
+        assert!(validate_preview_frame(&zero)
+            .expect_err("zero width must fail")
+            .contains("non-zero"));
+
+        let too_wide = decoded_frame(MAX_VIDEO_SIDE + 1, 1, 0);
+        assert!(validate_preview_frame(&too_wide)
+            .expect_err("oversized side must fail")
+            .contains("side cap"));
+    }
+
+    #[test]
+    fn preview_validation_rejects_pixel_length_mismatch() {
+        let frame = decoded_frame(2, 2, 3);
+        let error = validate_preview_frame(&frame).expect_err("mismatch must fail");
+        assert!(error.contains("does not match 2x2"));
+    }
+
+    #[test]
+    fn preview_validation_accepts_exact_gray8_buffer() {
+        let frame = decoded_frame(4, 3, 12);
+        assert_eq!(validate_preview_frame(&frame).expect("valid frame"), [4, 3]);
+    }
+
     #[test]
     fn verified_editor_snapshot_switches_workspace() {
         let mut app = PlayerApp::fallback("test".to_string());
