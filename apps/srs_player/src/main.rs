@@ -640,7 +640,7 @@ impl PlayerApp {
             .map(|value| format!("{value:08x}"))
             .unwrap_or_else(|| "n/a".to_string());
         self.playback.debug_stats = format!(
-            "worker={:?} | eos_draining={} | clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
+            "worker={:?} | eos_draining={} | clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_master_ms={:?} audio_consumed_ms={:?} audible_est_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
             snapshot.state,
             snapshot.eos_draining,
             snapshot.master_clock_source,
@@ -655,6 +655,8 @@ impl PlayerApp {
             snapshot.presented_video_frames,
             snapshot.decoded_position_ms,
             snapshot.audio_media_position_ms,
+            snapshot.audio_consumed_media_ms,
+            snapshot.estimated_audible_media_ms,
             snapshot.audio_consumed_samples,
             snapshot.audio_buffered_samples,
             snapshot.audio_underrun_samples,
@@ -1853,6 +1855,8 @@ mod tests {
             reorder_depth: 0,
             seek_in_progress: false,
             audio_media_position_ms: None,
+            audio_consumed_media_ms: None,
+            estimated_audible_media_ms: None,
             audio_consumed_samples: 0,
             audio_underrun_samples: 0,
             audio_stream_errors: 0,
