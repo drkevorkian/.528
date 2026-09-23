@@ -703,9 +703,36 @@ impl PlaybackWorker {
             }
         }
 
-        if self.scheduler.can_finish_eos() {
-            self.state = PlayerState::Ended;
-            self.emit_snapshot();
+        if self.scheduler.eos_pending {
+            if let Err(error) = self.enqueue_ready_presentations() {
+                self.fail(error);
+                return;
+            }
+
+            if !self.scheduler.is_full() {
+                match self.reorder.finish_eos() {
+                    Ok(()) if !self.presentation_time_slots_ms.is_empty() => {
+                        self.fail(
+                            "end of stream left unmatched presentation timestamp slots"
+                                .to_string(),
+                        );
+                        return;
+                    }
+                    Ok(()) => {}
+                    Err(error) => {
+                        self.fail(error);
+                        return;
+                    }
+                }
+            }
+
+            if self.scheduler.is_empty()
+                && self.reorder.depth() == 0
+                && self.presentation_time_slots_ms.is_empty()
+            {
+                self.state = PlayerState::Ended;
+                self.emit_snapshot();
+            }
         }
     }
 
@@ -745,22 +772,10 @@ impl PlaybackWorker {
                 self.emit_snapshot();
             }
             PlaybackEvent::EndOfStream => {
-                if let Err(error) = self.enqueue_ready_presentations() {
-                    self.fail(error);
-                    return;
-                }
-                match self.reorder.finish_eos() {
-                    Ok(()) if self.presentation_time_slots_ms.is_empty() => {
-                        self.scheduler.mark_eos();
-                        self.service_due_presentations(Instant::now());
-                        if self.state == PlayerState::Playing {
-                            self.emit_snapshot();
-                        }
-                    }
-                    Ok(()) => self.fail(
-                        "end of stream left unmatched presentation timestamp slots".to_string(),
-                    ),
-                    Err(error) => self.fail(error),
+                self.scheduler.mark_eos();
+                self.service_due_presentations(Instant::now());
+                if self.state == PlayerState::Playing {
+                    self.emit_snapshot();
                 }
             }
         }
