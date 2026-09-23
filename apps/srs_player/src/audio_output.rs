@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
+use cpal::{ErrorKind, SampleFormat, SizedSample, Stream, StreamConfig, SupportedStreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 const MIN_RING_SAMPLES: usize = 4_096;
@@ -65,6 +65,51 @@ impl AudibleAnchorSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u64)]
+pub(crate) enum AudioStreamIssue {
+    DeviceBusy = 1,
+    DeviceChanged = 2,
+    DeviceNotAvailable = 3,
+    RealtimeDenied = 4,
+    StreamInvalidated = 5,
+    Xrun = 6,
+    Fatal = 7,
+}
+
+impl AudioStreamIssue {
+    fn from_code(code: u64) -> Option<Self> {
+        match code {
+            1 => Some(Self::DeviceBusy),
+            2 => Some(Self::DeviceChanged),
+            3 => Some(Self::DeviceNotAvailable),
+            4 => Some(Self::RealtimeDenied),
+            5 => Some(Self::StreamInvalidated),
+            6 => Some(Self::Xrun),
+            7 => Some(Self::Fatal),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AudioStreamIssueEvent {
+    pub sequence: u64,
+    pub issue: AudioStreamIssue,
+}
+
+fn classify_stream_error(kind: ErrorKind) -> AudioStreamIssue {
+    match kind {
+        ErrorKind::DeviceBusy => AudioStreamIssue::DeviceBusy,
+        ErrorKind::DeviceChanged => AudioStreamIssue::DeviceChanged,
+        ErrorKind::DeviceNotAvailable => AudioStreamIssue::DeviceNotAvailable,
+        ErrorKind::RealtimeDenied => AudioStreamIssue::RealtimeDenied,
+        ErrorKind::StreamInvalidated => AudioStreamIssue::StreamInvalidated,
+        ErrorKind::Xrun => AudioStreamIssue::Xrun,
+        _ => AudioStreamIssue::Fatal,
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AudioTelemetry {
     pub consumed_samples: u64,
@@ -80,6 +125,7 @@ pub(crate) trait AudioSink: Send {
     fn epoch_ready(&self, epoch: u64) -> bool;
     fn push_pcm(&mut self, epoch: u64, samples: &[i16]) -> Result<usize>;
     fn telemetry(&self) -> AudioTelemetry;
+    fn latest_stream_issue(&self) -> Option<AudioStreamIssueEvent>;
     fn estimated_audible_samples(&self) -> Option<u64>;
     fn invalidate_audible_anchor(&self);
     fn buffered_samples(&self) -> usize;
@@ -97,6 +143,8 @@ pub struct AudioOutput {
     consumed_samples: Arc<AtomicU64>,
     underrun_samples: Arc<AtomicU64>,
     stream_errors: Arc<AtomicU64>,
+    stream_issue_sequence: Arc<AtomicU64>,
+    stream_issue_code: Arc<AtomicU64>,
     timing_generation: Arc<AtomicU64>,
     audible_anchor: Arc<AudibleAnchorSnapshot>,
     audible_floor_samples: AtomicU64,
@@ -132,6 +180,8 @@ impl AudioOutput {
         let consumed_samples = Arc::new(AtomicU64::new(0));
         let underrun_samples = Arc::new(AtomicU64::new(0));
         let stream_errors = Arc::new(AtomicU64::new(0));
+        let stream_issue_sequence = Arc::new(AtomicU64::new(0));
+        let stream_issue_code = Arc::new(AtomicU64::new(0));
         let timing_generation = Arc::new(AtomicU64::new(1));
         let audible_anchor = Arc::new(AudibleAnchorSnapshot::default());
 
@@ -145,6 +195,8 @@ impl AudioOutput {
             Arc::clone(&consumed_samples),
             Arc::clone(&underrun_samples),
             Arc::clone(&stream_errors),
+            Arc::clone(&stream_issue_sequence),
+            Arc::clone(&stream_issue_code),
             Arc::clone(&timing_generation),
             Arc::clone(&audible_anchor),
         )?;
@@ -160,6 +212,8 @@ impl AudioOutput {
             consumed_samples,
             underrun_samples,
             stream_errors,
+            stream_issue_sequence,
+            stream_issue_code,
             timing_generation,
             audible_anchor,
             audible_floor_samples: AtomicU64::new(0),
@@ -209,6 +263,15 @@ impl AudioOutput {
             requested_epoch: self.requested_epoch.load(Ordering::Acquire),
             callback_epoch: self.callback_epoch.load(Ordering::Acquire),
         }
+    }
+
+    pub fn latest_stream_issue(&self) -> Option<AudioStreamIssueEvent> {
+        let sequence = self.stream_issue_sequence.load(Ordering::Acquire);
+        if sequence == 0 {
+            return None;
+        }
+        let issue = AudioStreamIssue::from_code(self.stream_issue_code.load(Ordering::Acquire))?;
+        Some(AudioStreamIssueEvent { sequence, issue })
     }
 
     pub fn invalidate_audible_anchor(&self) {
@@ -280,6 +343,10 @@ impl AudioSink for AudioOutput {
 
     fn telemetry(&self) -> AudioTelemetry {
         AudioOutput::telemetry(self)
+    }
+
+    fn latest_stream_issue(&self) -> Option<AudioStreamIssueEvent> {
+        AudioOutput::latest_stream_issue(self)
     }
 
     fn estimated_audible_samples(&self) -> Option<u64> {
@@ -410,6 +477,8 @@ fn build_stream_for_format(
     consumed_samples: Arc<AtomicU64>,
     underrun_samples: Arc<AtomicU64>,
     stream_errors: Arc<AtomicU64>,
+    stream_issue_sequence: Arc<AtomicU64>,
+    stream_issue_code: Arc<AtomicU64>,
     timing_generation: Arc<AtomicU64>,
     audible_anchor: Arc<AudibleAnchorSnapshot>,
 ) -> Result<Stream> {
@@ -426,6 +495,8 @@ fn build_stream_for_format(
                 consumed_samples,
                 underrun_samples,
                 stream_errors,
+                stream_issue_sequence,
+                stream_issue_code,
                 timing_generation,
                 audible_anchor,
             )
@@ -550,6 +621,8 @@ fn build_typed_stream<T>(
     consumed_samples: Arc<AtomicU64>,
     underrun_samples: Arc<AtomicU64>,
     stream_errors: Arc<AtomicU64>,
+    stream_issue_sequence: Arc<AtomicU64>,
+    stream_issue_code: Arc<AtomicU64>,
     timing_generation: Arc<AtomicU64>,
     audible_anchor: Arc<AudibleAnchorSnapshot>,
 ) -> Result<Stream>
@@ -557,6 +630,8 @@ where
     T: FromPcmI16 + Send + 'static,
 {
     let callback_stream_errors = Arc::clone(&stream_errors);
+    let callback_issue_sequence = Arc::clone(&stream_issue_sequence);
+    let callback_issue_code = Arc::clone(&stream_issue_code);
     device
         .build_output_stream(
             config,
@@ -616,7 +691,10 @@ where
                     underrun_samples.fetch_add(underrun as u64, Ordering::Relaxed);
                 }
             },
-            move |_error| {
+            move |error| {
+                let issue = classify_stream_error(error.kind());
+                callback_issue_code.store(issue as u64, Ordering::Relaxed);
+                callback_issue_sequence.fetch_add(1, Ordering::Release);
                 callback_stream_errors.fetch_add(1, Ordering::Relaxed);
             },
             None,
