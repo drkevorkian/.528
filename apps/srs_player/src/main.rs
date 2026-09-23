@@ -10,8 +10,8 @@ use libsrs_app_services::{AppServices, DecodedVideoFrame, MediaInspection};
 use libsrs_licensing_client::{EffectiveMode, LicenseSnapshot, LicensingClient, VerificationState};
 use libsrs_licensing_proto::{ClientNotification, EntitlementClaims, UnsupportedCodecTrack};
 use playback_worker::{
-    MasterClockSource, PlaybackSnapshot, PlaybackWorkerCommand, PlaybackWorkerEvent,
-    PlaybackWorkerHandle, PlayerState,
+    AudioClockType, MasterClockSource, PlaybackSnapshot, PlaybackWorkerCommand,
+    PlaybackWorkerEvent, PlaybackWorkerHandle, PlayerState,
 };
 use rfd::FileDialog;
 
@@ -640,10 +640,11 @@ impl PlayerApp {
             .map(|value| format!("{value:08x}"))
             .unwrap_or_else(|| "n/a".to_string());
         self.playback.debug_stats = format!(
-            "worker={:?} | eos_draining={} | clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_master_ms={:?} audio_consumed_ms={:?} audible_est_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
+            "worker={:?} | eos_draining={} | clock={:?} audio_clock={:?} master_ms={} presented_ms={} av_skew_ms={} | held={} late_drop={} slot_drop={} | decoded_v={} decoded_a={} presented_v={} decoded_ms={} audio_master_ms={:?} audio_consumed_ms={:?} audible_est_ms={:?} | audio_samples={} audio_buffered={} underrun={} stream_err={} | reorder={} | crc={} | dims={}x{}",
             snapshot.state,
             snapshot.eos_draining,
             snapshot.master_clock_source,
+            snapshot.audio_clock_type,
             snapshot.master_media_ms,
             snapshot.presented_position_ms,
             snapshot.av_skew_ms,
@@ -1862,6 +1863,7 @@ mod tests {
             audio_stream_errors: 0,
             master_media_ms: 0,
             master_clock_source: MasterClockSource::Fallback,
+            audio_clock_type: None,
             held_frame_count: 0,
             av_skew_ms: 0,
             late_presentation_drops: 0,
