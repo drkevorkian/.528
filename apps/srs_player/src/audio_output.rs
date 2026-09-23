@@ -224,23 +224,14 @@ impl AudioOutput {
         let secs = u64::try_from(anchor.playback_nanos / 1_000_000_000).ok()?;
         let nanos = (anchor.playback_nanos % 1_000_000_000) as u32;
         let playback = cpal::StreamInstant::new(secs, nanos);
-        let now = self.stream.now();
-        let elapsed = now.checked_duration_since(playback)?;
-        let sample_rate = u64::from(self.sample_rate);
-        let channels = u64::from(self.channels);
-        let samples_per_second = sample_rate.checked_mul(channels)?;
-        let elapsed_samples = u64::try_from(
-            elapsed
-                .as_nanos()
-                .saturating_mul(u128::from(samples_per_second))
-                / 1_000_000_000,
+        estimate_audible_samples(
+            anchor.consumed_samples_before_buffer,
+            playback,
+            self.stream.now(),
+            self.consumed_samples.load(Ordering::Acquire),
+            self.sample_rate,
+            self.channels,
         )
-        .ok()?;
-        let candidate = anchor
-            .consumed_samples_before_buffer
-            .saturating_add(elapsed_samples);
-        let consumed = self.consumed_samples.load(Ordering::Acquire);
-        Some(candidate.min(consumed))
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -309,6 +300,30 @@ impl AudioSink for AudioOutput {
     fn play(&self) -> Result<()> {
         AudioOutput::play(self)
     }
+}
+
+fn estimate_audible_samples(
+    consumed_samples_before_buffer: u64,
+    playback: cpal::StreamInstant,
+    now: cpal::StreamInstant,
+    consumed_samples: u64,
+    sample_rate: u32,
+    channels: u16,
+) -> Option<u64> {
+    let elapsed = now.checked_duration_since(playback)?;
+    let samples_per_second = u64::from(sample_rate).checked_mul(u64::from(channels))?;
+    if samples_per_second == 0 {
+        return None;
+    }
+    let elapsed_samples = u64::try_from(
+        elapsed
+            .as_nanos()
+            .saturating_mul(u128::from(samples_per_second))
+            / 1_000_000_000,
+    )
+    .ok()?;
+    let candidate = consumed_samples_before_buffer.saturating_add(elapsed_samples);
+    Some(candidate.min(consumed_samples))
 }
 
 fn ring_capacity_samples(sample_rate: u32, channels: u16) -> Result<usize> {
@@ -609,6 +624,46 @@ fn fill_silence<T: FromPcmI16>(output: &mut [T]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audible_anchor_snapshot_preserves_full_u128_stream_time() {
+        let snapshot = AudibleAnchorSnapshot::default();
+        let playback_nanos = (u128::from(u64::MAX) << 64) | 0x1234_5678_9abc_def0;
+        snapshot.publish(AudibleAnchor {
+            playback_nanos,
+            consumed_samples_before_buffer: 987_654,
+            timing_generation: 42,
+        });
+
+        let anchor = snapshot.read().expect("coherent anchor");
+        assert_eq!(anchor.playback_nanos, playback_nanos);
+        assert_eq!(anchor.consumed_samples_before_buffer, 987_654);
+        assert_eq!(anchor.timing_generation, 42);
+    }
+
+    #[test]
+    fn audible_estimate_advances_with_stream_time_but_caps_at_real_pcm() {
+        let playback = cpal::StreamInstant::new(10, 0);
+        let now = cpal::StreamInstant::new(10, 500_000_000);
+        assert_eq!(
+            estimate_audible_samples(96_000, playback, now, 200_000, 48_000, 2),
+            Some(144_000)
+        );
+        assert_eq!(
+            estimate_audible_samples(96_000, playback, now, 120_000, 48_000, 2),
+            Some(120_000)
+        );
+    }
+
+    #[test]
+    fn audible_estimate_rejects_regressing_stream_time() {
+        let playback = cpal::StreamInstant::new(11, 0);
+        let now = cpal::StreamInstant::new(10, 999_999_999);
+        assert_eq!(
+            estimate_audible_samples(0, playback, now, 1_000, 48_000, 2),
+            None
+        );
+    }
 
     #[test]
     fn capacity_is_bounded() {
